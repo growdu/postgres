@@ -27,6 +27,9 @@
 #include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "commands/defrem.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/parse_utilcmd.h"
 #include "replication/logicalddl.h"
 #include "replication/logical.h"
 #include "storage/lmgr.h"
@@ -80,6 +83,196 @@ parse_ddl_string(const char *ddl_str)
 
 	pfree(rawstr);
 	return ddl_kind;
+}
+
+/*
+ * Check if a statement is a DDL statement we want to replicate.
+ *
+ * Currently supported DDL types:
+ * - CREATE TABLE / DROP TABLE / ALTER TABLE (table DDL)
+ * - Index statements (IndexStmt - includes CREATE/DROP INDEX)
+ */
+static bool
+is_replicable_ddl(Node *stmt)
+{
+	if (stmt == NULL)
+		return false;
+
+	switch (nodeTag(stmt))
+	{
+			/* Table DDL */
+		case T_CreateStmt:
+		case T_DropStmt:
+		case T_AlterTableStmt:
+			return true;
+
+			/* Index DDL - all index operations are T_IndexStmt */
+		case T_IndexStmt:
+			return true;
+
+		default:
+			return false;
+	}
+}
+
+/*
+ * Get DDL kind from statement node.
+ */
+static int
+get_ddl_kind(Node *stmt)
+{
+	if (stmt == NULL)
+		return DDL_KIND_NONE;
+
+	switch (nodeTag(stmt))
+	{
+			/* Table DDL */
+		case T_CreateStmt:
+		case T_DropStmt:
+		case T_AlterTableStmt:
+			return DDL_KIND_TABLE;
+
+			/* Index DDL */
+		case T_IndexStmt:
+			return DDL_KIND_INDEX;
+
+		default:
+			return DDL_KIND_NONE;
+	}
+}
+
+/*
+ * Get command tag for a DDL statement.
+ */
+static const char *
+get_ddl_command_tag(Node *stmt)
+{
+	if (stmt == NULL)
+		return "";
+
+	switch (nodeTag(stmt))
+	{
+		case T_CreateStmt:
+			return "CREATE TABLE";
+		case T_DropStmt:
+			return "DROP TABLE";
+		case T_AlterTableStmt:
+			return "ALTER TABLE";
+		case T_IndexStmt:
+			{
+				/* We can't easily distinguish CREATE/DROP/ALTER here
+				 * without more context, so use a generic tag */
+				return "INDEX";
+			}
+		default:
+			return "";
+	}
+}
+
+/*
+ * Get target table/index name from a DDL statement.
+ */
+static char *
+get_ddl_target_table(Node *stmt)
+{
+	if (stmt == NULL)
+		return NULL;
+
+	switch (nodeTag(stmt))
+	{
+		case T_CreateStmt:
+			{
+				CreateStmt *create = (CreateStmt *) stmt;
+				return create->relation->relname;
+			}
+
+		case T_DropStmt:
+			{
+				DropStmt *drop = (DropStmt *) stmt;
+				if (drop->objects != NIL)
+				{
+					List *obj = (List *) linitial(drop->objects);
+					if (obj != NIL && IsA(linitial(obj), RangeVar))
+					{
+						RangeVar *rv = (RangeVar *) linitial(obj);
+						return rv->relname;
+					}
+				}
+				return NULL;
+			}
+
+		case T_AlterTableStmt:
+			{
+				AlterTableStmt *alter = (AlterTableStmt *) stmt;
+				if (alter->relation != NULL)
+					return alter->relation->relname;
+				return NULL;
+			}
+
+		case T_IndexStmt:
+			{
+				IndexStmt *idx = (IndexStmt *) stmt;
+				if (idx->relation != NULL)
+					return idx->relation->relname;
+				return NULL;
+			}
+
+		default:
+			return NULL;
+	}
+}
+
+/*
+ * Build LogicalDDLCommand from a PlannedStmt and query string.
+ *
+ * Returns true if the statement is a replicable DDL.
+ */
+bool
+BuildLogicalDDLCommandIfNeeded(PlannedStmt *pstmt, const char *queryString,
+							   ProcessUtilityContext context,
+							   LogicalDDLCommand *cmd)
+{
+	Node	   *stmt;
+	int			ddl_kind;
+
+	/* Initialize command */
+	memset(cmd, 0, sizeof(LogicalDDLCommand));
+
+	/* We only handle utility statements (DDL are utility statements) */
+	if (pstmt->utilityStmt == NULL)
+		return false;
+
+	stmt = pstmt->utilityStmt;
+
+	/* Check if it's a DDL type we want to replicate */
+	if (!is_replicable_ddl(stmt))
+		return false;
+
+	/* Get the DDL kind */
+	ddl_kind = get_ddl_kind(stmt);
+	if (ddl_kind == DDL_KIND_NONE)
+		return false;
+
+	cmd->ddl_kind = ddl_kind;
+
+	/* Get command tag */
+	cmd->command_tag = pstrdup(get_ddl_command_tag(stmt));
+
+	/* Store query string */
+	cmd->query_string = pstrdup(queryString);
+
+	/* Get target table */
+	cmd->target_table = get_ddl_target_table(stmt);
+
+	/* Store transaction info */
+	cmd->xid = GetCurrentTransactionId();
+	cmd->ts = GetCurrentTransactionStartTimestamp();
+	cmd->lsn = GetXLogInsertRecPtr();
+
+	/* DDL seqno - could be a sequence number within the transaction */
+	cmd->ddl_seqno = 0;
+
+	return true;
 }
 
 /*
