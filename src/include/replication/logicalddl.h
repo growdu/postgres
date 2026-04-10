@@ -26,6 +26,9 @@ typedef enum ReplicableDDLKind
 	REPL_DDL_INDEX
 } ReplicableDDLKind;
 
+#define LOGICAL_DDL_MESSAGE_PREFIX_TABLE	"pg_ddl_table"
+#define LOGICAL_DDL_MESSAGE_PREFIX_INDEX	"pg_ddl_index"
+
 typedef struct LogicalDDLCommand
 {
 	ReplicableDDLKind kind;
@@ -56,6 +59,7 @@ extern bool GetLogicalDDLInfo(PlannedStmt *pstmt,
 							  Oid relid_hint,
 							  LogicalDDLCommand *cmd);
 extern void FreeLogicalDDLCommand(LogicalDDLCommand *cmd);
+extern const char *LogicalDDLMessagePrefix(ReplicableDDLKind kind);
+extern ReplicableDDLKind LogicalDDLKindFromMessagePrefix(const char *prefix);
 
 #endif							/* LOGICALDDL_H */
-

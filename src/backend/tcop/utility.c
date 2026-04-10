@@ -60,6 +60,7 @@
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
 #include "replication/logicalddl.h"
+#include "replication/message.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
@@ -2073,11 +2074,16 @@ MaybeCaptureLogicalDDL(PlannedStmt *pstmt,
 					   Oid relid_hint)
 {
 	LogicalDDLCommand cmd;
+	const char *prefix;
 
 	if (!GetLogicalDDLInfo(pstmt, queryString, context, address, relid_hint, &cmd))
 		return;
 
-	/* Patch 2 only captures and normalizes command metadata. */
+	prefix = LogicalDDLMessagePrefix(cmd.kind);
+	if (prefix != NULL && cmd.normalized_sql != NULL && cmd.normalized_sql[0] != '\0')
+		(void) LogLogicalMessage(prefix, cmd.normalized_sql,
+								 strlen(cmd.normalized_sql), true);
+
 	FreeLogicalDDLCommand(&cmd);
 }
 

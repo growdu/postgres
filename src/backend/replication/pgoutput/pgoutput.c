@@ -24,6 +24,7 @@
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
 #include "replication/logical.h"
+#include "replication/logicalddl.h"
 #include "replication/logicalproto.h"
 #include "replication/origin.h"
 #include "replication/pgoutput.h"
@@ -86,6 +87,8 @@ static void pgoutput_stream_prepare_txn(LogicalDecodingContext *ctx,
 static bool publications_valid;
 
 static List *LoadPublications(List *pubnames);
+static void load_publications_if_needed(PGOutputData *data);
+static bool should_forward_ddl_message(PGOutputData *data, const char *prefix);
 static void publication_invalidation_cb(Datum arg, int cacheid,
 										uint32 hashvalue);
 static void send_repl_origin(LogicalDecodingContext *ctx,
@@ -1818,6 +1821,58 @@ LoadPublications(List *pubnames)
 	}
 
 	return result;
+}
+
+static void
+load_publications_if_needed(PGOutputData *data)
+{
+	MemoryContext oldctx;
+
+	if (publications_valid)
+		return;
+
+	MemoryContextReset(data->pubctx);
+
+	oldctx = MemoryContextSwitchTo(data->pubctx);
+	data->publications = LoadPublications(data->publication_names);
+	MemoryContextSwitchTo(oldctx);
+	publications_valid = true;
+}
+
+static bool
+should_forward_ddl_message(PGOutputData *data, const char *prefix)
+{
+	ReplicableDDLKind kind;
+	int32		ddl_mask = PUBDDL_NONE;
+	ListCell   *lc;
+
+	kind = LogicalDDLKindFromMessagePrefix(prefix);
+	if (kind == REPL_DDL_KIND_INVALID)
+		return false;
+
+	load_publications_if_needed(data);
+
+	switch (kind)
+	{
+		case REPL_DDL_TABLE:
+			ddl_mask = PUBDDL_TABLE;
+			break;
+		case REPL_DDL_INDEX:
+			ddl_mask = PUBDDL_INDEX;
+			break;
+		case REPL_DDL_KIND_INVALID:
+			return false;
+	}
+
+	foreach(lc, data->publications)
+	{
+		Publication *pub = lfirst(lc);
+
+		if ((pub->pubddl & ddl_mask) != 0)
+			return true;
+	}
+
+	return false;
 }
 
 /*
