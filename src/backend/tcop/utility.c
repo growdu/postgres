@@ -2082,7 +2082,7 @@ MaybeCaptureLogicalDDL(PlannedStmt *pstmt,
 	prefix = LogicalDDLMessagePrefix(cmd.kind);
 	if (prefix != NULL && cmd.normalized_sql != NULL && cmd.normalized_sql[0] != '\0')
 		(void) LogLogicalMessage(prefix, cmd.normalized_sql,
-								 strlen(cmd.normalized_sql), true);
+								 strlen(cmd.normalized_sql), true, false);
 
 	FreeLogicalDDLCommand(&cmd);
 }

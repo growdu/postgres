@@ -21,6 +21,7 @@
 #include "catalog/objectaddress.h"
 #include "nodes/parsenodes.h"
 #include "replication/logicalddl.h"
+#include "tcop/tcopprot.h"
 #include "tcop/cmdtag.h"
 #include "utils/lsyscache.h"
 
@@ -51,7 +52,8 @@ GetLogicalDDLInfo(PlannedStmt *pstmt,
 	 * Skip utility processing that is not tied to a normal utility statement
 	 * execution path.
 	 */
-	if (context == PROCESS_UTILITY_QUERY_NONATOMIC)
+	if (context == PROCESS_UTILITY_QUERY_NONATOMIC ||
+		context == PROCESS_UTILITY_SUBCOMMAND)
 		return false;
 
 	parsetree = pstmt->utilityStmt;
@@ -186,6 +188,12 @@ get_replicable_ddl_kind(Node *parsetree, ReplicableDDLKind *kind)
 static char *
 extract_stmt_sql(PlannedStmt *pstmt, const char *queryString)
 {
+	List	   *raw_parsetree_list;
+	ReplicableDDLKind target_kind = REPL_DDL_KIND_INVALID;
+	RawStmt    *candidate = NULL;
+	ListCell   *lc;
+	RawStmt    *rawstmt;
+
 	if (queryString == NULL)
 		return NULL;
 
@@ -194,6 +202,49 @@ extract_stmt_sql(PlannedStmt *pstmt, const char *queryString)
 
 	if (pstmt->stmt_len > 0)
 		return pnstrdup(queryString + pstmt->stmt_location, pstmt->stmt_len);
+
+	/*
+	 * Some utility recursion paths preserve only the outer stmt_len (or leave
+	 * it as -1), which can make a naïve substring include following SQL
+	 * statements. Re-parse from current stmt_location and keep only the first
+	 * matching utility statement slice.
+	 */
+	raw_parsetree_list = pg_parse_query(queryString);
+	(void) get_replicable_ddl_kind(pstmt->utilityStmt, &target_kind);
+
+	foreach(lc, raw_parsetree_list)
+	{
+		ReplicableDDLKind raw_kind = REPL_DDL_KIND_INVALID;
+
+		rawstmt = lfirst_node(RawStmt, lc);
+
+		if (rawstmt->stmt_location < 0 || rawstmt->stmt_len <= 0)
+			continue;
+
+		if (!get_replicable_ddl_kind(rawstmt->stmt, &raw_kind))
+			continue;
+
+		if (target_kind != REPL_DDL_KIND_INVALID && raw_kind != target_kind)
+			continue;
+
+		/*
+		 * Prefer raw statements that start at or after the planner-reported
+		 * location, but keep a fallback in case that location was inherited
+		 * from a wrapper statement.
+		 */
+		if (pstmt->stmt_location >= 0 &&
+			rawstmt->stmt_location >= pstmt->stmt_location)
+		{
+			candidate = rawstmt;
+			break;
+		}
+
+		if (candidate == NULL)
+			candidate = rawstmt;
+	}
+
+	if (candidate != NULL)
+		return pnstrdup(queryString + candidate->stmt_location, candidate->stmt_len);
 
 	return pstrdup(queryString + pstmt->stmt_location);
 }

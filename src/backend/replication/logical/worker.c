@@ -144,6 +144,7 @@
 #include "access/tableam.h"
 #include "access/twophase.h"
 #include "access/xact.h"
+#include "catalog/pg_publication.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_subscription.h"
@@ -152,6 +153,7 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/execPartition.h"
+#include "executor/spi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
@@ -162,6 +164,7 @@
 #include "postmaster/walwriter.h"
 #include "replication/conflict.h"
 #include "replication/logicallauncher.h"
+#include "replication/logicalddl.h"
 #include "replication/logicalproto.h"
 #include "replication/logicalrelation.h"
 #include "replication/logicalworker.h"
@@ -187,6 +190,7 @@
 #include "utils/usercontext.h"
 
 #define NAPTIME_PER_CYCLE 1000	/* max sleep time between cycles (1s) */
+#define LOGICAL_DDL_MESSAGE_TRANSACTIONAL_FLAG	(1 << 0)
 
 typedef struct FlushPosition
 {
@@ -394,6 +398,7 @@ static void apply_handle_tuple_routing(ApplyExecutionData *edata,
 									   TupleTableSlot *remoteslot,
 									   LogicalRepTupleData *newtup,
 									   CmdType operation);
+static void apply_handle_message(StringInfo s);
 
 /* Functions for skipping changes */
 static void maybe_start_skipping_changes(XLogRecPtr finish_lsn);
@@ -2349,6 +2354,99 @@ apply_handle_type(StringInfo s)
 }
 
 /*
+ * Handle MESSAGE message.
+ *
+ * Logical replication now uses transactional logical messages with dedicated
+ * prefixes to carry DDL statements.
+ */
+static void
+apply_handle_message(StringInfo s)
+{
+	uint8		flags;
+	bool		transactional;
+	XLogRecPtr	message_lsn;
+	const char *prefix;
+	int			msgsz;
+	const char *message;
+	ReplicableDDLKind ddl_kind;
+	int32		ddl_mask = PUBDDL_NONE;
+	char	   *ddl_sql;
+	int			save_nestlevel;
+	int			rc;
+
+	/*
+	 * Quick return if we are skipping data modification changes or handling
+	 * streamed transactions.
+	 */
+	if (is_skipping_changes() ||
+		handle_streamed_transaction(LOGICAL_REP_MSG_MESSAGE, s))
+		return;
+
+	flags = pq_getmsgbyte(s);
+	if (flags & ~LOGICAL_DDL_MESSAGE_TRANSACTIONAL_FLAG)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg_internal("invalid flags in logical replication message")));
+
+	transactional = (flags & LOGICAL_DDL_MESSAGE_TRANSACTIONAL_FLAG) != 0;
+	message_lsn = pq_getmsgint64(s);
+	prefix = pq_getmsgstring(s);
+	msgsz = pq_getmsgint(s, 4);
+	message = pq_getmsgbytes(s, msgsz);
+
+	ddl_kind = LogicalDDLKindFromMessagePrefix(prefix);
+	if (ddl_kind == REPL_DDL_KIND_INVALID || !transactional || msgsz <= 0)
+		return;
+
+	switch (ddl_kind)
+	{
+		case REPL_DDL_TABLE:
+			ddl_mask = PUBDDL_TABLE;
+			break;
+		case REPL_DDL_INDEX:
+			ddl_mask = PUBDDL_INDEX;
+			break;
+		case REPL_DDL_KIND_INVALID:
+			return;
+	}
+
+	if ((MySubscription->ddl & ddl_mask) == 0)
+		return;
+
+	ddl_sql = pnstrdup(message, msgsz);
+
+	begin_replication_step();
+
+	/*
+	 * Keep a stable and predictable search path while replaying replicated
+	 * DDL statements.
+	 */
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "public, pg_catalog",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed while applying logical DDL message");
+
+	rc = SPI_execute(ddl_sql, false, 0);
+	if (rc < 0)
+		ereport(ERROR,
+				(errmsg("SPI_execute failed while applying logical DDL message"),
+				 errdetail("SPI_execute returned %s for SQL: %s",
+						   SPI_result_code_string(rc), ddl_sql)));
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed while applying logical DDL message");
+
+	AtEOXact_GUC(false, save_nestlevel);
+	end_replication_step();
+
+	/* silence compiler warning when ASSERTs are disabled */
+	(void) message_lsn;
+}
+
+/*
  * Check that we (the subscription owner) have sufficient privileges on the
  * target relation to perform the given operation.
  */
@@ -2409,6 +2507,37 @@ apply_handle_insert(StringInfo s)
 
 	relid = logicalrep_read_insert(s, &newtup);
 	rel = logicalrep_rel_open(relid, RowExclusiveLock);
+
+	/*
+	 * For DDL-replicated tables, relation state may be absent from
+	 * pg_subscription_rel when first row changes arrive in the same
+	 * transaction as CREATE TABLE. Register it as READY on-demand.
+	 */
+	if (rel->state == SUBREL_STATE_UNKNOWN)
+	{
+		XLogRecPtr	statelsn;
+		char		relstate;
+
+		relstate = GetSubscriptionRelState(MySubscription->oid,
+										   rel->localreloid,
+										   &statelsn);
+		if (relstate == SUBREL_STATE_UNKNOWN)
+		{
+			AddSubscriptionRelState(MySubscription->oid,
+									rel->localreloid,
+									SUBREL_STATE_READY,
+									InvalidXLogRecPtr,
+									false);
+			rel->state = SUBREL_STATE_READY;
+			rel->statelsn = InvalidXLogRecPtr;
+		}
+		else
+		{
+			rel->state = relstate;
+			rel->statelsn = statelsn;
+		}
+	}
+
 	if (!should_apply_changes_for_rel(rel))
 	{
 		/*
@@ -3417,12 +3546,7 @@ apply_dispatch(StringInfo s)
 			break;
 
 		case LOGICAL_REP_MSG_MESSAGE:
-
-			/*
-			 * Logical replication does not use generic logical messages yet.
-			 * Although, it could be used by other applications that use this
-			 * output plugin.
-			 */
+			apply_handle_message(s);
 			break;
 
 		case LOGICAL_REP_MSG_STREAM_START:

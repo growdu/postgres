@@ -1728,8 +1728,12 @@ pgoutput_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 {
 	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
 	TransactionId xid = InvalidTransactionId;
+	bool		forward_ddl = should_forward_ddl_message(data, prefix);
 
-	if (!data->messages)
+	if (!data->messages && !forward_ddl)
+		return;
+
+	if (forward_ddl && !transactional)
 		return;
 
 	/*
@@ -2108,7 +2112,6 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 {
 	RelationSyncEntry *entry;
 	bool		found;
-	MemoryContext oldctx;
 	Oid			relid = RelationGetRelid(relation);
 
 	Assert(RelationSyncCache != NULL);
@@ -2157,15 +2160,7 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 		List	   *rel_publications = NIL;
 
 		/* Reload publications if needed before use. */
-		if (!publications_valid)
-		{
-			MemoryContextReset(data->pubctx);
-
-			oldctx = MemoryContextSwitchTo(data->pubctx);
-			data->publications = LoadPublications(data->publication_names);
-			MemoryContextSwitchTo(oldctx);
-			publications_valid = true;
-		}
+		load_publications_if_needed(data);
 
 		/*
 		 * Reset schema_sent status as the relation definition may have
