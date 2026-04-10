@@ -60,6 +60,11 @@ CATALOG(pg_publication,6104,PublicationRelationId)
 	 * if stored generated column data should be published.
 	 */
 	char		pubgencols;
+
+	/*
+	 * Bitmap of DDL kinds to publish.
+	 */
+	int32		pubddl;
 } FormData_pg_publication;
 
 /* ----------------
@@ -131,8 +136,17 @@ typedef struct Publication
 	bool		alltables;
 	bool		pubviaroot;
 	PublishGencolsType pubgencols_type;
+	int32		pubddl;
 	PublicationActions pubactions;
 } Publication;
+
+/*
+ * Supported publication/subscription DDL bitmap values.
+ */
+#define PUBDDL_NONE		0
+#define PUBDDL_TABLE	(1 << 0)
+#define PUBDDL_INDEX	(1 << 1)
+#define PUBDDL_ALL		(PUBDDL_TABLE | PUBDDL_INDEX)
 
 typedef struct PublicationRelInfo
 {

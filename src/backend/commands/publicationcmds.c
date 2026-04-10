@@ -72,6 +72,7 @@ static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 								  AlterPublicationStmt *stmt);
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
 static char defGetGeneratedColsOption(DefElem *def);
+static int32 defGetDDLForPublicationOption(DefElem *def);
 
 
 static void
@@ -82,13 +83,16 @@ parse_publication_options(ParseState *pstate,
 						  bool *publish_via_partition_root_given,
 						  bool *publish_via_partition_root,
 						  bool *publish_generated_columns_given,
-						  char *publish_generated_columns)
+						  char *publish_generated_columns,
+						  bool *publish_ddl_given,
+						  int32 *pubddl)
 {
 	ListCell   *lc;
 
 	*publish_given = false;
 	*publish_via_partition_root_given = false;
 	*publish_generated_columns_given = false;
+	*publish_ddl_given = false;
 
 	/* defaults */
 	pubactions->pubinsert = true;
@@ -97,6 +101,7 @@ parse_publication_options(ParseState *pstate,
 	pubactions->pubtruncate = true;
 	*publish_via_partition_root = false;
 	*publish_generated_columns = PUBLISH_GENCOLS_NONE;
+	*pubddl = PUBDDL_NONE;
 
 	/* Parse options */
 	foreach(lc, options)
@@ -168,6 +173,13 @@ parse_publication_options(ParseState *pstate,
 				errorConflictingDefElem(defel, pstate);
 			*publish_generated_columns_given = true;
 			*publish_generated_columns = defGetGeneratedColsOption(defel);
+		}
+		else if (strcmp(defel->defname, "ddl") == 0)
+		{
+			if (*publish_ddl_given)
+				errorConflictingDefElem(defel, pstate);
+			*publish_ddl_given = true;
+			*pubddl = defGetDDLForPublicationOption(defel);
 		}
 		else
 			ereport(ERROR,
@@ -843,6 +855,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
 	char		publish_generated_columns;
+	bool		publish_ddl_given;
+	int32		pubddl;
 	AclResult	aclresult;
 	List	   *relations = NIL;
 	List	   *schemaidlist = NIL;
@@ -884,7 +898,10 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root,
 							  &publish_generated_columns_given,
-							  &publish_generated_columns);
+							  &publish_generated_columns,
+							  &publish_ddl_given,
+							  &pubddl);
+	(void) publish_ddl_given;
 
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
@@ -903,6 +920,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		BoolGetDatum(publish_via_partition_root);
 	values[Anum_pg_publication_pubgencols - 1] =
 		CharGetDatum(publish_generated_columns);
+	values[Anum_pg_publication_pubddl - 1] =
+		Int32GetDatum(pubddl);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -990,6 +1009,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
 	char		publish_generated_columns;
+	bool		publish_ddl_given;
+	int32		pubddl;
 	ObjectAddress obj;
 	Form_pg_publication pubform;
 	List	   *root_relids = NIL;
@@ -1001,7 +1022,9 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root,
 							  &publish_generated_columns_given,
-							  &publish_generated_columns);
+							  &publish_generated_columns,
+							  &publish_ddl_given,
+							  &pubddl);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
@@ -1115,6 +1138,12 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	{
 		values[Anum_pg_publication_pubgencols - 1] = CharGetDatum(publish_generated_columns);
 		replaces[Anum_pg_publication_pubgencols - 1] = true;
+	}
+
+	if (publish_ddl_given)
+	{
+		values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(pubddl);
+		replaces[Anum_pg_publication_pubddl - 1] = true;
 	}
 
 	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
@@ -2139,4 +2168,51 @@ defGetGeneratedColsOption(DefElem *def)
 			errdetail("Valid values are \"%s\" and \"%s\".", "none", "stored"));
 
 	return PUBLISH_GENCOLS_NONE;	/* keep compiler quiet */
+}
+
+/*
+ * Extract the ddl option value from a DefElem. The value is a comma-separated
+ * list of supported DDL kinds.
+ */
+static int32
+defGetDDLForPublicationOption(DefElem *def)
+{
+	char	   *ddl;
+	List	   *ddl_list;
+	ListCell   *lc;
+	int32		pubddl = PUBDDL_NONE;
+
+	if (def->arg == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("parameter \"%s\" requires a value", def->defname)));
+
+	/*
+	 * SplitIdentifierString destructively modifies its input, so make
+	 * a copy so we don't modify the memory of the executing statement.
+	 */
+	ddl = pstrdup(defGetString(def));
+
+	if (!SplitIdentifierString(ddl, ',', &ddl_list))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid list syntax in parameter \"%s\"",
+						def->defname)));
+
+	foreach(lc, ddl_list)
+	{
+		char	   *ddl_opt = (char *) lfirst(lc);
+
+		if (strcmp(ddl_opt, "table") == 0)
+			pubddl |= PUBDDL_TABLE;
+		else if (strcmp(ddl_opt, "index") == 0)
+			pubddl |= PUBDDL_INDEX;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized value for publication option \"%s\": \"%s\"",
+							def->defname, ddl_opt)));
+	}
+
+	return pubddl;
 }

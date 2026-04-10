@@ -26,6 +26,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_publication.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
@@ -52,6 +53,7 @@
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
 
 /*
  * Options that can be specified by the user in CREATE/ALTER SUBSCRIPTION
@@ -73,6 +75,7 @@
 #define SUBOPT_FAILOVER				0x00002000
 #define SUBOPT_LSN					0x00004000
 #define SUBOPT_ORIGIN				0x00008000
+#define SUBOPT_DDL					0x00010000
 
 /* check if the 'val' has 'bits' set */
 #define IsSet(val, bits)  (((val) & (bits)) == (bits))
@@ -99,6 +102,7 @@ typedef struct SubOpts
 	bool		runasowner;
 	bool		failover;
 	char	   *origin;
+	int32		ddl;
 	XLogRecPtr	lsn;
 } SubOpts;
 
@@ -107,11 +111,17 @@ static void check_publications_origin(WalReceiverConn *wrconn,
 									  List *publications, bool copydata,
 									  char *origin, Oid *subrel_local_oids,
 									  int subrel_count, char *subname);
+static void check_publications_ddl(WalReceiverConn *wrconn,
+								   List *publications, int32 wanted_ddl);
+static void validate_publications_ddl(Subscription *sub, List *publications,
+									  const char *subname, int32 wanted_ddl);
 static void check_duplicates_in_publist(List *publist, Datum *datums);
 static List *merge_publications(List *oldpublist, List *newpublist, bool addpub, const char *subname);
 static void ReportSlotConnectionError(List *rstates, Oid subid, char *slotname, char *err);
 static void CheckAlterSubOption(Subscription *sub, const char *option,
 								bool slot_needs_update, bool isTopLevel);
+static int32 defGetDDLForSubscriptionOption(DefElem *def);
+static char *ddlMaskToString(int32 ddl);
 
 
 /*
@@ -164,6 +174,8 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 		opts->failover = false;
 	if (IsSet(supported_opts, SUBOPT_ORIGIN))
 		opts->origin = pstrdup(LOGICALREP_ORIGIN_ANY);
+	if (IsSet(supported_opts, SUBOPT_DDL))
+		opts->ddl = PUBDDL_NONE;
 
 	/* Parse options */
 	foreach(lc, stmt_options)
@@ -329,6 +341,15 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 				ereport(ERROR,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("unrecognized origin value: \"%s\"", opts->origin));
+		}
+		else if (IsSet(supported_opts, SUBOPT_DDL) &&
+				 strcmp(defel->defname, "ddl") == 0)
+		{
+			if (IsSet(opts->specified_opts, SUBOPT_DDL))
+				errorConflictingDefElem(defel, pstate);
+
+			opts->specified_opts |= SUBOPT_DDL;
+			opts->ddl = defGetDDLForSubscriptionOption(defel);
 		}
 		else if (IsSet(supported_opts, SUBOPT_LSN) &&
 				 strcmp(defel->defname, "lsn") == 0)
@@ -503,6 +524,169 @@ check_publications(WalReceiverConn *wrconn, List *publications)
 }
 
 /*
+ * Check that subscription.ddl is a subset of the union of publication.ddl.
+ */
+static void
+check_publications_ddl(WalReceiverConn *wrconn, List *publications,
+					   int32 wanted_ddl)
+{
+	WalRcvExecResult *res;
+	StringInfo	cmd;
+	TupleTableSlot *slot;
+	Oid			tableRow[1] = {INT4OID};
+	bool		isnull;
+	int32		offered_ddl;
+
+	if (wanted_ddl == PUBDDL_NONE)
+		return;
+
+	cmd = makeStringInfo();
+	appendStringInfoString(cmd, "SELECT COALESCE(bit_or(t.pubddl), 0)::int4 FROM\n"
+						   " pg_catalog.pg_publication t WHERE\n"
+						   " t.pubname IN (");
+	GetPublicationsStr(publications, cmd, true);
+	appendStringInfoChar(cmd, ')');
+
+	res = walrcv_exec(wrconn, cmd->data, 1, tableRow);
+	destroyStringInfo(cmd);
+
+	if (res->status != WALRCV_OK_TUPLES)
+		ereport(ERROR,
+				errmsg("could not receive publication DDL settings from the publisher: %s",
+					   res->err));
+
+	slot = MakeSingleTupleTableSlot(res->tupledesc, &TTSOpsMinimalTuple);
+	if (!tuplestore_gettupleslot(res->tuplestore, true, false, slot))
+		ereport(ERROR,
+				errmsg("could not read publication DDL settings from the publisher"));
+
+	offered_ddl = DatumGetInt32(slot_getattr(slot, 1, &isnull));
+	if (isnull)
+		offered_ddl = PUBDDL_NONE;
+
+	ExecDropSingleTupleTableSlot(slot);
+	walrcv_clear_result(res);
+
+	if ((wanted_ddl & ~offered_ddl) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("subscription parameter \"%s\" requests unsupported DDL kinds",
+						"ddl"),
+				 errdetail("Requested kinds: %s. Offered by publications: %s.",
+						   ddlMaskToString(wanted_ddl),
+						   ddlMaskToString(offered_ddl))));
+}
+
+/*
+ * Connect to publisher and validate subscription/publication DDL compatibility.
+ */
+static void
+validate_publications_ddl(Subscription *sub, List *publications,
+						  const char *subname, int32 wanted_ddl)
+{
+	WalReceiverConn *wrconn;
+	char	   *err;
+	bool		must_use_password;
+
+	if (wanted_ddl == PUBDDL_NONE)
+		return;
+
+	/* Load the library providing us libpq calls. */
+	load_file("libpqwalreceiver", false);
+
+	must_use_password = sub->passwordrequired && !sub->ownersuperuser;
+	wrconn = walrcv_connect(sub->conninfo, true, true,
+							must_use_password, subname, &err);
+	if (!wrconn)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("subscription \"%s\" could not connect to the publisher: %s",
+						subname, err)));
+
+	PG_TRY();
+	{
+		check_publications_ddl(wrconn, publications, wanted_ddl);
+	}
+	PG_FINALLY();
+	{
+		walrcv_disconnect(wrconn);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Extract the ddl option value from a DefElem. The value is a comma-separated
+ * list of supported DDL kinds.
+ */
+static int32
+defGetDDLForSubscriptionOption(DefElem *def)
+{
+	char	   *ddl;
+	List	   *ddl_list;
+	ListCell   *lc;
+	int32		result = PUBDDL_NONE;
+
+	if (def->arg == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("parameter \"%s\" requires a value", def->defname)));
+
+	/*
+	 * SplitIdentifierString destructively modifies its input, so make
+	 * a copy so we don't modify the memory of the executing statement.
+	 */
+	ddl = pstrdup(defGetString(def));
+
+	if (!SplitIdentifierString(ddl, ',', &ddl_list))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid list syntax in parameter \"%s\"",
+						def->defname)));
+
+	foreach(lc, ddl_list)
+	{
+		char	   *ddl_opt = (char *) lfirst(lc);
+
+		if (strcmp(ddl_opt, "table") == 0)
+			result |= PUBDDL_TABLE;
+		else if (strcmp(ddl_opt, "index") == 0)
+			result |= PUBDDL_INDEX;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized value for subscription option \"%s\": \"%s\"",
+							def->defname, ddl_opt)));
+	}
+
+	return result;
+}
+
+/*
+ * Convert a ddl bitmap to a stable comma-separated list for diagnostics.
+ */
+static char *
+ddlMaskToString(int32 ddl)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (ddl & PUBDDL_TABLE)
+		appendStringInfoString(&buf, "table");
+	if (ddl & PUBDDL_INDEX)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "index");
+	}
+
+	if (buf.len == 0)
+		appendStringInfoString(&buf, "none");
+
+	return buf.data;
+}
+
+/*
  * Auxiliary function to build a text array out of a list of String nodes.
  */
 static Datum
@@ -563,7 +747,8 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 					  SUBOPT_SYNCHRONOUS_COMMIT | SUBOPT_BINARY |
 					  SUBOPT_STREAMING | SUBOPT_TWOPHASE_COMMIT |
 					  SUBOPT_DISABLE_ON_ERR | SUBOPT_PASSWORD_REQUIRED |
-					  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER | SUBOPT_ORIGIN);
+					  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER | SUBOPT_ORIGIN |
+					  SUBOPT_DDL);
 	parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
 
 	/*
@@ -670,6 +855,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	values[Anum_pg_subscription_subpasswordrequired - 1] = BoolGetDatum(opts.passwordrequired);
 	values[Anum_pg_subscription_subrunasowner - 1] = BoolGetDatum(opts.runasowner);
 	values[Anum_pg_subscription_subfailover - 1] = BoolGetDatum(opts.failover);
+	values[Anum_pg_subscription_subddl - 1] = Int32GetDatum(opts.ddl);
 	values[Anum_pg_subscription_subconninfo - 1] =
 		CStringGetTextDatum(conninfo);
 	if (opts.slot_name)
@@ -721,6 +907,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 		PG_TRY();
 		{
 			check_publications(wrconn, publications);
+			check_publications_ddl(wrconn, publications, opts.ddl);
 			check_publications_origin(wrconn, publications, opts.copy_data,
 									  opts.origin, NULL, 0, stmt->subname);
 
@@ -856,6 +1043,8 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 	{
 		if (validate_publications)
 			check_publications(wrconn, validate_publications);
+
+		check_publications_ddl(wrconn, sub->publications, sub->ddl);
 
 		/* Get the table list from publisher. */
 		pubrel_names = fetch_table_list(wrconn, sub->publications);
@@ -1165,7 +1354,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 								  SUBOPT_DISABLE_ON_ERR |
 								  SUBOPT_PASSWORD_REQUIRED |
 								  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
-								  SUBOPT_ORIGIN);
+								  SUBOPT_ORIGIN | SUBOPT_DDL);
 
 				parse_subscription_options(pstate, stmt->options,
 										   supported_opts, &opts);
@@ -1332,6 +1521,16 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					replaces[Anum_pg_subscription_suborigin - 1] = true;
 				}
 
+				if (IsSet(opts.specified_opts, SUBOPT_DDL))
+				{
+					values[Anum_pg_subscription_subddl - 1] =
+						Int32GetDatum(opts.ddl);
+					replaces[Anum_pg_subscription_subddl - 1] = true;
+
+					validate_publications_ddl(sub, sub->publications,
+											  stmt->subname, opts.ddl);
+				}
+
 				update_tuple = true;
 				break;
 			}
@@ -1376,6 +1575,9 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				supported_opts = SUBOPT_COPY_DATA | SUBOPT_REFRESH;
 				parse_subscription_options(pstate, stmt->options,
 										   supported_opts, &opts);
+
+				validate_publications_ddl(sub, stmt->publication,
+										  stmt->subname, sub->ddl);
 
 				values[Anum_pg_subscription_subpublications - 1] =
 					publicationListToArray(stmt->publication);
@@ -1425,6 +1627,9 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 										   supported_opts, &opts);
 
 				publist = merge_publications(sub->publications, stmt->publication, isadd, stmt->subname);
+
+				validate_publications_ddl(sub, publist, stmt->subname, sub->ddl);
+
 				values[Anum_pg_subscription_subpublications - 1] =
 					publicationListToArray(publist);
 				replaces[Anum_pg_subscription_subpublications - 1] = true;
