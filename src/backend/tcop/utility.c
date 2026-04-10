@@ -59,6 +59,7 @@
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
+#include "replication/logicalddl.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
@@ -80,6 +81,11 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+static void MaybeCaptureLogicalDDL(PlannedStmt *pstmt,
+								   const char *queryString,
+								   ProcessUtilityContext context,
+								   const ObjectAddress *address,
+								   Oid relid_hint);
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -1171,6 +1177,17 @@ ProcessUtilitySlow(ParseState *pstate,
 							EventTriggerCollectSimpleCommand(address,
 															 secondaryObject,
 															 stmt);
+							{
+								PlannedStmt	pstmt_ddl;
+
+								memset(&pstmt_ddl, 0, sizeof(pstmt_ddl));
+								pstmt_ddl.commandType = CMD_UTILITY;
+								pstmt_ddl.utilityStmt = stmt;
+
+								MaybeCaptureLogicalDDL(&pstmt_ddl, queryString,
+													   context, &address,
+													   address.objectId);
+							}
 
 							/*
 							 * Let NewRelationCreateToastTable decide if this
@@ -1212,6 +1229,17 @@ ProcessUtilitySlow(ParseState *pstate,
 							EventTriggerCollectSimpleCommand(address,
 															 secondaryObject,
 															 stmt);
+							{
+								PlannedStmt	pstmt_ddl;
+
+								memset(&pstmt_ddl, 0, sizeof(pstmt_ddl));
+								pstmt_ddl.commandType = CMD_UTILITY;
+								pstmt_ddl.utilityStmt = stmt;
+
+								MaybeCaptureLogicalDDL(&pstmt_ddl, queryString,
+													   context, &address,
+													   address.objectId);
+							}
 						}
 						else if (IsA(stmt, TableLikeClause))
 						{
@@ -1319,6 +1347,8 @@ ProcessUtilitySlow(ParseState *pstate,
 
 						/* ... and do it */
 						AlterTable(atstmt, lockmode, &atcontext);
+						MaybeCaptureLogicalDDL(pstmt, queryString, context,
+											   NULL, relid);
 
 						/* done */
 						EventTriggerAlterTableEnd();
@@ -1553,6 +1583,16 @@ ProcessUtilitySlow(ParseState *pstate,
 									true,	/* check_not_in_use */
 									false,	/* skip_build */
 									false); /* quiet */
+					{
+						PlannedStmt	pstmt_ddl;
+
+						memset(&pstmt_ddl, 0, sizeof(pstmt_ddl));
+						pstmt_ddl.commandType = CMD_UTILITY;
+						pstmt_ddl.utilityStmt = (Node *) stmt;
+
+						MaybeCaptureLogicalDDL(&pstmt_ddl, queryString,
+											   context, &address, relid);
+					}
 
 					/*
 					 * Add the CREATE INDEX node itself to stash right away;
@@ -1677,6 +1717,8 @@ ProcessUtilitySlow(ParseState *pstate,
 			case T_CreateTableAsStmt:
 				address = ExecCreateTableAs(pstate, (CreateTableAsStmt *) parsetree,
 											params, queryEnv, qc);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, address.objectId);
 				break;
 
 			case T_RefreshMatViewStmt:
@@ -1772,12 +1814,16 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_DropStmt:
 				ExecDropStmt((DropStmt *) parsetree, isTopLevel);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   NULL, InvalidOid);
 				/* no commands stashed for DROP */
 				commandCollected = true;
 				break;
 
 			case T_RenameStmt:
 				address = ExecRenameStmt((RenameStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, address.objectId);
 				break;
 
 			case T_AlterObjectDependsStmt:
@@ -2013,6 +2059,26 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 			RemoveObjects(stmt);
 			break;
 	}
+}
+
+/*
+ * Capture first-phase logical DDL metadata after a utility command has
+ * executed successfully.
+ */
+static void
+MaybeCaptureLogicalDDL(PlannedStmt *pstmt,
+					   const char *queryString,
+					   ProcessUtilityContext context,
+					   const ObjectAddress *address,
+					   Oid relid_hint)
+{
+	LogicalDDLCommand cmd;
+
+	if (!GetLogicalDDLInfo(pstmt, queryString, context, address, relid_hint, &cmd))
+		return;
+
+	/* Patch 2 only captures and normalizes command metadata. */
+	FreeLogicalDDLCommand(&cmd);
 }
 
 

@@ -6,6 +6,7 @@ backend_sources += files(
   'decode.c',
   'launcher.c',
   'logical.c',
+  'logicalddl.c',
   'logicalfuncs.c',
   'message.c',
   'origin.c',
