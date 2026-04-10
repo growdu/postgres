@@ -82,13 +82,16 @@ parse_publication_options(ParseState *pstate,
 						  bool *publish_via_partition_root_given,
 						  bool *publish_via_partition_root,
 						  bool *publish_generated_columns_given,
-						  char *publish_generated_columns)
+						  char *publish_generated_columns,
+						  bool *pubddl_given,
+						  int *pubddl)
 {
 	ListCell   *lc;
 
 	*publish_given = false;
 	*publish_via_partition_root_given = false;
 	*publish_generated_columns_given = false;
+	*pubddl_given = false;
 
 	/* defaults */
 	pubactions->pubinsert = true;
@@ -97,6 +100,7 @@ parse_publication_options(ParseState *pstate,
 	pubactions->pubtruncate = true;
 	*publish_via_partition_root = false;
 	*publish_generated_columns = PUBLISH_GENCOLS_NONE;
+	*pubddl = PUBDDL_NONE;
 
 	/* Parse options */
 	foreach(lc, options)
@@ -168,6 +172,40 @@ parse_publication_options(ParseState *pstate,
 				errorConflictingDefElem(defel, pstate);
 			*publish_generated_columns_given = true;
 			*publish_generated_columns = defGetGeneratedColsOption(defel);
+		}
+		else if (strcmp(defel->defname, "ddl") == 0)
+		{
+			char	   *ddl_str;
+			List	   *ddl_list;
+			ListCell   *lc2;
+
+			if (*pubddl_given)
+				errorConflictingDefElem(defel, pstate);
+			*pubddl_given = true;
+
+			ddl_str = pstrdup(defGetString(defel));
+
+			if (!SplitIdentifierString(ddl_str, ',', &ddl_list))
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("invalid list syntax in parameter \"%s\"",
+								"ddl")));
+
+			/* Process the ddl option list. */
+			foreach(lc2, ddl_list)
+			{
+				char	   *ddl_opt = (char *) lfirst(lc2);
+
+				if (strcmp(ddl_opt, "table") == 0)
+					*pubddl |= PUBDDL_TABLE;
+				else if (strcmp(ddl_opt, "index") == 0)
+					*pubddl |= PUBDDL_INDEX;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("unrecognized value for publication option \"%s\": \"%s\"",
+									"ddl", ddl_opt)));
+			}
 		}
 		else
 			ereport(ERROR,
@@ -843,6 +881,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
 	char		publish_generated_columns;
+	bool		pubddl_given;
+	int			pubddl;
 	AclResult	aclresult;
 	List	   *relations = NIL;
 	List	   *schemaidlist = NIL;
@@ -884,7 +924,9 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root,
 							  &publish_generated_columns_given,
-							  &publish_generated_columns);
+							  &publish_generated_columns,
+							  &pubddl_given,
+							  &pubddl);
 
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
@@ -903,6 +945,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		BoolGetDatum(publish_via_partition_root);
 	values[Anum_pg_publication_pubgencols - 1] =
 		CharGetDatum(publish_generated_columns);
+	values[Anum_pg_publication_pubddl - 1] =
+		Int32GetDatum(pubddl);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -990,6 +1034,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
 	char		publish_generated_columns;
+	bool		pubddl_given;
+	int			pubddl;
 	ObjectAddress obj;
 	Form_pg_publication pubform;
 	List	   *root_relids = NIL;
@@ -1001,7 +1047,9 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root,
 							  &publish_generated_columns_given,
-							  &publish_generated_columns);
+							  &publish_generated_columns,
+							  &pubddl_given,
+							  &pubddl);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
@@ -1115,6 +1163,12 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	{
 		values[Anum_pg_publication_pubgencols - 1] = CharGetDatum(publish_generated_columns);
 		replaces[Anum_pg_publication_pubgencols - 1] = true;
+	}
+
+	if (pubddl_given)
+	{
+		values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(pubddl);
+		replaces[Anum_pg_publication_pubddl - 1] = true;
 	}
 
 	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,

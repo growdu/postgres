@@ -93,6 +93,11 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 
 	/* Only publish data originating from the specified origin */
 	text		suborigin BKI_DEFAULT(LOGICALREP_ORIGIN_ANY);
+
+	/*
+	 * Bitmap of DDL kinds to subscribe.
+	 */
+	int32		subddl;
 #endif
 } FormData_pg_subscription;
 
@@ -137,6 +142,7 @@ typedef struct Subscription
 	List	   *publications;	/* List of publication names to subscribe to */
 	char	   *origin;			/* Only publish data originating from the
 								 * specified origin */
+	int32		subddl;			/* Bitmap of DDL kinds to subscribe */
 } Subscription;
 
 #ifdef EXPOSE_TO_CLIENT_CODE
