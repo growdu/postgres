@@ -38,6 +38,7 @@
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_shseclabel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
@@ -309,6 +310,7 @@ IsSharedRelation(Oid relationId)
 		relationId == DatabaseRelationId ||
 		relationId == DbRoleSettingRelationId ||
 		relationId == ParameterAclRelationId ||
+		relationId == PublicationSyncRelationId ||
 		relationId == ReplicationOriginRelationId ||
 		relationId == SharedDependRelationId ||
 		relationId == SharedDescriptionRelationId ||
@@ -328,6 +330,9 @@ IsSharedRelation(Oid relationId)
 		relationId == DbRoleSettingDatidRolidIndexId ||
 		relationId == ParameterAclOidIndexId ||
 		relationId == ParameterAclParnameIndexId ||
+		relationId == 6601 ||  /* PublicationSyncLsnIndexId */
+		relationId == 6602 ||  /* PublicationSyncTimestampIndexId */
+		relationId == 6603 ||  /* PublicationSyncPublicationIndexId */
 		relationId == ReplicationOriginIdentIndex ||
 		relationId == ReplicationOriginNameIndex ||
 		relationId == SharedDependDependerIndexId ||

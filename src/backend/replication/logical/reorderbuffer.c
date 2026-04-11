@@ -91,6 +91,7 @@
 
 #include "access/detoast.h"
 #include "access/heapam.h"
+#include "catalog/pg_publication_sync.h"
 #include "access/rewriteheap.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -2357,7 +2358,8 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 							 relpathperm(change->data.tp.rlocator,
 										 MAIN_FORKNUM).str);
 
-					if (!RelationIsLogicallyLogged(relation))
+					if (!RelationIsLogicallyLogged(relation) &&
+						RelationGetRelid(relation) != PublicationSyncRelationId)
 						goto change_done;
 
 					/*

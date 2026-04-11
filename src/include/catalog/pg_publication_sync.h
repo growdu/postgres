@@ -28,13 +28,13 @@
  *		typedef struct FormData_pg_publication_sync
  * ----------------
  */
-CATALOG(pg_publication_sync,6120,PublicationSyncRelationId) BKI_SHARED_RELATION
+CATALOG(pg_publication_sync,6600,PublicationSyncRelationId) BKI_SHARED_RELATION
 {
 	/* LSN position for ordering */
 	XLogRecPtr	psnlsn;
 
 	/* Timestamp of the event */
-	TimestampTz pstimestamp;
+	int64 pstimestamp;
 
 	/* Message type: 'Q'=DDL SQL, 'A'=add object, 'D'=delete object */
 	char		psnmsgtype;
@@ -67,15 +67,15 @@ typedef FormData_pg_publication_sync *Form_pg_publication_sync;
  */
 
 /* Index on lsn for ordering */
-DECLARE_UNIQUE_INDEX_PKEY(pg_publication_sync_lsn_index, 6121, PublicationSyncLsnIndexId,
+DECLARE_UNIQUE_INDEX_PKEY(pg_publication_sync_lsn_index, 6601, PublicationSyncLsnIndexId,
     pg_publication_sync, btree(psnlsn xlog_ops));
 
 /* Index on timestamp for time-based queries */
-DECLARE_INDEX(pg_publication_sync_timestamp_index, 6122, PublicationSyncTimestampIndexId,
+DECLARE_INDEX(pg_publication_sync_timestamp_index, 6602, PublicationSyncTimestampIndexId,
     pg_publication_sync, btree(pstimestamp timestamptz_ops));
 
 /* Index on publications for filtering by publication */
-DECLARE_INDEX(pg_publication_sync_publication_index, 6123, PublicationSyncPublicationIndexId,
+DECLARE_INDEX(pg_publication_sync_publication_index, 6603, PublicationSyncPublicationIndexId,
     pg_publication_sync, gin(psnpublications name_ops));
 
 #endif							/* PG_PUBLICATION_SYNC_H */

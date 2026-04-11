@@ -14,6 +14,7 @@
 #include "access/xlogdefs.h"
 #include "catalog/pg_publication.h"
 #include "nodes/pg_list.h"
+#include "tcop/utility.h"
 #include "utils/timestamp.h"
 
 /*
@@ -125,5 +126,21 @@ extern LogicalDDLCommand *SyncTupleToLogicalDDLCommand(HeapTuple tuple, TupleDes
  * Get DDL bitmap from string representation (e.g., "table,index").
  */
 extern int	parse_ddl_string(const char *ddl_str);
+
+/*
+ * Register the DDL capture ProcessUtility hook.
+ * Call this during startup to enable DDL capture.
+ */
+extern void RegisterLogicalDDLCaptureHook(void);
+
+/*
+ * Read and deserialize a DDL message from the logical replication stream.
+ * Returns a newly allocated string containing the SQL, or NULL if not a DDL message.
+ * The caller is responsible for freeing the returned string.
+ *
+ * Note: This only reads the DDL-specific payload, not the full MESSAGE protocol.
+ * The caller should have already read the MESSAGE header (xid, flags, lsn, prefix).
+ */
+extern char *logicalrep_read_ddl_message(StringInfo s);
 
 #endif							/* LOGICALDDL_H */

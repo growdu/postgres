@@ -36,6 +36,7 @@
 #include "pgstat.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
+#include "replication/logicalddl.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slotsync.h"
 #include "replication/snapbuild.h"
@@ -580,6 +581,22 @@ CreateDecodingContext(XLogRecPtr start_lsn,
 								 start_lsn, InvalidTransactionId, false,
 								 fast_forward, false, xl_routine, prepare_write,
 								 do_write, update_progress);
+
+	/*
+	 * Register DDL capture hook on first call. This enables automatic DDL
+	 * capture on the publisher side when users execute DDL statements.
+	 * The hook will only be registered once, even if this function is
+	 * called multiple times.
+	 */
+	{
+		static bool ddl_capture_hook_registered = false;
+
+		if (!ddl_capture_hook_registered)
+		{
+			RegisterLogicalDDLCaptureHook();
+			ddl_capture_hook_registered = true;
+		}
+	}
 
 	/* call output plugin initialization callback */
 	old_context = MemoryContextSwitchTo(ctx->context);

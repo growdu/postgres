@@ -160,7 +160,9 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/walwriter.h"
+#include "catalog/pg_publication.h"
 #include "replication/conflict.h"
+#include "replication/logicalddl.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalproto.h"
 #include "replication/logicalrelation.h"
@@ -173,6 +175,7 @@
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/dynahash.h"
 #include "utils/guc.h"
@@ -295,6 +298,7 @@ static bool MySubscriptionValid = false;
 static List *on_commit_wakeup_workers_subids = NIL;
 
 bool		in_remote_transaction = false;
+bool		in_ddl_replay = false;
 static XLogRecPtr remote_final_lsn = InvalidXLogRecPtr;
 
 /* fields valid only when processing streamed transaction */
@@ -394,6 +398,9 @@ static void apply_handle_tuple_routing(ApplyExecutionData *edata,
 									   TupleTableSlot *remoteslot,
 									   LogicalRepTupleData *newtup,
 									   CmdType operation);
+
+/* Functions for DDL replication */
+static void apply_handle_ddl(StringInfo s);
 
 /* Functions for skipping changes */
 static void maybe_start_skipping_changes(XLogRecPtr finish_lsn);
@@ -1434,6 +1441,108 @@ apply_handle_origin(StringInfo s)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg_internal("ORIGIN message sent out of order")));
+}
+
+/*
+ * Handle DDL message.
+ *
+ * This handles DDL messages sent via the generic logical replication message
+ * mechanism with prefix "pg_ddl".
+ */
+static void
+apply_handle_ddl(StringInfo s)
+{
+	char	   *msg;
+
+	/*
+	 * DDL messages should only be processed within a transaction.
+	 */
+	if (!IsTransactionState())
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg_internal("DDL message received outside of transaction")));
+
+	/*
+	 * Read and discard transaction ID, flags, and LSN.
+	 * These are part of the MESSAGE protocol but not needed for DDL processing.
+	 */
+	(void) pq_getmsgint(s, 4);		/* xid - not needed */
+	(void) pq_getmsgbyte(s);		/* flags - not needed */
+	(void) pq_getmsgint64(s);		/* lsn - not needed */
+
+	/*
+	 * Note: Publication matching is already done on the publisher side
+	 * in pgoutput_write_publication_sync(). We trust that filtering here.
+	 * However, we still check the subscription's subddl setting.
+	 */
+
+	/* Check if subscription allows DDL */
+	if ((MySubscription->subddl & PUBDDL_ALL) == 0)
+	{
+		/* Subscription doesn't want any DDL */
+		return;
+	}
+
+	/* Read DDL message - returns NULL if not a DDL message */
+	msg = logicalrep_read_ddl_message(s);
+	if (msg == NULL)
+		return;  /* Not a DDL message */
+
+	/*
+	 * Set in_ddl_replay flag to prevent this DDL from being captured
+	 * and replicated back to the publisher.
+	 */
+	in_ddl_replay = true;
+
+	PG_TRY();
+	{
+		List	   *raw_parsetree_list;
+		ListCell   *lc;
+
+		/* Parse the DDL statement */
+		raw_parsetree_list = pg_parse_query(msg);
+
+		/* Execute each statement */
+		foreach(lc, raw_parsetree_list)
+		{
+			Node	   *stmt = (Node *) lfirst(lc);
+			PlannedStmt *planned;
+
+			/*
+			 * Build a PlannedStmt for the DDL statement.
+			 * For utility statements (DDL), we wrap the statement in a
+			 * PlannedStmt with commandType = CMD_UTILITY.
+			 */
+			planned = makeNode(PlannedStmt);
+			planned->commandType = CMD_UTILITY;
+			planned->canSetTag = true;
+			planned->utilityStmt = stmt;
+			planned->stmt_location = 0;
+			planned->stmt_len = strlen(msg);
+
+			/*
+			 * Execute the DDL statement via standard_ProcessUtility.
+			 * We use standard_ProcessUtility directly because in_ddl_replay
+			 * is already set to prevent re-capture.
+			 */
+			standard_ProcessUtility(planned, msg,
+									false,  /* readOnlyTree */
+									PROCESS_UTILITY_QUERY_NONATOMIC,
+									NULL,  /* params */
+									NULL,  /* queryEnv */
+									None_Receiver, NULL);  /* dest, qc */
+		}
+	}
+	PG_CATCH();
+	{
+		in_ddl_replay = false;
+		pfree(msg);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	in_ddl_replay = false;
+	pfree(msg);
 }
 
 /*
@@ -3417,12 +3526,7 @@ apply_dispatch(StringInfo s)
 			break;
 
 		case LOGICAL_REP_MSG_MESSAGE:
-
-			/*
-			 * Logical replication does not use generic logical messages yet.
-			 * Although, it could be used by other applications that use this
-			 * output plugin.
-			 */
+			apply_handle_ddl(s);
 			break;
 
 		case LOGICAL_REP_MSG_STREAM_START:

@@ -16,6 +16,7 @@
 #include "catalog/partition.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "commands/defrem.h"
 #include "commands/subscriptioncmds.h"
@@ -25,6 +26,7 @@
 #include "parser/parse_relation.h"
 #include "replication/logical.h"
 #include "replication/logicalproto.h"
+#include "replication/logicalddl.h"
 #include "replication/origin.h"
 #include "replication/pgoutput.h"
 #include "rewrite/rewriteHandler.h"
@@ -451,7 +453,18 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 {
 	PGOutputData *data = palloc0(sizeof(PGOutputData));
 	static bool publication_callback_registered = false;
+	static bool ddl_capture_hook_registered = false;
 	MemoryContextCallback *mcallback;
+
+	/*
+	 * Register DDL capture hook on first call. This enables automatic DDL
+	 * capture on the publisher side when users execute DDL statements.
+	 */
+	if (!ddl_capture_hook_registered)
+	{
+		RegisterLogicalDDLCaptureHook();
+		ddl_capture_hook_registered = true;
+	}
 
 	/* Create our memory context for private allocations. */
 	data->context = AllocSetContextCreate(ctx->context,
@@ -1474,6 +1487,135 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 }
 
 /*
+ * Sends DDL captured in pg_publication_sync over wire.
+ *
+ * This handles DDL replication by extracting the DDL command from
+ * pg_publication_sync and sending it as a logical replication message.
+ */
+static void
+pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
+								ReorderBufferTXN *txn,
+								Relation relation,
+								ReorderBufferChange *change)
+{
+	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
+	HeapTuple	tuple;
+	Datum		values[Natts_pg_publication_sync];
+	bool		isnull[Natts_pg_publication_sync];
+	Datum		datum;
+	ArrayType  *publications_arr;
+	Datum	   *pub_elems;
+	int			nelems;
+	int			i;
+	bool		matches_publication = false;
+	char	   *sql_string;
+
+	/* Extract the tuple from the change */
+	if (change->action == REORDER_BUFFER_CHANGE_INSERT)
+		tuple = change->data.tp.newtuple;
+	else if (change->action == REORDER_BUFFER_CHANGE_DELETE)
+		tuple = change->data.tp.oldtuple;
+	else
+		return;	/* UPDATE not expected for pg_publication_sync */
+
+	if (!HeapTupleIsValid(tuple))
+		return;
+
+	/* Parse the tuple */
+	heap_deform_tuple(tuple, RelationGetDescr(relation), values, isnull);
+
+	/* Get the message type - only process 'Q' (DDL SQL) messages */
+	datum = heap_getattr(tuple, Anum_pg_publication_sync_psnmsgtype,
+						RelationGetDescr(relation), &isnull[Anum_pg_publication_sync_psnmsgtype - 1]);
+	if (isnull[Anum_pg_publication_sync_psnmsgtype - 1] ||
+		DatumGetChar(datum) != PSN_MSG_TYPE_DDL)
+		return;	/* Not a DDL SQL message */
+
+	/* Get the SQL string from psnmsgdata */
+	datum = heap_getattr(tuple, Anum_pg_publication_sync_psnmsgdata,
+						RelationGetDescr(relation), &isnull[Anum_pg_publication_sync_psnmsgdata - 1]);
+	if (isnull[Anum_pg_publication_sync_psnmsgdata - 1])
+		return;	/* No SQL data */
+
+	sql_string = TextDatumGetCString(datum);
+
+	/* Get the publications array */
+	datum = heap_getattr(tuple, Anum_pg_publication_sync_psnpublications,
+						RelationGetDescr(relation), &isnull[Anum_pg_publication_sync_psnpublications - 1]);
+
+	/*
+	 * If the DDL has no publications specified, skip it.
+	 * This shouldn't normally happen but be defensive.
+	 */
+	if (isnull[Anum_pg_publication_sync_psnpublications - 1])
+		return;
+
+	publications_arr = DatumGetArrayTypeP(datum);
+	deconstruct_array_builtin(publications_arr, TEXTOID, &pub_elems, NULL, &nelems);
+
+	/*
+	 * Check if any of the target publications match the publications
+	 * that this output plugin is replicating.
+	 */
+	for (i = 0; i < nelems; i++)
+	{
+		char	   *pub_name = TextDatumGetCString(pub_elems[i]);
+		ListCell   *lc;
+
+		foreach(lc, data->publications)
+		{
+			Publication *pub = (Publication *) lfirst(lc);
+
+			if (strcmp(pub->name, pub_name) == 0)
+			{
+				/* Publication match found */
+				if (pub->pubddl)
+					matches_publication = true;
+				break;
+			}
+		}
+
+		if (matches_publication)
+			break;
+	}
+
+	/* Clean up the array elements */
+	pfree(pub_elems);
+
+	/* Only send if a matching publication with ddl=true was found */
+	if (!matches_publication)
+		return;
+
+	/*
+	 * Send BEGIN if we haven't yet, to ensure the DDL is wrapped
+	 * in a transaction.
+	 */
+	{
+		PGOutputTxnData *txndata = (PGOutputTxnData *) txn->output_plugin_private;
+
+		if (txndata && !txndata->sent_begin_txn)
+			pgoutput_send_begin(ctx, txn);
+	}
+
+	/*
+	 * Send the DDL message directly, bypassing the 'messages' option check.
+	 * DDL replication is critical for schema consistency and should always
+	 * be sent regardless of the messages setting.
+	 *
+	 * Note: We always use txn->xid to ensure a valid xid is sent, which is
+	 * required by the subscriber protocol.
+	 */
+	{
+		TransactionId xid = txn->xid;
+
+		OutputPluginPrepareWrite(ctx, true);
+		logicalrep_write_message(ctx->out, xid, InvalidXLogRecPtr, true,
+								 "pg_ddl", strlen(sql_string), sql_string);
+		OutputPluginWrite(ctx, true);
+	}
+}
+
+/*
  * Sends the decoded DML over wire.
  *
  * This is called both in streaming and non-streaming modes.
@@ -1494,7 +1636,15 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	TupleTableSlot *new_slot = NULL;
 
 	if (!is_publishable_relation(relation))
+	{
+		/*
+		 * Handle pg_publication_sync specially - we need to send DDL changes
+		 * for tables that are in publications with ddl = true.
+		 */
+		if (RelationGetRelid(relation) == PublicationSyncRelationId)
+			pgoutput_write_publication_sync(ctx, txn, relation, change);
 		return;
+	}
 
 	/*
 	 * Remember the xid for the change in streaming mode. We need to send xid
