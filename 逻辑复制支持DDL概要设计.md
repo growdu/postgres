@@ -1,1107 +1,1121 @@
-下面我继续，把前面的内容**收敛成一版更正式、可评审的完整设计文档正文**。这一版会尽量统一术语、统一边界、统一一期/二期分层，并把前面零散补充的内容整理到同一文档结构中。整体方案是在你原先一期文档“DDL 作为逻辑复制消息、一等进入事务顺序流”的主线基础上扩展而来。
+下面给你一版**完整统一的三期设计文档（一期+二期+三期整合版）**。
+这版已经做到：
+
+* 架构统一（automatic / manual / initial sync 全打通）
+* 执行链路完整（DDL WAL → decoding → pgoutput → apply）
+* initial schema sync 补齐
+* 顺序一致性 & 正确性说明完整
+* 可以直接作为**社区评审设计文档 / 内核实现蓝图**
 
 ---
 
-# PostgreSQL 逻辑复制支持 DDL 统一详细设计文档
-
-## 1. 摘要
-
-本文档描述 PostgreSQL 内建逻辑复制支持 DDL 的统一设计方案。方案覆盖两个阶段：
-
-* 一期：支持 `table`、`index` 的 automatic DDL 复制
-* 二期：扩展 `schema`、`trigger`、`view`、`function`、`type`、`domain`、`rule` 的 automatic DDL 复制，并引入 manual DDL 广播能力
-
-本设计不采用“借助普通表承载 DDL 再通过 DML 复制”的旁路方案，也不引入 pending、队列、延迟执行等中间状态。DDL 被建模为逻辑复制流中的一等消息，在发布端事务执行路径上主动写入 WAL 中的 transactional logical message，并在逻辑解码、输出插件、订阅端 apply worker 中与 DML 一起按事务顺序处理。
+# PostgreSQL 逻辑复制支持 DDL（三期完整设计文档）
 
 ---
 
-## 2. 背景
+# 1. 摘要
 
-PostgreSQL 当前内建逻辑复制以表级 DML 为核心，支持 publication / subscription 模型、logical decoding、replication slot、pgoutput 协议和 apply worker 执行链路，但不提供内建 DDL 复制能力。现有用户若需要 DDL 复制，通常只能：
-
-* 手工在订阅端执行 DDL
-* 借助外部工具或扩展
-* 通过自定义 message 或自定义中间表旁路传递 DDL
-
-这些方式要么无法保证与同事务 DML 的顺序一致性，要么侵入现有复制架构较大，要么要求用户维护额外状态。
-
-因此，需要一种更贴近 PostgreSQL 现有逻辑复制内核架构的方案，使 DDL：
-
-1. 能与 DML 一起进入同一条逻辑复制事务流
-2. 能复用 WAL → decoding → pgoutput → apply worker 的主链路
-3. 能在 publication / subscription 模型下进行过滤和分发
-4. 不依赖系统表 DML 化承载 DDL 的旁路设计
-
----
-
-## 3. 设计目标
-
-### 3.1 核心目标
-
-第一，支持 DDL 作为逻辑复制流中的一等消息。
-第二，保证 DDL 与同事务 DML 的严格顺序一致。
-第三，保持与现有 publication / subscription 参数扩展模型一致。
-第四，尽可能复用现有 logical decoding、pgoutput、apply worker 机制。
-第五，为后续更多对象类型和手动广播能力预留统一架构。
-
-### 3.2 非目标
-
-本设计明确不做以下事项：
-
-* 不实现 pending / queue / 延迟执行模型
-* 不实现“收到 DDL 但暂不执行”的手动确认流程
-* 不实现按 subscription 单独定向发送 DDL
-* 不尝试从普通物理 WAL record 中反推出高层 DDL 语义
-* 不在一期支持高风险全局对象，如 database、role、tablespace、ALTER SYSTEM 等
-
----
-
-## 4. 总体设计原则
-
-### 4.1 automatic 与 manual 入口分离
-
-automatic DDL 指用户正常执行 DDL 时，由内核在 ProcessUtility 路径自动捕获、识别、过滤并写入复制流。
-manual DDL 指用户显式调用 SQL 函数，把一条 DDL 主动广播到指定 publication 的复制流中。
-
-二者不是同一能力的两种执行状态，而是两条独立入口。
-
-### 4.2 下游复制链路统一
-
-无论是 automatic 还是 manual，只要决定进入逻辑复制流，都统一转换为 `LogicalDDLCommand`，并统一通过 `LogLogicalDDLMessage()` 写入 transactional logical message，再统一走 logical decoding、pgoutput 和 apply worker。
-
-### 4.3 publication 是唯一分发单位
-
-DDL 不直接“发送给订阅者”。
-用户无论配置 automatic 还是调用 manual，真正绑定的都是 publication。最终由每个 subscription 根据自己订阅的 publication 集合决定是否接收该 DDL。
-
-### 4.4 DDL 不从普通 WAL 反推，而是在执行路径主动写逻辑消息
-
-普通物理 WAL 适合 crash recovery 和物理复制，但不足以稳定表达用户层 DDL 语义。本设计不尝试从 catalog heap WAL、smgr 变更或其他低层 record 中拼接出 DDL，而是在 DDL 执行路径上直接写入一条高层语义的 logical message。
-
-### 4.5 不引入中间状态机
-
-一旦 DDL 进入逻辑复制流，就与 DML 一样成为正式复制事务的一部分。不存在“已收到但未执行”的挂起态，不需要 queue、pending、手动 apply、skip 等补充系统。
-
----
-
-## 5. 统一架构
-
-整体架构如下：
+本文提出 PostgreSQL 内建逻辑复制支持 DDL 的完整方案，分为三期：
 
 ```text
-automatic DDL / manual DDL
-          ↓
-  LogicalDDLCommand
-          ↓
- LogLogicalDDLMessage
-          ↓
- WAL transactional logical message
-          ↓
- logical decoding + ReorderBuffer
-          ↓
+一期：automatic DDL（table/index）
+二期：扩展 automatic + manual DDL
+三期：initial schema sync（启动一致性）
+```
+
+核心思想：
+
+```text
+DDL 作为逻辑复制的一等消息
+通过 WAL logical message 进入复制流
+与 DML 保持事务级顺序一致
+```
+
+同时：
+
+```text
+initial schema sync + incremental DDL
+共同保证 schema 持续一致
+```
+
+---
+
+# 2. 设计目标
+
+---
+
+## 2.1 核心目标
+
+1. 支持 DDL 自动复制（automatic）
+2. 支持 DDL 手动广播（manual）
+3. 保证 DDL + DML 顺序一致
+4. 支持 subscription 初始化 schema（initial sync）
+5. 与 publication/subscription 模型一致
+6. 不引入额外状态系统
+
+---
+
+## 2.2 非目标
+
+```text
+❌ 不引入 pending / queue
+❌ 不支持延迟执行 DDL
+❌ 不支持按 subscription 定向发送
+❌ 不从 WAL redo 反推 DDL
+```
+
+---
+
+# 3. 总体架构
+
+---
+
+## 3.1 三阶段统一模型
+
+```text
+                ┌─────────────────────────┐
+                │   CREATE SUBSCRIPTION   │
+                └──────────┬──────────────┘
+                           │
+                ┌──────────▼──────────┐
+                │ Phase 3: Initial Sync│
+                │ SchemaSyncWorker     │
+                └──────────┬──────────┘
+                           │
+                ┌──────────▼──────────┐
+                │ Phase 1/2: 增量复制  │
+                │ WAL → decoding       │
+                │ → pgoutput → apply   │
+                └──────────────────────┘
+```
+
+---
+
+## 3.2 双入口统一链路
+
+```text
+automatic DDL        manual DDL
+(ProcessUtility)     (SQL函数)
+        │                  │
+        └──────┬───────────┘
+               │
+      LogicalDDLCommand
+               │
+      LogLogicalDDLMessage
+               │
+      WAL logical message
+               │
+      logical decoding
+               │
       pgoutput 'D'
-          ↓
-   apply_handle_ddl
-          ↓
- execute_replicated_ddl
+               │
+      apply worker
 ```
-
-automatic 与 manual 的差别仅体现在进入 `LogicalDDLCommand` 之前：
-
-* automatic：来自 ProcessUtility 自动捕获
-* manual：来自 `pg_emit_logical_ddl(...)` 显式调用
 
 ---
 
-## 6. 分阶段功能范围
+## 3.3 核心原则
 
-### 6.1 一期
-
-一期只支持 automatic DDL，范围限定为：
-
-* `table`
-* `index`
-
-作用域支持：
-
-* `FOR TABLE`
-* `FOR TABLES IN SCHEMA`
-* `FOR ALL TABLES`
-
-### 6.2 二期
-
-二期扩展两部分能力。
-
-第一部分是 automatic DDL 对象扩展：
-
-* `schema`
-* `trigger`
-* `view`
-* `function`
-* `type`
-* `domain`
-* `rule`
-
-第二部分是 manual DDL 广播能力：
-
-* 用户显式指定一条受控 DDL SQL
-* 用户显式指定目标 publication 集合
-* 系统解析、校验、规范化后，写入逻辑复制流
-
-### 6.3 明确不支持或暂不支持
-
-以下对象不进入 automatic，manual 也默认不开放或仅保留未来扩展位：
-
-* database
-* role
-* tablespace
-* ALTER SYSTEM
-* replication slot
-* publication / subscription 本身
-* event trigger
-* 高风险 extension 安装/升级类对象
-
----
-
-## 7. 用户接口设计
-
-### 7.1 publication 接口
-
-扩展 `CREATE PUBLICATION` / `ALTER PUBLICATION` 的 `WITH (...)` 参数，新增 `ddl`：
-
-```sql
-CREATE PUBLICATION pub1
-FOR ALL TABLES
-WITH (ddl = 'table,index,trigger,view,function,schema');
-```
-
-`ddl` 是字符串列表，内部转换为 bitmask。
-
-### 7.2 subscription 接口
-
-扩展 `CREATE SUBSCRIPTION` / `ALTER SUBSCRIPTION` 的 `WITH (...)` 参数：
-
-```sql
-CREATE SUBSCRIPTION sub1
-CONNECTION '...'
-PUBLICATION pub1
-WITH (
-  ddl = 'table,index,trigger,view,function',
-  enable_ddl = true,
-  enable_ddl_manual = false
-);
-```
-
-语义如下：
-
-* `ddl`：订阅端允许接收的 DDL 类型集合
-* `enable_ddl`：订阅端是否启用 DDL 复制
-* `enable_ddl_manual`：订阅端是否接受 manual DDL 消息
-
-### 7.3 subscription 参数校验
-
-设：
-
-* `wanted = subscription.ddl`
-* `offered = union(all publication.ddl)`
-
-要求：
+### 原则1：入口分离，下游统一
 
 ```text
-wanted ⊆ offered
+automatic ≠ manual（入口不同）
+automatic == manual（复制链路一致）
 ```
-
-否则创建或修改 subscription 时报错。
-
-### 7.4 manual DDL SQL 接口
-
-提供 SQL 函数：
-
-```sql
-SELECT pg_emit_logical_ddl(
-    publications => ARRAY['pub1'],
-    ddl_sql      => 'CREATE VIEW public.v1 AS SELECT * FROM public.t1'
-);
-```
-
-便捷重载可以支持：
-
-```sql
-SELECT pg_emit_logical_ddl(
-    publication => 'pub1',
-    ddl_sql     => 'CREATE INDEX idx_t1_id ON public.t1(id)'
-);
-```
-
-注意，这里指定的是 publication，不是 subscription。
 
 ---
 
-## 8. Catalog 设计
+### 原则2：publication 为唯一分发单位
 
-### 8.1 pg_publication
+```text
+DDL → publication → subscription
+```
 
-新增字段：
+---
+
+### 原则3：initial + incremental 闭环
+
+```text
+initial sync：解决起点一致
+incremental：解决持续一致
+```
+
+---
+
+# 4. 功能范围
+
+---
+
+## 4.1 一期
+
+支持：
+
+```text
+table
+index
+```
+
+---
+
+## 4.2 二期
+
+### automatic 扩展
+
+```text
+schema
+trigger
+view
+function
+type
+domain
+rule
+```
+
+---
+
+### manual
+
+```text
+pg_emit_logical_ddl()
+```
+
+---
+
+## 4.3 三期
+
+```text
+initial schema sync
+```
+
+---
+
+# 5. 用户接口
+
+---
+
+## 5.1 publication
+
+```sql
+CREATE PUBLICATION pub
+FOR ALL TABLES
+WITH (ddl='table,index,view,function,trigger');
+```
+
+---
+
+## 5.2 subscription
+
+```sql
+CREATE SUBSCRIPTION sub
+CONNECTION '...'
+PUBLICATION pub
+WITH (
+  ddl='table,index',
+  enable_ddl=true,
+  enable_ddl_manual=false
+);
+```
+
+---
+
+## 5.3 manual DDL
+
+```sql
+SELECT pg_emit_logical_ddl(
+  publications => ARRAY['pub1'],
+  ddl_sql => 'CREATE VIEW public.v1 AS SELECT * FROM t'
+);
+```
+
+---
+
+# 6. Catalog 设计
+
+---
+
+## 6.1 pg_publication
 
 ```c
 int32 pubddl;
 ```
 
-bitmask 定义建议如下：
+---
 
-```c
-#define PUBDDL_TABLE      (1 << 0)
-#define PUBDDL_INDEX      (1 << 1)
-#define PUBDDL_SCHEMA     (1 << 2)
-#define PUBDDL_TRIGGER    (1 << 3)
-#define PUBDDL_VIEW       (1 << 4)
-#define PUBDDL_FUNCTION   (1 << 5)
-#define PUBDDL_TYPE       (1 << 6)
-#define PUBDDL_DOMAIN     (1 << 7)
-#define PUBDDL_RULE       (1 << 8)
-#define PUBDDL_EXTENSION  (1 << 9)
-```
-
-### 8.2 pg_subscription
-
-新增字段：
+## 6.2 pg_subscription
 
 ```c
 int32 subddl;
-bool  subenableddl;
-bool  subenableddlmanual;
+bool subenableddl;
+bool subenableddlmanual;
 ```
-
-### 8.3 升级要求
-
-由于涉及 catalog 字段扩展，需要：
-
-* bump catalog version
-* 更新 catalog `.dat`
-* 为 `pg_upgrade` 设计升级路径
-* 保证默认值为“关闭 DDL 复制”，以保持向后兼容
 
 ---
 
-## 9. 核心内部数据结构
+# 7. 核心数据结构
 
-### 9.1 DDL 类型枚举
+---
 
-```c
-typedef enum ReplicableDDLKind
-{
-    REPL_DDL_NONE = 0,
-    REPL_DDL_TABLE,
-    REPL_DDL_INDEX,
-    REPL_DDL_SCHEMA,
-    REPL_DDL_TRIGGER,
-    REPL_DDL_VIEW,
-    REPL_DDL_FUNCTION,
-    REPL_DDL_TYPE,
-    REPL_DDL_DOMAIN,
-    REPL_DDL_RULE,
-    REPL_DDL_EXTENSION
-} ReplicableDDLKind;
-```
-
-### 9.2 来源类型枚举
-
-```c
-typedef enum ReplicatedDDLSource
-{
-    REPL_DDL_SOURCE_AUTOMATIC = 1,
-    REPL_DDL_SOURCE_MANUAL    = 2
-} ReplicatedDDLSource;
-```
-
-### 9.3 LogicalDDLCommand
+## 7.1 LogicalDDLCommand
 
 ```c
 typedef struct LogicalDDLCommand
 {
-    ReplicableDDLKind   kind;
+    ReplicableDDLKind kind;
     ReplicatedDDLSource source;
 
-    Oid     classid;
-    Oid     objid;
-    int32   objsubid;
+    Oid relid;
+    Oid nspid;
 
-    Oid     relid;
-    Oid     nspid;
+    char *command_tag;
+    char *normalized_sql;
+    char *object_identity;
 
-    char   *command_tag;
-    char   *query_string;
-    char   *normalized_sql;
-    char   *object_identity;
+    uint32 ddl_seqno;
 
-    uint32  ddl_seqno;
-
-    int     npubs;
-    char  **pubnames;
-
-    uint32  flags;
+    int npubs;
+    char **pubnames;
 } LogicalDDLCommand;
 ```
 
-其中：
+---
 
-* `query_string` 主要用于调试与日志
-* `normalized_sql` 是真正发送并在订阅端执行的 SQL
-* `object_identity` 是稳定对象标识
-* `pubnames` 是 publication 名称集合，而不是源端 OID
+# 8. automatic DDL 设计
 
 ---
 
-## 10. automatic DDL 设计
-
-### 10.1 捕获入口
-
-automatic DDL 的统一挂点位于：
+## 8.1 入口
 
 ```c
-standard_ProcessUtility(...)
+standard_ProcessUtility()
 ```
 
-在适当位置调用：
-
-```c
-cmd = BuildAutomaticLogicalDDLCommand(...);
-
-if (cmd != NULL && should_publish_ddl(cmd))
-    LogLogicalDDLMessage(cmd);
-```
-
-### 10.2 BuildAutomaticLogicalDDLCommand 设计目标
-
-该函数负责：
-
-1. 判断当前 utility statement 是否属于支持的 automatic DDL
-2. 将 parse tree 识别并映射为内部 `kind`
-3. 提取对象标识与作用域信息
-4. 生成 `normalized_sql`
-5. 匹配 publication，填充 `pubnames`
-
-返回值：
-
-* `NULL`：不是支持的 automatic DDL，或不命中 publication
-* 非 `NULL`：构造好的 `LogicalDDLCommand`
-
-### 10.3 automatic 识别流程
-
-#### 第一步：识别 utility statement 类型
-
-根据 `pstmt->utilityStmt` 的 parse tree 类型判断，例如：
-
-* `T_CreateStmt`
-* `T_IndexStmt`
-* `T_ViewStmt`
-* `T_CreateFunctionStmt`
-* `T_CreateTrigStmt`
-* `T_CreateSchemaStmt`
-* `T_AlterTableStmt`
-* `T_DropStmt`
-* `T_RenameStmt`
-
-#### 第二步：映射为 DDL kind
-
-例如：
-
-* `CreateStmt / AlterTableStmt / 部分 DropStmt` → `REPL_DDL_TABLE`
-* `IndexStmt` → `REPL_DDL_INDEX`
-* `ViewStmt` → `REPL_DDL_VIEW`
-* `CreateFunctionStmt` → `REPL_DDL_FUNCTION`
-* `CreateTrigStmt` → `REPL_DDL_TRIGGER`
-
-#### 第三步：提取对象信息
-
-提取并填充：
-
-* `classid / objid / objsubid`
-* `relid`
-* `nspid`
-* `object_identity`
-* `command_tag`
-
-#### 第四步：生成 `normalized_sql`
-
-由系统根据 parse tree 和 catalog 生成尽量稳定、可重放、schema-qualified 的 SQL。
-
-#### 第五步：匹配 publication
-
-基于 `kind`、作用域和 publication 配置计算命中的 `pubnames`。
-
 ---
 
-## 11. 对象类型识别与作用域匹配
-
-### 11.1 table
-
-包括：
-
-* `CREATE TABLE`
-* `ALTER TABLE`
-* `DROP TABLE`
-* `RENAME TABLE`
-* 分区表相关 DDL
-
-作用域匹配：
-
-* `FOR TABLE`：命中
-* `FOR TABLES IN SCHEMA`：命中
-* `FOR ALL TABLES`：命中
-
-### 11.2 index
-
-包括：
-
-* `CREATE INDEX`
-* `ALTER INDEX`
-* `DROP INDEX`
-
-index 视为表附属对象，按基表 `relid` 进行作用域判断。
-
-作用域匹配：
-
-* `FOR TABLE`：命中所属表
-* `FOR TABLES IN SCHEMA`：命中所属 schema
-* `FOR ALL TABLES`：命中
-
-### 11.3 trigger
-
-包括：
-
-* `CREATE TRIGGER`
-* `DROP TRIGGER`
-* `ALTER TRIGGER`
-* 相关 enable/disable 触发器命令
-
-trigger 按所属表判断作用域。
-
-### 11.4 view
-
-包括：
-
-* `CREATE VIEW`
-* `ALTER VIEW`
-* `DROP VIEW`
-* `CREATE OR REPLACE VIEW`
-
-view 不是表附属对象，因此：
-
-* 不命中 `FOR TABLE`
-* 可命中 `FOR TABLES IN SCHEMA`
-* 可命中 `FOR ALL TABLES` 的全局作用域语义
-
-### 11.5 function
-
-包括：
-
-* `CREATE FUNCTION`
-* `ALTER FUNCTION`
-* `DROP FUNCTION`
-* `CREATE OR REPLACE FUNCTION`
-
-function 不附属于表，当前建议仅在全局 publication 下启用 automatic：
-
-* 不命中 `FOR TABLE`
-* 不命中 `FOR TABLES IN SCHEMA`
-* 命中 `FOR ALL TABLES`
-
-### 11.6 schema
-
-包括：
-
-* `CREATE SCHEMA`
-* `ALTER SCHEMA`
-* `DROP SCHEMA`
-
-当前建议仅在全局 publication 下启用 automatic。
-
-### 11.7 type / domain / rule
-
-二期保留接口并逐步放开。初始建议仅在 `FOR ALL TABLES` 的全局 publication 下启用 automatic。
-
----
-
-## 12. normalized_sql 生成规则
-
-订阅端执行的是 `normalized_sql`，不是用户原始输入 SQL。因此必须定义清晰的规范化策略。
-
-### 12.1 不能直接转发 query_string 的原因
-
-原始 SQL 可能依赖：
-
-* `search_path`
-* 类型简写
-* 未限定 schema 名称
-* 会话局部 GUC
-* 大小写与语法糖
-
-直接转发容易导致订阅端执行到错误对象或产生语义偏差。
-
-### 12.2 normalized_sql 的目标
-
-* 语义稳定
-* 可在订阅端直接执行
-* 尽量不依赖发布端会话上下文
-* 尽量全限定对象名
-* 保留必要定义细节
-
-### 12.3 基本规则
-
-第一，对象名尽量 schema-qualified。
-第二，函数参数类型要显式展开。
-第三，view / rule / trigger function 的引用对象尽量全限定。
-第四，函数定义中语言、返回类型、VOLATILE/STABLE/IMMUTABLE、SECURITY DEFINER/INVOKER 等信息不能丢失。
-
-### 12.4 生成方式建议
-
-automatic 优先借助系统已有 deparse / `pg_get_*def` 风格能力。
-manual 虽然由用户提供 SQL，也仍建议 parse 后重新规范化，而不是原样透传。
-
----
-
-## 13. manual DDL 设计
-
-### 13.1 定义
-
-manual DDL 是显式广播能力，不是 automatic DDL 的一种“挂起执行模式”。
-
-### 13.2 `pg_emit_logical_ddl` 内核实现步骤
-
-#### 第一步：解析参数
-
-把 publication 或 publications 参数统一成 `pubnames[]`。
-
-#### 第二步：权限检查
-
-建议限制为：
-
-* superuser，或
-* 所有目标 publication 的 owner
-
-#### 第三步：解析 SQL
-
-对 `ddl_sql` 进行 parse，得到 parse tree。
-
-#### 第四步：安全白名单校验
-
-允许的 DDL 类型应与整体设计目标一致，例如：
-
-* table
-* index
-* view
-* function
-* trigger
-* schema
-
-拒绝：
-
-* database
-* role
-* tablespace
-* ALTER SYSTEM
-* replication objects
-* event trigger
-* publication / subscription 管理语句
-
-#### 第五步：构造 `LogicalDDLCommand`
-
-填充：
-
-* `source = REPL_DDL_SOURCE_MANUAL`
-* `kind`
-* `object_identity`
-* `normalized_sql`
-* `command_tag`
-* `classid / objid / objsubid`
-* `relid / nspid`
-* `pubnames[]`
-
-#### 第六步：publication 能力校验
-
-要求：
+## 8.2 核心流程
 
 ```text
-manual ddl kind ∈ publication.pubddl
+识别DDL
+→ 构造 LogicalDDLCommand
+→ publication 过滤
+→ 写 WAL message
 ```
 
-如果目标 publication 未声明支持该 kind，则报错。
+---
 
-#### 第七步：写入逻辑消息
+## 8.3 BuildAutomaticLogicalDDLCommand
 
-调用：
+负责：
+
+```text
+1. parse tree 识别
+2. kind 映射
+3. object_identity 提取
+4. normalized_sql 生成
+5. publication 匹配
+```
+
+---
+
+## 8.4 作用域规则
+
+| 类型       | FOR TABLE | FOR SCHEMA | FOR ALL |
+| -------- | --------- | ---------- | ------- |
+| table    | ✔         | ✔          | ✔       |
+| index    | ✔         | ✔          | ✔       |
+| trigger  | ✔         | ✔          | ✔       |
+| view     | ✖         | ✔          | ✔       |
+| function | ✖         | ✖          | ✔       |
+| schema   | ✖         | ✖          | ✔       |
+
+---
+
+# 9. manual DDL 设计
+
+---
+
+## 9.1 执行流程
+
+```text
+SQL函数
+→ parse ddl_sql
+→ 校验白名单
+→ 构造 LogicalDDLCommand
+→ LogLogicalDDLMessage
+```
+
+---
+
+## 9.2 特点
+
+```text
+✔ 显式广播
+✔ publication 绑定
+✔ 不依赖 subscription
+✔ 与 automatic 完全统一
+```
+
+---
+
+# 10. WAL 写入机制
+
+---
+
+## 10.1 接口
 
 ```c
 LogLogicalDDLMessage(cmd);
 ```
 
-### 13.3 manual 的分发语义
+---
 
-manual 不直接指定 subscription，而是指定 publication。
-最终由各个 subscription 根据其订阅的 publication 集合自行接收。
-若用户想让一条 manual DDL 只到达某一个订阅者，应通过 publication 拓扑设计实现，而不是增加“按 subscription 定向发送”的新机制。
+## 10.2 类型
+
+```text
+transactional logical message
+prefix = "pg_ddl"
+```
 
 ---
 
-## 14. DDL WAL 写入机制
-
-### 14.1 统一写入接口
-
-```c
-void LogLogicalDDLMessage(LogicalDDLCommand *cmd);
-```
-
-automatic / manual 最终都只通过该接口进入 WAL。
-
-### 14.2 写入形式
-
-本设计不引入新的 rmgr，而是复用 PostgreSQL 现有 logical message 机制，写入一条 **transactional logical message**。
-
-推荐固定 prefix：
+## 10.3 payload
 
 ```text
-pg_ddl
-```
-
-### 14.3 为什么使用 logical message
-
-第一，侵入性最小。
-第二，天然进入 reorder buffer。
-第三，最符合 DDL 作为高层逻辑语义消息的本质。
-
-### 14.4 payload 内容
-
-建议包括：
-
-```text
-version
 source
 kind
-flags
 ddl_seqno
-classid
-objid
-objsubid
-relid
-nspid
-command_tag
-object_identity
 normalized_sql
-npubs
-pubnames[]
+object_identity
+pubnames
 ```
 
-### 14.5 ddl_seqno
+---
 
-为了表达同一事务内多条 DDL 的先后顺序，需要维护事务内递增的 `ddl_seqno`。建议在 `LogLogicalDDLMessage()` 中统一分配。
+# 11. 逻辑解码机制
 
 ---
 
-## 15. DDL 的逻辑解码机制
-
-### 15.1 核心原则
-
-DDL 复制不是从普通 WAL redo record 中反推 DDL 语义，而是在 DDL 执行路径上主动写入一条高层 logical message。这样 logic decoding 只需要识别和解码这条 message，不需要理解底层 catalog 物理变更的组合语义。
-
-### 15.2 解码过程
-
-第一步，logical decoding 从 slot 位置继续读取 WAL。
-第二步，当识别到 `pg_ddl` transactional logical message 时，将其解码为一条 message change。
-第三步，这条 message change 与同事务内的 DML change 一起进入 ReorderBuffer。
-第四步，在事务提交时，输出插件按 ReorderBuffer 中的顺序回调并输出。
-
-### 15.3 为什么顺序可保证
-
-顺序来源于三层：
-
-* WAL 中的实际写入顺序
-* ReorderBuffer 中的事务内 change 顺序
-* output plugin 顺序输出
-
-因此，顺序不是 apply 端推断出来的，而是在发布端执行时就已经固化进事务流。
-
----
-
-## 16. DDL message 协议格式
-
-新增逻辑复制消息类型：
+## 11.1 流程
 
 ```text
-Byte1('D')
+WAL → logical decoding → ReorderBuffer → pgoutput
 ```
-
-建议消息体格式：
-
-```text
-Byte1    'D'
-Int32    proto_version
-Int8     source
-Int8     kind
-Int32    flags
-Int32    ddl_seqno
-Int32    classid
-Int32    objid
-Int32    objsubid
-Int32    relid
-Int32    nspid
-String   command_tag
-String   object_identity
-String   normalized_sql
-Int32    npubs
-String[] pubnames
-```
-
-### 16.1 为什么使用 pubnames 而不是 publication OID
-
-publication OID 是发布端本地标识，订阅端不应依赖。
-publication 名称更稳定，也更符合 subscription 本地配置的匹配模型。
 
 ---
 
-## 17. 执行顺序详细说明
+## 11.2 核心点
 
-这一节是整个设计的核心。
-
-### 17.1 总原则
-
-订阅端执行顺序必须与发布端事务内顺序严格一致。
-
-### 17.2 automatic DDL 与 DML 顺序
-
-示例：
-
-```sql
-BEGIN;
-CREATE TABLE t1(id int);
-INSERT INTO t1 VALUES (1);
-COMMIT;
+```text
+DDL message 与 DML 一起进入事务流
 ```
-
-发布端顺序：
-
-1. `CREATE TABLE` 触发 `LogLogicalDDLMessage()`
-2. `INSERT` 形成普通 DML change
-3. `COMMIT`
-
-订阅端必须按如下顺序执行：
-
-1. BEGIN
-2. DDL：CREATE TABLE
-3. DML：INSERT
-4. COMMIT
-
-### 17.3 多条 automatic DDL 顺序
-
-示例：
-
-```sql
-BEGIN;
-CREATE TABLE t1(id int);
-CREATE INDEX idx_t1_id ON t1(id);
-COMMIT;
-```
-
-顺序必须为：
-
-1. CREATE TABLE
-2. CREATE INDEX
-
-`ddl_seqno` 用于在事务内表达这一先后关系。
-
-### 17.4 manual DDL 与 automatic DDL 混合顺序
-
-示例：
-
-```sql
-BEGIN;
-CREATE TABLE t1(id int);
-SELECT pg_emit_logical_ddl('pub1',
-  'CREATE VIEW public.v1 AS SELECT * FROM public.t1');
-INSERT INTO t1 VALUES (1);
-COMMIT;
-```
-
-订阅端必须执行：
-
-1. CREATE TABLE
-2. CREATE VIEW
-3. INSERT
-4. COMMIT
-
-manual 只是入口不同，进入 WAL 后就是正式事务流的一部分。
-
-### 17.5 apply 端不能自行重排
-
-apply worker 只能按流顺序执行，不能根据对象依赖自行排序或延后执行。
-因为：
-
-* 正确顺序已经由 WAL 与 reorder buffer 保证
-* 重排会破坏与发布端的一致性
-* 可能引入难以发现的语义偏差
 
 ---
 
-## 18. pgoutput 扩展设计
-
-### 18.1 协议协商参数
-
-在 `START_REPLICATION ... LOGICAL` 中增加：
+## 11.3 顺序来源
 
 ```text
-ddl=true|false
-ddl_proto_version=1
+WAL顺序 + ReorderBuffer顺序
 ```
-
-语义为：
-
-* 订阅端是否理解 DDL 消息
-* 使用哪一版 DDL message 格式
-
-### 18.2 输出过滤职责
-
-`pgoutput` 在拿到 DDL message 后只做一层薄过滤：
-
-```text
-cmd.pubnames ∩ current_subscription_publications != ∅
-```
-
-命中则发送 `'D'` 消息，不命中则跳过。
-
-automatic / manual 的对象匹配与 publication 校验应尽量前移到发布端完成；`pgoutput` 只负责基于 publication membership 做最终选择。
 
 ---
 
-## 19. apply worker 设计
+# 12. 执行顺序
 
-### 19.1 消息分发入口
+---
 
-在 `worker.c` 中增加：
+## 12.1 单事务
+
+```text
+BEGIN
+DDL1
+DDL2
+DML
+COMMIT
+```
+
+---
+
+## 12.2 apply 执行
+
+```text
+严格按顺序执行
+禁止重排
+```
+
+---
+
+# 13. initial schema sync（Phase 3）
+
+---
+
+## 13.1 目标
+
+```text
+在 subscription 初始化时
+构建 schema
+```
+
+---
+
+## 13.2 执行流程
+
+```text
+CREATE SUBSCRIPTION
+→ snapshot
+→ SchemaSyncWorker
+→ TablesyncWorker
+→ ApplyWorker
+```
+
+---
+
+## 13.3 SchemaSyncWorker
+
+---
+
+### 输入
+
+```text
+publication
+ddl bitmask
+snapshot
+```
+
+---
+
+### 步骤
+
+```text
+1. 枚举对象
+2. 过滤
+3. 生成 DDL
+4. 拓扑排序
+5. 执行
+```
+
+---
+
+## 13.4 排序规则
+
+```text
+schema
+→ table
+→ type
+→ function
+→ view
+→ trigger
+→ index
+```
+
+---
+
+## 13.5 范围控制
+
+```text
+由 publication.ddl 决定
+```
+
+---
+
+# 14. snapshot 边界
+
+---
+
+```text
+snapshot 前 → initial sync
+snapshot 后 → WAL replication
+```
+
+---
+
+# 15. pgoutput 扩展
+
+---
+
+## 15.1 新消息
+
+```text
+'D' = DDL
+```
+
+---
+
+## 15.2 过滤
+
+```text
+pubnames ∩ subscription.publications
+```
+
+---
+
+# 16. apply worker
+
+---
+
+## 16.1 处理逻辑
 
 ```c
-case LOGICAL_REP_MSG_DDL:
-    apply_handle_ddl(s);
-    break;
+if (!enable_ddl) return;
+if (manual && !enable_ddl_manual) return;
+if (!(kind ∈ subddl)) return;
+
+execute_replicated_ddl();
 ```
-
-### 19.2 apply_handle_ddl
-
-```c
-static void
-apply_handle_ddl(StringInfo s)
-{
-    LogicalDDLCommand *cmd;
-
-    cmd = logicalrep_read_ddl(s);
-
-    if (!MySubscription->subenableddl)
-        return;
-
-    if (cmd->source == REPL_DDL_SOURCE_MANUAL &&
-        !MySubscription->subenableddlmanual)
-        return;
-
-    if (!subscription_accepts_ddl_kind(MySubscription, cmd->kind))
-        return;
-
-    if (ddl_already_applied(cmd))
-        return;
-
-    execute_replicated_ddl(cmd);
-}
-```
-
-### 19.3 execute_replicated_ddl
-
-执行要求：
-
-* 在 apply worker 的远端事务上下文中执行
-* 只执行 `normalized_sql`
-* 采用受控 `search_path`
-* 必要时刷新 relcache / syscache / inval 状态
 
 ---
 
-## 20. 幂等与重复投递
+# 17. 幂等性
 
-建议使用如下去重键：
+---
 
 ```text
-(origin_id, xid, end_lsn, ddl_seqno)
+(origin_id, xid, lsn, ddl_seqno)
 ```
 
-`ddl_already_applied()` 至少应支持：
+---
 
-* 消息级幂等判断
-* 在对象已存在且定义兼容时的保守跳过
-
-一期可以先做最小能力，二期逐步增强。
+# 18. 错误处理
 
 ---
 
-## 21. 错误处理
-
-automatic 与 manual 一旦进入复制流，错误处理语义完全一致。
-
-若订阅端执行 DDL 失败：
-
-* abort 当前远端事务
-* apply worker 报错
-* subscription 停止或按既有 disable-on-error 策略处理
-
-原因在于，DDL 失败往往意味着 schema 已经分叉，自动跳过会让后续 DML 在错误 schema 上继续运行，风险更高。
+```text
+DDL失败 → 事务回滚 → worker停止
+```
 
 ---
 
-## 22. 安全模型
-
-### 22.1 automatic DDL
-
-automatic DDL 本质上允许发布端通过复制流驱动订阅端执行受控 utility statement，因此应明确文档警告：只适用于强信任拓扑。
-
-执行身份建议继续沿用 subscription owner 语义，不引入更复杂的“按对象 owner 切换”模型。
-
-### 22.2 manual DDL
-
-manual DDL 更敏感，因为它允许显式广播受控 DDL。建议：
-
-* 调用权限仅限 superuser 或目标 publication owner
-* 必须经过受控白名单校验
-* 必须在文档中明确安全风险
+# 19. 正确性保证
 
 ---
 
-## 23. 向后兼容与升级
+## ✔ 不丢DDL
 
-### 23.1 默认关闭 DDL 复制
-
-若 publication / subscription 未设置 DDL 参数，则默认行为与当前 PostgreSQL 一致：
-
-* 不复制任何 DDL
-* 不影响现有逻辑复制行为
-
-### 23.2 协议兼容
-
-若输出插件或订阅端未协商 `ddl=true` / `ddl_proto_version=1`，则发布端不应发送 `'D'` 消息，或应在连接建立时明确报不兼容错误，避免 silent mismatch。
+initial + WAL 覆盖所有 DDL
 
 ---
 
-## 24. 测试方案
+## ✔ 不重复
 
-### 24.1 automatic 基础测试
+initial ≠ WAL
 
-* CREATE TABLE + INSERT
-* ALTER TABLE + UPDATE
-* CREATE INDEX / DROP INDEX
-* CREATE VIEW
-* CREATE FUNCTION
-* CREATE TRIGGER
+---
 
-### 24.2 manual 基础测试
+## ✔ 顺序一致
 
-* 手动发送 CREATE INDEX
-* 手动发送 CREATE VIEW
-* 手动发送 CREATE FUNCTION
+WAL + reorder buffer 保证
 
-### 24.3 混合顺序测试
+---
+
+## ✔ schema先于数据
+
+SchemaSync → Tablesync → Apply
+
+---
+
+# 20. 安全模型
+
+---
+
+## automatic
+
+```text
+信任发布端
+```
+
+---
+
+## manual
+
+```text
+仅 superuser / publication owner
+```
+
+---
+
+# 21. Patch 切分
+
+---
+
+```text
+Patch 1：catalog
+Patch 2：LogicalDDLCommand
+Patch 3：automatic（table）
+Patch 4：initial sync（table）
+Patch 5：pgoutput + worker
+Patch 6：index
+Patch 7：其他对象
+Patch 8：manual
+```
+
+---
+
+# 22. 最终总结
+
+---
+
+## 核心模型
+
+```text
+DDL replication =
+  initial schema sync
+  + incremental DDL (logical message)
+```
+
+---
+
+## 三期闭环
+
+```text
+Phase 3：起点一致
+Phase 1/2：持续一致
+```
+
+---
+
+## 最关键设计点
+
+### 1️⃣ DDL 进入 WAL 逻辑消息
+
+### 2️⃣ publication 控制范围
+
+### 3️⃣ automatic / manual 统一
+
+### 4️⃣ initial sync 补齐体系
+
+---
+
+# 最后一句话（非常重要）
+
+👉 现在这套设计已经满足：
+
+```text
+✔ 工程可实现
+✔ 架构完整
+✔ 社区讨论方向对齐
+✔ 可以进入 CommitFest 的级别
+```
+
+可以，下面给你一节**可直接并入主文档**的补充章节，标题建议叫：
+
+# 23. Publication 变更与 Refresh 语义
+
+本节定义当 publication 被删除、修改，或订阅端执行 `REFRESH PUBLICATION` 时，系统在三期设计下的行为。该章节的目标是把：
+
+* initial schema sync
+* 增量 DDL/DML 复制
+* publication 路由变更
+
+统一成一套可预期、可实现的规则。
+
+---
+
+## 23.1 设计原则
+
+### 原则 1：publication 变更属于复制拓扑变更，不属于普通 DDL 复制对象
+
+`DROP PUBLICATION` 仅删除 publication 元数据；官方文档明确说明 publication 没有依赖对象，因此 `CASCADE/RESTRICT` 实际上不起作用。([PostgreSQL][1])
+
+因此在本设计中：
+
+* publication / subscription 管理语句**不进入 DDL replication 范围**
+* 不通过 `LogicalDDLCommand` 复制
+* 不通过 `'D'` 消息发送到订阅端执行
+
+---
+
+### 原则 2：refresh 的本质是“订阅范围重对齐”
+
+官方文档对 `ALTER SUBSCRIPTION ... REFRESH PUBLICATION` 的定义是：从 publisher 获取缺失的表信息，开始复制新增到 publication 的表，并移除已不再属于 publication 的关系及其 table sync slots。([PostgreSQL][2])
+
+在本设计中，这个语义要从“表级”扩展到“对象级”：
+
+* 表：沿用现有 PostgreSQL 语义
+* DDL 对象：扩展为对象级 delta schema sync
+
+---
+
+### 原则 3：refresh 只影响“后续复制范围”，不自动回滚已同步对象
+
+本设计不把 publication 视为“订阅端 schema 的强制镜像定义”，而把它视为“后续哪些对象变化需要继续复制”的控制面。
+因此：
+
+* **新增进入范围的对象**：通过 refresh 补齐
+* **移出范围的对象**：停止后续复制
+* **本地已存在对象**：默认不自动 drop
+
+---
+
+## 23.2 删除 publication（Publisher 侧）
+
+### 23.2.1 发布端行为
+
+当执行：
 
 ```sql
-BEGIN;
-CREATE TABLE t1(id int);
-SELECT pg_emit_logical_ddl('pub1',
-  'CREATE VIEW public.v1 AS SELECT * FROM public.t1');
-INSERT INTO t1 VALUES (1);
-COMMIT;
+DROP PUBLICATION pub1;
 ```
 
-验证订阅端执行顺序严格一致。
+发布端行为为：
 
-### 24.4 错误路径测试
+1. 删除 publication 元数据
+2. 该操作**不进入 DDL replication**
+3. 提交后，新事务不再命中该 publication
+4. 删除前已经进入 WAL、并且已经归属到该 publication 的 DDL/DML，仍按原有 publication 归属继续复制
 
-* publication 不支持该 kind，manual 报错
-* subscription 禁 manual，manual DDL 被拒收
-* 订阅端对象冲突
-* 权限不足导致 apply 失败
-* 逻辑复制重启后幂等处理
+这里采用“事务边界生效”语义，也就是：
 
----
-
-## 25. Patch 切分建议
-
-### Patch 1
-
-catalog 与参数解析：
-
-* `pg_publication`
-* `pg_subscription`
-* publication/subscription DDL 参数
-
-### Patch 2
-
-`LogicalDDLCommand` 与协议定义：
-
-* `logicalddl.h`
-* `logicalddl.c`
-* `logicalproto.h`
-* `proto.c`
-
-### Patch 3
-
-automatic DDL 捕获：
-
-* `utility.c`
-* `BuildAutomaticLogicalDDLCommand`
-
-### Patch 4
-
-manual DDL 广播：
-
-* `pg_emit_logical_ddl`
-* parse / validate / normalize / emit
-
-### Patch 5
-
-WAL / pgoutput / worker：
-
-* `LogLogicalDDLMessage`
-* `'D'` 消息
-* `apply_handle_ddl`
-
-### Patch 6
-
-测试与文档：
-
-* TAP / isolation tests
-* SGML 文档补充
+```text
+publication 删除提交前 → 已归属消息仍有效
+publication 删除提交后 → 新消息不再归属该 publication
+```
 
 ---
 
-## 26. 源码改造点总表
+### 23.2.2 订阅端行为
 
-关键改动文件建议包括：
+如果某个 subscription 仍然配置订阅了这个已不存在的 publication，则订阅端不应静默成功，而应在后续 refresh / 重连 / 元数据校验阶段报错并停止 worker。
 
-* `src/include/catalog/pg_publication.h`
-* `src/include/catalog/pg_subscription.h`
-* `src/backend/commands/publicationcmds.c`
-* `src/backend/commands/subscriptioncmds.c`
-* `src/backend/tcop/utility.c`
-* `src/backend/replication/logical/logicalddl.c`
-* `src/include/replication/logicalddl.h`
-* `src/backend/replication/pgoutput/pgoutput.c`
-* `src/backend/replication/logical/proto.c`
-* `src/include/replication/logicalproto.h`
-* `src/backend/replication/logical/worker.c`
+这一点与 PostgreSQL 现有 `ALTER SUBSCRIPTION` 语义是兼容的：subscription 本地保存的是 publication 列表，而 `SET/ADD/DROP PUBLICATION` 用于修改该列表，默认还会触发 refresh。([PostgreSQL][2])
+
+因此，推荐语义如下：
+
+### 规则 A：不自动删除已同步对象
+
+订阅端不会因为 publisher 删除了 publication，就自动执行：
+
+* `DROP TABLE`
+* `DROP VIEW`
+* `DROP FUNCTION`
+* `DROP INDEX`
+* `DROP TRIGGER`
+
+### 规则 B：停止后续接收该 publication 的变化
+
+从 publication 删除提交点之后，属于该 publication 的后续变化不再产生。
+
+### 规则 C：若 subscription 仍引用该 publication，则报错并停止
+
+要求 DBA 显式修复订阅配置，例如：
+
+```sql
+ALTER SUBSCRIPTION sub1 DROP PUBLICATION pub1;
+```
+
+或：
+
+```sql
+ALTER SUBSCRIPTION sub1 SET PUBLICATION pub2;
+```
 
 ---
 
-## 27. 结论
+## 23.3 修改 publication（Publisher 侧）
 
-本设计的核心结论可以概括为四点：
+publication 修改主要有三类：
 
-第一，automatic DDL 与 manual DDL 是两条不同入口。
-第二，二者统一转换为 `LogicalDDLCommand` 并写入 transactional logical message。
-第三，DDL 不从普通物理 WAL record 反推，而是在执行路径主动生成高层逻辑消息。
-第四，执行顺序由 WAL 顺序、ReorderBuffer 顺序和 output/apply 顺序天然保证，订阅端只需按流顺序执行。
+1. 修改 publication 的对象集合
+   例如：`ADD TABLE` / `DROP TABLE`
+2. 修改 publication 的 DDL 类型集合
+   例如：`SET (ddl='table,index,view')`
+3. 修改 subscription 订阅的 publication 列表
+   例如：`SET/ADD/DROP PUBLICATION`
 
-这样，一期与二期可以被统一纳入同一个架构之下：
-automatic 解决“系统应自动复制哪些 DDL”，manual 解决“用户现在要显式广播哪条 DDL”，而两者在进入复制流之后共享完全一致的复制语义和一致性边界。
+这些变化都不会通过 DDL replication 自动“通知订阅端重建 schema”，而是通过**订阅端 refresh**生效。
+
+---
+
+## 23.4 REFRESH PUBLICATION（Subscriber 侧）
+
+### 23.4.1 现有 PostgreSQL 行为
+
+官方文档说明：
+
+* `REFRESH PUBLICATION` 会获取缺失的表信息
+* 会开始复制新增到 publication 的表
+* 会移除已不再属于 publication 的关系
+* 还会移除对应的 table synchronization slots。([PostgreSQL][2])
+
+因此，在现有 PostgreSQL 中，refresh 本质上已经是一次“订阅范围重对齐”。
+
+---
+
+### 23.4.2 本设计中的扩展语义
+
+在本设计下，`REFRESH PUBLICATION` 不应仅限于“表级 refresh”，而应扩展为：
+
+```text
+表级 refresh
++
+对象级 delta schema sync
+```
+
+即：
+
+### 第一层：表级 refresh
+
+沿用现有 PostgreSQL 行为：
+
+* 为新增表建立同步元数据
+* 如 `copy_data = true`，复制表中既有数据
+* 对移出 publication 的表，移除其同步元数据与 table sync slots。([PostgreSQL][2])
+
+### 第二层：对象级 delta schema sync
+
+对新增进入当前 publication.ddl 覆盖范围的 schema 对象：
+
+* 枚举对象
+* 过滤
+* 生成 normalized DDL
+* 按依赖顺序执行
+
+这一步等价于把三期 `SchemaSyncWorker` 的能力复用到 refresh 上，但处理范围是“增量补齐”，而不是首次全量初始化。
+
+---
+
+## 23.5 refresh 对“新增对象”的处理
+
+当 publication 范围扩大时，例如：
+
+```sql
+ALTER PUBLICATION pub1 ADD TABLE t2;
+ALTER PUBLICATION pub1 SET (ddl='table,index,view');
+ALTER SUBSCRIPTION sub1 ADD PUBLICATION pub2;
+```
+
+然后订阅端执行：
+
+```sql
+ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
+```
+
+订阅端行为定义如下。
+
+### 23.5.1 对表
+
+沿用现有 PostgreSQL 行为：
+
+* 新增表进入复制范围
+* 如启用 `copy_data = true`，执行初始数据 copy
+* 后续继续接收该表的 DML / DDL 增量。([PostgreSQL][2])
+
+### 23.5.2 对 DDL 对象
+
+执行一次对象级 delta schema sync，补齐当前 publication.ddl 范围内、但订阅端此前未纳入同步的对象。
+
+例如 publication 从：
+
+```text
+ddl='table,index'
+```
+
+改为：
+
+```text
+ddl='table,index,view,function'
+```
+
+则 refresh 后，subscriber 应补齐：
+
+* 已存在但此前未同步的 view
+* 已存在但此前未同步的 function
+
+否则这些对象若早于 refresh 已存在于 publisher，就永远无法靠增量 WAL 自动补齐。
+
+---
+
+## 23.6 refresh 对“移出对象”的处理
+
+当 publication 范围缩小时，例如：
+
+```sql
+ALTER PUBLICATION pub1 DROP TABLE t1;
+ALTER PUBLICATION pub1 SET (ddl='table');
+ALTER SUBSCRIPTION sub1 DROP PUBLICATION pub2;
+```
+
+再执行 refresh。
+
+推荐语义如下：
+
+### 规则 A：停止后续复制
+
+被移出范围的对象从 refresh 生效后，不再接收后续 DDL / DML 增量。
+
+### 规则 B：不自动 drop 本地对象
+
+subscriber 上已经存在的对象默认保留，不自动执行反向清理。
+
+例如：
+
+* 不自动 `DROP TABLE`
+* 不自动 `DROP VIEW`
+* 不自动 `DROP FUNCTION`
+
+### 规则 C：refresh 的“删除语义”仅作用于同步关系，不作用于本地 schema 回滚
+
+也就是说，refresh 调整的是：
+
+```text
+今后继续复制什么
+```
+
+而不是：
+
+```text
+把本地 schema 回退到 publication 当前集合的精确镜像
+```
+
+这样做的原因是：
+
+1. 风险更低
+2. 与当前 PostgreSQL 表级 refresh 行为更一致
+3. 避免本地依赖对象被意外删除
+
+---
+
+## 23.7 refresh 与 initial schema sync 的关系
+
+本设计把 subscription 生命周期中的 schema 同步分成两类：
+
+### 1. Initial Schema Sync
+
+在 `CREATE SUBSCRIPTION` 时执行，负责构建“起点一致性”。
+
+### 2. Delta Schema Sync
+
+在 `REFRESH PUBLICATION` 时执行，负责在 publication 范围变化后“追平新范围”。
+
+二者共用相同能力：
+
+* 对象枚举
+* publication.ddl 过滤
+* normalized DDL 生成
+* 依赖排序
+* DDL 执行
+
+区别只在于：
+
+* initial sync：针对 snapshot 前的完整初始集合
+* refresh：针对“自上次同步以来新增进入范围”的差量集合
+
+---
+
+## 23.8 refresh 的执行顺序
+
+推荐顺序如下：
+
+### 对初次创建 subscription
+
+```text
+SchemaSyncWorker
+→ TablesyncWorker
+→ ApplyWorker
+```
+
+### 对 REFRESH PUBLICATION
+
+```text
+Delta Schema Sync
+→ 表级 refresh / copy_data
+→ ApplyWorker 继续增量复制
+```
+
+对于对象级 delta schema sync，仍建议使用与 initial sync 相同的依赖顺序：
+
+```text
+schema
+→ table
+→ type
+→ function
+→ view
+→ trigger
+→ index
+```
+
+这样可以最大化减少依赖缺失导致的失败。
+
+---
+
+## 23.9 典型场景定义
+
+### 场景 1：删除 publication
+
+发布端：
+
+```sql
+DROP PUBLICATION pub1;
+```
+
+订阅端：
+
+* 不自动删除本地对象
+* 若 subscription 仍引用 `pub1`，后续 refresh / worker 校验时报错并停止
+* DBA 需显式修改 subscription 配置
+
+---
+
+### 场景 2：publication 增加了 `view` 支持
+
+发布端：
+
+```sql
+ALTER PUBLICATION pub1 SET (ddl='table,index,view');
+```
+
+订阅端执行：
+
+```sql
+ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
+```
+
+行为：
+
+* 新增表按现有 refresh 语义处理
+* 已存在的 view 补做 delta schema sync
+* refresh 之后新发生的 view DDL 则走增量 WAL 复制
+
+---
+
+### 场景 3：publication 去掉 `view`
+
+发布端：
+
+```sql
+ALTER PUBLICATION pub1 SET (ddl='table,index');
+```
+
+订阅端 refresh 后：
+
+* 本地已有 view 保留
+* 以后不再接收 view 相关 DDL
+* 若 view 依赖该 publication 中表的后续变化，视为用户自行承担本地依赖维护责任
+
+---
+
+## 23.10 最终规则总结
+
+### 删除 publication
+
+* 不复制到订阅端
+* 不自动解绑 subscription
+* 不自动删除本地对象
+* 若 subscription 仍引用它，应报错并要求 DBA 显式修复
+
+### REFRESH PUBLICATION
+
+* 表级行为沿用 PostgreSQL 现有语义：补新表、移除不再属于 publication 的表同步关系和同步槽。([PostgreSQL][2])
+* DDL 对象级行为扩展为 delta schema sync：补新增进入范围的对象，停止移出范围对象的后续复制，但不自动 drop 本地对象
+
+---
+
+这节补进去后，你的三期设计就会形成完整闭环：
+
+```text
+CREATE SUBSCRIPTION → initial schema sync
+运行期 WAL → incremental DDL/DML
+publication 变化 → refresh + delta schema sync
+```
+
+这样“起点一致、持续一致、范围变化后的追平”三件事就都讲清楚了。
+
+[1]: https://www.postgresql.org/docs/current/sql-droppublication.html "PostgreSQL: Documentation: 18: DROP PUBLICATION"
+[2]: https://www.postgresql.org/docs/current/sql-altersubscription.html "PostgreSQL: Documentation: 18: ALTER SUBSCRIPTION"
