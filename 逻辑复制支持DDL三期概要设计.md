@@ -4,6 +4,16 @@
 
 ---
 
+## 当前实现状态（截至 2026-04-11）
+
+| 模块 | 文档目标 | 当前代码状态 |
+| --- | --- | --- |
+| Initial schema sync | SchemaSyncWorker 初始化订阅端 schema | 未实现（本文件为设计方案） |
+| 与增量 DDL 衔接 | snapshot 前后边界闭环 | 未实现 |
+| 与 manual DDL 协同 | initial 期间 manual 语义 | manual 未实现，协同逻辑未实现 |
+
+---
+
 # 1. 设计目标
 
 ---
@@ -15,7 +25,7 @@
 ```text
 ✔ 支持增量 DDL replication
 ✔ DDL 与 DML 顺序一致
-✔ automatic + manual 统一链路
+✔ automatic 链路可用（manual 规划中）
 ```
 
 但缺失：
@@ -98,7 +108,7 @@ snapshot 后 DDL → logical replication
 
 ```text
 一期：automatic DDL（table/index）
-二期：扩展 automatic + manual DDL
+二期：扩展 automatic DDL（manual 预留）
 三期：initial schema sync（补齐启动阶段）
 ```
 
@@ -438,20 +448,20 @@ tablesync 只做数据复制
 
 ---
 
-# 9. manual DDL 与 initial sync
+# 9. manual DDL 与 initial sync（预留）
 
 ---
 
-## 9.1 场景
+## 9.1 场景（未来扩展）
 
 ```text
 initial sync 过程中
-用户执行 pg_emit_logical_ddl()
+若后续支持 pg_emit_logical_ddl()
 ```
 
 ---
 
-## 9.2 规则
+## 9.2 规则（预留）
 
 ```text
 manual DDL → 正常写 WAL
@@ -460,7 +470,7 @@ manual DDL → 正常写 WAL
 
 ---
 
-## 9.3 要求
+## 9.3 要求（预留）
 
 ```text
 SchemaSyncWorker 必须先完成

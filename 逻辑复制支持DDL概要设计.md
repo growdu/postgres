@@ -1,26 +1,35 @@
-下面给你一版**完整统一的三期设计文档（一期+二期+三期整合版）**。
-这版已经做到：
+下面给出一版**统一的总体设计文档（一期+二期+三期+四期整合）**。
+文档同时覆盖：
 
-* 架构统一（automatic / manual / initial sync 全打通）
-* 执行链路完整（DDL WAL → decoding → pgoutput → apply）
-* initial schema sync 补齐
-* 顺序一致性 & 正确性说明完整
-* 可以直接作为**社区评审设计文档 / 内核实现蓝图**
+* 已落地能力（当前代码）
+* 规划能力（尚未实现）
+* 分期演进路线
 
 ---
 
-# PostgreSQL 逻辑复制支持 DDL（三期完整设计文档）
+# PostgreSQL 逻辑复制支持 DDL（总体设计与分期路线）
+
+## 当前实现状态（截至 2026-04-11）
+
+| 阶段 | 目标 | 当前代码状态 |
+| --- | --- | --- |
+| 一期 | automatic DDL（table/index） | 已实现 |
+| 二期 | automatic 扩展对象（type/function/domain/trigger/view/rule/schema/extension） | 已实现 |
+| 二期（manual） | `pg_emit_logical_ddl` 手动广播 | 未实现（预留） |
+| 三期 | initial schema sync（SchemaSyncWorker） | 未实现（预留） |
+| 四期 | refresh 对象级 delta/cleanup | 未实现（预留） |
 
 ---
 
 # 1. 摘要
 
-本文提出 PostgreSQL 内建逻辑复制支持 DDL 的完整方案，分为三期：
+本文提出 PostgreSQL 内建逻辑复制支持 DDL 的分期方案：
 
 ```text
 一期：automatic DDL（table/index）
-二期：扩展 automatic + manual DDL
+二期：扩展 automatic DDL（manual 预留）
 三期：initial schema sync（启动一致性）
+四期：publication 变更收敛（refresh 对象级扩展）
 ```
 
 核心思想：
@@ -31,11 +40,11 @@ DDL 作为逻辑复制的一等消息
 与 DML 保持事务级顺序一致
 ```
 
-同时：
+目标上：
 
 ```text
-initial schema sync + incremental DDL
-共同保证 schema 持续一致
+initial schema sync + incremental DDL + refresh delta
+形成完整闭环
 ```
 
 ---
@@ -47,9 +56,9 @@ initial schema sync + incremental DDL
 ## 2.1 核心目标
 
 1. 支持 DDL 自动复制（automatic）
-2. 支持 DDL 手动广播（manual）
+2. 预留 DDL 手动广播（manual）
 3. 保证 DDL + DML 顺序一致
-4. 支持 subscription 初始化 schema（initial sync）
+4. 预留 subscription 初始化 schema（initial sync）
 5. 与 publication/subscription 模型一致
 6. 不引入额外状态系统
 
@@ -203,22 +212,20 @@ WITH (ddl='table,index,view,function,trigger');
 
 ---
 
-## 5.2 subscription
+## 5.2 subscription（当前实现）
 
 ```sql
 CREATE SUBSCRIPTION sub
 CONNECTION '...'
 PUBLICATION pub
 WITH (
-  ddl='table,index',
-  enable_ddl=true,
-  enable_ddl_manual=false
+  ddl='table,index'
 );
 ```
 
 ---
 
-## 5.3 manual DDL
+## 5.3 manual DDL（预留）
 
 ```sql
 SELECT pg_emit_logical_ddl(
@@ -241,12 +248,10 @@ int32 pubddl;
 
 ---
 
-## 6.2 pg_subscription
+## 6.2 pg_subscription（当前实现）
 
 ```c
 int32 subddl;
-bool subenableddl;
-bool subenableddlmanual;
 ```
 
 ---
@@ -329,7 +334,7 @@ standard_ProcessUtility()
 
 ---
 
-# 9. manual DDL 设计
+# 9. manual DDL 设计（预留）
 
 ---
 
@@ -345,7 +350,7 @@ SQL函数
 
 ---
 
-## 9.2 特点
+## 9.2 特点（目标）
 
 ```text
 ✔ 显式广播
@@ -443,11 +448,11 @@ COMMIT
 
 ---
 
-# 13. initial schema sync（Phase 3）
+# 13. initial schema sync（Phase 3，预留）
 
 ---
 
-## 13.1 目标
+## 13.1 目标（未实现）
 
 ```text
 在 subscription 初始化时
@@ -468,7 +473,7 @@ CREATE SUBSCRIPTION
 
 ---
 
-## 13.3 SchemaSyncWorker
+## 13.3 SchemaSyncWorker（未实现）
 
 ---
 
@@ -547,15 +552,13 @@ pubnames ∩ subscription.publications
 
 ---
 
-# 16. apply worker
+# 16. apply worker（当前实现）
 
 ---
 
 ## 16.1 处理逻辑
 
 ```c
-if (!enable_ddl) return;
-if (manual && !enable_ddl_manual) return;
 if (!(kind ∈ subddl)) return;
 
 execute_replicated_ddl();
@@ -683,22 +686,11 @@ Phase 1/2：持续一致
 
 ---
 
-# 最后一句话（非常重要）
+# 四期补充章节
 
-👉 现在这套设计已经满足：
+# 23. Publication 变更与 Refresh 语义（四期规划，未实现）
 
-```text
-✔ 工程可实现
-✔ 架构完整
-✔ 社区讨论方向对齐
-✔ 可以进入 CommitFest 的级别
-```
-
-可以，下面给你一节**可直接并入主文档**的补充章节，标题建议叫：
-
-# 23. Publication 变更与 Refresh 语义
-
-本节定义当 publication 被删除、修改，或订阅端执行 `REFRESH PUBLICATION` 时，系统在三期设计下的行为。该章节的目标是把：
+本节定义当 publication 被删除、修改，或订阅端执行 `REFRESH PUBLICATION` 时的目标行为。该章节属于四期规划，当前代码尚未实现对象级 refresh 扩展。章节目标是把：
 
 * initial schema sync
 * 增量 DDL/DML 复制
@@ -838,7 +830,7 @@ publication 修改主要有三类：
 
 ---
 
-### 23.4.2 本设计中的扩展语义
+### 23.4.2 本设计中的扩展语义（未实现）
 
 在本设计下，`REFRESH PUBLICATION` 不应仅限于“表级 refresh”，而应扩展为：
 
@@ -1107,7 +1099,7 @@ ALTER PUBLICATION pub1 SET (ddl='table,index');
 
 ---
 
-这节补进去后，你的三期设计就会形成完整闭环：
+该节代表目标闭环模型（当前未完全落地）：
 
 ```text
 CREATE SUBSCRIPTION → initial schema sync

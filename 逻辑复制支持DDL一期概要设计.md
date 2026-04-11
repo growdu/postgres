@@ -1,5 +1,14 @@
 # 逻辑复制支持DDL概要设计
 
+## 实现状态（截至 2026-04-11）
+
+| 阶段 | 文档目标 | 当前代码状态 |
+| --- | --- | --- |
+| 一期 | automatic DDL（table/index） | 已实现，且能力已扩展超出一期范围 |
+| 二期 | 扩展对象类型 + manual DDL | 扩展对象类型已实现；manual 未实现 |
+| 三期 | initial schema sync | 未实现 |
+| 四期 | refresh delta/cleanup 收敛 | 未实现 |
+
 ## 1. 背景与目标
 
 PostgreSQL 当前内建逻辑复制主要覆盖表级 DML 复制。logical decoding 的本质是从 WAL 中提取持久化变更，转成更高层可理解的变更流；复制槽保证“按源端发生顺序”向客户端提供变化序列。([PostgreSQL][1])
@@ -160,10 +169,9 @@ int32 pubddl;
 
 ```c
 int32 subddl;
-bool  subddlmanual;   /* 二期可选 */
 ```
 
-一期可只做 `subddl`。
+一期仅需 `subddl`。`subddlmanual` 与 pending 队列方案不作为本版本目标。
 
 ---
 
@@ -537,25 +545,11 @@ DDL apply 失败时建议保持同样语义：
 
 ## 16. Manual 模式设计
 
-你之前想提供 `pg_sync_ddl(ddl)` 这种手动函数。按内核级方案，建议不要让用户手输 SQL 再“二次广播”。
+一期不实现 manual DDL。
 
-更合理的是二期引入：
+二期如果引入 manual，采用“直接广播到 logical message”的模型，不引入 pending 队列与人工确认执行流。
 
-```sql
-ALTER SUBSCRIPTION sub SET (ddl_manual = true);
-```
-
-含义：
-
-* publisher 仍发送 DDL message
-* subscriber 收到后不立即执行，而是记为 pending
-* 用户再执行：
-
-  ```sql
-  SELECT pg_apply_pending_ddl('subname', lsn);
-  ```
-
-一期可以先不做 manual，先把 automatic 跑通。
+当前代码中尚未实现 `pg_emit_logical_ddl()` 或 `ddl_manual` 类参数。
 
 ---
 

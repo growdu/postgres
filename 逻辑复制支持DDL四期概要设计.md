@@ -2,7 +2,18 @@
 
 # PostgreSQL 逻辑复制 DDL 四期设计文档
 
-# —— Publication 变更与对象级 Refresh（完整实现）
+# —— Publication 变更与对象级 Refresh（设计方案，未实现）
+
+---
+
+## 当前实现状态（截至 2026-04-11）
+
+| 模块 | 文档目标 | 当前代码状态 |
+| --- | --- | --- |
+| REFRESH 对象级 delta schema sync | 新增对象自动补齐 | 未实现 |
+| 移出范围对象治理 | 停止复制 + 可选 cleanup | 未实现 |
+| `pg_subscription_rel_ext` | 对象级状态跟踪系统表 | 未实现 |
+| `drop_missing_objects` 参数 | refresh 可选删除策略 | 未实现 |
 
 ---
 
@@ -14,7 +25,7 @@
 让 publication 变更在订阅端可正确收敛
 ```
 
-具体实现：
+目标模型：
 
 ```text
 REFRESH PUBLICATION =
@@ -32,7 +43,7 @@ initial sync（起点一致）
 + incremental（持续一致）
 ```
 
-完整闭环。
+目标是形成闭环。
 
 ---
 
@@ -585,5 +596,4 @@ REFRESH =
 ```text
 “schema 生命周期完全受 logical replication 管控”
 ```
-
 

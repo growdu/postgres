@@ -3,6 +3,16 @@
 
 ---
 
+## 当前实现状态（截至 2026-04-11）
+
+| 模块 | 文档目标 | 当前代码状态 |
+| --- | --- | --- |
+| automatic 扩展对象类型 | schema/trigger/view/function/type/domain/rule/extension | 已实现 |
+| publication/subscription `ddl` 过滤 | `pubddl/subddl` 位图与校验 | 已实现 |
+| manual DDL（`pg_emit_logical_ddl`） | 手动广播入口 | 未实现（本文件为设计预留） |
+
+---
+
 ## 1. 目标与范围
 
 ### 1.1 目标
@@ -19,7 +29,7 @@ schema / trigger / view / function / type / domain / rule
 
 ---
 
-### （2）新增 manual DDL 广播能力
+### （2）设计预留 manual DDL 广播能力（当前未实现）
 
 提供 SQL 接口：
 
@@ -153,8 +163,13 @@ int32 pubddl;
 
 ```c
 int32 subddl;                /* 接受的DDL类型 */
-bool  subenableddl;          /* 是否开启DDL复制 */
-bool  subenableddlmanual;    /* 是否接受manual DDL */
+```
+
+说明：
+
+```text
+当前代码仅包含 subddl。
+subenableddl / subenableddlmanual 作为后续候选扩展，尚未落地。
 ```
 
 ---
@@ -320,6 +335,8 @@ extension
 
 ---
 
+> 本章为预留设计，当前代码尚未实现。
+
 ## 6.1 SQL接口
 
 ```sql
@@ -473,12 +490,6 @@ static void apply_handle_ddl(StringInfo s)
 {
     cmd = logicalrep_read_ddl(s);
 
-    if (!subenableddl)
-        return;
-
-    if (cmd->source == MANUAL && !subenableddlmanual)
-        return;
-
     if (!(cmd->kind & subddl))
         return;
 
@@ -487,6 +498,13 @@ static void apply_handle_ddl(StringInfo s)
 
     execute_replicated_ddl(cmd);
 }
+```
+
+当前实现说明：
+
+```text
+manual source 分支尚未落地；
+执行过滤以 subddl 为主。
 ```
 
 ---
