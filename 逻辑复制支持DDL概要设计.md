@@ -1,4 +1,4 @@
-下面给出一版**统一的总体设计文档（一期+二期+三期+四期整合）**。
+下面给出一版**统一的总体设计文档（一期+二期+三期+四期+五期整合）**。
 文档同时覆盖：
 
 * 已落地能力（当前代码）
@@ -16,8 +16,10 @@
 | 一期 | automatic DDL（table/index） | 已实现 |
 | 二期 | automatic 扩展对象（type/function/domain/trigger/view/rule/schema/extension） | 已实现 |
 | 二期（manual） | `pg_emit_logical_ddl` 手动广播 | 未实现（预留） |
+| 五期A（前置） | 最小运行保障（错误模型/基础观测/STRICT） | 未实现（预留） |
 | 三期 | initial schema sync（SchemaSyncWorker） | 未实现（预留） |
 | 四期 | refresh 对象级 delta/cleanup | 未实现（预留） |
+| 五期B | 完整运行治理（状态/恢复编排/RELAXED） | 未实现（预留） |
 
 ---
 
@@ -28,8 +30,10 @@
 ```text
 一期：automatic DDL（table/index）
 二期：扩展 automatic DDL（manual 预留）
+五期A：最小运行保障（错误模型/基础观测/STRICT，前置）
 三期：initial schema sync（启动一致性）
 四期：publication 变更收敛（refresh 对象级扩展）
+五期B：完整运行治理（状态/观测/恢复/同步模式扩展）
 ```
 
 核心思想：
@@ -73,29 +77,41 @@ initial schema sync + incremental DDL + refresh delta
 ❌ 不从 WAL redo 反推 DDL
 ```
 
+## 2.3 五期新增重点覆盖（分层预留）
+
+```text
+五期A（前置到三期前）：
+  错误模型（fatal/retryable）
+  基础观测字段（xid/lsn/object_identity/result/sqlstate）
+  STRICT 默认语义
+
+五期B（四期后）：
+  状态管理（核心）
+  恢复能力（skip / retry / resync）编排
+  RELAXED 模式与边界
+  完整运维观测链路
+```
+
+详细方案见《逻辑复制支持DDL五期概要设计.md》。
+
 ---
 
 # 3. 总体架构
 
 ---
 
-## 3.1 三阶段统一模型
+## 3.1 实施阶段统一模型（推荐顺序）
 
 ```text
-                ┌─────────────────────────┐
-                │   CREATE SUBSCRIPTION   │
-                └──────────┬──────────────┘
-                           │
-                ┌──────────▼──────────┐
-                │ Phase 3: Initial Sync│
-                │ SchemaSyncWorker     │
-                └──────────┬──────────┘
-                           │
-                ┌──────────▼──────────┐
-                │ Phase 1/2: 增量复制  │
-                │ WAL → decoding       │
-                │ → pgoutput → apply   │
-                └──────────────────────┘
+Phase 1/2: 增量复制能力
+  ↓
+Phase 5A: 最小运行保障（错误模型/基础观测/STRICT）
+  ↓
+Phase 3: Initial Sync（SchemaSyncWorker）
+  ↓
+Phase 4: Refresh Delta / Cleanup
+  ↓
+Phase 5B: 完整运行治理（状态/恢复编排/RELAXED）
 ```
 
 ---
@@ -649,6 +665,13 @@ Patch 7：其他对象
 Patch 8：manual
 ```
 
+推荐节奏补充：
+
+```text
+在进入三期/四期前先落地五期A（错误模型 + 基础观测 + STRICT）
+五期B（状态/恢复编排/RELAXED）在四期后收敛实现
+```
+
 ---
 
 # 22. 最终总结
@@ -665,11 +688,14 @@ DDL replication =
 
 ---
 
-## 三期闭环
+## 五期闭环（推荐实施顺序）
 
 ```text
+Phase 1/2：增量复制能力
+Phase 5A：最小运行保障（前置）
 Phase 3：起点一致
-Phase 1/2：持续一致
+Phase 4：范围变更收敛
+Phase 5B：完整运行治理
 ```
 
 ---

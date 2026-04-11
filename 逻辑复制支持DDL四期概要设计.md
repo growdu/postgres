@@ -25,6 +25,8 @@
 让 publication 变更在订阅端可正确收敛
 ```
 
+前置假设（推荐）：在进入四期前，已完成五期A最小运行保障（错误模型/基础观测/STRICT）。
+
 目标模型：
 
 ```text
@@ -596,4 +598,3 @@ REFRESH =
 ```text
 “schema 生命周期完全受 logical replication 管控”
 ```
-

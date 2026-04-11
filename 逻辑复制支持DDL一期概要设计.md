@@ -6,8 +6,10 @@
 | --- | --- | --- |
 | 一期 | automatic DDL（table/index） | 已实现，且能力已扩展超出一期范围 |
 | 二期 | 扩展对象类型 + manual DDL | 扩展对象类型已实现；manual 未实现 |
+| 五期A（前置） | 最小运行保障（错误模型/基础观测/STRICT） | 未实现 |
 | 三期 | initial schema sync | 未实现 |
 | 四期 | refresh delta/cleanup 收敛 | 未实现 |
+| 五期B | 完整运行治理（状态/恢复编排/RELAXED） | 未实现 |
 
 ## 1. 背景与目标
 
@@ -72,6 +74,11 @@ DDL 并不等同于所有 utility statement。第一期只支持安全子集，�
 * `type`
 * `domain`
 * `extension`
+
+运行面增强能力归入五期设计，并拆分为：
+
+* 五期A（前置）：错误模型 + 基础观测 + `STRICT`
+* 五期B（后置）：状态管理 + 恢复编排 + `RELAXED`
 
 ---
 
@@ -473,6 +480,11 @@ DDL apply 失败时建议保持同样语义：
 
 * DDL 失败通常意味着 schema 已分叉
 * 自动跳过会导致后续 DML 继续在错误 schema 上执行
+
+同步模式与恢复动作分层归入五期设计：
+
+* 五期A：先落地 `STRICT`
+* 五期B：再落地 `RELAXED` 与 `retry/skip/resync` 编排
 
 ---
 
