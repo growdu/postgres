@@ -1864,6 +1864,30 @@ should_forward_ddl_message(PGOutputData *data, const char *prefix)
 		case REPL_DDL_INDEX:
 			ddl_mask = PUBDDL_INDEX;
 			break;
+		case REPL_DDL_TYPE:
+			ddl_mask = PUBDDL_TYPE;
+			break;
+		case REPL_DDL_FUNCTION:
+			ddl_mask = PUBDDL_FUNCTION;
+			break;
+		case REPL_DDL_DOMAIN:
+			ddl_mask = PUBDDL_DOMAIN;
+			break;
+		case REPL_DDL_TRIGGER:
+			ddl_mask = PUBDDL_TRIGGER;
+			break;
+		case REPL_DDL_VIEW:
+			ddl_mask = PUBDDL_VIEW;
+			break;
+		case REPL_DDL_RULE:
+			ddl_mask = PUBDDL_RULE;
+			break;
+		case REPL_DDL_SCHEMA:
+			ddl_mask = PUBDDL_SCHEMA;
+			break;
+		case REPL_DDL_EXTENSION:
+			ddl_mask = PUBDDL_EXTENSION;
+			break;
 		case REPL_DDL_KIND_INVALID:
 			return false;
 	}

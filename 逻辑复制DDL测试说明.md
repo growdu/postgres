@@ -7,6 +7,7 @@
 1. DDL 能否自动同步到订阅端。
 2. DDL 与 DML 同事务复制是否顺序正确。
 3. 出现问题时能否快速定位为“发布端未发送”或“订阅端未接收/未应用”。
+4. `type/function/domain/trigger/view/rule/schema/extension` 是否可被正确过滤和同步。
 
 ---
 
@@ -62,7 +63,10 @@ CREATE TABLE public.t_base(id int primary key, note text);
 DROP PUBLICATION IF EXISTS pub_ddl;
 CREATE PUBLICATION pub_ddl
 FOR ALL TABLES
-WITH (publish = 'insert,update,delete,truncate', ddl = 'table,index');
+WITH (
+  publish = 'insert,update,delete,truncate',
+  ddl = 'table,index,type,function,domain,trigger,view,rule,schema,extension'
+);
 ```
 
 订阅端：
@@ -72,7 +76,12 @@ DROP SUBSCRIPTION IF EXISTS sub_ddl;
 CREATE SUBSCRIPTION sub_ddl
 CONNECTION 'host=127.0.0.1 port=55432 dbname=postgres user=postgres'
 PUBLICATION pub_ddl
-WITH (copy_data=false, create_slot=true, enabled=true, ddl='table,index');
+WITH (
+  copy_data=false,
+  create_slot=true,
+  enabled=true,
+  ddl='table,index,type,function,domain,trigger,view,rule,schema,extension'
+);
 ```
 
 ### 4.2 执行
@@ -164,9 +173,67 @@ ALTER SUBSCRIPTION sub_ddl SET (ddl = 'table,index');
 
 ---
 
-## 7. 问题定位：发布端没发还是订阅端没收
+## 7. 场景四：新增对象类型冒烟验证
 
-### 7.1 先看配置是否匹配
+发布端（单事务内执行，便于检查顺序）：
+
+```sql
+BEGIN;
+CREATE SCHEMA IF NOT EXISTS s_ddl;
+CREATE TYPE s_ddl.status_t AS ENUM ('ok','bad');
+CREATE DOMAIN s_ddl.email_t AS text CHECK (position('@' in VALUE) > 1);
+CREATE FUNCTION s_ddl.f_add(a int, b int) RETURNS int
+LANGUAGE SQL
+AS $$ SELECT a + b $$;
+CREATE TABLE s_ddl.t_obj (id int primary key, v int);
+CREATE VIEW s_ddl.v_obj AS SELECT id, v FROM s_ddl.t_obj;
+CREATE RULE r_obj_ins AS ON INSERT TO s_ddl.v_obj DO INSTEAD
+  INSERT INTO s_ddl.t_obj(id, v) VALUES (NEW.id, NEW.v);
+CREATE FUNCTION s_ddl.tr_set_v() RETURNS trigger
+LANGUAGE plpgsql
+AS $$ BEGIN NEW.v := COALESCE(NEW.v, 0); RETURN NEW; END $$;
+CREATE TRIGGER tr_obj_bi
+BEFORE INSERT ON s_ddl.t_obj
+FOR EACH ROW EXECUTE FUNCTION s_ddl.tr_set_v();
+COMMIT;
+```
+
+订阅端验证（按对象类型核对）：
+
+```sql
+SELECT to_regnamespace('s_ddl') IS NOT NULL AS schema_ok;
+SELECT to_regtype('s_ddl.status_t') IS NOT NULL AS type_ok;
+SELECT to_regtype('s_ddl.email_t') IS NOT NULL AS domain_ok;
+SELECT to_regprocedure('s_ddl.f_add(int,int)') IS NOT NULL AS function_ok;
+SELECT to_regclass('s_ddl.v_obj') IS NOT NULL AS view_ok;
+SELECT EXISTS (
+  SELECT 1 FROM pg_rewrite r
+  JOIN pg_class c ON c.oid = r.ev_class
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = 's_ddl' AND c.relname = 'v_obj' AND r.rulename = 'r_obj_ins'
+) AS rule_ok;
+SELECT EXISTS (
+  SELECT 1 FROM pg_trigger t
+  JOIN pg_class c ON c.oid = t.tgrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = 's_ddl' AND c.relname = 't_obj' AND t.tgname = 'tr_obj_bi'
+) AS trigger_ok;
+```
+
+`extension` 建议单独验证（取决于测试环境是否安装扩展包）：
+
+```sql
+-- 发布端
+CREATE EXTENSION IF NOT EXISTS hstore;
+-- 订阅端
+SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hstore') AS extension_ok;
+```
+
+---
+
+## 8. 问题定位：发布端没发还是订阅端没收
+
+### 8.1 先看配置是否匹配
 
 发布端：
 
@@ -180,7 +247,7 @@ SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'pub_ddl';
 SELECT subname, subddl FROM pg_subscription WHERE subname = 'sub_ddl';
 ```
 
-### 7.2 再看发布端逻辑槽是否出现 DDL message（可选）
+### 8.2 再看发布端逻辑槽是否出现 DDL message（可选）
 
 ```sql
 SELECT lsn, xid, encode(data, 'escape') AS msg
@@ -193,9 +260,9 @@ FROM pg_logical_slot_peek_binary_changes(
 );
 ```
 
-观察点：输出中应包含 DDL message（prefix 为 `pg_ddl_table`/`pg_ddl_index`）。
+观察点：输出中应包含 DDL message（prefix 如 `pg_ddl_table`、`pg_ddl_view`、`pg_ddl_type`、`pg_ddl_extension`）。
 
-### 7.3 发布端已发送但订阅端无结果
+### 8.3 发布端已发送但订阅端无结果
 
 重点查订阅端：
 
@@ -204,7 +271,7 @@ FROM pg_logical_slot_peek_binary_changes(
 
 ---
 
-## 8. 清理步骤
+## 9. 清理步骤
 
 订阅端：
 
@@ -220,6 +287,7 @@ DROP TABLE IF EXISTS public.t_mix;
 DROP TABLE IF EXISTS public.t_ddl_auto;
 DROP TABLE IF EXISTS public.t_filter;
 DROP TABLE IF EXISTS public.t_base;
+DROP SCHEMA IF EXISTS s_ddl CASCADE;
 ```
 
 如果是临时实例，还可停止并清理数据目录：

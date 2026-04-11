@@ -8,6 +8,14 @@
 
 - `table`
 - `index`
+- `type`
+- `function`
+- `domain`
+- `trigger`
+- `view`
+- `rule`
+- `schema`
+- `extension`
 
 当前 `ddl` 默认值：
 
@@ -49,12 +57,12 @@
 -- 示例表
 CREATE TABLE public.t_base(id int primary key, note text);
 
--- 发布 DML + DDL（table/index）
+-- 发布 DML + DDL（示例：全部支持类型）
 CREATE PUBLICATION pub_ddl
 FOR ALL TABLES
 WITH (
   publish = 'insert,update,delete,truncate',
-  ddl = 'table,index'
+  ddl = 'table,index,type,function,domain,trigger,view,rule,schema,extension'
 );
 ```
 
@@ -68,15 +76,15 @@ WITH (
   copy_data = false,
   create_slot = true,
   enabled = true,
-  ddl = 'table,index'
+  ddl = 'table,index,type,function,domain,trigger,view,rule,schema,extension'
 );
 ```
 
 ### 3.3 修改已存在对象
 
 ```sql
-ALTER PUBLICATION pub_ddl SET (ddl = 'table');
-ALTER SUBSCRIPTION sub_ddl SET (ddl = 'table');
+ALTER PUBLICATION pub_ddl SET (ddl = 'table,view,type');
+ALTER SUBSCRIPTION sub_ddl SET (ddl = 'table,view,type');
 ```
 
 ---
@@ -89,7 +97,15 @@ ALTER SUBSCRIPTION sub_ddl SET (ddl = 'table');
 SELECT pubname,
        pubddl,
        (pubddl & 1) <> 0 AS has_table,
-       (pubddl & 2) <> 0 AS has_index
+       (pubddl & 2) <> 0 AS has_index,
+       (pubddl & 4) <> 0 AS has_type,
+       (pubddl & 8) <> 0 AS has_function,
+       (pubddl & 16) <> 0 AS has_domain,
+       (pubddl & 32) <> 0 AS has_trigger,
+       (pubddl & 64) <> 0 AS has_view,
+       (pubddl & 128) <> 0 AS has_rule,
+       (pubddl & 256) <> 0 AS has_schema,
+       (pubddl & 512) <> 0 AS has_extension
 FROM pg_publication
 ORDER BY 1;
 ```
@@ -98,7 +114,15 @@ ORDER BY 1;
 SELECT subname,
        subddl,
        (subddl & 1) <> 0 AS has_table,
-       (subddl & 2) <> 0 AS has_index
+       (subddl & 2) <> 0 AS has_index,
+       (subddl & 4) <> 0 AS has_type,
+       (subddl & 8) <> 0 AS has_function,
+       (subddl & 16) <> 0 AS has_domain,
+       (subddl & 32) <> 0 AS has_trigger,
+       (subddl & 64) <> 0 AS has_view,
+       (subddl & 128) <> 0 AS has_rule,
+       (subddl & 256) <> 0 AS has_schema,
+       (subddl & 512) <> 0 AS has_extension
 FROM pg_subscription
 ORDER BY 1;
 ```
@@ -108,7 +132,7 @@ ORDER BY 1;
 推荐顺序：
 
 1. 先确认 publication/subscription 的 `ddl` 配置匹配。
-2. 再看发布端复制槽消息（是否出现 `MESSAGE`，prefix 为 `pg_ddl_table`/`pg_ddl_index`）。
+2. 再看发布端复制槽消息（是否出现 `MESSAGE`，prefix 如 `pg_ddl_table`、`pg_ddl_view`、`pg_ddl_type`）。
 3. 若发布端已发送，再检查订阅端 worker 日志是否执行/报错。
 
 ---
@@ -117,7 +141,7 @@ ORDER BY 1;
 
 ### 5.1 关于对象范围
 
-- `ddl='table,index'` 表示“允许发送/接收哪些 DDL 类型”，不改变 publication 对数据对象本身的可见范围。
+- `ddl='table,index,type,function,domain,trigger,view,rule,schema,extension'` 表示“允许发送/接收哪些 DDL 类型”，不改变 publication 对数据对象本身的可见范围。
 - 若使用 `FOR TABLE ...`，只会复制被纳入 publication 的表数据；新建表是否复制，取决于 publication 范围（例如 `FOR ALL TABLES` 更适合自动跟随新表）。
 
 ### 5.2 关于 search_path
@@ -127,8 +151,8 @@ ORDER BY 1;
 
 ### 5.3 当前阶段限制
 
-- 当前只支持 `table/index` 两类 DDL。
-- 不在本期范围内的对象（如 view/function/type/extension）不会通过该机制自动同步。
+- 当前支持 `table/index/type/function/domain/trigger/view/rule/schema/extension`。
+- 不在上述清单内的对象类型不会通过该机制自动同步。
 
 ---
 
@@ -141,7 +165,7 @@ ORDER BY 1;
 处理：
 
 1. 降低 subscription `ddl`（例如只保留 `table`）。
-2. 或提升 publication `ddl`（例如改为 `table,index`）。
+2. 或提升 publication `ddl`（例如改为 `table,index,view,type`）。
 
 ### 6.2 DDL 同步了，但新表 DML 没同步
 
@@ -154,7 +178,7 @@ ORDER BY 1;
 
 ## 7. 推荐最小实践
 
-1. 先用 `FOR ALL TABLES + ddl='table,index'` 验证链路通畅。
+1. 先用 `FOR ALL TABLES + ddl='table,index,type,function,domain,trigger,view,rule,schema,extension'` 验证链路通畅。
 2. 再按业务收敛 publication 范围。
 3. DDL 与对象名尽量 schema-qualified。
 4. 每次调整 `ddl` 选项后立即跑一轮“DDL + DML 混合事务”回归测试。

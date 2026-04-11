@@ -2207,6 +2207,22 @@ defGetDDLForPublicationOption(DefElem *def)
 			pubddl |= PUBDDL_TABLE;
 		else if (strcmp(ddl_opt, "index") == 0)
 			pubddl |= PUBDDL_INDEX;
+		else if (strcmp(ddl_opt, "type") == 0)
+			pubddl |= PUBDDL_TYPE;
+		else if (strcmp(ddl_opt, "function") == 0)
+			pubddl |= PUBDDL_FUNCTION;
+		else if (strcmp(ddl_opt, "domain") == 0)
+			pubddl |= PUBDDL_DOMAIN;
+		else if (strcmp(ddl_opt, "trigger") == 0)
+			pubddl |= PUBDDL_TRIGGER;
+		else if (strcmp(ddl_opt, "view") == 0)
+			pubddl |= PUBDDL_VIEW;
+		else if (strcmp(ddl_opt, "rule") == 0)
+			pubddl |= PUBDDL_RULE;
+		else if (strcmp(ddl_opt, "schema") == 0)
+			pubddl |= PUBDDL_SCHEMA;
+		else if (strcmp(ddl_opt, "extension") == 0)
+			pubddl |= PUBDDL_EXTENSION;
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),

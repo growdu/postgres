@@ -25,7 +25,13 @@
 #include "tcop/cmdtag.h"
 #include "utils/lsyscache.h"
 
-static bool get_replicable_ddl_kind(Node *parsetree, ReplicableDDLKind *kind);
+static bool get_replicable_ddl_kind(Node *parsetree, Oid relid_hint,
+									 ReplicableDDLKind *kind);
+static ReplicableDDLKind get_drop_stmt_kind(DropStmt *stmt);
+static ReplicableDDLKind get_rename_stmt_kind(RenameStmt *stmt);
+static ReplicableDDLKind get_alter_table_kind(AlterTableStmt *stmt,
+											  Oid relid_hint);
+static bool is_trigger_alter_table_subcmd(AlterTableType subtype);
 static char *extract_stmt_sql(PlannedStmt *pstmt, const char *queryString);
 
 /*
@@ -57,7 +63,7 @@ GetLogicalDDLInfo(PlannedStmt *pstmt,
 		return false;
 
 	parsetree = pstmt->utilityStmt;
-	if (!get_replicable_ddl_kind(parsetree, &cmd->kind))
+	if (!get_replicable_ddl_kind(parsetree, relid_hint, &cmd->kind))
 		return false;
 
 	command_tag = GetCommandTagName(CreateCommandTag(parsetree));
@@ -118,63 +124,241 @@ FreeLogicalDDLCommand(LogicalDDLCommand *cmd)
 }
 
 /*
- * Identify first-phase supported DDL classes (table/index family).
+ * Identify supported DDL classes from utility parse trees.
  */
 static bool
-get_replicable_ddl_kind(Node *parsetree, ReplicableDDLKind *kind)
+get_replicable_ddl_kind(Node *parsetree, Oid relid_hint,
+						ReplicableDDLKind *kind)
 {
 	switch (nodeTag(parsetree))
 	{
 		case T_CreateStmt:
 		case T_CreateForeignTableStmt:
-		case T_CreateTableAsStmt:
-		case T_AlterTableStmt:
 			*kind = REPL_DDL_TABLE;
 			return true;
+
+		case T_CreateTableAsStmt:
+			{
+				CreateTableAsStmt *stmt = castNode(CreateTableAsStmt, parsetree);
+
+				if (stmt->objtype == OBJECT_MATVIEW)
+					*kind = REPL_DDL_VIEW;
+				else
+					*kind = REPL_DDL_TABLE;
+				return true;
+			}
+
+		case T_AlterTableStmt:
+			*kind = get_alter_table_kind(castNode(AlterTableStmt, parsetree),
+										 relid_hint);
+			return *kind != REPL_DDL_KIND_INVALID;
 
 		case T_IndexStmt:
 			*kind = REPL_DDL_INDEX;
 			return true;
 
-		case T_DropStmt:
+		case T_DefineStmt:
 			{
-				DropStmt   *stmt = castNode(DropStmt, parsetree);
+				DefineStmt *stmt = castNode(DefineStmt, parsetree);
 
-				if (stmt->removeType == OBJECT_INDEX)
+				if (stmt->kind == OBJECT_TYPE)
 				{
-					*kind = REPL_DDL_INDEX;
-					return true;
-				}
-
-				if (stmt->removeType == OBJECT_TABLE ||
-					stmt->removeType == OBJECT_FOREIGN_TABLE)
-				{
-					*kind = REPL_DDL_TABLE;
+					*kind = REPL_DDL_TYPE;
 					return true;
 				}
 			}
 			break;
+
+		case T_CompositeTypeStmt:
+		case T_CreateEnumStmt:
+		case T_CreateRangeStmt:
+		case T_AlterEnumStmt:
+		case T_AlterTypeStmt:
+			*kind = REPL_DDL_TYPE;
+			return true;
+
+		case T_CreateFunctionStmt:
+			*kind = REPL_DDL_FUNCTION;
+			return true;
+
+		case T_AlterFunctionStmt:
+			{
+				AlterFunctionStmt *stmt = castNode(AlterFunctionStmt, parsetree);
+
+				if (stmt->objtype == OBJECT_FUNCTION ||
+					stmt->objtype == OBJECT_PROCEDURE ||
+					stmt->objtype == OBJECT_ROUTINE)
+				{
+					*kind = REPL_DDL_FUNCTION;
+					return true;
+				}
+			}
+			break;
+
+		case T_CreateDomainStmt:
+		case T_AlterDomainStmt:
+			*kind = REPL_DDL_DOMAIN;
+			return true;
+
+		case T_CreateTrigStmt:
+			*kind = REPL_DDL_TRIGGER;
+			return true;
+
+		case T_ViewStmt:
+			*kind = REPL_DDL_VIEW;
+			return true;
+
+		case T_RuleStmt:
+			*kind = REPL_DDL_RULE;
+			return true;
+
+		case T_CreateSchemaStmt:
+			*kind = REPL_DDL_SCHEMA;
+			return true;
+
+		case T_CreateExtensionStmt:
+		case T_AlterExtensionStmt:
+		case T_AlterExtensionContentsStmt:
+			*kind = REPL_DDL_EXTENSION;
+			return true;
+
+		case T_DropStmt:
+			*kind = get_drop_stmt_kind(castNode(DropStmt, parsetree));
+			return *kind != REPL_DDL_KIND_INVALID;
 
 		case T_RenameStmt:
-			{
-				RenameStmt *stmt = castNode(RenameStmt, parsetree);
+			*kind = get_rename_stmt_kind(castNode(RenameStmt, parsetree));
+			return *kind != REPL_DDL_KIND_INVALID;
 
-				if (stmt->renameType == OBJECT_INDEX)
-				{
-					*kind = REPL_DDL_INDEX;
-					return true;
-				}
-
-				if (stmt->renameType == OBJECT_TABLE ||
-					stmt->renameType == OBJECT_FOREIGN_TABLE ||
-					stmt->renameType == OBJECT_COLUMN)
-				{
-					*kind = REPL_DDL_TABLE;
-					return true;
-				}
-			}
+		default:
 			break;
+	}
 
+	return false;
+}
+
+static ReplicableDDLKind
+get_drop_stmt_kind(DropStmt *stmt)
+{
+	switch (stmt->removeType)
+	{
+		case OBJECT_INDEX:
+			return REPL_DDL_INDEX;
+		case OBJECT_TABLE:
+		case OBJECT_FOREIGN_TABLE:
+			return REPL_DDL_TABLE;
+		case OBJECT_TYPE:
+			return REPL_DDL_TYPE;
+		case OBJECT_DOMAIN:
+			return REPL_DDL_DOMAIN;
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+		case OBJECT_ROUTINE:
+			return REPL_DDL_FUNCTION;
+		case OBJECT_TRIGGER:
+			return REPL_DDL_TRIGGER;
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+			return REPL_DDL_VIEW;
+		case OBJECT_RULE:
+			return REPL_DDL_RULE;
+		case OBJECT_SCHEMA:
+			return REPL_DDL_SCHEMA;
+		case OBJECT_EXTENSION:
+			return REPL_DDL_EXTENSION;
+		default:
+			break;
+	}
+
+	return REPL_DDL_KIND_INVALID;
+}
+
+static ReplicableDDLKind
+get_rename_stmt_kind(RenameStmt *stmt)
+{
+	switch (stmt->renameType)
+	{
+		case OBJECT_INDEX:
+			return REPL_DDL_INDEX;
+		case OBJECT_TABLE:
+		case OBJECT_FOREIGN_TABLE:
+			return REPL_DDL_TABLE;
+		case OBJECT_COLUMN:
+			if (stmt->relationType == OBJECT_VIEW ||
+				stmt->relationType == OBJECT_MATVIEW)
+				return REPL_DDL_VIEW;
+			return REPL_DDL_TABLE;
+		case OBJECT_TYPE:
+			return REPL_DDL_TYPE;
+		case OBJECT_DOMAIN:
+			return REPL_DDL_DOMAIN;
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+		case OBJECT_ROUTINE:
+			return REPL_DDL_FUNCTION;
+		case OBJECT_TRIGGER:
+			return REPL_DDL_TRIGGER;
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+			return REPL_DDL_VIEW;
+		case OBJECT_RULE:
+			return REPL_DDL_RULE;
+		case OBJECT_SCHEMA:
+			return REPL_DDL_SCHEMA;
+		case OBJECT_EXTENSION:
+			return REPL_DDL_EXTENSION;
+		default:
+			break;
+	}
+
+	return REPL_DDL_KIND_INVALID;
+}
+
+static ReplicableDDLKind
+get_alter_table_kind(AlterTableStmt *stmt, Oid relid_hint)
+{
+	bool		has_trigger_cmd = false;
+	bool		has_non_trigger_cmd = false;
+	ListCell   *lc;
+
+	foreach(lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+		if (is_trigger_alter_table_subcmd(cmd->subtype))
+			has_trigger_cmd = true;
+		else
+			has_non_trigger_cmd = true;
+	}
+
+	if (has_trigger_cmd && !has_non_trigger_cmd)
+		return REPL_DDL_TRIGGER;
+
+	if (OidIsValid(relid_hint))
+	{
+		char		relkind = get_rel_relkind(relid_hint);
+
+		if (relkind == RELKIND_VIEW || relkind == RELKIND_MATVIEW)
+			return REPL_DDL_VIEW;
+	}
+
+	return REPL_DDL_TABLE;
+}
+
+static bool
+is_trigger_alter_table_subcmd(AlterTableType subtype)
+{
+	switch (subtype)
+	{
+		case AT_EnableTrig:
+		case AT_EnableAlwaysTrig:
+		case AT_EnableReplicaTrig:
+		case AT_DisableTrig:
+		case AT_EnableTrigAll:
+		case AT_DisableTrigAll:
+		case AT_EnableTrigUser:
+		case AT_DisableTrigUser:
+			return true;
 		default:
 			break;
 	}
@@ -210,7 +394,8 @@ extract_stmt_sql(PlannedStmt *pstmt, const char *queryString)
 	 * matching utility statement slice.
 	 */
 	raw_parsetree_list = pg_parse_query(queryString);
-	(void) get_replicable_ddl_kind(pstmt->utilityStmt, &target_kind);
+	(void) get_replicable_ddl_kind(pstmt->utilityStmt, InvalidOid,
+								   &target_kind);
 
 	foreach(lc, raw_parsetree_list)
 	{
@@ -221,7 +406,7 @@ extract_stmt_sql(PlannedStmt *pstmt, const char *queryString)
 		if (rawstmt->stmt_location < 0 || rawstmt->stmt_len <= 0)
 			continue;
 
-		if (!get_replicable_ddl_kind(rawstmt->stmt, &raw_kind))
+		if (!get_replicable_ddl_kind(rawstmt->stmt, InvalidOid, &raw_kind))
 			continue;
 
 		if (target_kind != REPL_DDL_KIND_INVALID && raw_kind != target_kind)
@@ -258,6 +443,22 @@ LogicalDDLMessagePrefix(ReplicableDDLKind kind)
 			return LOGICAL_DDL_MESSAGE_PREFIX_TABLE;
 		case REPL_DDL_INDEX:
 			return LOGICAL_DDL_MESSAGE_PREFIX_INDEX;
+		case REPL_DDL_TYPE:
+			return LOGICAL_DDL_MESSAGE_PREFIX_TYPE;
+		case REPL_DDL_FUNCTION:
+			return LOGICAL_DDL_MESSAGE_PREFIX_FUNCTION;
+		case REPL_DDL_DOMAIN:
+			return LOGICAL_DDL_MESSAGE_PREFIX_DOMAIN;
+		case REPL_DDL_TRIGGER:
+			return LOGICAL_DDL_MESSAGE_PREFIX_TRIGGER;
+		case REPL_DDL_VIEW:
+			return LOGICAL_DDL_MESSAGE_PREFIX_VIEW;
+		case REPL_DDL_RULE:
+			return LOGICAL_DDL_MESSAGE_PREFIX_RULE;
+		case REPL_DDL_SCHEMA:
+			return LOGICAL_DDL_MESSAGE_PREFIX_SCHEMA;
+		case REPL_DDL_EXTENSION:
+			return LOGICAL_DDL_MESSAGE_PREFIX_EXTENSION;
 		case REPL_DDL_KIND_INVALID:
 			break;
 	}
@@ -275,6 +476,22 @@ LogicalDDLKindFromMessagePrefix(const char *prefix)
 		return REPL_DDL_TABLE;
 	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_INDEX) == 0)
 		return REPL_DDL_INDEX;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_TYPE) == 0)
+		return REPL_DDL_TYPE;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_FUNCTION) == 0)
+		return REPL_DDL_FUNCTION;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_DOMAIN) == 0)
+		return REPL_DDL_DOMAIN;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_TRIGGER) == 0)
+		return REPL_DDL_TRIGGER;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_VIEW) == 0)
+		return REPL_DDL_VIEW;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_RULE) == 0)
+		return REPL_DDL_RULE;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_SCHEMA) == 0)
+		return REPL_DDL_SCHEMA;
+	if (strcmp(prefix, LOGICAL_DDL_MESSAGE_PREFIX_EXTENSION) == 0)
+		return REPL_DDL_EXTENSION;
 
 	return REPL_DDL_KIND_INVALID;
 }

@@ -651,6 +651,22 @@ defGetDDLForSubscriptionOption(DefElem *def)
 			result |= PUBDDL_TABLE;
 		else if (strcmp(ddl_opt, "index") == 0)
 			result |= PUBDDL_INDEX;
+		else if (strcmp(ddl_opt, "type") == 0)
+			result |= PUBDDL_TYPE;
+		else if (strcmp(ddl_opt, "function") == 0)
+			result |= PUBDDL_FUNCTION;
+		else if (strcmp(ddl_opt, "domain") == 0)
+			result |= PUBDDL_DOMAIN;
+		else if (strcmp(ddl_opt, "trigger") == 0)
+			result |= PUBDDL_TRIGGER;
+		else if (strcmp(ddl_opt, "view") == 0)
+			result |= PUBDDL_VIEW;
+		else if (strcmp(ddl_opt, "rule") == 0)
+			result |= PUBDDL_RULE;
+		else if (strcmp(ddl_opt, "schema") == 0)
+			result |= PUBDDL_SCHEMA;
+		else if (strcmp(ddl_opt, "extension") == 0)
+			result |= PUBDDL_EXTENSION;
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -678,6 +694,54 @@ ddlMaskToString(int32 ddl)
 		if (buf.len > 0)
 			appendStringInfoChar(&buf, ',');
 		appendStringInfoString(&buf, "index");
+	}
+	if (ddl & PUBDDL_TYPE)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "type");
+	}
+	if (ddl & PUBDDL_FUNCTION)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "function");
+	}
+	if (ddl & PUBDDL_DOMAIN)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "domain");
+	}
+	if (ddl & PUBDDL_TRIGGER)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "trigger");
+	}
+	if (ddl & PUBDDL_VIEW)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "view");
+	}
+	if (ddl & PUBDDL_RULE)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "rule");
+	}
+	if (ddl & PUBDDL_SCHEMA)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "schema");
+	}
+	if (ddl & PUBDDL_EXTENSION)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfoString(&buf, "extension");
 	}
 
 	if (buf.len == 0)

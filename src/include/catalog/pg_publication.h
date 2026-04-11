@@ -146,7 +146,18 @@ typedef struct Publication
 #define PUBDDL_NONE		0
 #define PUBDDL_TABLE	(1 << 0)
 #define PUBDDL_INDEX	(1 << 1)
-#define PUBDDL_ALL		(PUBDDL_TABLE | PUBDDL_INDEX)
+#define PUBDDL_TYPE		(1 << 2)
+#define PUBDDL_FUNCTION	(1 << 3)
+#define PUBDDL_DOMAIN	(1 << 4)
+#define PUBDDL_TRIGGER	(1 << 5)
+#define PUBDDL_VIEW		(1 << 6)
+#define PUBDDL_RULE		(1 << 7)
+#define PUBDDL_SCHEMA	(1 << 8)
+#define PUBDDL_EXTENSION (1 << 9)
+#define PUBDDL_ALL		(PUBDDL_TABLE | PUBDDL_INDEX | PUBDDL_TYPE | \
+						 PUBDDL_FUNCTION | PUBDDL_DOMAIN | PUBDDL_TRIGGER | \
+						 PUBDDL_VIEW | PUBDDL_RULE | PUBDDL_SCHEMA | \
+						 PUBDDL_EXTENSION)
 
 typedef struct PublicationRelInfo
 {

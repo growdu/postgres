@@ -1132,6 +1132,8 @@ ProcessUtilitySlow(ParseState *pstate,
 									queryString,
 									pstmt->stmt_location,
 									pstmt->stmt_len);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   NULL, InvalidOid);
 
 				/*
 				 * EventTriggerCollectSimpleCommand called by
@@ -1417,6 +1419,9 @@ ProcessUtilitySlow(ParseState *pstate,
 								 (int) stmt->subtype);
 							break;
 					}
+
+					MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				}
 				break;
 
@@ -1480,6 +1485,9 @@ ProcessUtilitySlow(ParseState *pstate,
 								 (int) stmt->kind);
 							break;
 					}
+
+					MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				}
 				break;
 
@@ -1616,15 +1624,21 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_CreateExtensionStmt:
 				address = CreateExtension(pstate, (CreateExtensionStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_AlterExtensionStmt:
 				address = ExecAlterExtensionStmt(pstate, (AlterExtensionStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_AlterExtensionContentsStmt:
 				address = ExecAlterExtensionContentsStmt((AlterExtensionContentsStmt *) parsetree,
 														 &secondaryObject);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_CreateFdwStmt:
@@ -1669,19 +1683,27 @@ ProcessUtilitySlow(ParseState *pstate,
 
 					address = DefineCompositeType(stmt->typevar,
 												  stmt->coldeflist);
+					MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				}
 				break;
 
 			case T_CreateEnumStmt:	/* CREATE TYPE AS ENUM */
 				address = DefineEnum((CreateEnumStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_CreateRangeStmt: /* CREATE TYPE AS RANGE */
 				address = DefineRange(pstate, (CreateRangeStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_AlterEnumStmt:	/* ALTER TYPE (enum) */
 				address = AlterEnum((AlterEnumStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_ViewStmt:	/* CREATE VIEW */
@@ -1690,6 +1712,8 @@ ProcessUtilitySlow(ParseState *pstate,
 									 pstmt->stmt_location, pstmt->stmt_len);
 				EventTriggerCollectSimpleCommand(address, secondaryObject,
 												 parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				/* stashed internally */
 				commandCollected = true;
 				EventTriggerAlterTableEnd();
@@ -1697,14 +1721,20 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_CreateFunctionStmt:	/* CREATE FUNCTION */
 				address = CreateFunction(pstate, (CreateFunctionStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_AlterFunctionStmt:	/* ALTER FUNCTION */
 				address = AlterFunction(pstate, (AlterFunctionStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_RuleStmt:	/* CREATE RULE */
 				address = DefineRule((RuleStmt *) parsetree, queryString);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_CreateSeqStmt:
@@ -1748,6 +1778,8 @@ ProcessUtilitySlow(ParseState *pstate,
 										queryString, InvalidOid, InvalidOid,
 										InvalidOid, InvalidOid, InvalidOid,
 										InvalidOid, NULL, false, false);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_CreatePLangStmt:
@@ -1756,6 +1788,8 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_CreateDomainStmt:
 				address = DefineDomain(pstate, (CreateDomainStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_CreateConversionStmt:
@@ -1849,6 +1883,8 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_AlterTypeStmt:
 				address = AlterType((AlterTypeStmt *) parsetree);
+				MaybeCaptureLogicalDDL(pstmt, queryString, context,
+									   &address, InvalidOid);
 				break;
 
 			case T_CommentStmt:
@@ -2075,6 +2111,15 @@ MaybeCaptureLogicalDDL(PlannedStmt *pstmt,
 {
 	LogicalDDLCommand cmd;
 	const char *prefix;
+
+	/*
+	 * CREATE/ALTER EXTENSION executes many internal utility statements while
+	 * creating_extension is true. Replicating both those internal statements
+	 * and the top-level extension command causes duplicate replay on
+	 * subscribers. Keep only the top-level extension command.
+	 */
+	if (creating_extension)
+		return;
 
 	if (!GetLogicalDDLInfo(pstmt, queryString, context, address, relid_hint, &cmd))
 		return;
