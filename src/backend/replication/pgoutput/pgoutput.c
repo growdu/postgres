@@ -453,18 +453,7 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 {
 	PGOutputData *data = palloc0(sizeof(PGOutputData));
 	static bool publication_callback_registered = false;
-	static bool ddl_capture_hook_registered = false;
 	MemoryContextCallback *mcallback;
-
-	/*
-	 * Register DDL capture hook on first call. This enables automatic DDL
-	 * capture on the publisher side when users execute DDL statements.
-	 */
-	if (!ddl_capture_hook_registered)
-	{
-		RegisterLogicalDDLCaptureHook();
-		ddl_capture_hook_registered = true;
-	}
 
 	/* Create our memory context for private allocations. */
 	data->context = AllocSetContextCreate(ctx->context,

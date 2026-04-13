@@ -20,6 +20,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_publication.h"
+#include "catalog/pg_publication_sync.h"
 #include "nodes/bitmapset.h"
 #include "partitioning/partdefs.h"
 #include "rewrite/prs2lock.h"
@@ -713,7 +714,8 @@ RelationCloseSmgr(Relation relation)
 	(XLogLogicalInfoActive() && \
 	 RelationNeedsWAL(relation) && \
 	 (relation)->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&	\
-	 !IsCatalogRelation(relation))
+	 (!IsCatalogRelation(relation) || \
+	  RelationGetRelid(relation) == PublicationSyncRelationId))
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);

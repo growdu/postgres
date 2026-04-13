@@ -59,6 +59,7 @@
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
+#include "replication/logicalddl.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
@@ -80,6 +81,7 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+static void CleanupLogicalDDLCommand(LogicalDDLCommand *cmd);
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -505,10 +507,16 @@ ProcessUtility(PlannedStmt *pstmt,
 			   DestReceiver *dest,
 			   QueryCompletion *qc)
 {
+	LogicalDDLCommand ddl_cmd;
+	bool		ddl_captured;
+
 	Assert(IsA(pstmt, PlannedStmt));
 	Assert(pstmt->commandType == CMD_UTILITY);
 	Assert(queryString != NULL);	/* required as of 8.4 */
 	Assert(qc == NULL || qc->commandTag == CMDTAG_UNKNOWN);
+
+	ddl_captured = BuildLogicalDDLCommandIfNeeded(pstmt, queryString,
+												  context, &ddl_cmd);
 
 	/*
 	 * We provide a function hook variable that lets loadable plugins get
@@ -523,6 +531,31 @@ ProcessUtility(PlannedStmt *pstmt,
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
 								context, params, queryEnv,
 								dest, qc);
+
+	if (ddl_captured && ddl_cmd.normalized_sql != NULL)
+		PublicationSyncInsert(&ddl_cmd);
+
+	if (ddl_captured)
+		CleanupLogicalDDLCommand(&ddl_cmd);
+}
+
+static void
+CleanupLogicalDDLCommand(LogicalDDLCommand *cmd)
+{
+	if (cmd->command_tag)
+		pfree(cmd->command_tag);
+	if (cmd->query_string)
+		pfree(cmd->query_string);
+	if (cmd->normalized_sql)
+		pfree(cmd->normalized_sql);
+	if (cmd->object_identity)
+		pfree(cmd->object_identity);
+	if (cmd->target_table)
+		pfree(cmd->target_table);
+	if (cmd->publication_names)
+		list_free_deep(cmd->publication_names);
+	if (cmd->ddl_kind_names)
+		list_free_deep(cmd->ddl_kind_names);
 }
 
 /*

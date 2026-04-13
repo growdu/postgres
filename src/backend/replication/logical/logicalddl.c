@@ -522,7 +522,7 @@ PublicationSyncBuildTuple(Relation rel, LogicalDDLCommand *cmd)
 	char	   *namespace_str;
 	int			i;
 	int			num_pubs;
-	char	  **pub_names;
+	Datum	   *pub_datums;
 
 	/* Initialize values and nulls */
 	memset(values, 0, sizeof(values));
@@ -556,15 +556,15 @@ PublicationSyncBuildTuple(Relation rel, LogicalDDLCommand *cmd)
 	if (cmd->publication_names != NIL)
 	{
 		num_pubs = list_length(cmd->publication_names);
-		pub_names = (char **) palloc(num_pubs * sizeof(char *));
+		pub_datums = (Datum *) palloc(num_pubs * sizeof(Datum));
 		i = 0;
 		foreach(lc, cmd->publication_names)
 		{
-			pub_names[i++] = (char *) lfirst(lc);
+			pub_datums[i++] = CStringGetTextDatum((char *) lfirst(lc));
 		}
 
-		publications_arr = construct_array((Datum *) pub_names, num_pubs,
-										   TEXTOID, -1, false, 'i');
+		publications_arr = construct_array_builtin(pub_datums, num_pubs,
+												   TEXTOID);
 		values[Anum_pg_publication_sync_psnpublications - 1] = PointerGetDatum(publications_arr);
 	}
 	else
@@ -945,6 +945,9 @@ next_hook:
 void
 RegisterLogicalDDLCaptureHook(void)
 {
+	if (ProcessUtility_hook == logicalddl_ProcessUtility_hook)
+		return;
+
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = logicalddl_ProcessUtility_hook;
 }

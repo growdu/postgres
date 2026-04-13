@@ -310,7 +310,6 @@ IsSharedRelation(Oid relationId)
 		relationId == DatabaseRelationId ||
 		relationId == DbRoleSettingRelationId ||
 		relationId == ParameterAclRelationId ||
-		relationId == PublicationSyncRelationId ||
 		relationId == ReplicationOriginRelationId ||
 		relationId == SharedDependRelationId ||
 		relationId == SharedDescriptionRelationId ||
@@ -330,9 +329,6 @@ IsSharedRelation(Oid relationId)
 		relationId == DbRoleSettingDatidRolidIndexId ||
 		relationId == ParameterAclOidIndexId ||
 		relationId == ParameterAclParnameIndexId ||
-		relationId == 6601 ||  /* PublicationSyncLsnIndexId */
-		relationId == 6602 ||  /* PublicationSyncTimestampIndexId */
-		relationId == 6603 ||  /* PublicationSyncPublicationIndexId */
 		relationId == ReplicationOriginIdentIndex ||
 		relationId == ReplicationOriginNameIndex ||
 		relationId == SharedDependDependerIndexId ||

@@ -28,7 +28,7 @@
  *		typedef struct FormData_pg_publication_sync
  * ----------------
  */
-CATALOG(pg_publication_sync,6600,PublicationSyncRelationId) BKI_SHARED_RELATION
+CATALOG(pg_publication_sync,6600,PublicationSyncRelationId)
 {
 	/* LSN position for ordering */
 	XLogRecPtr	psnlsn;
