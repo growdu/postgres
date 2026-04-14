@@ -402,6 +402,20 @@ typedef struct StdRdOptions
 	 ((StdRdOptions *) (relation)->rd_options)->user_catalog_table : false)
 
 /*
+ * RelationIsLogicalDecodingCatalogTable
+ *		Returns whether a relation should follow the user_catalog_table
+ *		logical decoding path even when it is an internal system catalog.
+ *
+ * pg_publication_sync is an internal control-plane queue: it must be readable
+ * through historic catalog snapshots and must keep tuple data in WAL, but
+ * pgoutput later turns its rows into DDL messages instead of publishing it as
+ * a user table.
+ */
+#define RelationIsLogicalDecodingCatalogTable(relation) \
+	(RelationIsUsedAsCatalogTable(relation) || \
+	 RelationGetRelid(relation) == PublicationSyncRelationId)
+
+/*
  * RelationGetParallelWorkers
  *		Returns the relation's parallel_workers reloption setting.
  *		Note multiple eval of argument!
@@ -696,7 +710,8 @@ RelationCloseSmgr(Relation relation)
 #define RelationIsAccessibleInLogicalDecoding(relation) \
 	(XLogLogicalInfoActive() && \
 	 RelationNeedsWAL(relation) && \
-	 (IsCatalogRelation(relation) || RelationIsUsedAsCatalogTable(relation)))
+	 (IsCatalogRelation(relation) || \
+	  RelationIsLogicalDecodingCatalogTable(relation)))
 
 /*
  * RelationIsLogicallyLogged
@@ -715,7 +730,7 @@ RelationCloseSmgr(Relation relation)
 	 RelationNeedsWAL(relation) && \
 	 (relation)->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&	\
 	 (!IsCatalogRelation(relation) || \
-	  RelationGetRelid(relation) == PublicationSyncRelationId))
+	  RelationIsLogicalDecodingCatalogTable(relation)))
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);

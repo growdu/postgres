@@ -1499,13 +1499,14 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 	bool		matches_publication = false;
 	char	   *sql_string;
 
-	/* Extract the tuple from the change */
-	if (change->action == REORDER_BUFFER_CHANGE_INSERT)
-		tuple = change->data.tp.newtuple;
-	else if (change->action == REORDER_BUFFER_CHANGE_DELETE)
-		tuple = change->data.tp.oldtuple;
-	else
-		return;	/* UPDATE not expected for pg_publication_sync */
+	/*
+	 * pg_publication_sync is an append-only DDL event queue.  Its INSERTs are
+	 * converted to protocol messages; pruning DELETEs must not replay old DDL.
+	 */
+	if (change->action != REORDER_BUFFER_CHANGE_INSERT)
+		return;
+
+	tuple = change->data.tp.newtuple;
 
 	if (!HeapTupleIsValid(tuple))
 		return;
@@ -1598,7 +1599,7 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 		TransactionId xid = txn->xid;
 
 		OutputPluginPrepareWrite(ctx, true);
-		logicalrep_write_message(ctx->out, xid, InvalidXLogRecPtr, true,
+		logicalrep_write_message(ctx->out, xid, change->lsn, true,
 								 "pg_ddl", strlen(sql_string), sql_string);
 		OutputPluginWrite(ctx, true);
 	}

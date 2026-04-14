@@ -2358,8 +2358,7 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 							 relpathperm(change->data.tp.rlocator,
 										 MAIN_FORKNUM).str);
 
-					if (!RelationIsLogicallyLogged(relation) &&
-						RelationGetRelid(relation) != PublicationSyncRelationId)
+					if (!RelationIsLogicallyLogged(relation))
 						goto change_done;
 
 					/*
