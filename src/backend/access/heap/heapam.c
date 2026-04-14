@@ -2231,7 +2231,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 
 		recptr = XLogInsert(RM_HEAP_ID, info);
 
-		if (RelationGetRelid(relation) == PublicationSyncRelationId)
+		if (RelationIsPublicationSync(relation))
 			elog(DEBUG1,
 				 "logicalddl: WAL logged pg_publication_sync insert at %X/%X flags=0x%02X contains_tuple=%s accessible=%s logically_logged=%s",
 				 LSN_FORMAT_ARGS(recptr),

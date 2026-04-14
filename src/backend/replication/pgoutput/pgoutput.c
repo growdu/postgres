@@ -1674,16 +1674,19 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	TupleTableSlot *old_slot = NULL;
 	TupleTableSlot *new_slot = NULL;
 
-	if (!is_publishable_relation(relation))
+	/*
+	 * pg_publication_sync is an internal system catalog queue, not a
+	 * publishable user relation.  Allow it through before normal publication
+	 * filtering and translate INSERT rows into DDL protocol messages.
+	 */
+	if (RelationIsPublicationSync(relation))
 	{
-		/*
-		 * Handle pg_publication_sync specially - we need to send DDL changes
-		 * for tables that are in publications with ddl = true.
-		 */
-		if (RelationGetRelid(relation) == PublicationSyncRelationId)
-			pgoutput_write_publication_sync(ctx, txn, relation, change);
+		pgoutput_write_publication_sync(ctx, txn, relation, change);
 		return;
 	}
+
+	if (!is_publishable_relation(relation))
+		return;
 
 	/*
 	 * Remember the xid for the change in streaming mode. We need to send xid

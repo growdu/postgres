@@ -402,18 +402,33 @@ typedef struct StdRdOptions
 	 ((StdRdOptions *) (relation)->rd_options)->user_catalog_table : false)
 
 /*
- * RelationIsLogicalDecodingCatalogTable
- *		Returns whether a relation should follow the user_catalog_table
- *		logical decoding path even when it is an internal system catalog.
+ * RelationIsPublicationSync
+ *		Returns whether a relation is pg_publication_sync, the internal DDL
+ *		replication queue.
+ */
+#define RelationIsPublicationSync(relation) \
+	(RelationGetRelid(relation) == PublicationSyncRelationId)
+
+/*
+ * RelationIsLogicalDecodingSystemTable
+ *		Returns whether an internal system table is explicitly allowed to
+ *		participate in logical decoding.
  *
- * pg_publication_sync is an internal control-plane queue: it must be readable
- * through historic catalog snapshots and must keep tuple data in WAL, but
- * pgoutput later turns its rows into DDL messages instead of publishing it as
- * a user table.
+ * System catalogs are normally not decoded as row changes.  pg_publication_sync
+ * is the control-plane exception: it must keep tuple data in WAL and be
+ * delivered to pgoutput, where INSERT rows are converted into DDL messages.
+ */
+#define RelationIsLogicalDecodingSystemTable(relation) \
+	RelationIsPublicationSync(relation)
+
+/*
+ * RelationIsLogicalDecodingCatalogTable
+ *		Returns whether a relation should follow the logical decoding catalog
+ *		table path.
  */
 #define RelationIsLogicalDecodingCatalogTable(relation) \
 	(RelationIsUsedAsCatalogTable(relation) || \
-	 RelationGetRelid(relation) == PublicationSyncRelationId)
+	 RelationIsLogicalDecodingSystemTable(relation))
 
 /*
  * RelationGetParallelWorkers
