@@ -26,6 +26,7 @@
 #include "executor/nodeModifyTable.h"
 #include "replication/conflict.h"
 #include "replication/logicalrelation.h"
+#include "replication/logicalsysrel.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -657,11 +658,12 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 	ItemPointer tid = &(searchslot->tts_tid);
 
 	/*
-	 * We support only non-system tables, with
-	 * check_publication_add_relation() accountable.
+	 * For catalog relations we only allow the explicit logical-replication
+	 * whitelist.
 	 */
 	Assert(rel->rd_rel->relkind == RELKIND_RELATION);
-	Assert(!IsCatalogRelation(rel));
+	Assert(!IsCatalogRelation(rel) ||
+		   IsLogicalRepSystemRelationOid(RelationGetRelid(rel)));
 
 	CheckCmdReplicaIdentity(rel, CMD_UPDATE);
 

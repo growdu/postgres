@@ -32,6 +32,7 @@
 #include "catalog/pg_type.h"
 #include "commands/publicationcmds.h"
 #include "funcapi.h"
+#include "replication/logicalsysrel.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -55,6 +56,10 @@ typedef struct
 static void
 check_publication_add_relation(Relation targetrel)
 {
+	Oid			relid = RelationGetRelid(targetrel);
+	bool		is_sysrel = IsCatalogRelation(targetrel);
+	bool		is_allowed_sysrel = IsLogicalRepSystemRelationOid(relid);
+
 	/* Must be a regular or partitioned table */
 	if (RelationGetForm(targetrel)->relkind != RELKIND_RELATION &&
 		RelationGetForm(targetrel)->relkind != RELKIND_PARTITIONED_TABLE)
@@ -65,7 +70,7 @@ check_publication_add_relation(Relation targetrel)
 				 errdetail_relkind_not_supported(RelationGetForm(targetrel)->relkind)));
 
 	/* Can't be system table */
-	if (IsCatalogRelation(targetrel))
+	if (is_sysrel && !is_allowed_sysrel)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cannot add relation \"%s\" to publication",
@@ -133,11 +138,13 @@ check_publication_add_schema(Oid schemaid)
 static bool
 is_publishable_class(Oid relid, Form_pg_class reltuple)
 {
+	bool		is_allowed_sysrel = IsLogicalRepSystemRelationOid(relid);
+
 	return (reltuple->relkind == RELKIND_RELATION ||
 			reltuple->relkind == RELKIND_PARTITIONED_TABLE) &&
-		!IsCatalogRelationOid(relid) &&
+		(!IsCatalogRelationOid(relid) || is_allowed_sysrel) &&
 		reltuple->relpersistence == RELPERSISTENCE_PERMANENT &&
-		relid >= FirstNormalObjectId;
+		(relid >= FirstNormalObjectId || is_allowed_sysrel);
 }
 
 /*

@@ -22,6 +22,7 @@
 #include "catalog/pg_publication.h"
 #include "nodes/bitmapset.h"
 #include "partitioning/partdefs.h"
+#include "replication/logicalsysrel.h"
 #include "rewrite/prs2lock.h"
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
@@ -705,15 +706,17 @@ RelationCloseSmgr(Relation relation)
  * We don't log information for unlogged tables (since they don't WAL log
  * anyway), for foreign tables (since they don't WAL log, either),
  * and for system tables (their content is hard to make sense of, and
- * it would complicate decoding slightly for little gain). Note that we *do*
- * log information for user defined catalog tables since they presumably are
- * interesting to the user...
+ * it would complicate decoding slightly for little gain), except for a small
+ * explicit whitelist used by logical replication of selected system tables.
+ * Note that we *do* log information for user defined catalog tables since
+ * they presumably are interesting to the user...
  */
 #define RelationIsLogicallyLogged(relation) \
 	(XLogLogicalInfoActive() && \
 	 RelationNeedsWAL(relation) && \
 	 (relation)->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&	\
-	 !IsCatalogRelation(relation))
+	 (!IsCatalogRelation(relation) || \
+	  IsLogicalRepSystemRelationOid(RelationGetRelid(relation))))
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);

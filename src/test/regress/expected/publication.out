@@ -54,6 +54,26 @@ SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
  p          | t             |       144
 (1 row)
 
+SELECT pg_relation_is_publishable('pg_catalog.pg_publication_sync'::regclass);
+ pg_relation_is_publishable 
+----------------------------
+ t
+(1 row)
+
+SET client_min_messages = 'ERROR';
+CREATE PUBLICATION testpub_sysrel FOR TABLE pg_catalog.pg_publication_sync;
+RESET client_min_messages;
+SELECT schemaname, tablename
+  FROM pg_publication_tables
+ WHERE pubname = 'testpub_sysrel'
+ ORDER BY 1, 2;
+ schemaname |      tablename      
+------------+---------------------
+ pg_catalog | pg_publication_sync
+(1 row)
+
+DROP PUBLICATION testpub_sysrel;
+
 -- error cases
 CREATE PUBLICATION testpub_xxx WITH (foo);
 ERROR:  unrecognized publication parameter: "foo"

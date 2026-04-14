@@ -34,6 +34,16 @@ SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
  WHERE p.pubname = 'testpub_default'
  ORDER BY 1, 2, 3;
 
+SELECT pg_relation_is_publishable('pg_catalog.pg_publication_sync'::regclass);
+SET client_min_messages = 'ERROR';
+CREATE PUBLICATION testpub_sysrel FOR TABLE pg_catalog.pg_publication_sync;
+RESET client_min_messages;
+SELECT schemaname, tablename
+  FROM pg_publication_tables
+ WHERE pubname = 'testpub_sysrel'
+ ORDER BY 1, 2;
+DROP PUBLICATION testpub_sysrel;
+
 -- error cases
 CREATE PUBLICATION testpub_xxx WITH (foo);
 CREATE PUBLICATION testpub_xxx WITH (publish = 'cluster, vacuum');

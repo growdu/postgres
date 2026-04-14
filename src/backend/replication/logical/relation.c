@@ -25,6 +25,7 @@
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "replication/logicalrelation.h"
+#include "replication/logicalsysrel.h"
 #include "replication/worker_internal.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -422,6 +423,18 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 							remoterel->nspname, remoterel->relname)));
 		entry->localrel = table_open(relid, NoLock);
 		entry->localreloid = relid;
+
+		/*
+		 * Keep the system-relation support scope explicit. Non-whitelisted
+		 * catalogs remain invalid logical replication targets.
+		 */
+		if (IsCatalogRelation(entry->localrel) &&
+			!IsLogicalRepSystemRelationOid(RelationGetRelid(entry->localrel)))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot use relation \"%s.%s\" as logical replication target",
+							remoterel->nspname, remoterel->relname),
+					 errdetail("This operation is not supported for system tables.")));
 
 		/* Check for supported relkind. */
 		CheckSubscriptionRelkind(entry->localrel->rd_rel->relkind,
