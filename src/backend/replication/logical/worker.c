@@ -1480,13 +1480,26 @@ apply_handle_ddl(StringInfo s)
 	if ((MySubscription->subddl & PUBDDL_ALL) == 0)
 	{
 		/* Subscription doesn't want any DDL */
+		elog(DEBUG1,
+			 "logicalddl: apply worker ignored DDL message because subscription \"%s\" has subddl=%d",
+			 MySubscription->name,
+			 MySubscription->subddl);
 		return;
 	}
 
 	/* Read DDL message - returns NULL if not a DDL message */
 	msg = logicalrep_read_ddl_message(s);
 	if (msg == NULL)
+	{
+		elog(DEBUG1,
+			 "logicalddl: apply worker ignored non-DDL logical message");
 		return;  /* Not a DDL message */
+	}
+
+	elog(DEBUG1,
+		 "logicalddl: apply worker received DDL message subscription=\"%s\" sql=\"%s\"",
+		 MySubscription->name,
+		 msg);
 
 	/*
 	 * Set in_ddl_replay flag to prevent this DDL from being captured
@@ -1542,6 +1555,10 @@ apply_handle_ddl(StringInfo s)
 	PG_END_TRY();
 
 	in_ddl_replay = false;
+	elog(DEBUG1,
+		 "logicalddl: apply worker applied DDL message subscription=\"%s\" sql=\"%s\"",
+		 MySubscription->name,
+		 msg);
 	pfree(msg);
 }
 

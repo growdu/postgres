@@ -903,17 +903,24 @@ DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	xlrec = (xl_heap_insert *) XLogRecGetData(r);
 
+	/* only interested in our database */
+	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
+	if (target_locator.dbOid != ctx->slot->data.database)
+		return;
+
 	/*
 	 * Ignore insert records without new tuples (this does happen when
 	 * raw_heap_insert marks the TOAST record as HEAP_INSERT_NO_LOGICAL).
 	 */
 	if (!(xlrec->flags & XLH_INSERT_CONTAINS_NEW_TUPLE))
+	{
+		elog(DEBUG2,
+			 "logicalddl: logical decoding skipped heap insert without tuple data for locator %u/%u/%u flags=0x%02X at %X/%X",
+			 target_locator.spcOid, target_locator.dbOid, target_locator.relNumber,
+			 xlrec->flags,
+			 LSN_FORMAT_ARGS(buf->origptr));
 		return;
-
-	/* only interested in our database */
-	XLogRecGetBlockTag(r, 0, &target_locator, NULL, NULL);
-	if (target_locator.dbOid != ctx->slot->data.database)
-		return;
+	}
 
 	/* output plugin doesn't look for this origin, no need to queue */
 	if (FilterByOrigin(ctx, XLogRecGetOrigin(r)))

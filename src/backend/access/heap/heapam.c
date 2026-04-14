@@ -42,6 +42,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_publication_sync.h"
 #include "commands/vacuum.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
@@ -2229,6 +2230,15 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
 		recptr = XLogInsert(RM_HEAP_ID, info);
+
+		if (RelationGetRelid(relation) == PublicationSyncRelationId)
+			elog(DEBUG1,
+				 "logicalddl: WAL logged pg_publication_sync insert at %X/%X flags=0x%02X contains_tuple=%s accessible=%s logically_logged=%s",
+				 LSN_FORMAT_ARGS(recptr),
+				 xlrec.flags,
+				 (xlrec.flags & XLH_INSERT_CONTAINS_NEW_TUPLE) ? "true" : "false",
+				 RelationIsAccessibleInLogicalDecoding(relation) ? "true" : "false",
+				 RelationIsLogicallyLogged(relation) ? "true" : "false");
 
 		PageSetLSN(page, recptr);
 	}

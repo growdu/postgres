@@ -2358,8 +2358,22 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 							 relpathperm(change->data.tp.rlocator,
 										 MAIN_FORKNUM).str);
 
+					if (RelationGetRelid(relation) == PublicationSyncRelationId)
+						elog(DEBUG1,
+							 "logicalddl: reorderbuffer saw pg_publication_sync action=%d at %X/%X logically_logged=%s accessible=%s catalog=%s",
+							 change->action,
+							 LSN_FORMAT_ARGS(change->lsn),
+							 RelationIsLogicallyLogged(relation) ? "true" : "false",
+							 RelationIsAccessibleInLogicalDecoding(relation) ? "true" : "false",
+							 IsCatalogRelation(relation) ? "true" : "false");
+
 					if (!RelationIsLogicallyLogged(relation))
+					{
+						if (RelationGetRelid(relation) == PublicationSyncRelationId)
+							elog(DEBUG1,
+								 "logicalddl: reorderbuffer skipped pg_publication_sync because relation is not logically logged");
 						goto change_done;
+					}
 
 					/*
 					 * Ignore temporary heaps created during DDL unless the

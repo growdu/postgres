@@ -1499,17 +1499,32 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 	bool		matches_publication = false;
 	char	   *sql_string;
 
+	elog(DEBUG1,
+		 "logicalddl: pgoutput saw pg_publication_sync change action=%d xid=%u lsn=%X/%X",
+		 change->action,
+		 txn->xid,
+		 LSN_FORMAT_ARGS(change->lsn));
+
 	/*
 	 * pg_publication_sync is an append-only DDL event queue.  Its INSERTs are
 	 * converted to protocol messages; pruning DELETEs must not replay old DDL.
 	 */
 	if (change->action != REORDER_BUFFER_CHANGE_INSERT)
+	{
+		elog(DEBUG1,
+			 "logicalddl: pgoutput ignored pg_publication_sync action=%d",
+			 change->action);
 		return;
+	}
 
 	tuple = change->data.tp.newtuple;
 
 	if (!HeapTupleIsValid(tuple))
+	{
+		elog(DEBUG1,
+			 "logicalddl: pgoutput ignored pg_publication_sync insert without tuple");
 		return;
+	}
 
 	/* Parse the tuple */
 	heap_deform_tuple(tuple, RelationGetDescr(relation), values, isnull);
@@ -1519,15 +1534,28 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 						RelationGetDescr(relation), &isnull[Anum_pg_publication_sync_psnmsgtype - 1]);
 	if (isnull[Anum_pg_publication_sync_psnmsgtype - 1] ||
 		DatumGetChar(datum) != PSN_MSG_TYPE_DDL)
+	{
+		elog(DEBUG1,
+			 "logicalddl: pgoutput ignored pg_publication_sync row with msgtype=%c isnull=%s",
+			 isnull[Anum_pg_publication_sync_psnmsgtype - 1] ? '?' : DatumGetChar(datum),
+			 isnull[Anum_pg_publication_sync_psnmsgtype - 1] ? "true" : "false");
 		return;	/* Not a DDL SQL message */
+	}
 
 	/* Get the SQL string from psnmsgdata */
 	datum = heap_getattr(tuple, Anum_pg_publication_sync_psnmsgdata,
 						RelationGetDescr(relation), &isnull[Anum_pg_publication_sync_psnmsgdata - 1]);
 	if (isnull[Anum_pg_publication_sync_psnmsgdata - 1])
+	{
+		elog(DEBUG1,
+			 "logicalddl: pgoutput ignored pg_publication_sync DDL row without SQL data");
 		return;	/* No SQL data */
+	}
 
 	sql_string = TextDatumGetCString(datum);
+	elog(DEBUG1,
+		 "logicalddl: pgoutput decoded DDL SQL=\"%s\"",
+		 sql_string);
 
 	/* Get the publications array */
 	datum = heap_getattr(tuple, Anum_pg_publication_sync_psnpublications,
@@ -1538,7 +1566,12 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 	 * This shouldn't normally happen but be defensive.
 	 */
 	if (isnull[Anum_pg_publication_sync_psnpublications - 1])
+	{
+		elog(DEBUG1,
+			 "logicalddl: pgoutput ignored DDL SQL because publication array is null sql=\"%s\"",
+			 sql_string);
 		return;
+	}
 
 	publications_arr = DatumGetArrayTypeP(datum);
 	deconstruct_array_builtin(publications_arr, TEXTOID, &pub_elems, NULL, &nelems);
@@ -1561,6 +1594,12 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 				/* Publication match found */
 				if (pub->pubddl)
 					matches_publication = true;
+				elog(DEBUG1,
+					 "logicalddl: pgoutput publication check row_pub=\"%s\" output_pub=\"%s\" output_pubddl=%d matched=%s",
+					 pub_name,
+					 pub->name,
+					 pub->pubddl,
+					 matches_publication ? "true" : "false");
 				break;
 			}
 		}
@@ -1574,7 +1613,12 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 
 	/* Only send if a matching publication with ddl=true was found */
 	if (!matches_publication)
+	{
+		elog(DEBUG1,
+			 "logicalddl: pgoutput skipped DDL because no output publication matched sql=\"%s\"",
+			 sql_string);
 		return;
+	}
 
 	/*
 	 * Send BEGIN if we haven't yet, to ensure the DDL is wrapped
@@ -1602,6 +1646,11 @@ pgoutput_write_publication_sync(LogicalDecodingContext *ctx,
 		logicalrep_write_message(ctx->out, xid, change->lsn, true,
 								 "pg_ddl", strlen(sql_string), sql_string);
 		OutputPluginWrite(ctx, true);
+		elog(DEBUG1,
+			 "logicalddl: pgoutput sent DDL message xid=%u lsn=%X/%X sql=\"%s\"",
+			 xid,
+			 LSN_FORMAT_ARGS(change->lsn),
+			 sql_string);
 	}
 }
 

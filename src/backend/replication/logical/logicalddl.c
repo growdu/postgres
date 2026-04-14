@@ -477,7 +477,12 @@ BuildLogicalDDLCommandIfNeeded(PlannedStmt *pstmt, const char *queryString,
 
 	/* If no publications have DDL enabled for this table, skip */
 	if (cmd->publication_names == NIL)
+	{
+		elog(DEBUG1,
+			 "logicalddl: skip DDL capture, no matching ddl-enabled publication kind=%d relid=%u query=\"%s\"",
+			 ddl_kind, relid, queryString ? queryString : "");
 		return false;
+	}
 
 	/* Get command tag */
 	cmd->command_tag = pstrdup(get_ddl_command_tag(stmt));
@@ -504,6 +509,13 @@ BuildLogicalDDLCommandIfNeeded(PlannedStmt *pstmt, const char *queryString,
 
 	/* DDL seqno - could be a sequence number within the transaction */
 	cmd->ddl_seqno = 0;
+
+	elog(DEBUG1,
+		 "logicalddl: captured DDL kind=%d relid=%u publications=%d sql=\"%s\"",
+		 cmd->ddl_kind,
+		 relid,
+		 list_length(cmd->publication_names),
+		 cmd->normalized_sql ? cmd->normalized_sql : "");
 
 	return true;
 }
@@ -599,6 +611,12 @@ PublicationSyncInsert(LogicalDDLCommand *cmd)
 
 	/* Insert into catalog */
 	CatalogTupleInsert(rel, tup);
+
+	elog(DEBUG1,
+		 "logicalddl: inserted pg_publication_sync row kind=%d publications=%d sql=\"%s\"",
+		 cmd->ddl_kind,
+		 list_length(cmd->publication_names),
+		 cmd->normalized_sql ? cmd->normalized_sql : "");
 
 	/* Cleanup */
 	heap_freetuple(tup);
