@@ -408,7 +408,11 @@ BuildLogicalDDLCommandIfNeeded(PlannedStmt *pstmt, const char *queryString,
 	Node	   *stmt;
 	int			ddl_kind;
 	Oid			relid;
-	List	   *pubids;
+	Oid			nspid = InvalidOid;
+	List	   *pubids = NIL;
+	List	   *relpubids = NIL;
+	List	   *schemapubids = NIL;
+	List	   *allpubids = NIL;
 	ListCell   *lc;
 
 	/* Initialize command */
@@ -443,20 +447,38 @@ BuildLogicalDDLCommandIfNeeded(PlannedStmt *pstmt, const char *queryString,
 	relid = get_ddl_target_relid(stmt);
 
 	/*
-	 * Get list of publications that this table belongs to and have DDL enabled.
-	 * For CREATE TABLE, we need to check the target namespace.
+	 * Get all publications that could cover this DDL target.
+	 *
+	 * A table DDL can be published through an explicit FOR TABLE publication,
+	 * a FOR TABLES IN SCHEMA publication, or a FOR ALL TABLES publication.
+	 * CREATE TABLE has no relid yet, so only namespace/all-tables publications
+	 * can match it at capture time.
 	 */
 	if (relid != InvalidOid)
-		pubids = GetRelationPublications(relid);
-	else
 	{
-		/*
-		 * For CREATE TABLE, get publications via schema.
-		 * The table doesn't exist yet, so we can't get publications by relid.
-		 */
-		Oid			nspid = get_ddl_target_namespace(stmt);
-		pubids = GetSchemaPublications(nspid);
+		relpubids = GetRelationPublications(relid);
+		nspid = get_rel_namespace(relid);
 	}
+	else
+		nspid = get_ddl_target_namespace(stmt);
+
+	if (OidIsValid(nspid))
+		schemapubids = GetSchemaPublications(nspid);
+
+	allpubids = GetAllTablesPublications();
+
+	pubids = list_concat_unique_oid(pubids, relpubids);
+	pubids = list_concat_unique_oid(pubids, schemapubids);
+	pubids = list_concat_unique_oid(pubids, allpubids);
+
+	elog(DEBUG1,
+		 "logicalddl: publication lookup kind=%d relid=%u nspid=%u table_pubs=%d schema_pubs=%d all_table_pubs=%d total_pubs=%d query=\"%s\"",
+		 ddl_kind, relid, nspid,
+		 list_length(relpubids),
+		 list_length(schemapubids),
+		 list_length(allpubids),
+		 list_length(pubids),
+		 queryString ? queryString : "");
 
 	/* Filter publications that have DDL enabled */
 	cmd->publication_names = NIL;
@@ -464,8 +486,14 @@ BuildLogicalDDLCommandIfNeeded(PlannedStmt *pstmt, const char *queryString,
 	{
 		Oid			pubid = lfirst_oid(lc);
 		Publication *pub = GetPublication(pubid);
+		bool		ddl_matched = (pub->pubddl & ddl_kind) != 0;
 
-		if ((pub->pubddl & ddl_kind) != 0)
+		elog(DEBUG1,
+			 "logicalddl: publication candidate name=\"%s\" oid=%u pubddl=%d ddl_kind=%d matched=%s",
+			 pub->name, pubid, pub->pubddl, ddl_kind,
+			 ddl_matched ? "true" : "false");
+
+		if (ddl_matched)
 		{
 			cmd->publication_names = lappend(cmd->publication_names, pstrdup(pub->name));
 		}
@@ -473,14 +501,17 @@ BuildLogicalDDLCommandIfNeeded(PlannedStmt *pstmt, const char *queryString,
 		pfree(pub);
 	}
 
+	list_free(relpubids);
+	list_free(schemapubids);
+	list_free(allpubids);
 	list_free(pubids);
 
 	/* If no publications have DDL enabled for this table, skip */
 	if (cmd->publication_names == NIL)
 	{
 		elog(DEBUG1,
-			 "logicalddl: skip DDL capture, no matching ddl-enabled publication kind=%d relid=%u query=\"%s\"",
-			 ddl_kind, relid, queryString ? queryString : "");
+			 "logicalddl: skip DDL capture, no matching ddl-enabled publication kind=%d relid=%u nspid=%u query=\"%s\"",
+			 ddl_kind, relid, nspid, queryString ? queryString : "");
 		return false;
 	}
 
