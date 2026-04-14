@@ -2296,7 +2296,7 @@ match_previous_words(int pattern_id,
 								 "CURRENT_SCHEMA");
 	/* ALTER PUBLICATION <name> SET ( */
 	else if (Matches("ALTER", "PUBLICATION", MatchAny, MatchAnyN, "SET", "("))
-		COMPLETE_WITH("publish", "publish_generated_columns", "publish_via_partition_root");
+		COMPLETE_WITH("ddl", "publish", "publish_generated_columns", "publish_via_partition_root");
 	/* ALTER SUBSCRIPTION <name> */
 	else if (Matches("ALTER", "SUBSCRIPTION", MatchAny))
 		COMPLETE_WITH("CONNECTION", "ENABLE", "DISABLE", "OWNER TO",
@@ -2313,7 +2313,7 @@ match_previous_words(int pattern_id,
 		COMPLETE_WITH("(", "PUBLICATION");
 	/* ALTER SUBSCRIPTION <name> SET ( */
 	else if (Matches("ALTER", "SUBSCRIPTION", MatchAny, MatchAnyN, "SET", "("))
-		COMPLETE_WITH("binary", "disable_on_error", "failover", "origin",
+		COMPLETE_WITH("binary", "ddl", "disable_on_error", "failover", "origin",
 					  "password_required", "run_as_owner", "slot_name",
 					  "streaming", "synchronous_commit", "two_phase");
 	/* ALTER SUBSCRIPTION <name> SKIP ( */
@@ -3590,7 +3590,7 @@ match_previous_words(int pattern_id,
 		COMPLETE_WITH("WITH (");
 	/* Complete "CREATE PUBLICATION <name> [...] WITH" */
 	else if (Matches("CREATE", "PUBLICATION", MatchAnyN, "WITH", "("))
-		COMPLETE_WITH("publish", "publish_generated_columns", "publish_via_partition_root");
+		COMPLETE_WITH("ddl", "publish", "publish_generated_columns", "publish_via_partition_root");
 
 /* CREATE RULE */
 	/* Complete "CREATE [ OR REPLACE ] RULE <sth>" with "AS ON" */
@@ -3750,7 +3750,7 @@ match_previous_words(int pattern_id,
 		COMPLETE_WITH("WITH (");
 	/* Complete "CREATE SUBSCRIPTION <name> ...  WITH ( <opt>" */
 	else if (Matches("CREATE", "SUBSCRIPTION", MatchAnyN, "WITH", "("))
-		COMPLETE_WITH("binary", "connect", "copy_data", "create_slot",
+		COMPLETE_WITH("binary", "connect", "copy_data", "create_slot", "ddl",
 					  "disable_on_error", "enabled", "failover", "origin",
 					  "password_required", "run_as_owner", "slot_name",
 					  "streaming", "synchronous_commit", "two_phase");

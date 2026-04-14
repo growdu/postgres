@@ -52,6 +52,9 @@ CATALOG(pg_publication,6104,PublicationRelationId)
 	/* true if truncates are published */
 	bool		pubtruncate;
 
+	/* bitmask of ddl kinds allowed by this publication */
+	int32		pubddl BKI_DEFAULT(0);
+
 	/* true if partition changes are published using root schema */
 	bool		pubviaroot;
 
@@ -130,6 +133,7 @@ typedef struct Publication
 	char	   *name;
 	bool		alltables;
 	bool		pubviaroot;
+	int32		pubddl;
 	PublishGencolsType pubgencols_type;
 	PublicationActions pubactions;
 } Publication;
@@ -140,6 +144,18 @@ typedef struct PublicationRelInfo
 	Node	   *whereClause;
 	List	   *columns;
 } PublicationRelInfo;
+
+#define PUBDDL_TABLE		(1 << 0)
+#define PUBDDL_INDEX		(1 << 1)
+#define PUBDDL_SEQUENCE		(1 << 2)
+#define PUBDDL_TRIGGER		(1 << 3)
+#define PUBDDL_VIEW			(1 << 4)
+#define PUBDDL_RULE			(1 << 5)
+#define PUBDDL_SCHEMA		(1 << 6)
+#define PUBDDL_FUNCTION		(1 << 7)
+#define PUBDDL_TYPE			(1 << 8)
+#define PUBDDL_DOMAIN		(1 << 9)
+#define PUBDDL_EXTENSION	(1 << 10)
 
 extern Publication *GetPublication(Oid pubid);
 extern Publication *GetPublicationByName(const char *pubname, bool missing_ok);

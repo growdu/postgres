@@ -234,6 +234,18 @@ static int	nsequences = 0;
 	fmtQualifiedId((obj)->dobj.namespace->dobj.name, \
 				   (obj)->dobj.name)
 
+#define PUBDDL_TABLE		(1 << 0)
+#define PUBDDL_INDEX		(1 << 1)
+#define PUBDDL_SEQUENCE		(1 << 2)
+#define PUBDDL_TRIGGER		(1 << 3)
+#define PUBDDL_VIEW			(1 << 4)
+#define PUBDDL_RULE			(1 << 5)
+#define PUBDDL_SCHEMA		(1 << 6)
+#define PUBDDL_FUNCTION		(1 << 7)
+#define PUBDDL_TYPE			(1 << 8)
+#define PUBDDL_DOMAIN		(1 << 9)
+#define PUBDDL_EXTENSION	(1 << 10)
+
 static void help(const char *progname);
 static void setup_connection(Archive *AH,
 							 const char *dumpencoding, const char *dumpsnapshot,
@@ -261,6 +273,7 @@ static void prohibit_crossdb_refs(PGconn *conn, const char *dbname,
 static NamespaceInfo *findNamespace(Oid nsoid);
 static void dumpTableData(Archive *fout, const TableDataInfo *tdinfo);
 static void refreshMatViewData(Archive *fout, const TableDataInfo *tdinfo);
+static void append_pubddl_list(PQExpBuffer query, int ddlmask);
 static const char *getRoleName(const char *roleoid_str);
 static void collectRoleNames(Archive *fout);
 static void getAdditionalACLs(Archive *fout);
@@ -4411,6 +4424,87 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 	free(qtabname);
 }
 
+static void
+append_pubddl_list(PQExpBuffer query, int ddlmask)
+{
+	bool		first = true;
+
+	if (ddlmask & PUBDDL_TABLE)
+	{
+		appendPQExpBufferStr(query, "table");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_INDEX)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "index");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_SEQUENCE)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "sequence");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_TRIGGER)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "trigger");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_VIEW)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "view");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_RULE)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "rule");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_SCHEMA)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "schema");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_FUNCTION)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "function");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_TYPE)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "type");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_DOMAIN)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "domain");
+		first = false;
+	}
+	if (ddlmask & PUBDDL_EXTENSION)
+	{
+		if (!first)
+			appendPQExpBufferStr(query, ", ");
+		appendPQExpBufferStr(query, "extension");
+	}
+}
+
 /*
  * getPublications
  *	  get information about publications
@@ -4431,6 +4525,7 @@ getPublications(Archive *fout)
 	int			i_pubupdate;
 	int			i_pubdelete;
 	int			i_pubtruncate;
+	int			i_pubddl;
 	int			i_pubviaroot;
 	int			i_pubgencols;
 	int			i,
@@ -4450,6 +4545,11 @@ getPublications(Archive *fout)
 		appendPQExpBufferStr(query, "p.pubtruncate, ");
 	else
 		appendPQExpBufferStr(query, "false AS pubtruncate, ");
+
+	if (fout->remoteVersion >= 180000)
+		appendPQExpBufferStr(query, "p.pubddl, ");
+	else
+		appendPQExpBufferStr(query, "0 AS pubddl, ");
 
 	if (fout->remoteVersion >= 130000)
 		appendPQExpBufferStr(query, "p.pubviaroot, ");
@@ -4479,6 +4579,7 @@ getPublications(Archive *fout)
 	i_pubupdate = PQfnumber(res, "pubupdate");
 	i_pubdelete = PQfnumber(res, "pubdelete");
 	i_pubtruncate = PQfnumber(res, "pubtruncate");
+	i_pubddl = PQfnumber(res, "pubddl");
 	i_pubviaroot = PQfnumber(res, "pubviaroot");
 	i_pubgencols = PQfnumber(res, "pubgencols");
 
@@ -4503,6 +4604,7 @@ getPublications(Archive *fout)
 			(strcmp(PQgetvalue(res, i, i_pubdelete), "t") == 0);
 		pubinfo[i].pubtruncate =
 			(strcmp(PQgetvalue(res, i, i_pubtruncate), "t") == 0);
+		pubinfo[i].pubddl = atoi(PQgetvalue(res, i, i_pubddl));
 		pubinfo[i].pubviaroot =
 			(strcmp(PQgetvalue(res, i, i_pubviaroot), "t") == 0);
 		pubinfo[i].pubgencols_type =
@@ -4583,6 +4685,9 @@ dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 		first = false;
 	}
 
+	appendPQExpBufferChar(query, '\'');
+	appendPQExpBufferStr(query, ", ddl = '");
+	append_pubddl_list(query, pubinfo->pubddl);
 	appendPQExpBufferChar(query, '\'');
 
 	if (pubinfo->pubviaroot)
@@ -4989,6 +5094,7 @@ getSubscriptions(Archive *fout)
 	int			i_subdisableonerr;
 	int			i_subpasswordrequired;
 	int			i_subrunasowner;
+	int			i_subddl;
 	int			i_subconninfo;
 	int			i_subslotname;
 	int			i_subsynccommit;
@@ -5060,6 +5166,11 @@ getSubscriptions(Archive *fout)
 						  " '%s' AS suborigin,\n",
 						  LOGICALREP_ORIGIN_ANY);
 
+	if (fout->remoteVersion >= 180000)
+		appendPQExpBufferStr(query, " s.subddl,\n");
+	else
+		appendPQExpBufferStr(query, " 0 AS subddl,\n");
+
 	if (dopt->binary_upgrade && fout->remoteVersion >= 170000)
 		appendPQExpBufferStr(query, " o.remote_lsn AS suboriginremotelsn,\n"
 							 " s.subenabled,\n");
@@ -5105,6 +5216,7 @@ getSubscriptions(Archive *fout)
 	i_subdisableonerr = PQfnumber(res, "subdisableonerr");
 	i_subpasswordrequired = PQfnumber(res, "subpasswordrequired");
 	i_subrunasowner = PQfnumber(res, "subrunasowner");
+	i_subddl = PQfnumber(res, "subddl");
 	i_subfailover = PQfnumber(res, "subfailover");
 	i_subconninfo = PQfnumber(res, "subconninfo");
 	i_subslotname = PQfnumber(res, "subslotname");
@@ -5137,6 +5249,7 @@ getSubscriptions(Archive *fout)
 			(strcmp(PQgetvalue(res, i, i_subpasswordrequired), "t") == 0);
 		subinfo[i].subrunasowner =
 			(strcmp(PQgetvalue(res, i, i_subrunasowner), "t") == 0);
+		subinfo[i].subddl = atoi(PQgetvalue(res, i, i_subddl));
 		subinfo[i].subfailover =
 			(strcmp(PQgetvalue(res, i, i_subfailover), "t") == 0);
 		subinfo[i].subconninfo =
@@ -5396,6 +5509,10 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 
 	if (subinfo->subfailover)
 		appendPQExpBufferStr(query, ", failover = true");
+
+	appendPQExpBufferStr(query, ", ddl = '");
+	append_pubddl_list(query, subinfo->subddl);
+	appendPQExpBufferChar(query, '\'');
 
 	if (strcmp(subinfo->subsynccommit, "off") != 0)
 		appendPQExpBuffer(query, ", synchronous_commit = %s", fmtId(subinfo->subsynccommit));

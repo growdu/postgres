@@ -50,6 +50,7 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_subscription.h"
@@ -4033,6 +4034,31 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+		case PublicationSyncRelationId:
+			{
+				HeapTuple	tup;
+				char	   *pubname;
+				Form_pg_publication_sync pfsform;
+
+				tup = SearchSysCache1(PUBLICATIONSYNC,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for publication sync %u",
+							 object->objectId);
+					break;
+				}
+
+				pfsform = (Form_pg_publication_sync) GETSTRUCT(tup);
+				pubname = get_publication_name(pfsform->pfsyncpubid, false);
+
+				appendStringInfo(&buffer, _("publication sync item in publication %s"),
+								 pubname);
+				ReleaseSysCache(tup);
+				break;
+			}
+
 		case SubscriptionRelationId:
 			{
 				char	   *subname = get_subscription_name(object->objectId,
@@ -4660,6 +4686,10 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 
 		case PublicationRelRelationId:
 			appendStringInfoString(&buffer, "publication relation");
+			break;
+
+		case PublicationSyncRelationId:
+			appendStringInfoString(&buffer, "publication sync");
 			break;
 
 		case SubscriptionRelationId:
@@ -5958,6 +5988,36 @@ getObjectIdentityParts(const ObjectAddress *object,
 
 				if (objargs)
 					*objargs = list_make1(pubname);
+
+				ReleaseSysCache(tup);
+				break;
+			}
+
+		case PublicationSyncRelationId:
+			{
+				HeapTuple	tup;
+				char	   *pubname;
+				Form_pg_publication_sync pfsform;
+
+				tup = SearchSysCache1(PUBLICATIONSYNC,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for publication sync %u",
+							 object->objectId);
+					break;
+				}
+
+				pfsform = (Form_pg_publication_sync) GETSTRUCT(tup);
+				pubname = get_publication_name(pfsform->pfsyncpubid, false);
+
+				appendStringInfo(&buffer, "%s kind %c", pubname,
+								 pfsform->pfsynckind);
+				if (objname)
+					*objname = list_make1(pubname);
+				else
+					pfree(pubname);
 
 				ReleaseSysCache(tup);
 				break;

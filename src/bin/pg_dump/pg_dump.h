@@ -673,6 +673,7 @@ typedef struct _PublicationInfo
 	bool		pubupdate;
 	bool		pubdelete;
 	bool		pubtruncate;
+	int			pubddl;
 	bool		pubviaroot;
 	PublishGencolsType pubgencols_type;
 } PublicationInfo;
@@ -716,6 +717,7 @@ typedef struct _SubscriptionInfo
 	bool		subpasswordrequired;
 	bool		subrunasowner;
 	bool		subfailover;
+	int			subddl;
 	char	   *subconninfo;
 	char	   *subslotname;
 	char	   *subsynccommit;

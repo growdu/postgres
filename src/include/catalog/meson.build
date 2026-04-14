@@ -67,6 +67,7 @@ catalog_headers = [
   'pg_publication.h',
   'pg_publication_namespace.h',
   'pg_publication_rel.h',
+  'pg_publication_sync.h',
   'pg_subscription.h',
   'pg_subscription_rel.h',
 ]

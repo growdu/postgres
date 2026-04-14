@@ -53,6 +53,7 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_subscription.h"
@@ -1438,6 +1439,10 @@ doDeletion(const ObjectAddress *object, int flags)
 
 		case PublicationRelRelationId:
 			RemovePublicationRelById(object->objectId);
+			break;
+
+		case PublicationSyncRelationId:
+			RemovePublicationSyncById(object->objectId);
 			break;
 
 		case PublicationRelationId:

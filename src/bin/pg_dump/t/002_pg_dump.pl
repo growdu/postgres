@@ -3432,7 +3432,7 @@ my %tests = (
 		create_order => 50,
 		create_sql => 'CREATE PUBLICATION pub1;',
 		regexp => qr/^
-			\QCREATE PUBLICATION pub1 WITH (publish = 'insert, update, delete, truncate');\E
+			\QCREATE PUBLICATION pub1 WITH (publish = 'insert, update, delete, truncate', ddl = '');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3443,7 +3443,7 @@ my %tests = (
 						 FOR ALL TABLES
 						 WITH (publish = \'\');',
 		regexp => qr/^
-			\QCREATE PUBLICATION pub2 FOR ALL TABLES WITH (publish = '');\E
+			\QCREATE PUBLICATION pub2 FOR ALL TABLES WITH (publish = '', ddl = '');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3452,7 +3452,7 @@ my %tests = (
 		create_order => 50,
 		create_sql => 'CREATE PUBLICATION pub3;',
 		regexp => qr/^
-			\QCREATE PUBLICATION pub3 WITH (publish = 'insert, update, delete, truncate');\E
+			\QCREATE PUBLICATION pub3 WITH (publish = 'insert, update, delete, truncate', ddl = '');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3461,7 +3461,7 @@ my %tests = (
 		create_order => 50,
 		create_sql => 'CREATE PUBLICATION pub4;',
 		regexp => qr/^
-			\QCREATE PUBLICATION pub4 WITH (publish = 'insert, update, delete, truncate');\E
+			\QCREATE PUBLICATION pub4 WITH (publish = 'insert, update, delete, truncate', ddl = '');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3471,7 +3471,7 @@ my %tests = (
 		create_sql =>
 		  'CREATE PUBLICATION pub5 WITH (publish_generated_columns = stored);',
 		regexp => qr/^
-			\QCREATE PUBLICATION pub5 WITH (publish = 'insert, update, delete, truncate', publish_generated_columns = stored);\E
+			\QCREATE PUBLICATION pub5 WITH (publish = 'insert, update, delete, truncate', ddl = '', publish_generated_columns = stored);\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 	},
@@ -3482,7 +3482,7 @@ my %tests = (
 						 CONNECTION \'dbname=doesnotexist\' PUBLICATION pub1
 						 WITH (connect = false);',
 		regexp => qr/^
-			\QCREATE SUBSCRIPTION sub1 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub1', streaming = parallel);\E
+			\QCREATE SUBSCRIPTION sub1 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub1', streaming = parallel, ddl = '');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 		unlike => {
@@ -3497,7 +3497,7 @@ my %tests = (
 						 CONNECTION \'dbname=doesnotexist\' PUBLICATION pub1
 						 WITH (connect = false, origin = none, streaming = off);',
 		regexp => qr/^
-			\QCREATE SUBSCRIPTION sub2 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub2', streaming = off, origin = none);\E
+			\QCREATE SUBSCRIPTION sub2 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub2', streaming = off, ddl = '', origin = none);\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 		unlike => {
@@ -3512,7 +3512,7 @@ my %tests = (
 						 CONNECTION \'dbname=doesnotexist\' PUBLICATION pub1
 						 WITH (connect = false, origin = any, streaming = on);',
 		regexp => qr/^
-			\QCREATE SUBSCRIPTION sub3 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub3', streaming = on);\E
+			\QCREATE SUBSCRIPTION sub3 CONNECTION 'dbname=doesnotexist' PUBLICATION pub1 WITH (connect = false, slot_name = 'sub3', streaming = on, ddl = '');\E
 			/xm,
 		like => { %full_runs, section_post_data => 1, },
 		unlike => {

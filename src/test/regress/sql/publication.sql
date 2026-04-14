@@ -19,10 +19,26 @@ CREATE PUBLICATION testpub_ins_trunct WITH (publish = insert);
 RESET client_min_messages;
 
 ALTER PUBLICATION testpub_default SET (publish = update);
+ALTER PUBLICATION testpub_default SET (ddl = 'table,index,trigger');
+SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
+SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
+  FROM pg_publication_sync s
+  JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE p.pubname = 'testpub_default'
+ ORDER BY 1, 2, 3;
+ALTER PUBLICATION testpub_default SET (ddl = 'view,function');
+SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
+SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
+  FROM pg_publication_sync s
+  JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE p.pubname = 'testpub_default'
+ ORDER BY 1, 2, 3;
 
 -- error cases
 CREATE PUBLICATION testpub_xxx WITH (foo);
 CREATE PUBLICATION testpub_xxx WITH (publish = 'cluster, vacuum');
+CREATE PUBLICATION testpub_xxx WITH (ddl = 'table, unknown_ddl');
+CREATE PUBLICATION testpub_xxx WITH (ddl = 'table', ddl = 'index');
 CREATE PUBLICATION testpub_xxx WITH (publish_via_partition_root = 'true', publish_via_partition_root = '0');
 CREATE PUBLICATION testpub_xxx WITH (publish_generated_columns = stored, publish_generated_columns = none);
 CREATE PUBLICATION testpub_xxx WITH (publish_generated_columns = foo);

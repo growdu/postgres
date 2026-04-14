@@ -14,10 +14,12 @@
 
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
@@ -29,6 +31,7 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -42,6 +45,7 @@
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -72,6 +76,10 @@ static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 								  AlterPublicationStmt *stmt);
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
 static char defGetGeneratedColsOption(DefElem *def);
+static int	parse_publication_ddl_option(ParseState *pstate, DefElem *defel);
+static void upsert_publication_sync_default(Oid pubid, int ddlmask);
+
+#define PFSYNC_KIND_PUBLICATION	'p'
 
 
 static void
@@ -82,13 +90,16 @@ parse_publication_options(ParseState *pstate,
 						  bool *publish_via_partition_root_given,
 						  bool *publish_via_partition_root,
 						  bool *publish_generated_columns_given,
-						  char *publish_generated_columns)
+						  char *publish_generated_columns,
+						  bool *ddl_given,
+						  int *ddlmask)
 {
 	ListCell   *lc;
 
 	*publish_given = false;
 	*publish_via_partition_root_given = false;
 	*publish_generated_columns_given = false;
+	*ddl_given = false;
 
 	/* defaults */
 	pubactions->pubinsert = true;
@@ -97,6 +108,7 @@ parse_publication_options(ParseState *pstate,
 	pubactions->pubtruncate = true;
 	*publish_via_partition_root = false;
 	*publish_generated_columns = PUBLISH_GENCOLS_NONE;
+	*ddlmask = 0;
 
 	/* Parse options */
 	foreach(lc, options)
@@ -169,11 +181,173 @@ parse_publication_options(ParseState *pstate,
 			*publish_generated_columns_given = true;
 			*publish_generated_columns = defGetGeneratedColsOption(defel);
 		}
+		else if (strcmp(defel->defname, "ddl") == 0)
+		{
+			if (*ddl_given)
+				errorConflictingDefElem(defel, pstate);
+
+			*ddl_given = true;
+			*ddlmask = parse_publication_ddl_option(pstate, defel);
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("unrecognized publication parameter: \"%s\"", defel->defname)));
 	}
+}
+
+static int
+parse_publication_ddl_option(ParseState *pstate, DefElem *defel)
+{
+	char	   *ddl;
+	List	   *ddl_list;
+	ListCell   *lc;
+	int			ddlmask = 0;
+
+	(void) pstate;
+
+	if (!defel->arg)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("publication parameter \"%s\" requires a value", defel->defname)));
+
+	/*
+	 * SplitIdentifierString destructively modifies its input, so make a copy
+	 * first.
+	 */
+	ddl = pstrdup(defGetString(defel));
+	if (!SplitIdentifierString(ddl, ',', &ddl_list))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid list syntax in parameter \"%s\"", defel->defname)));
+
+	foreach(lc, ddl_list)
+	{
+		char	   *ddl_opt = (char *) lfirst(lc);
+
+		if (pg_strcasecmp(ddl_opt, "table") == 0)
+			ddlmask |= PUBDDL_TABLE;
+		else if (pg_strcasecmp(ddl_opt, "index") == 0)
+			ddlmask |= PUBDDL_INDEX;
+		else if (pg_strcasecmp(ddl_opt, "sequence") == 0)
+			ddlmask |= PUBDDL_SEQUENCE;
+		else if (pg_strcasecmp(ddl_opt, "trigger") == 0)
+			ddlmask |= PUBDDL_TRIGGER;
+		else if (pg_strcasecmp(ddl_opt, "view") == 0)
+			ddlmask |= PUBDDL_VIEW;
+		else if (pg_strcasecmp(ddl_opt, "rule") == 0)
+			ddlmask |= PUBDDL_RULE;
+		else if (pg_strcasecmp(ddl_opt, "schema") == 0)
+			ddlmask |= PUBDDL_SCHEMA;
+		else if (pg_strcasecmp(ddl_opt, "function") == 0)
+			ddlmask |= PUBDDL_FUNCTION;
+		else if (pg_strcasecmp(ddl_opt, "type") == 0)
+			ddlmask |= PUBDDL_TYPE;
+		else if (pg_strcasecmp(ddl_opt, "domain") == 0)
+			ddlmask |= PUBDDL_DOMAIN;
+		else if (pg_strcasecmp(ddl_opt, "extension") == 0)
+			ddlmask |= PUBDDL_EXTENSION;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized value for publication option \"%s\": \"%s\"",
+							defel->defname, ddl_opt)));
+	}
+
+	return ddlmask;
+}
+
+static void
+upsert_publication_sync_default(Oid pubid, int ddlmask)
+{
+	Relation	rel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	rel = table_open(PublicationSyncRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key,
+				Anum_pg_publication_sync_pfsyncpubid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(pubid));
+	scan = systable_beginscan(rel, PublicationSyncPubidIndexId, true,
+							  NULL, 1, &key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_publication_sync form = (Form_pg_publication_sync) GETSTRUCT(tup);
+
+		if (form->pfsynckind != PFSYNC_KIND_PUBLICATION)
+			continue;
+
+		found = true;
+
+		if (form->pfsyncddl != ddlmask || !form->pfsyncenabled)
+		{
+			bool		nulls[Natts_pg_publication_sync];
+			bool		replaces[Natts_pg_publication_sync];
+			Datum		values[Natts_pg_publication_sync];
+			HeapTuple	newtup;
+
+			memset(nulls, false, sizeof(nulls));
+			memset(replaces, false, sizeof(replaces));
+			memset(values, 0, sizeof(values));
+
+			values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
+			replaces[Anum_pg_publication_sync_pfsyncddl - 1] = true;
+			values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
+			replaces[Anum_pg_publication_sync_pfsyncenabled - 1] = true;
+
+			newtup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
+									   replaces);
+			CatalogTupleUpdate(rel, &newtup->t_self, newtup);
+			heap_freetuple(newtup);
+		}
+	}
+
+	systable_endscan(scan);
+
+	if (!found)
+	{
+		Datum		values[Natts_pg_publication_sync];
+		bool		nulls[Natts_pg_publication_sync];
+		HeapTuple	newtup;
+		Oid			pfsyncoid;
+		ObjectAddress myself,
+					referenced;
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, false, sizeof(nulls));
+
+		pfsyncoid = GetNewOidWithIndex(rel, PublicationSyncObjectIndexId,
+									   Anum_pg_publication_sync_oid);
+		values[Anum_pg_publication_sync_oid - 1] = ObjectIdGetDatum(pfsyncoid);
+		values[Anum_pg_publication_sync_pfsyncpubid - 1] = ObjectIdGetDatum(pubid);
+		values[Anum_pg_publication_sync_pfsynckind - 1] =
+			CharGetDatum(PFSYNC_KIND_PUBLICATION);
+		values[Anum_pg_publication_sync_pfsyncnspid - 1] =
+			ObjectIdGetDatum(InvalidOid);
+		values[Anum_pg_publication_sync_pfsyncrelid - 1] =
+			ObjectIdGetDatum(InvalidOid);
+		values[Anum_pg_publication_sync_pfsyncobjid - 1] =
+			ObjectIdGetDatum(InvalidOid);
+		values[Anum_pg_publication_sync_pfsyncsubid - 1] = Int32GetDatum(0);
+		values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
+		values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
+		nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
+
+		newtup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+		CatalogTupleInsert(rel, newtup);
+		heap_freetuple(newtup);
+
+		ObjectAddressSet(myself, PublicationSyncRelationId, pfsyncoid);
+		ObjectAddressSet(referenced, PublicationRelationId, pubid);
+		recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
+	}
+
+	table_close(rel, RowExclusiveLock);
 }
 
 /*
@@ -843,6 +1017,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
 	char		publish_generated_columns;
+	bool		ddl_given;
+	int			ddlmask;
 	AclResult	aclresult;
 	List	   *relations = NIL;
 	List	   *schemaidlist = NIL;
@@ -884,7 +1060,9 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root,
 							  &publish_generated_columns_given,
-							  &publish_generated_columns);
+							  &publish_generated_columns,
+							  &ddl_given,
+							  &ddlmask);
 
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
@@ -899,6 +1077,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		BoolGetDatum(pubactions.pubdelete);
 	values[Anum_pg_publication_pubtruncate - 1] =
 		BoolGetDatum(pubactions.pubtruncate);
+	values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(ddlmask);
 	values[Anum_pg_publication_pubviaroot - 1] =
 		BoolGetDatum(publish_via_partition_root);
 	values[Anum_pg_publication_pubgencols - 1] =
@@ -916,6 +1095,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 
 	/* Make the changes visible. */
 	CommandCounterIncrement();
+	upsert_publication_sync_default(puboid, ddlmask);
 
 	/* Associate objects with the publication. */
 	if (stmt->for_all_tables)
@@ -990,6 +1170,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	bool		publish_via_partition_root;
 	bool		publish_generated_columns_given;
 	char		publish_generated_columns;
+	bool		ddl_given;
+	int			ddlmask;
 	ObjectAddress obj;
 	Form_pg_publication pubform;
 	List	   *root_relids = NIL;
@@ -1001,7 +1183,9 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root,
 							  &publish_generated_columns_given,
-							  &publish_generated_columns);
+							  &publish_generated_columns,
+							  &ddl_given,
+							  &ddlmask);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
@@ -1117,6 +1301,12 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 		replaces[Anum_pg_publication_pubgencols - 1] = true;
 	}
 
+	if (ddl_given)
+	{
+		values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(ddlmask);
+		replaces[Anum_pg_publication_pubddl - 1] = true;
+	}
+
 	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
 							replaces);
 
@@ -1124,6 +1314,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 	CommandCounterIncrement();
+	if (ddl_given)
+		upsert_publication_sync_default(pubform->oid, ddlmask);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
@@ -1649,6 +1841,27 @@ RemovePublicationSchemaById(Oid psoid)
 
 	ReleaseSysCache(tup);
 
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * Remove publication DDL sync metadata by mapping OID.
+ */
+void
+RemovePublicationSyncById(Oid pfoid)
+{
+	Relation	rel;
+	HeapTuple	tup;
+
+	rel = table_open(PublicationSyncRelationId, RowExclusiveLock);
+
+	tup = SearchSysCache1(PUBLICATIONSYNC, ObjectIdGetDatum(pfoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for publication sync %u", pfoid);
+
+	CatalogTupleDelete(rel, &tup->t_self);
+
+	ReleaseSysCache(tup);
 	table_close(rel, RowExclusiveLock);
 }
 

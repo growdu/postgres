@@ -1087,6 +1087,7 @@ GetPublication(Oid pubid)
 	pub->pubactions.pubupdate = pubform->pubupdate;
 	pub->pubactions.pubdelete = pubform->pubdelete;
 	pub->pubactions.pubtruncate = pubform->pubtruncate;
+	pub->pubddl = pubform->pubddl;
 	pub->pubviaroot = pubform->pubviaroot;
 	pub->pubgencols_type = pubform->pubgencols;
 

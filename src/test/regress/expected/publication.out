@@ -20,11 +20,51 @@ SET client_min_messages = 'ERROR';
 CREATE PUBLICATION testpub_ins_trunct WITH (publish = insert);
 RESET client_min_messages;
 ALTER PUBLICATION testpub_default SET (publish = update);
+ALTER PUBLICATION testpub_default SET (ddl = 'table,index,trigger');
+SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
+    pubname     | pubddl 
+----------------+--------
+ testpub_default |     11
+(1 row)
+
+SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
+  FROM pg_publication_sync s
+  JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE p.pubname = 'testpub_default'
+ ORDER BY 1, 2, 3;
+ pfsynckind | pfsyncenabled | pfsyncddl 
+------------+---------------+-----------
+ p          | t             |        11
+(1 row)
+
+ALTER PUBLICATION testpub_default SET (ddl = 'view,function');
+SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
+    pubname     | pubddl 
+----------------+--------
+ testpub_default |    144
+(1 row)
+
+SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
+  FROM pg_publication_sync s
+  JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE p.pubname = 'testpub_default'
+ ORDER BY 1, 2, 3;
+ pfsynckind | pfsyncenabled | pfsyncddl 
+------------+---------------+-----------
+ p          | t             |       144
+(1 row)
+
 -- error cases
 CREATE PUBLICATION testpub_xxx WITH (foo);
 ERROR:  unrecognized publication parameter: "foo"
 CREATE PUBLICATION testpub_xxx WITH (publish = 'cluster, vacuum');
 ERROR:  unrecognized value for publication option "publish": "cluster"
+CREATE PUBLICATION testpub_xxx WITH (ddl = 'table, unknown_ddl');
+ERROR:  unrecognized value for publication option "ddl": "unknown_ddl"
+CREATE PUBLICATION testpub_xxx WITH (ddl = 'table', ddl = 'index');
+ERROR:  conflicting or redundant options
+LINE 1: CREATE PUBLICATION testpub_xxx WITH (ddl = 'table', ddl = '...
+                                                            ^
 CREATE PUBLICATION testpub_xxx WITH (publish_via_partition_root = 'true', publish_via_partition_root = '0');
 ERROR:  conflicting or redundant options
 LINE 1: ...ub_xxx WITH (publish_via_partition_root = 'true', publish_vi...
