@@ -49,7 +49,9 @@ rtk make -C src/bin/pg_dump check
 ## 3. 单节点 SQL 验证（手工）
 
 ```sql
+CREATE TABLE pub_ddl_test_tbl(id int primary key, v text);
 CREATE PUBLICATION pub_ddl_test
+FOR TABLE pub_ddl_test_tbl
 WITH (ddl = 'table,index,trigger');
 
 SELECT pubname, pubddl
@@ -74,8 +76,8 @@ JOIN pg_publication p ON p.oid = s.pfsyncpubid
 WHERE p.pubname = 'pub_ddl_test';
 
 -- 错误校验
-CREATE PUBLICATION pub_ddl_bad WITH (ddl = 'table,not_exist_kind');
-CREATE PUBLICATION pub_ddl_dup WITH (ddl = 'table', ddl = 'index');
+CREATE PUBLICATION pub_ddl_bad FOR TABLE pub_ddl_test_tbl WITH (ddl = 'table,not_exist_kind');
+CREATE PUBLICATION pub_ddl_dup FOR TABLE pub_ddl_test_tbl WITH (ddl = 'table', ddl = 'index');
 ```
 
 预期：
@@ -87,24 +89,25 @@ CREATE PUBLICATION pub_ddl_dup WITH (ddl = 'table', ddl = 'index');
 ### 3.1 单条 DDL 仅写一条对象记录（含 publication_list）
 
 ```sql
-CREATE PUBLICATION pub_ddl_obj_a WITH (ddl = 'table,index');
-CREATE PUBLICATION pub_ddl_obj_b WITH (ddl = 'table');
-
 CREATE TABLE ddl_obj_once(id int);
+CREATE PUBLICATION pub_ddl_obj_a FOR TABLE ddl_obj_once WITH (ddl = 'table,index');
+CREATE PUBLICATION pub_ddl_obj_b FOR TABLE ddl_obj_once WITH (ddl = 'table');
+
+ALTER TABLE ddl_obj_once ADD COLUMN c1 int;
 
 SELECT count(*) AS ddl_obj_rows
   FROM pg_publication_sync
  WHERE pfsynckind = 'o'
-   AND position('CREATE TABLE ddl_obj_once' in ddl_str) > 0;
+   AND position('ALTER TABLE ddl_obj_once' in ddl_str) > 0;
 
 SELECT coalesce(bool_or(position('pub_ddl_obj_a' in publication_list) > 0), false) AS has_pub_a,
        coalesce(bool_or(position('pub_ddl_obj_b' in publication_list) > 0), false) AS has_pub_b
   FROM pg_publication_sync
  WHERE pfsynckind = 'o'
-   AND position('CREATE TABLE ddl_obj_once' in ddl_str) > 0;
+   AND position('ALTER TABLE ddl_obj_once' in ddl_str) > 0;
 
-DROP TABLE ddl_obj_once;
 DROP PUBLICATION pub_ddl_obj_a, pub_ddl_obj_b;
+DROP TABLE ddl_obj_once;
 ```
 
 预期：
@@ -159,7 +162,8 @@ WHERE subname = 'sub1';
 publisher：
 
 ```sql
-CREATE PUBLICATION pub_sys_late WITH (ddl = 'table,index');
+CREATE TABLE t_sys_late(id int primary key, v text);
+CREATE PUBLICATION pub_sys_late FOR TABLE t_sys_late WITH (ddl = 'table,index');
 ```
 
 subscriber：
@@ -174,8 +178,7 @@ WITH (copy_data = false);
 publisher（订阅创建后触发）：
 
 ```sql
-CREATE PUBLICATION pub_sync_late WITH (ddl = 'table,index');
-ALTER PUBLICATION pub_sync_late SET (ddl = 'view,function');
+ALTER TABLE t_sys_late ADD COLUMN c2 int;
 ```
 
 subscriber：
@@ -183,14 +186,17 @@ subscriber：
 ```sql
 SELECT p.pubname, s.pfsynckind, s.message_type, s.ddl_str
   FROM pg_publication_sync s
-  JOIN pg_publication p ON p.oid = s.pfsyncpubid
- WHERE p.pubname = 'pub_sync_late'
+  LEFT JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE (s.pfsynckind = 'p' AND p.pubname = 'pub_sys_late')
+    OR (s.pfsynckind = 'o'
+        AND position('pub_sys_late' in coalesce(s.publication_list, '')) > 0
+        AND position('t_sys_late' in coalesce(s.ddl_str, '')) > 0)
  ORDER BY s.pfsynckind, s.oid;
 ```
 
 预期：
 
-* 能看到 `pub_sync_late` 的 `pfsynckind='p'` 与 `pfsynckind='o'` 记录；
+* 能看到 `pub_sys_late` 的 `pfsynckind='p'` 与 `pfsynckind='o'` 记录；
 * 说明订阅建立后新增的 `pg_publication_sync` 数据可以实时同步。
 
 ---
