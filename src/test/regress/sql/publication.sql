@@ -21,18 +21,20 @@ RESET client_min_messages;
 ALTER PUBLICATION testpub_default SET (publish = update);
 ALTER PUBLICATION testpub_default SET (ddl = 'table,index,trigger');
 SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
-SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
+SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl,
+       s.message_type, s.target_table, s.ddl_str
   FROM pg_publication_sync s
   JOIN pg_publication p ON p.oid = s.pfsyncpubid
  WHERE p.pubname = 'testpub_default'
- ORDER BY 1, 2, 3;
+ ORDER BY 1, 2, 3, 4, 5, 6;
 ALTER PUBLICATION testpub_default SET (ddl = 'view,function');
 SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
-SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl
+SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl,
+       s.message_type, s.target_table, s.ddl_str
   FROM pg_publication_sync s
   JOIN pg_publication p ON p.oid = s.pfsyncpubid
  WHERE p.pubname = 'testpub_default'
- ORDER BY 1, 2, 3;
+ ORDER BY 1, 2, 3, 4, 5, 6;
 
 SELECT pg_relation_is_publishable('pg_catalog.pg_publication_sync'::regclass);
 SET client_min_messages = 'ERROR';

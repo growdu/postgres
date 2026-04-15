@@ -336,6 +336,9 @@ upsert_publication_sync_default(Oid pubid, int ddlmask)
 		values[Anum_pg_publication_sync_pfsyncsubid - 1] = Int32GetDatum(0);
 		values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
 		values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
+		nulls[Anum_pg_publication_sync_message_type - 1] = true;
+		nulls[Anum_pg_publication_sync_target_table - 1] = true;
+		nulls[Anum_pg_publication_sync_ddl_str - 1] = true;
 		nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
 
 		newtup = heap_form_tuple(RelationGetDescr(rel), values, nulls);

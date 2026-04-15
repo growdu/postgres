@@ -39,6 +39,9 @@ CATALOG(pg_publication_sync,9352,PublicationSyncRelationId)
 	int32		pfsyncddl BKI_DEFAULT(0);
 
 #ifdef CATALOG_VARLEN
+	text		message_type BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		target_table BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		ddl_str BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 	text		pfsyncextra BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 #endif
 } FormData_pg_publication_sync;
