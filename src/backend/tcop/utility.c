@@ -692,8 +692,6 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	Relation	pubrel;
 	TableScanDesc pubscan;
 	HeapTuple	pubtup;
-	CommandTag	tag;
-	const char *tagname;
 	char	   *ddl_sql;
 	char	   *target_table;
 	int			ddlmask;
@@ -707,8 +705,6 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	if (!UtilityStmtShouldCaptureDDL(parsetree))
 		return;
 
-	tag = CreateCommandTag(parsetree);
-	tagname = GetCommandTagName(tag);
 	ddl_sql = UtilityStatementText(pstmt, queryString);
 	target_table = UtilityStmtTargetTable(parsetree);
 	ddlmask = UtilityStmtDDLMask(parsetree);
@@ -774,7 +770,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 		values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
 		values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
 		values[Anum_pg_publication_sync_message_type - 1] =
-			CStringGetTextDatum(tagname);
+			CStringGetTextDatum("Q");
 
 		if (target_table != NULL)
 			values[Anum_pg_publication_sync_target_table - 1] =

@@ -153,6 +153,7 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/execPartition.h"
+#include "executor/spi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
@@ -175,6 +176,7 @@
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/dynahash.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -386,6 +388,8 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
+static void maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
+												 TupleTableSlot *newslot);
 static bool FindReplTupleInLocalRel(ApplyExecutionData *edata, Relation localrel,
 									LogicalRepRelation *remoterel,
 									Oid localidxoid,
@@ -2505,6 +2509,102 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 	/* Do the insert. */
 	TargetPrivilegesCheck(relinfo->ri_RelationDesc, ACL_INSERT);
 	ExecSimpleRelationInsert(relinfo, estate, remoteslot);
+	maybe_apply_publication_sync_message(relinfo, remoteslot);
+}
+
+/*
+ * Execute the message payload carried by pg_publication_sync tuples.
+ *
+ * Currently only "Q" is supported, where ddl_str is replayed as SQL text on
+ * the subscriber.
+ */
+static void
+maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
+									 TupleTableSlot *newslot)
+{
+	Relation	localrel = relinfo->ri_RelationDesc;
+	bool		isnull;
+	char		pfsynckind;
+	Datum		kinddatum;
+	Datum		msgdatum;
+	char	   *message_type;
+
+	if (RelationGetRelid(localrel) != PublicationSyncRelationId)
+		return;
+
+	kinddatum = slot_getattr(newslot,
+							 Anum_pg_publication_sync_pfsynckind,
+							 &isnull);
+	if (isnull)
+		return;
+
+	pfsynckind = DatumGetChar(kinddatum);
+	if (pfsynckind != PFSYNC_KIND_OBJECT)
+		return;
+
+	msgdatum = slot_getattr(newslot,
+							Anum_pg_publication_sync_message_type,
+							&isnull);
+	if (isnull)
+		return;
+
+	message_type = TextDatumGetCString(msgdatum);
+
+	if (strcmp(message_type, "Q") == 0)
+	{
+		Datum		ddldatum;
+		char	   *ddl_sql;
+		int			spi_rc;
+
+		ddldatum = slot_getattr(newslot,
+								Anum_pg_publication_sync_ddl_str,
+								&isnull);
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("pg_publication_sync message type \"Q\" requires ddl_str")));
+
+		ddl_sql = TextDatumGetCString(ddldatum);
+		if (ddl_sql[0] == '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("pg_publication_sync message type \"Q\" requires non-empty ddl_str")));
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed while applying pg_publication_sync message");
+
+		PG_TRY();
+		{
+			spi_rc = SPI_execute(ddl_sql, false, 0);
+			if (spi_rc != SPI_OK_UTILITY && spi_rc != SPI_OK_SELINTO)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("failed to execute pg_publication_sync ddl_str"),
+						 errdetail("SPI_execute returned %s.",
+								   SPI_result_code_string(spi_rc))));
+
+			if (SPI_finish() != SPI_OK_FINISH)
+				elog(ERROR, "SPI_finish failed while applying pg_publication_sync message");
+		}
+		PG_CATCH();
+		{
+			(void) SPI_finish();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		pfree(ddl_sql);
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unsupported pg_publication_sync message type \"%s\"",
+						message_type),
+				 errhint("Currently only message type \"Q\" is supported.")));
+	}
+
+	pfree(message_type);
 }
 
 /*
@@ -2734,6 +2834,7 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 		TargetPrivilegesCheck(relinfo->ri_RelationDesc, ACL_UPDATE);
 		ExecSimpleRelationUpdate(relinfo, estate, &epqstate, localslot,
 								 remoteslot);
+		maybe_apply_publication_sync_message(relinfo, remoteslot);
 	}
 	else
 	{

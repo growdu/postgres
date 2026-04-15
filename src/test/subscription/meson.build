@@ -42,6 +42,7 @@ tests += {
       't/033_run_as_table_owner.pl',
       't/034_temporal.pl',
       't/035_conflicts.pl',
+      't/036_pg_publication_sync_apply.pl',
       't/100_bugs.pl',
     ],
   },
