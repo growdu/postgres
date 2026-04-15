@@ -26,6 +26,7 @@ SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl,
   FROM pg_publication_sync s
   JOIN pg_publication p ON p.oid = s.pfsyncpubid
  WHERE p.pubname = 'testpub_default'
+   AND s.pfsynckind = 'p'
  ORDER BY 1, 2, 3, 4, 5, 6;
 ALTER PUBLICATION testpub_default SET (ddl = 'view,function');
 SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
@@ -34,17 +35,18 @@ SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl,
   FROM pg_publication_sync s
   JOIN pg_publication p ON p.oid = s.pfsyncpubid
  WHERE p.pubname = 'testpub_default'
+   AND s.pfsynckind = 'p'
  ORDER BY 1, 2, 3, 4, 5, 6;
 
 SELECT pg_relation_is_publishable('pg_catalog.pg_publication_sync'::regclass);
-SET client_min_messages = 'ERROR';
-CREATE PUBLICATION testpub_sysrel FOR TABLE pg_catalog.pg_publication_sync;
-RESET client_min_messages;
 SELECT schemaname, tablename
   FROM pg_publication_tables
- WHERE pubname = 'testpub_sysrel'
+ WHERE pubname = 'testpub_default'
  ORDER BY 1, 2;
-DROP PUBLICATION testpub_sysrel;
+SELECT schemaname, tablename
+  FROM pg_publication_tables
+ WHERE pubname = 'testpub_ins_trunct'
+ ORDER BY 1, 2;
 
 -- error cases
 CREATE PUBLICATION testpub_xxx WITH (foo);

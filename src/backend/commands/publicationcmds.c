@@ -79,8 +79,6 @@ static char defGetGeneratedColsOption(DefElem *def);
 static int	parse_publication_ddl_option(ParseState *pstate, DefElem *defel);
 static void upsert_publication_sync_default(Oid pubid, int ddlmask);
 
-#define PFSYNC_KIND_PUBLICATION	'p'
-
 
 static void
 parse_publication_options(ParseState *pstate,

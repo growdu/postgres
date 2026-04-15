@@ -29,6 +29,7 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_type.h"
 #include "commands/publicationcmds.h"
 #include "funcapi.h"
@@ -774,6 +775,39 @@ GetRelationPublications(Oid relid)
 
 	ReleaseSysCacheList(pubrellist);
 
+	/*
+	 * pg_publication_sync is implicitly synchronized whenever publication DDL
+	 * sync is enabled via WITH (ddl = ...), so include those publications
+	 * without requiring explicit ADD TABLE.
+	 */
+	if (relid == PublicationSyncRelationId)
+	{
+		Relation	rel;
+		ScanKeyData scankey;
+		SysScanDesc scan;
+		HeapTuple	tup;
+
+		rel = table_open(PublicationRelationId, AccessShareLock);
+		ScanKeyInit(&scankey,
+					Anum_pg_publication_pubddl,
+					BTGreaterStrategyNumber, F_INT4GT,
+					Int32GetDatum(0));
+		scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, &scankey);
+
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Oid			pubid = ((Form_pg_publication) GETSTRUCT(tup))->oid;
+
+			result = lappend_oid(result, pubid);
+		}
+
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+
+		list_sort(result, list_oid_cmp);
+		list_deduplicate_oid(result);
+	}
+
 	return result;
 }
 
@@ -815,6 +849,20 @@ GetPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt)
 
 	systable_endscan(scan);
 	table_close(pubrelsrel, AccessShareLock);
+
+	/* Implicitly include pg_publication_sync when publication has ddl enabled. */
+	{
+		HeapTuple	pubtup = SearchSysCache1(PUBLICATIONOID,
+											 ObjectIdGetDatum(pubid));
+
+		if (!HeapTupleIsValid(pubtup))
+			elog(ERROR, "cache lookup failed for publication %u", pubid);
+
+		if (((Form_pg_publication) GETSTRUCT(pubtup))->pubddl != 0)
+			result = lappend_oid(result, PublicationSyncRelationId);
+
+		ReleaseSysCache(pubtup);
+	}
 
 	/* Now sort and de-duplicate the result list */
 	list_sort(result, list_oid_cmp);
@@ -891,6 +939,7 @@ GetAllTablesPublicationRelations(bool pubviaroot)
 		Oid			relid = relForm->oid;
 
 		if (is_publishable_class(relid, relForm) &&
+			relid != PublicationSyncRelationId &&
 			!(relForm->relispartition && pubviaroot))
 			result = lappend_oid(result, relid);
 	}
@@ -912,6 +961,7 @@ GetAllTablesPublicationRelations(bool pubviaroot)
 			Oid			relid = relForm->oid;
 
 			if (is_publishable_class(relid, relForm) &&
+				relid != PublicationSyncRelationId &&
 				!relForm->relispartition)
 				result = lappend_oid(result, relid);
 		}
@@ -1168,7 +1218,12 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 			 * those. Otherwise, get the partitioned table itself.
 			 */
 			if (pub_elem->alltables)
+			{
 				pub_elem_tables = GetAllTablesPublicationRelations(pub_elem->pubviaroot);
+				if (pub_elem->pubddl != 0)
+					pub_elem_tables = lappend_oid(pub_elem_tables,
+												  PublicationSyncRelationId);
+			}
 			else
 			{
 				List	   *relids,

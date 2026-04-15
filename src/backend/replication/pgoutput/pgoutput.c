@@ -16,6 +16,7 @@
 #include "catalog/partition.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "commands/defrem.h"
 #include "commands/subscriptioncmds.h"
@@ -2203,8 +2204,9 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 			 */
 			if (pub->alltables)
 			{
-				publish = true;
-				if (pub->pubviaroot && am_partition)
+				publish = (relid != PublicationSyncRelationId ||
+						   pub->pubddl != 0);
+				if (publish && pub->pubviaroot && am_partition)
 				{
 					List	   *ancestors = get_partition_ancestors(relid);
 

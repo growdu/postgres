@@ -55,6 +55,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_publication.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_shseclabel.h"
 #include "catalog/pg_statistic_ext.h"
@@ -5867,6 +5868,16 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 			elog(ERROR, "cache lookup failed for publication %u", pubid);
 
 		pubform = (Form_pg_publication) GETSTRUCT(tup);
+
+		/*
+		 * pg_publication_sync is implicitly replicated only for publications
+		 * that enabled ddl sync via WITH (ddl = ...).
+		 */
+		if (relid == PublicationSyncRelationId && pubform->pubddl == 0)
+		{
+			ReleaseSysCache(tup);
+			continue;
+		}
 
 		pubdesc->pubactions.pubinsert |= pubform->pubinsert;
 		pubdesc->pubactions.pubupdate |= pubform->pubupdate;

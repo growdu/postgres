@@ -53,6 +53,11 @@ CATALOG(pg_publication_sync,9352,PublicationSyncRelationId)
  */
 typedef FormData_pg_publication_sync *Form_pg_publication_sync;
 
+#define PFSYNC_KIND_PUBLICATION	'p'
+#define PFSYNC_KIND_RELATION	'r'
+#define PFSYNC_KIND_NAMESPACE	'n'
+#define PFSYNC_KIND_OBJECT		'o'
+
 DECLARE_TOAST(pg_publication_sync, 9356, 9357);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_publication_sync_oid_index, 9353, PublicationSyncObjectIndexId, pg_publication_sync, btree(oid oid_ops));
