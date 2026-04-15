@@ -338,6 +338,7 @@ upsert_publication_sync_default(Oid pubid, int ddlmask)
 		nulls[Anum_pg_publication_sync_target_table - 1] = true;
 		nulls[Anum_pg_publication_sync_ddl_str - 1] = true;
 		nulls[Anum_pg_publication_sync_publication_list - 1] = true;
+		nulls[Anum_pg_publication_sync_search_path - 1] = true;
 		nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
 
 		newtup = heap_form_tuple(RelationGetDescr(rel), values, nulls);

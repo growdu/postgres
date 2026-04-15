@@ -199,6 +199,69 @@ SELECT p.pubname, s.pfsynckind, s.message_type, s.ddl_str
 * 能看到 `pub_sys_late` 的 `pfsynckind='p'` 与 `pfsynckind='o'` 记录；
 * 说明订阅建立后新增的 `pg_publication_sync` 数据可以实时同步。
 
+### 4.4 验证订阅端对 `message_type='Q'` 的 DDL apply
+
+> 目标：订阅端收到 `pg_publication_sync` 行后，不仅写系统表，还会执行该行 `ddl_str`。
+
+publisher：
+
+```sql
+CREATE TABLE t_apply_base(id int primary key);
+CREATE SCHEMA t_apply_nsp;
+CREATE PUBLICATION pub_apply FOR TABLE t_apply_base WITH (ddl = 'table');
+```
+
+subscriber：
+
+```sql
+CREATE TABLE t_apply_base(id int primary key);
+CREATE SCHEMA t_apply_nsp;
+CREATE SUBSCRIPTION sub_apply
+CONNECTION 'host=127.0.0.1 port=<publisher_port> dbname=<db> user=<user> password=<pwd>'
+PUBLICATION pub_apply
+WITH (copy_data = false);
+```
+
+publisher（订阅在线后触发）：
+
+```sql
+SET search_path = t_apply_nsp;
+CREATE TABLE t_apply_q(id int primary key);
+```
+
+subscriber：
+
+```sql
+SELECT to_regclass('t_apply_nsp.t_apply_q') IS NOT NULL AS ddl_applied;
+
+SELECT count(*) AS q_rows
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND message_type = 'Q'
+   AND search_path = 't_apply_nsp'
+   AND position('CREATE TABLE t_apply_q' in ddl_str) > 0;
+```
+
+预期：
+
+* `ddl_applied = true`；
+* `q_rows = 1`；
+* 说明订阅端已按 `Q` 消息执行 `ddl_str`，同时保留同步到本地的 `pg_publication_sync` 记录。
+
+### 4.5 `message_type` 分支框架验证（A/D 预留）
+
+当前实现约束：
+
+* apply 分发器支持识别 `Q/A/D` 三种消息类型；
+* 仅 `Q` 已实现（执行 `ddl_str`）；
+* `A`、`D` 为预留分支，当前显式返回 `FEATURE_NOT_SUPPORTED`；
+* 未知类型也会显式报错，不会被静默吞掉。
+
+验证点：
+
+* 收到 `A` 或 `D` 时，日志/报错包含 “not supported yet”；
+* 收到未知类型时，日志/报错包含 “Supported message types are Q/A/D; only Q is implemented now.”
+
 ---
 
 ## 5. 备份恢复验证（手工）

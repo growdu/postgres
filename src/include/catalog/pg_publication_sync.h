@@ -43,6 +43,7 @@ CATALOG(pg_publication_sync,9352,PublicationSyncRelationId)
 	text		target_table BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 	text		ddl_str BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 	text		publication_list BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		search_path BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 	text		pfsyncextra BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 #endif
 } FormData_pg_publication_sync;

@@ -694,6 +694,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	HeapTuple	pubtup;
 	char	   *ddl_sql;
 	char	   *target_table;
+	char	   *ddl_search_path;
 	int			ddlmask;
 	Oid			selected_pubid = InvalidOid;
 	StringInfoData publication_list_buf;
@@ -707,6 +708,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 
 	ddl_sql = UtilityStatementText(pstmt, queryString);
 	target_table = UtilityStmtTargetTable(parsetree);
+	ddl_search_path = GetConfigOptionByName("search_path", NULL, false);
 	ddlmask = UtilityStmtDDLMask(parsetree);
 
 	pubrel = table_open(PublicationRelationId, AccessShareLock);
@@ -790,6 +792,12 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 		else
 			nulls[Anum_pg_publication_sync_publication_list - 1] = true;
 
+		if (ddl_search_path != NULL && ddl_search_path[0] != '\0')
+			values[Anum_pg_publication_sync_search_path - 1] =
+				CStringGetTextDatum(ddl_search_path);
+		else
+			nulls[Anum_pg_publication_sync_search_path - 1] = true;
+
 		nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
 
 		newtup = heap_form_tuple(RelationGetDescr(syncrel), values, nulls);
@@ -807,6 +815,8 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 		pfree(target_table);
 	if (ddl_sql != NULL)
 		pfree(ddl_sql);
+	if (ddl_search_path != NULL)
+		pfree(ddl_search_path);
 	if (has_publication)
 		pfree(publication_list_buf.data);
 }

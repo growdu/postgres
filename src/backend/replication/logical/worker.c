@@ -271,6 +271,14 @@ typedef enum
 	TRANS_PARALLEL_APPLY,
 } TransApplyAction;
 
+typedef enum PublicationSyncMessageKind
+{
+	PUBLICATION_SYNC_MSG_Q,
+	PUBLICATION_SYNC_MSG_A,
+	PUBLICATION_SYNC_MSG_D,
+	PUBLICATION_SYNC_MSG_UNKNOWN
+} PublicationSyncMessageKind;
+
 /* errcontext tracker */
 static ApplyErrorCallbackArg apply_error_callback_arg =
 {
@@ -388,6 +396,10 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
+static PublicationSyncMessageKind decode_publication_sync_message_type(const char *message_type);
+static void apply_publication_sync_message_q(TupleTableSlot *newslot);
+static void apply_publication_sync_message_a(TupleTableSlot *newslot);
+static void apply_publication_sync_message_d(TupleTableSlot *newslot);
 static void maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 												 TupleTableSlot *newslot);
 static bool FindReplTupleInLocalRel(ApplyExecutionData *edata, Relation localrel,
@@ -2512,11 +2524,127 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 	maybe_apply_publication_sync_message(relinfo, remoteslot);
 }
 
+static PublicationSyncMessageKind
+decode_publication_sync_message_type(const char *message_type)
+{
+	if (strcmp(message_type, "Q") == 0)
+		return PUBLICATION_SYNC_MSG_Q;
+	if (strcmp(message_type, "A") == 0)
+		return PUBLICATION_SYNC_MSG_A;
+	if (strcmp(message_type, "D") == 0)
+		return PUBLICATION_SYNC_MSG_D;
+	return PUBLICATION_SYNC_MSG_UNKNOWN;
+}
+
+static void
+apply_publication_sync_message_q(TupleTableSlot *newslot)
+{
+	bool		isnull;
+	Datum		ddldatum;
+	Datum		searchpathdatum;
+	char	   *ddl_sql;
+	char	   *captured_search_path;
+	char	   *saved_search_path;
+	int			spi_rc;
+
+	ddldatum = slot_getattr(newslot,
+							Anum_pg_publication_sync_ddl_str,
+							&isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires ddl_str")));
+
+	ddl_sql = TextDatumGetCString(ddldatum);
+	if (ddl_sql[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires non-empty ddl_str")));
+
+	searchpathdatum = slot_getattr(newslot,
+								   Anum_pg_publication_sync_search_path,
+								   &isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires search_path")));
+
+	captured_search_path = TextDatumGetCString(searchpathdatum);
+	if (captured_search_path[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires non-empty search_path")));
+
+	saved_search_path = GetConfigOptionByName("search_path", NULL, false);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed while applying pg_publication_sync message");
+
+	PG_TRY();
+	{
+		(void) set_config_option("search_path", captured_search_path,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+
+		spi_rc = SPI_execute(ddl_sql, false, 0);
+		if (spi_rc != SPI_OK_UTILITY && spi_rc != SPI_OK_SELINTO)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("failed to execute pg_publication_sync ddl_str"),
+					 errdetail("SPI_execute returned %s.",
+							   SPI_result_code_string(spi_rc))));
+
+		(void) set_config_option("search_path", saved_search_path,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+
+		if (SPI_finish() != SPI_OK_FINISH)
+			elog(ERROR, "SPI_finish failed while applying pg_publication_sync message");
+	}
+	PG_CATCH();
+	{
+		(void) set_config_option("search_path", saved_search_path,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+		(void) SPI_finish();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	pfree(saved_search_path);
+	pfree(captured_search_path);
+	pfree(ddl_sql);
+}
+
+static void
+apply_publication_sync_message_a(TupleTableSlot *newslot)
+{
+	(void) newslot;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_publication_sync message type \"A\" is not supported yet"),
+			 errhint("Reserved for ALTER-style apply flow.")));
+}
+
+static void
+apply_publication_sync_message_d(TupleTableSlot *newslot)
+{
+	(void) newslot;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_publication_sync message type \"D\" is not supported yet"),
+			 errhint("Reserved for DROP-style apply flow.")));
+}
+
 /*
  * Execute the message payload carried by pg_publication_sync tuples.
  *
- * Currently only "Q" is supported, where ddl_str is replayed as SQL text on
- * the subscriber.
+ * Message dispatch framework:
+ *   Q: Execute ddl_str as SQL on subscriber.
+ *   A: Reserved (framework branch, not implemented).
+ *   D: Reserved (framework branch, not implemented).
  */
 static void
 maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
@@ -2528,6 +2656,7 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	Datum		kinddatum;
 	Datum		msgdatum;
 	char	   *message_type;
+	PublicationSyncMessageKind msgkind;
 
 	if (RelationGetRelid(localrel) != PublicationSyncRelationId)
 		return;
@@ -2549,59 +2678,26 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 		return;
 
 	message_type = TextDatumGetCString(msgdatum);
+	msgkind = decode_publication_sync_message_type(message_type);
 
-	if (strcmp(message_type, "Q") == 0)
+	switch (msgkind)
 	{
-		Datum		ddldatum;
-		char	   *ddl_sql;
-		int			spi_rc;
-
-		ddldatum = slot_getattr(newslot,
-								Anum_pg_publication_sync_ddl_str,
-								&isnull);
-		if (isnull)
+		case PUBLICATION_SYNC_MSG_Q:
+			apply_publication_sync_message_q(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_A:
+			apply_publication_sync_message_a(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_D:
+			apply_publication_sync_message_d(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_UNKNOWN:
 			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("pg_publication_sync message type \"Q\" requires ddl_str")));
-
-		ddl_sql = TextDatumGetCString(ddldatum);
-		if (ddl_sql[0] == '\0')
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("pg_publication_sync message type \"Q\" requires non-empty ddl_str")));
-
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "SPI_connect failed while applying pg_publication_sync message");
-
-		PG_TRY();
-		{
-			spi_rc = SPI_execute(ddl_sql, false, 0);
-			if (spi_rc != SPI_OK_UTILITY && spi_rc != SPI_OK_SELINTO)
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("failed to execute pg_publication_sync ddl_str"),
-						 errdetail("SPI_execute returned %s.",
-								   SPI_result_code_string(spi_rc))));
-
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed while applying pg_publication_sync message");
-		}
-		PG_CATCH();
-		{
-			(void) SPI_finish();
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-
-		pfree(ddl_sql);
-	}
-	else
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("unsupported pg_publication_sync message type \"%s\"",
-						message_type),
-				 errhint("Currently only message type \"Q\" is supported.")));
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported pg_publication_sync message type \"%s\"",
+							message_type),
+					 errhint("Supported message types are Q/A/D; only Q is implemented now.")));
+			break;
 	}
 
 	pfree(message_type);

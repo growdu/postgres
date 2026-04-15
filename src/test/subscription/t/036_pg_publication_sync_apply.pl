@@ -25,6 +25,8 @@ $node_publisher->safe_psql('postgres',
 	"CREATE TABLE tap_sync_base (id int primary key)");
 $node_subscriber->safe_psql('postgres',
 	"CREATE TABLE tap_sync_base (id int primary key)");
+$node_publisher->safe_psql('postgres', "CREATE SCHEMA tap_sync_nsp");
+$node_subscriber->safe_psql('postgres', "CREATE SCHEMA tap_sync_nsp");
 
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
 
@@ -42,12 +44,12 @@ $node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub');
 # Emit one DDL on publisher. It should be captured as a pg_publication_sync row
 # (message_type = 'Q') and replayed on subscriber.
 $node_publisher->safe_psql('postgres',
-	"CREATE TABLE tap_sync_ddl_q (id int primary key)");
+	"SET search_path = tap_sync_nsp; CREATE TABLE tap_sync_ddl_q (id int primary key)");
 $node_publisher->wait_for_catchup('tap_sub');
 
 my $result = $node_subscriber->safe_psql(
 	'postgres',
-	"SELECT to_regclass('public.tap_sync_ddl_q') IS NOT NULL");
+	"SELECT to_regclass('tap_sync_nsp.tap_sync_ddl_q') IS NOT NULL");
 is($result, 't',
 	'message type Q from pg_publication_sync executes ddl_str on subscriber');
 
@@ -58,9 +60,11 @@ SELECT count(*)
   FROM pg_publication_sync
  WHERE pfsynckind = 'o'
    AND message_type = 'Q'
+   AND search_path = 'tap_sync_nsp'
    AND position('CREATE TABLE tap_sync_ddl_q' in ddl_str) > 0
 ));
-is($result, '1', 'subscriber keeps synced pg_publication_sync row');
+is($result, '1',
+	'subscriber keeps synced pg_publication_sync row with captured search_path');
 
 $node_subscriber->stop('fast');
 $node_publisher->stop('fast');
