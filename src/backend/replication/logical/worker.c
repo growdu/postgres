@@ -146,6 +146,7 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "commands/tablecmds.h"
@@ -475,9 +476,19 @@ should_apply_changes_for_rel(LogicalRepRelMapEntry *rel)
 								MySubscription->name),
 						 errdetail("Cannot handle streamed replication transactions using parallel apply workers until all tables have been synchronized.")));
 
+			if (rel->localreloid == PublicationSyncRelationId)
+				return (rel->state == SUBREL_STATE_READY ||
+						rel->state == SUBREL_STATE_UNKNOWN);
+
 			return rel->state == SUBREL_STATE_READY;
 
 		case WORKERTYPE_APPLY:
+			if (rel->localreloid == PublicationSyncRelationId)
+				return (rel->state == SUBREL_STATE_READY ||
+						rel->state == SUBREL_STATE_UNKNOWN ||
+						(rel->state == SUBREL_STATE_SYNCDONE &&
+						 rel->statelsn <= remote_final_lsn));
+
 			return (rel->state == SUBREL_STATE_READY ||
 					(rel->state == SUBREL_STATE_SYNCDONE &&
 					 rel->statelsn <= remote_final_lsn));

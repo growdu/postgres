@@ -152,6 +152,47 @@ WHERE subname = 'sub1';
 * `subddl` 首次落盘后为 `3`（table+index）
 * `ALTER` 后更新为 `144`（view+function）
 
+### 4.3 订阅先建立后验证 `pg_publication_sync` 增量同步
+
+> 目标：覆盖“订阅已在线，后续 `pg_publication_sync` 新记录必须可见”的场景。
+
+publisher：
+
+```sql
+CREATE PUBLICATION pub_sys_late WITH (ddl = 'table,index');
+```
+
+subscriber：
+
+```sql
+CREATE SUBSCRIPTION sub_sys_late
+CONNECTION 'host=127.0.0.1 port=<publisher_port> dbname=<db> user=<user> password=<pwd>'
+PUBLICATION pub_sys_late
+WITH (copy_data = false);
+```
+
+publisher（订阅创建后触发）：
+
+```sql
+CREATE PUBLICATION pub_sync_late WITH (ddl = 'table,index');
+ALTER PUBLICATION pub_sync_late SET (ddl = 'view,function');
+```
+
+subscriber：
+
+```sql
+SELECT p.pubname, s.pfsynckind, s.message_type, s.ddl_str
+  FROM pg_publication_sync s
+  JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE p.pubname = 'pub_sync_late'
+ ORDER BY s.pfsynckind, s.oid;
+```
+
+预期：
+
+* 能看到 `pub_sync_late` 的 `pfsynckind='p'` 与 `pfsynckind='o'` 记录；
+* 说明订阅建立后新增的 `pg_publication_sync` 数据可以实时同步。
+
 ---
 
 ## 5. 备份恢复验证（手工）

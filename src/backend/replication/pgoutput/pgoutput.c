@@ -2185,88 +2185,110 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 		 * but here we only need to consider ones that the subscriber
 		 * requested.
 		 */
-		foreach(lc, data->publications)
-		{
-			Publication *pub = lfirst(lc);
-			bool		publish = false;
-
-			/*
-			 * Under what relid should we publish changes in this publication?
-			 * We'll use the top-most relid across all publications. Also
-			 * track the ancestor level for this publication.
-			 */
-			Oid			pub_relid = relid;
-			int			ancestor_level = 0;
-
-			/*
-			 * If this is a FOR ALL TABLES publication, pick the partition
-			 * root and set the ancestor level accordingly.
-			 */
-			if (pub->alltables)
+			foreach(lc, data->publications)
 			{
-				publish = (relid != PublicationSyncRelationId ||
-						   pub->pubddl != 0);
-				if (publish && pub->pubviaroot && am_partition)
-				{
-					List	   *ancestors = get_partition_ancestors(relid);
-
-					pub_relid = llast_oid(ancestors);
-					ancestor_level = list_length(ancestors);
-				}
-			}
-
-			if (!publish)
-			{
-				bool		ancestor_published = false;
+				Publication *pub = lfirst(lc);
+				bool		publish = false;
 
 				/*
-				 * For a partition, check if any of the ancestors are
-				 * published.  If so, note down the topmost ancestor that is
-				 * published via this publication, which will be used as the
-				 * relation via which to publish the partition's changes.
+				 * Under what relid should we publish changes in this publication?
+				 * We'll use the top-most relid across all publications. Also
+				 * track the ancestor level for this publication.
 				 */
-				if (am_partition)
+				Oid			pub_relid = relid;
+				int			ancestor_level = 0;
+
+				/*
+				 * pg_publication_sync is replication metadata and should flow to
+				 * all connected subscribers (subject to their publication list),
+				 * without requiring explicit table membership.
+				 */
+				if (relid == PublicationSyncRelationId)
+					publish = true;
+
+				/*
+				 * If this is a FOR ALL TABLES publication, pick the partition
+				 * root and set the ancestor level accordingly.
+				 */
+				if (pub->alltables)
 				{
-					Oid			ancestor;
-					int			level;
-					List	   *ancestors = get_partition_ancestors(relid);
-
-					ancestor = GetTopMostAncestorInPublication(pub->oid,
-															   ancestors,
-															   &level);
-
-					if (ancestor != InvalidOid)
+					publish = true;
+					if (publish && pub->pubviaroot && am_partition)
 					{
-						ancestor_published = true;
-						if (pub->pubviaroot)
-						{
-							pub_relid = ancestor;
-							ancestor_level = level;
-						}
+						List	   *ancestors = get_partition_ancestors(relid);
+
+						pub_relid = llast_oid(ancestors);
+						ancestor_level = list_length(ancestors);
 					}
 				}
 
-				if (list_member_oid(pubids, pub->oid) ||
-					list_member_oid(schemaPubids, pub->oid) ||
-					ancestor_published)
-					publish = true;
-			}
+				if (!publish)
+				{
+					bool		ancestor_published = false;
 
-			/*
-			 * If the relation is to be published, determine actions to
-			 * publish, and list of columns, if appropriate.
-			 *
-			 * Don't publish changes for partitioned tables, because
-			 * publishing those of its partitions suffices, unless partition
-			 * changes won't be published due to pubviaroot being set.
-			 */
-			if (publish &&
-				(relkind != RELKIND_PARTITIONED_TABLE || pub->pubviaroot))
-			{
-				entry->pubactions.pubinsert |= pub->pubactions.pubinsert;
-				entry->pubactions.pubupdate |= pub->pubactions.pubupdate;
-				entry->pubactions.pubdelete |= pub->pubactions.pubdelete;
-				entry->pubactions.pubtruncate |= pub->pubactions.pubtruncate;
+					/*
+					 * For a partition, check if any of the ancestors are
+					 * published.  If so, note down the topmost ancestor that is
+					 * published via this publication, which will be used as the
+					 * relation via which to publish the partition's changes.
+					 */
+					if (am_partition)
+					{
+						Oid			ancestor;
+						int			level;
+						List	   *ancestors = get_partition_ancestors(relid);
+
+						ancestor = GetTopMostAncestorInPublication(pub->oid,
+																   ancestors,
+																   &level);
+
+						if (ancestor != InvalidOid)
+						{
+							ancestor_published = true;
+							if (pub->pubviaroot)
+							{
+								pub_relid = ancestor;
+								ancestor_level = level;
+							}
+						}
+					}
+
+					if (list_member_oid(pubids, pub->oid) ||
+						list_member_oid(schemaPubids, pub->oid) ||
+						ancestor_published)
+						publish = true;
+				}
+
+				/*
+				 * If the relation is to be published, determine actions to
+				 * publish, and list of columns, if appropriate.
+				 *
+				 * Don't publish changes for partitioned tables, because
+				 * publishing those of its partitions suffices, unless partition
+				 * changes won't be published due to pubviaroot being set.
+				 */
+				if (publish &&
+					(relkind != RELKIND_PARTITIONED_TABLE || pub->pubviaroot))
+				{
+					/*
+					 * pg_publication_sync acts as logical-replication metadata.
+					 * Always publish all row-level actions for it, regardless of
+					 * publication's regular publish=... DML action mask.
+					 */
+					if (relid == PublicationSyncRelationId)
+					{
+						entry->pubactions.pubinsert = true;
+						entry->pubactions.pubupdate = true;
+						entry->pubactions.pubdelete = true;
+						entry->pubactions.pubtruncate = true;
+					}
+					else
+					{
+						entry->pubactions.pubinsert |= pub->pubactions.pubinsert;
+						entry->pubactions.pubupdate |= pub->pubactions.pubupdate;
+						entry->pubactions.pubdelete |= pub->pubactions.pubdelete;
+						entry->pubactions.pubtruncate |= pub->pubactions.pubtruncate;
+					}
 
 				/*
 				 * We want to publish the changes as the top-most ancestor
