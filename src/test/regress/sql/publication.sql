@@ -47,6 +47,22 @@ SELECT schemaname, tablename
   FROM pg_publication_tables
  WHERE pubname = 'testpub_ins_trunct'
  ORDER BY 1, 2;
+SET client_min_messages = 'ERROR';
+CREATE PUBLICATION testpub_ddl2 WITH (ddl = 'table,index');
+CREATE PUBLICATION testpub_ddl3 WITH (ddl = 'table');
+RESET client_min_messages;
+CREATE TABLE testpub_obj_once (a int);
+SELECT count(*) AS ddl_obj_rows
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND position('CREATE TABLE testpub_obj_once' in ddl_str) > 0;
+SELECT coalesce(bool_or(position('testpub_ddl2' in publication_list) > 0), false) AS has_pub2,
+       coalesce(bool_or(position('testpub_ddl3' in publication_list) > 0), false) AS has_pub3
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND position('CREATE TABLE testpub_obj_once' in ddl_str) > 0;
+DROP TABLE testpub_obj_once;
+DROP PUBLICATION testpub_ddl2, testpub_ddl3;
 
 -- error cases
 CREATE PUBLICATION testpub_xxx WITH (foo);

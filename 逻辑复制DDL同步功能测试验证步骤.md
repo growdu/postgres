@@ -29,6 +29,7 @@ rtk make -C src/test/regress check TESTS=publication
 * `CREATE/ALTER PUBLICATION ... WITH (ddl=...)` 语法可用
 * `pg_publication.pubddl` 正确写入
 * `pg_publication_sync` 生成并更新 publication 级默认项
+* DDL 对象捕获采用“单条 DDL 对应单条 `pfsynckind='o'`”模型
 * 非法 `ddl` token 与重复 `ddl` 参数报错
 
 ### 2.2 pg_dump 回归
@@ -83,6 +84,35 @@ CREATE PUBLICATION pub_ddl_dup WITH (ddl = 'table', ddl = 'index');
 * `pg_publication_sync` 的 publication 级条目同步更新
 * 非法 token 与重复参数均报错
 
+### 3.1 单条 DDL 仅写一条对象记录（含 publication_list）
+
+```sql
+CREATE PUBLICATION pub_ddl_obj_a WITH (ddl = 'table,index');
+CREATE PUBLICATION pub_ddl_obj_b WITH (ddl = 'table');
+
+CREATE TABLE ddl_obj_once(id int);
+
+SELECT count(*) AS ddl_obj_rows
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND position('CREATE TABLE ddl_obj_once' in ddl_str) > 0;
+
+SELECT coalesce(bool_or(position('pub_ddl_obj_a' in publication_list) > 0), false) AS has_pub_a,
+       coalesce(bool_or(position('pub_ddl_obj_b' in publication_list) > 0), false) AS has_pub_b
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND position('CREATE TABLE ddl_obj_once' in ddl_str) > 0;
+
+DROP TABLE ddl_obj_once;
+DROP PUBLICATION pub_ddl_obj_a, pub_ddl_obj_b;
+```
+
+预期：
+
+* `ddl_obj_rows = 1`；
+* `has_pub_a = true` 且 `has_pub_b = true`；
+* 即单条 DDL 只落一条 `pg_publication_sync` 记录，`publication_list` 记录关联 publication 名称集合。
+
 ---
 
 ## 4. 双节点 subscription 验证（手工）
@@ -135,4 +165,3 @@ rtk rg "CREATE PUBLICATION|CREATE SUBSCRIPTION|ddl =" /tmp/ddl_sync.sql
 
 * publication/subscription 的建表语句中都包含 `ddl = '...'`
 * 还原后 `pg_publication.pubddl` 与 `pg_subscription.subddl` 一致
-
