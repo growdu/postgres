@@ -66,6 +66,66 @@ SELECT count(*)
 is($result, '1',
 	'subscriber keeps synced pg_publication_sync row with captured search_path');
 
+# Verify capture/apply filtering:
+# 1) capture only publications whose WITH (ddl=...) matches statement kind
+# 2) apply only rows whose publication_list intersects subscription publications
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tap_filter_t1 (id int primary key)");
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tap_filter_t2 (id int primary key)");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE tap_filter_t1 (id int primary key)");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE tap_filter_t2 (id int primary key)");
+
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_match FOR TABLE tap_filter_t1 WITH (ddl = 'table')");
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_skip FOR TABLE tap_filter_t2 WITH (ddl = 'table')");
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_idx FOR TABLE tap_filter_t1 WITH (ddl = 'index')");
+
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION tap_sub_filter "
+	. "CONNECTION '$publisher_connstr application_name=tap_sub_filter' "
+	. "PUBLICATION tap_pub_match "
+	. "WITH (copy_data = false, ddl = 'table')");
+
+$node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub_filter');
+
+$node_publisher->safe_psql('postgres',
+	"ALTER TABLE tap_filter_t1 ADD COLUMN c_match int");
+$node_publisher->safe_psql('postgres',
+	"ALTER TABLE tap_filter_t2 ADD COLUMN c_skip int");
+$node_publisher->wait_for_catchup('tap_sub_filter');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	"SELECT EXISTS (SELECT 1 FROM pg_attribute "
+	. "WHERE attrelid = 'tap_filter_t1'::regclass "
+	. "AND attname = 'c_match' AND NOT attisdropped)");
+is($result, 't',
+	'apply executes DDL when publication_list intersects subscription publications');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	"SELECT EXISTS (SELECT 1 FROM pg_attribute "
+	. "WHERE attrelid = 'tap_filter_t2'::regclass "
+	. "AND attname = 'c_skip' AND NOT attisdropped)");
+is($result, 'f',
+	'apply skips DDL when publication_list does not intersect subscription publications');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT coalesce(bool_or(position('tap_pub_idx' in publication_list) > 0), false)
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND position('ALTER TABLE tap_filter_t1 ADD COLUMN c_match' in ddl_str) > 0
+));
+is($result, 'f',
+	'capture filters out publications whose ddl option does not include table');
+
 $node_subscriber->stop('fast');
 $node_publisher->stop('fast');
 

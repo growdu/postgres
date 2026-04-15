@@ -188,6 +188,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/usercontext.h"
+#include "utils/varlena.h"
 
 #define NAPTIME_PER_CYCLE 1000	/* max sleep time between cycles (1s) */
 
@@ -396,6 +397,7 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
+static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
 static PublicationSyncMessageKind decode_publication_sync_message_type(const char *message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
 static void apply_publication_sync_message_a(TupleTableSlot *newslot);
@@ -2524,6 +2526,79 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 	maybe_apply_publication_sync_message(relinfo, remoteslot);
 }
 
+static bool
+publication_sync_row_matches_subscription(TupleTableSlot *newslot)
+{
+	bool		isnull;
+	Datum		ddlmask_datum;
+	int32		ddlmask;
+	Datum		publist_datum;
+	char	   *publist;
+	char	   *rawlist;
+	List	   *row_publications = NIL;
+	ListCell   *lc_row;
+	bool		matched = false;
+
+	if (MySubscription == NULL)
+		return false;
+
+	ddlmask_datum = slot_getattr(newslot,
+								 Anum_pg_publication_sync_pfsyncddl,
+								 &isnull);
+	if (isnull)
+		return false;
+
+	ddlmask = DatumGetInt32(ddlmask_datum);
+	if (ddlmask == 0 || (MySubscription->subddl & ddlmask) == 0)
+		return false;
+
+	publist_datum = slot_getattr(newslot,
+								 Anum_pg_publication_sync_publication_list,
+								 &isnull);
+	if (isnull)
+		return false;
+
+	publist = TextDatumGetCString(publist_datum);
+	if (publist[0] == '\0')
+	{
+		pfree(publist);
+		return false;
+	}
+
+	rawlist = pstrdup(publist);
+	pfree(publist);
+
+	if (!SplitIdentifierString(rawlist, ',', &row_publications))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid publication_list in pg_publication_sync")));
+
+	foreach(lc_row, row_publications)
+	{
+		char	   *row_pubname = (char *) lfirst(lc_row);
+		ListCell   *lc_sub;
+
+		foreach(lc_sub, MySubscription->publications)
+		{
+			char	   *sub_pubname = (char *) lfirst(lc_sub);
+
+			if (strcmp(row_pubname, sub_pubname) == 0)
+			{
+				matched = true;
+				break;
+			}
+		}
+
+		if (matched)
+			break;
+	}
+
+	list_free_deep(row_publications);
+	pfree(rawlist);
+
+	return matched;
+}
+
 static PublicationSyncMessageKind
 decode_publication_sync_message_type(const char *message_type)
 {
@@ -2669,6 +2744,9 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 
 	pfsynckind = DatumGetChar(kinddatum);
 	if (pfsynckind != PFSYNC_KIND_OBJECT)
+		return;
+
+	if (!publication_sync_row_matches_subscription(newslot))
 		return;
 
 	msgdatum = slot_getattr(newslot,

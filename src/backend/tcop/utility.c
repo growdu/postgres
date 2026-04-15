@@ -26,6 +26,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaddress.h"
+#include "catalog/partition.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_publication.h"
@@ -64,6 +65,7 @@
 #include "commands/vacuum.h"
 #include "commands/view.h"
 #include "miscadmin.h"
+#include "parser/parse_relation.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
 #include "rewrite/rewriteDefine.h"
@@ -91,6 +93,14 @@ static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
 static bool UtilityStmtShouldCaptureDDL(Node *parsetree);
 static int	UtilityStmtDDLMask(Node *parsetree);
 static char *UtilityStmtTargetTable(Node *parsetree);
+static RangeVar *UtilityStmtTargetRangeVar(Node *parsetree);
+static Oid UtilityStmtTargetRelid(Node *parsetree);
+static bool UtilityStmtNeedsRelationScopeFilter(int ddlmask);
+static bool PublicationMatchesRelationScope(Form_pg_publication pubform,
+											Oid target_relid,
+											List *target_relpubids,
+											List *target_schemapubids,
+											List *target_ancestors);
 static char *UtilityStatementText(PlannedStmt *pstmt, const char *queryString);
 static void CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString);
 
@@ -669,6 +679,97 @@ UtilityStmtTargetTable(Node *parsetree)
 	}
 }
 
+static RangeVar *
+UtilityStmtTargetRangeVar(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+			return ((CreateStmt *) parsetree)->relation;
+		case T_CreateForeignTableStmt:
+			return ((CreateForeignTableStmt *) parsetree)->base.relation;
+		case T_CreateTableAsStmt:
+			return ((CreateTableAsStmt *) parsetree)->into->rel;
+		case T_AlterTableStmt:
+			return ((AlterTableStmt *) parsetree)->relation;
+		case T_TruncateStmt:
+			{
+				TruncateStmt *stmt = (TruncateStmt *) parsetree;
+
+				return stmt->relations ? linitial_node(RangeVar, stmt->relations) : NULL;
+			}
+		case T_IndexStmt:
+			return ((IndexStmt *) parsetree)->relation;
+		case T_ReindexStmt:
+			{
+				ReindexStmt *stmt = (ReindexStmt *) parsetree;
+
+				if (stmt->kind == REINDEX_OBJECT_TABLE)
+					return stmt->relation;
+				return NULL;
+			}
+		case T_CreateSeqStmt:
+			return ((CreateSeqStmt *) parsetree)->sequence;
+		case T_AlterSeqStmt:
+			return ((AlterSeqStmt *) parsetree)->sequence;
+		case T_CreateTrigStmt:
+			return ((CreateTrigStmt *) parsetree)->relation;
+		case T_ViewStmt:
+			return ((ViewStmt *) parsetree)->view;
+		case T_RuleStmt:
+			return ((RuleStmt *) parsetree)->relation;
+		case T_RenameStmt:
+			return ((RenameStmt *) parsetree)->relation;
+		default:
+			return NULL;
+	}
+}
+
+static Oid
+UtilityStmtTargetRelid(Node *parsetree)
+{
+	RangeVar   *rv = UtilityStmtTargetRangeVar(parsetree);
+
+	if (rv == NULL)
+		return InvalidOid;
+
+	return RangeVarGetRelid(rv, NoLock, true);
+}
+
+static bool
+UtilityStmtNeedsRelationScopeFilter(int ddlmask)
+{
+	int			relscope_mask = PUBDDL_TABLE | PUBDDL_INDEX | PUBDDL_SEQUENCE |
+		PUBDDL_TRIGGER | PUBDDL_VIEW | PUBDDL_RULE;
+
+	return (ddlmask & relscope_mask) != 0;
+}
+
+static bool
+PublicationMatchesRelationScope(Form_pg_publication pubform,
+								Oid target_relid,
+								List *target_relpubids,
+								List *target_schemapubids,
+								List *target_ancestors)
+{
+	if (pubform->puballtables)
+		return true;
+
+	if (list_member_oid(target_relpubids, pubform->oid))
+		return true;
+
+	if (list_member_oid(target_schemapubids, pubform->oid))
+		return true;
+
+	if (target_ancestors != NIL &&
+		OidIsValid(GetTopMostAncestorInPublication(pubform->oid,
+												   target_ancestors,
+												   NULL)))
+		return true;
+
+	return false;
+}
+
 static char *
 UtilityStatementText(PlannedStmt *pstmt, const char *queryString)
 {
@@ -696,6 +797,11 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	char	   *target_table;
 	char	   *ddl_search_path;
 	int			ddlmask;
+	bool		needs_rel_scope_filter;
+	Oid			target_relid = InvalidOid;
+	List	   *target_relpubids = NIL;
+	List	   *target_schemapubids = NIL;
+	List	   *target_ancestors = NIL;
 	Oid			selected_pubid = InvalidOid;
 	StringInfoData publication_list_buf;
 	bool		has_publication = false;
@@ -710,6 +816,21 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	target_table = UtilityStmtTargetTable(parsetree);
 	ddl_search_path = GetConfigOptionByName("search_path", NULL, false);
 	ddlmask = UtilityStmtDDLMask(parsetree);
+	if (ddlmask == 0)
+		goto done;
+
+	needs_rel_scope_filter = UtilityStmtNeedsRelationScopeFilter(ddlmask);
+	if (needs_rel_scope_filter)
+	{
+		target_relid = UtilityStmtTargetRelid(parsetree);
+		if (!OidIsValid(target_relid))
+			goto done;
+
+		target_relpubids = GetRelationPublications(target_relid);
+		target_schemapubids = GetSchemaPublications(get_rel_namespace(target_relid));
+		if (get_rel_relispartition(target_relid))
+			target_ancestors = get_partition_ancestors(target_relid);
+	}
 
 	pubrel = table_open(PublicationRelationId, AccessShareLock);
 	pubscan = table_beginscan_catalog(pubrel, 0, NULL);
@@ -721,6 +842,12 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 		if (pubform->pubddl == 0)
 			continue;
 		if (ddlmask != 0 && (pubform->pubddl & ddlmask) == 0)
+			continue;
+		if (needs_rel_scope_filter &&
+			!PublicationMatchesRelationScope(pubform, target_relid,
+											 target_relpubids,
+											 target_schemapubids,
+											 target_ancestors))
 			continue;
 
 		if (!has_publication)
@@ -810,6 +937,11 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 
 		table_close(syncrel, RowExclusiveLock);
 	}
+
+done:
+	list_free(target_relpubids);
+	list_free(target_schemapubids);
+	list_free(target_ancestors);
 
 	if (target_table != NULL)
 		pfree(target_table);

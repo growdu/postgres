@@ -262,6 +262,32 @@ SELECT count(*) AS q_rows
 * 收到 `A` 或 `D` 时，日志/报错包含 “not supported yet”；
 * 收到未知类型时，日志/报错包含 “Supported message types are Q/A/D; only Q is implemented now.”
 
+### 4.6 过滤规则验证（capture/apply 一致性）
+
+要验证的规则：
+
+1. capture 端只捕获命中 publication `with (ddl=...)` 的 DDL 类型；
+2. capture 端只捕获命中 publication 对象范围（`FOR TABLE` / `FOR TABLES IN SCHEMA` / `FOR ALL TABLES`）的 DDL；
+3. apply 端仅在 `subddl` 命中且 `publication_list` 与订阅 publication 列表有交集时执行。
+
+建议最小场景：
+
+* 发布端建 3 个 publication：
+  * `CREATE SCHEMA app; CREATE TABLE app.t_schema(id int primary key);`
+  * `pub_tbl`：`FOR TABLE t_tbl WITH (ddl='table')`
+  * `pub_schema`：`FOR TABLES IN SCHEMA app WITH (ddl='table')`
+  * `pub_idx`：`FOR TABLE t_tbl WITH (ddl='index')`
+* 订阅端只订阅 `pub_tbl`，并设置 `ddl='table'`；
+* 在发布端分别执行：
+  * `ALTER TABLE t_tbl ADD COLUMN c1 int`
+  * `ALTER TABLE app.t_schema ADD COLUMN c2 int`
+
+预期：
+
+* `t_tbl.c1` 在订阅端存在；
+* `app.t_schema.c2` 在订阅端不存在（publication 列表无交集）；
+* `pg_publication_sync` 中对应 `ALTER TABLE t_tbl ...` 的行，`publication_list` 不包含 `pub_idx`（类型过滤生效）。
+
 ---
 
 ## 5. 备份恢复验证（手工）
