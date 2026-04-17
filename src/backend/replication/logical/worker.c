@@ -153,7 +153,6 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/execPartition.h"
-#include "executor/spi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
@@ -174,7 +173,9 @@
 #include "storage/buffile.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#include "tcop/dest.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/dynahash.h"
@@ -398,6 +399,7 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
 static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
+static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(const char *message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
 static void apply_publication_sync_message_a(TupleTableSlot *newslot);
@@ -2599,6 +2601,92 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 	return matched;
 }
 
+/*
+ * Parse and execute SQL utility statements one-by-one.
+ *
+ * This follows the same parse-tree execution model used by core SQL script
+ * runners (e.g. extension script execution), instead of handing the raw text
+ * directly to SPI.
+ */
+static void
+execute_publication_sync_sql_command(const char *sql)
+{
+	List	   *raw_parsetree_list;
+	DestReceiver *dest;
+	ListCell   *lc1;
+
+	raw_parsetree_list = pg_parse_query(sql);
+	dest = CreateDestReceiver(DestNone);
+
+	foreach(lc1, raw_parsetree_list)
+	{
+		RawStmt    *parsetree = lfirst_node(RawStmt, lc1);
+		MemoryContext per_parsetree_context;
+		MemoryContext oldcontext;
+		List	   *stmt_list;
+		ListCell   *lc2;
+
+		per_parsetree_context =
+			AllocSetContextCreate(CurrentMemoryContext,
+								  "publication sync apply per-statement context",
+								  ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(per_parsetree_context);
+
+		/* Let parser/planner see any DDL done by previous statements. */
+		CommandCounterIncrement();
+
+		stmt_list = pg_analyze_and_rewrite_fixedparams(parsetree,
+													   sql,
+													   NULL,
+													   0,
+													   NULL);
+		stmt_list = pg_plan_queries(stmt_list, sql, CURSOR_OPT_PARALLEL_OK, NULL);
+
+		foreach(lc2, stmt_list)
+		{
+			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
+
+			CommandCounterIncrement();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
+			PG_TRY();
+			{
+				if (stmt->utilityStmt == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("pg_publication_sync message type \"Q\" only supports utility statements")));
+
+				if (IsA(stmt->utilityStmt, TransactionStmt))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("transaction control statements are not allowed in pg_publication_sync ddl_str")));
+
+				ProcessUtility(stmt,
+							   sql,
+							   false,
+							   PROCESS_UTILITY_QUERY,
+							   NULL,
+							   NULL,
+							   dest,
+							   NULL);
+			}
+			PG_CATCH();
+			{
+				PopActiveSnapshot();
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+
+			PopActiveSnapshot();
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(per_parsetree_context);
+	}
+
+	CommandCounterIncrement();
+}
+
 static PublicationSyncMessageKind
 decode_publication_sync_message_type(const char *message_type)
 {
@@ -2620,7 +2708,6 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 	char	   *ddl_sql;
 	char	   *captured_search_path;
 	char	   *saved_search_path;
-	int			spi_rc;
 
 	ddldatum = slot_getattr(newslot,
 							Anum_pg_publication_sync_ddl_str,
@@ -2652,36 +2739,23 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 
 	saved_search_path = GetConfigOptionByName("search_path", NULL, false);
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed while applying pg_publication_sync message");
-
 	PG_TRY();
 	{
 		(void) set_config_option("search_path", captured_search_path,
 								 PGC_USERSET, PGC_S_SESSION,
 								 GUC_ACTION_SET, true, 0, false);
 
-		spi_rc = SPI_execute(ddl_sql, false, 0);
-		if (spi_rc != SPI_OK_UTILITY && spi_rc != SPI_OK_SELINTO)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("failed to execute pg_publication_sync ddl_str"),
-					 errdetail("SPI_execute returned %s.",
-							   SPI_result_code_string(spi_rc))));
+		execute_publication_sync_sql_command(ddl_sql);
 
 		(void) set_config_option("search_path", saved_search_path,
 								 PGC_USERSET, PGC_S_SESSION,
 								 GUC_ACTION_SET, true, 0, false);
-
-		if (SPI_finish() != SPI_OK_FINISH)
-			elog(ERROR, "SPI_finish failed while applying pg_publication_sync message");
 	}
 	PG_CATCH();
 	{
 		(void) set_config_option("search_path", saved_search_path,
 								 PGC_USERSET, PGC_S_SESSION,
 								 GUC_ACTION_SET, true, 0, false);
-		(void) SPI_finish();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
