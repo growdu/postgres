@@ -126,6 +126,131 @@ SELECT coalesce(bool_or(position('tap_pub_idx' in publication_list) > 0), false)
 is($result, 'f',
 	'capture filters out publications whose ddl option does not include table');
 
+# Verify FOR TABLES IN SCHEMA auto-tracking:
+# 1) CREATE TABLE DDL apply should auto-add pg_subscription_rel state (READY)
+# 2) Subsequent DML for the new table should be applied automatically
+# 3) DROP TABLE should remove local table and subscription mapping
+$node_publisher->safe_psql('postgres', "CREATE SCHEMA tap_sync_dyn");
+$node_subscriber->safe_psql('postgres', "CREATE SCHEMA tap_sync_dyn");
+
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_dyn FOR TABLES IN SCHEMA tap_sync_dyn WITH (ddl = 'table')");
+
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION tap_sub_dyn "
+	. "CONNECTION '$publisher_connstr application_name=tap_sub_dyn' "
+	. "PUBLICATION tap_pub_dyn "
+	. "WITH (copy_data = false, ddl = 'table')");
+
+$node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub_dyn');
+
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tap_sync_dyn.tap_dyn_t (id int primary key, v text)");
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tap_sync_dyn.tap_dyn_t VALUES (1, 'schema-auto')");
+$node_publisher->wait_for_catchup('tap_sub_dyn');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	"SELECT to_regclass('tap_sync_dyn.tap_dyn_t') IS NOT NULL");
+is($result, 't',
+	'FOR TABLES IN SCHEMA: CREATE TABLE is auto-applied on subscriber');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	"SELECT count(*) FROM tap_sync_dyn.tap_dyn_t");
+is($result, '1',
+	'FOR TABLES IN SCHEMA: new table DML is auto-applied');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+  JOIN pg_class c ON c.oid = sr.srrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE s.subname = 'tap_sub_dyn'
+   AND n.nspname = 'tap_sync_dyn'
+   AND c.relname = 'tap_dyn_t'
+));
+is($result, '1',
+	'FOR TABLES IN SCHEMA: new table is auto-tracked in pg_subscription_rel');
+
+$node_publisher->safe_psql('postgres', "DROP TABLE tap_sync_dyn.tap_dyn_t");
+$node_publisher->wait_for_catchup('tap_sub_dyn');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	"SELECT to_regclass('tap_sync_dyn.tap_dyn_t') IS NULL");
+is($result, 't',
+	'FOR TABLES IN SCHEMA: DROP TABLE is applied on subscriber');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+ WHERE s.subname = 'tap_sub_dyn'
+));
+is($result, '0',
+	'FOR TABLES IN SCHEMA: dropped table is removed from pg_subscription_rel');
+
+# Verify FOR ALL TABLES has the same auto-tracking behavior for newly created
+# tables.
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_all FOR ALL TABLES WITH (ddl = 'table')");
+
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION tap_sub_all "
+	. "CONNECTION '$publisher_connstr application_name=tap_sub_all' "
+	. "PUBLICATION tap_pub_all "
+	. "WITH (copy_data = false, ddl = 'table')");
+
+$node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub_all');
+
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tap_all_t (id int primary key, v text)");
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tap_all_t VALUES (1, 'all-auto')");
+$node_publisher->wait_for_catchup('tap_sub_all');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	"SELECT count(*) FROM tap_all_t");
+is($result, '1',
+	'FOR ALL TABLES: new table DML is auto-applied');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+  JOIN pg_class c ON c.oid = sr.srrelid
+ WHERE s.subname = 'tap_sub_all'
+   AND c.relname = 'tap_all_t'
+));
+is($result, '1',
+	'FOR ALL TABLES: new table is auto-tracked in pg_subscription_rel');
+
+$node_publisher->safe_psql('postgres', "DROP TABLE tap_all_t");
+$node_publisher->wait_for_catchup('tap_sub_all');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+  JOIN pg_class c ON c.oid = sr.srrelid
+ WHERE s.subname = 'tap_sub_all'
+   AND c.relname = 'tap_all_t'
+));
+is($result, '0',
+	'FOR ALL TABLES: dropped table is removed from pg_subscription_rel');
+
 $node_subscriber->stop('fast');
 $node_publisher->stop('fast');
 

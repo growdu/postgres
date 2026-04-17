@@ -288,6 +288,105 @@ SELECT count(*) AS q_rows
 * `app.t_schema.c2` 在订阅端不存在（publication 列表无交集）；
 * `pg_publication_sync` 中对应 `ALTER TABLE t_tbl ...` 的行，`publication_list` 不包含 `pub_idx`（类型过滤生效）。
 
+### 4.7 `FOR TABLES IN SCHEMA / FOR ALL TABLES` 自动纳管验证（CREATE/DROP）
+
+目标：
+
+1. `CREATE TABLE` 经 `pg_publication_sync` 的 `Q` 消息 apply 后，订阅端会自动把新表加入 `pg_subscription_rel`（READY）；
+2. 新表后续 DML 无需手工 `ALTER SUBSCRIPTION ... REFRESH PUBLICATION` 即可自动 apply；
+3. `DROP TABLE` apply 后，订阅端会自动将该表从订阅关系中剔除。
+
+发布端：
+
+```sql
+CREATE SCHEMA t_auto_schema;
+CREATE PUBLICATION pub_auto_schema FOR TABLES IN SCHEMA t_auto_schema WITH (ddl='table');
+CREATE PUBLICATION pub_auto_all FOR ALL TABLES WITH (ddl='table');
+```
+
+订阅端：
+
+```sql
+CREATE SUBSCRIPTION sub_auto_schema
+CONNECTION 'host=127.0.0.1 port=<publisher_port> dbname=<db> user=<user> password=<pwd>'
+PUBLICATION pub_auto_schema
+WITH (copy_data = false, ddl = 'table');
+
+CREATE SUBSCRIPTION sub_auto_all
+CONNECTION 'host=127.0.0.1 port=<publisher_port> dbname=<db> user=<user> password=<pwd>'
+PUBLICATION pub_auto_all
+WITH (copy_data = false, ddl = 'table');
+```
+
+发布端（先 `FOR TABLES IN SCHEMA`）：
+
+```sql
+CREATE TABLE t_auto_schema.t_new_schema(id int primary key, v text);
+INSERT INTO t_auto_schema.t_new_schema VALUES (1, 'schema-auto');
+```
+
+订阅端验证：
+
+```sql
+SELECT count(*) FROM t_auto_schema.t_new_schema;
+
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+  JOIN pg_class c ON c.oid = sr.srrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE s.subname = 'sub_auto_schema'
+   AND n.nspname = 't_auto_schema'
+   AND c.relname = 't_new_schema';
+```
+
+发布端（再 `FOR ALL TABLES`）：
+
+```sql
+CREATE TABLE t_new_all(id int primary key, v text);
+INSERT INTO t_new_all VALUES (1, 'all-auto');
+```
+
+订阅端验证：
+
+```sql
+SELECT count(*) FROM t_new_all;
+
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+  JOIN pg_class c ON c.oid = sr.srrelid
+ WHERE s.subname = 'sub_auto_all'
+   AND c.relname = 't_new_all';
+```
+
+发布端（删除新表）：
+
+```sql
+DROP TABLE t_auto_schema.t_new_schema;
+DROP TABLE t_new_all;
+```
+
+订阅端验证：
+
+```sql
+SELECT to_regclass('t_auto_schema.t_new_schema') IS NULL AS schema_dropped;
+SELECT to_regclass('t_new_all') IS NULL AS all_dropped;
+
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+  JOIN pg_class c ON c.oid = sr.srrelid
+ WHERE (s.subname = 'sub_auto_schema' AND c.relname = 't_new_schema')
+    OR (s.subname = 'sub_auto_all' AND c.relname = 't_new_all');
+```
+
+预期：
+
+* 两个新表在订阅端都能收到 DML（`count(*) = 1`）；
+* 两个新表都能自动出现在各自订阅的 `pg_subscription_rel`；
+* `DROP TABLE` 后，订阅端本地表消失，且 `pg_subscription_rel` 不再保留对应映射（`count(*) = 0`）。
+
 ---
 
 ## 5. 备份恢复验证（手工）

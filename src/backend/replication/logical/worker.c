@@ -145,6 +145,7 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
@@ -399,6 +400,7 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
 static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
+static void maybe_track_publication_sync_created_relation(Node *utilityStmt);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(const char *message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -2602,6 +2604,47 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 }
 
 /*
+ * For schema/all-table publications, newly created relations need to be added
+ * into pg_subscription_rel so that incoming DML can be applied immediately.
+ */
+static void
+maybe_track_publication_sync_created_relation(Node *utilityStmt)
+{
+	RangeVar   *rv = NULL;
+	Oid			relid;
+	char		relstate;
+
+	if (MySubscription == NULL)
+		return;
+
+	if (IsA(utilityStmt, CreateStmt))
+		rv = ((CreateStmt *) utilityStmt)->relation;
+	else if (IsA(utilityStmt, CreateTableAsStmt))
+	{
+		CreateTableAsStmt *ctas = (CreateTableAsStmt *) utilityStmt;
+
+		if (ctas->into != NULL)
+			rv = ctas->into->rel;
+	}
+	else
+		return;
+
+	if (rv == NULL)
+		return;
+
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	if (!OidIsValid(relid))
+		return;
+
+	relstate = GetSubscriptionRelState(MySubscription->oid, relid, NULL);
+	if (relstate != SUBREL_STATE_UNKNOWN)
+		return;
+
+	AddSubscriptionRelState(MySubscription->oid, relid, SUBREL_STATE_READY,
+							InvalidXLogRecPtr, false);
+}
+
+/*
  * Parse and execute SQL utility statements one-by-one.
  *
  * This follows the same parse-tree execution model used by core SQL script
@@ -2669,6 +2712,8 @@ execute_publication_sync_sql_command(const char *sql)
 							   NULL,
 							   dest,
 							   NULL);
+
+				maybe_track_publication_sync_created_relation(stmt->utilityStmt);
 			}
 			PG_CATCH();
 			{
