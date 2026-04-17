@@ -21,22 +21,18 @@ RESET client_min_messages;
 ALTER PUBLICATION testpub_default SET (publish = update);
 ALTER PUBLICATION testpub_default SET (ddl = 'table,index,trigger');
 SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
-SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl,
-       s.message_type, s.target_table, s.ddl_str
+SELECT count(*) AS non_message_rows
   FROM pg_publication_sync s
   JOIN pg_publication p ON p.oid = s.pfsyncpubid
  WHERE p.pubname = 'testpub_default'
-   AND s.pfsynckind = 'p'
- ORDER BY 1, 2, 3, 4, 5, 6;
+   AND s.pfsyncmsgtype IS NULL;
 ALTER PUBLICATION testpub_default SET (ddl = 'view,function');
 SELECT pubname, pubddl FROM pg_publication WHERE pubname = 'testpub_default';
-SELECT s.pfsynckind, s.pfsyncenabled, s.pfsyncddl,
-       s.message_type, s.target_table, s.ddl_str
+SELECT count(*) AS non_message_rows
   FROM pg_publication_sync s
   JOIN pg_publication p ON p.oid = s.pfsyncpubid
  WHERE p.pubname = 'testpub_default'
-   AND s.pfsynckind = 'p'
- ORDER BY 1, 2, 3, 4, 5, 6;
+   AND s.pfsyncmsgtype IS NULL;
 
 SELECT pg_relation_is_publishable('pg_catalog.pg_publication_sync'::regclass);
 SELECT schemaname, tablename
@@ -54,13 +50,14 @@ RESET client_min_messages;
 CREATE TABLE testpub_obj_once (a int);
 SELECT count(*) AS ddl_obj_rows
   FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND position('CREATE TABLE testpub_obj_once' in ddl_str) > 0;
-SELECT coalesce(bool_or(position('testpub_ddl2' in publication_list) > 0), false) AS has_pub2,
-       coalesce(bool_or(position('testpub_ddl3' in publication_list) > 0), false) AS has_pub3
+ WHERE pfsyncmsgtype = 'Q'
+   AND position('CREATE TABLE testpub_obj_once' in pfsyncddlsql) > 0;
+SELECT coalesce(bool_or(position('testpub_ddl2' in pfsyncpublicationlist) > 0), false) AS has_pub2,
+       coalesce(bool_or(position('testpub_ddl3' in pfsyncpublicationlist) > 0), false) AS has_pub3
   FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND position('CREATE TABLE testpub_obj_once' in ddl_str) > 0;
+ WHERE pfsyncmsgtype = 'Q'
+   AND position('CREATE TABLE testpub_obj_once' in pfsyncddlsql) > 0;
+SELECT pg_publication_sync_prune() >= 0 AS prune_ok;
 DROP TABLE testpub_obj_once;
 DROP PUBLICATION testpub_ddl2, testpub_ddl3;
 

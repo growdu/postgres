@@ -2,7 +2,7 @@
 
 # Verify subscriber-side apply of pg_publication_sync rows.
 #
-# Message type "Q" should execute ddl_str on subscriber after the row itself
+# Message type "Q" should execute pfsyncddlsql on subscriber after the row itself
 # is applied into pg_publication_sync.
 use strict;
 use warnings FATAL => 'all';
@@ -42,7 +42,7 @@ $node_subscriber->safe_psql('postgres',
 $node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub');
 
 # Emit one DDL on publisher. It should be captured as a pg_publication_sync row
-# (message_type = 'Q') and replayed on subscriber.
+# (pfsyncmsgtype = 'Q') and replayed on subscriber.
 $node_publisher->safe_psql('postgres',
 	"SET search_path = tap_sync_nsp; CREATE TABLE tap_sync_ddl_q (id int primary key)");
 $node_publisher->wait_for_catchup('tap_sub');
@@ -51,24 +51,23 @@ my $result = $node_subscriber->safe_psql(
 	'postgres',
 	"SELECT to_regclass('tap_sync_nsp.tap_sync_ddl_q') IS NOT NULL");
 is($result, 't',
-	'message type Q from pg_publication_sync executes ddl_str on subscriber');
+	'message type Q from pg_publication_sync executes pfsyncddlsql on subscriber');
 
 $result = $node_subscriber->safe_psql(
 	'postgres',
 	qq(
 SELECT count(*)
   FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND message_type = 'Q'
-   AND search_path = 'tap_sync_nsp'
-   AND position('CREATE TABLE tap_sync_ddl_q' in ddl_str) > 0
+ WHERE pfsyncmsgtype = 'Q'
+   AND pfsyncsearchpath = 'tap_sync_nsp'
+   AND position('CREATE TABLE tap_sync_ddl_q' in pfsyncddlsql) > 0
 ));
 is($result, '1',
 	'subscriber keeps synced pg_publication_sync row with captured search_path');
 
 # Verify capture/apply filtering:
 # 1) capture only publications whose WITH (ddl=...) matches statement kind
-# 2) apply only rows whose publication_list intersects subscription publications
+# 2) publish rows per publication and route by pfsyncpubid
 $node_publisher->safe_psql('postgres',
 	"CREATE TABLE tap_filter_t1 (id int primary key)");
 $node_publisher->safe_psql('postgres',
@@ -105,7 +104,7 @@ $result = $node_subscriber->safe_psql(
 	. "WHERE attrelid = 'tap_filter_t1'::regclass "
 	. "AND attname = 'c_match' AND NOT attisdropped)");
 is($result, 't',
-	'apply executes DDL when publication_list intersects subscription publications');
+	'apply executes DDL for matching publication');
 
 $result = $node_subscriber->safe_psql(
 	'postgres',
@@ -113,18 +112,18 @@ $result = $node_subscriber->safe_psql(
 	. "WHERE attrelid = 'tap_filter_t2'::regclass "
 	. "AND attname = 'c_skip' AND NOT attisdropped)");
 is($result, 'f',
-	'apply skips DDL when publication_list does not intersect subscription publications');
+	'apply skips DDL for non-subscribed publication');
 
 $result = $node_subscriber->safe_psql(
 	'postgres',
 	qq(
-SELECT coalesce(bool_or(position('tap_pub_idx' in publication_list) > 0), false)
+SELECT count(*)
   FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND position('ALTER TABLE tap_filter_t1 ADD COLUMN c_match' in ddl_str) > 0
+ WHERE pfsyncmsgtype = 'Q'
+   AND position('ALTER TABLE tap_filter_t1 ADD COLUMN c_match' in pfsyncddlsql) > 0
 ));
-is($result, 'f',
-	'capture filters out publications whose ddl option does not include table');
+is($result, '1',
+	'Q messages are expanded per publication and routed to subscribed publication only');
 
 # Verify publication table membership changes are propagated via
 # message_type A/D and applied to subscription relation mapping.
@@ -159,10 +158,9 @@ $result = $node_subscriber->safe_psql(
 	qq(
 SELECT count(*)
   FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND message_type = 'A'
-   AND target_table = 'public.tap_ad_t'
-   AND position('tap_pub_ad' in publication_list) > 0
+ WHERE pfsyncmsgtype = 'A'
+   AND pfsynctargettable = 'public.tap_ad_t'
+   AND pfsyncpubid IS NOT NULL
 ));
 is($result, '1',
 	'ALTER PUBLICATION ADD TABLE emits message type A');
@@ -184,10 +182,9 @@ $result = $node_subscriber->safe_psql(
 	qq(
 SELECT count(*)
   FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND message_type = 'D'
-   AND target_table = 'public.tap_ad_t'
-   AND position('tap_pub_ad' in publication_list) > 0
+ WHERE pfsyncmsgtype = 'D'
+   AND pfsynctargettable = 'public.tap_ad_t'
+   AND pfsyncpubid IS NOT NULL
 ));
 is($result, '1',
 	'ALTER PUBLICATION DROP TABLE emits message type D');
@@ -361,14 +358,15 @@ $node_publisher->safe_psql('postgres',
 $result = $node_publisher->safe_psql(
 	'postgres',
 	qq(
-SELECT coalesce(bool_or(position('tap_scope_for_table' in publication_list) > 0), false)::text
+SELECT coalesce(bool_or(p.pubname = 'tap_scope_for_table'), false)::text
        || '|' ||
-       coalesce(bool_or(position('tap_scope_for_schema' in publication_list) > 0), false)::text
+       coalesce(bool_or(p.pubname = 'tap_scope_for_schema'), false)::text
        || '|' ||
-       coalesce(bool_or(position('tap_scope_for_all' in publication_list) > 0), false)::text
-  FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND position('CREATE FUNCTION tap_scope_filter_fn' in ddl_str) > 0
+       coalesce(bool_or(p.pubname = 'tap_scope_for_all'), false)::text
+  FROM pg_publication_sync s
+  JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE s.pfsyncmsgtype = 'Q'
+   AND position('CREATE FUNCTION tap_scope_filter_fn' in s.pfsyncddlsql) > 0
 ));
 is($result, 'false|true|true',
 	'publisher scope filter: function DDL captured only by schema/all publications');

@@ -2537,12 +2537,6 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 	bool		isnull;
 	Datum		ddlmask_datum;
 	int32		ddlmask;
-	Datum		publist_datum;
-	char	   *publist;
-	char	   *rawlist;
-	List	   *row_publications = NIL;
-	ListCell   *lc_row;
-	bool		matched = false;
 
 	if (MySubscription == NULL)
 		return false;
@@ -2557,51 +2551,7 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 	if (ddlmask == 0 || (MySubscription->subddl & ddlmask) == 0)
 		return false;
 
-	publist_datum = slot_getattr(newslot,
-								 Anum_pg_publication_sync_publication_list,
-								 &isnull);
-	if (isnull)
-		return false;
-
-	publist = TextDatumGetCString(publist_datum);
-	if (publist[0] == '\0')
-	{
-		pfree(publist);
-		return false;
-	}
-
-	rawlist = pstrdup(publist);
-	pfree(publist);
-
-	if (!SplitIdentifierString(rawlist, ',', &row_publications))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid publication_list in pg_publication_sync")));
-
-	foreach(lc_row, row_publications)
-	{
-		char	   *row_pubname = (char *) lfirst(lc_row);
-		ListCell   *lc_sub;
-
-		foreach(lc_sub, MySubscription->publications)
-		{
-			char	   *sub_pubname = (char *) lfirst(lc_sub);
-
-			if (strcmp(row_pubname, sub_pubname) == 0)
-			{
-				matched = true;
-				break;
-			}
-		}
-
-		if (matched)
-			break;
-	}
-
-	list_free_deep(row_publications);
-	pfree(rawlist);
-
-	return matched;
+	return true;
 }
 
 /*
@@ -2703,7 +2653,7 @@ execute_publication_sync_sql_command(const char *sql)
 				if (IsA(stmt->utilityStmt, TransactionStmt))
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("transaction control statements are not allowed in pg_publication_sync ddl_str")));
+							 errmsg("transaction control statements are not allowed in pg_publication_sync pfsyncddlsql")));
 
 				ProcessUtility(stmt,
 							   sql,
@@ -2756,32 +2706,32 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 	char	   *saved_search_path;
 
 	ddldatum = slot_getattr(newslot,
-							Anum_pg_publication_sync_ddl_str,
+							Anum_pg_publication_sync_pfsyncddlsql,
 							&isnull);
 	if (isnull)
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"Q\" requires ddl_str")));
+				 errmsg("pg_publication_sync message type \"Q\" requires pfsyncddlsql")));
 
 	ddl_sql = TextDatumGetCString(ddldatum);
 	if (ddl_sql[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"Q\" requires non-empty ddl_str")));
+				 errmsg("pg_publication_sync message type \"Q\" requires non-empty pfsyncddlsql")));
 
 	searchpathdatum = slot_getattr(newslot,
-								   Anum_pg_publication_sync_search_path,
+								   Anum_pg_publication_sync_pfsyncsearchpath,
 								   &isnull);
 	if (isnull)
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"Q\" requires search_path")));
+				 errmsg("pg_publication_sync message type \"Q\" requires pfsyncsearchpath")));
 
 	captured_search_path = TextDatumGetCString(searchpathdatum);
 	if (captured_search_path[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"Q\" requires non-empty search_path")));
+				 errmsg("pg_publication_sync message type \"Q\" requires non-empty pfsyncsearchpath")));
 
 	saved_search_path = GetConfigOptionByName("search_path", NULL, false);
 
@@ -2823,18 +2773,18 @@ apply_publication_sync_message_a(TupleTableSlot *newslot)
 	char		relstate;
 
 	target_datum = slot_getattr(newslot,
-								Anum_pg_publication_sync_target_table,
+								Anum_pg_publication_sync_pfsynctargettable,
 								&isnull);
 	if (isnull)
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"A\" requires target_table")));
+				 errmsg("pg_publication_sync message type \"A\" requires pfsynctargettable")));
 
 	target_table = TextDatumGetCString(target_datum);
 	if (target_table[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"A\" requires non-empty target_table")));
+				 errmsg("pg_publication_sync message type \"A\" requires non-empty pfsynctargettable")));
 
 	name_list = stringToQualifiedNameList(target_table, NULL);
 	rv = makeRangeVarFromNameList(name_list);
@@ -2863,18 +2813,18 @@ apply_publication_sync_message_d(TupleTableSlot *newslot)
 	char		relstate;
 
 	target_datum = slot_getattr(newslot,
-								Anum_pg_publication_sync_target_table,
+								Anum_pg_publication_sync_pfsynctargettable,
 								&isnull);
 	if (isnull)
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"D\" requires target_table")));
+				 errmsg("pg_publication_sync message type \"D\" requires pfsynctargettable")));
 
 	target_table = TextDatumGetCString(target_datum);
 	if (target_table[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"D\" requires non-empty target_table")));
+				 errmsg("pg_publication_sync message type \"D\" requires non-empty pfsynctargettable")));
 
 	name_list = stringToQualifiedNameList(target_table, NULL);
 	rv = makeRangeVarFromNameList(name_list);
@@ -2897,7 +2847,7 @@ apply_publication_sync_message_d(TupleTableSlot *newslot)
  * Execute the message payload carried by pg_publication_sync tuples.
  *
  * Message dispatch framework:
- *   Q: Execute ddl_str as SQL on subscriber.
+ *   Q: Execute pfsyncddlsql as SQL on subscriber.
  *   A: Add relation into subscriber subscription mapping.
  *   D: Drop relation from subscriber subscription mapping.
  */
@@ -2907,8 +2857,6 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 {
 	Relation	localrel = relinfo->ri_RelationDesc;
 	bool		isnull;
-	char		pfsynckind;
-	Datum		kinddatum;
 	Datum		msgdatum;
 	char	   *message_type;
 	PublicationSyncMessageKind msgkind;
@@ -2920,21 +2868,11 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	if (RelationGetRelid(localrel) != PublicationSyncRelationId)
 		return;
 
-	kinddatum = slot_getattr(newslot,
-							 Anum_pg_publication_sync_pfsynckind,
-							 &isnull);
-	if (isnull)
-		return;
-
-	pfsynckind = DatumGetChar(kinddatum);
-	if (pfsynckind != PFSYNC_KIND_OBJECT)
-		return;
-
 	if (!publication_sync_row_matches_subscription(newslot))
 		return;
 
 	msgdatum = slot_getattr(newslot,
-							Anum_pg_publication_sync_message_type,
+							Anum_pg_publication_sync_pfsyncmsgtype,
 							&isnull);
 	if (isnull)
 		return;

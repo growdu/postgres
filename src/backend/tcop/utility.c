@@ -19,11 +19,11 @@
 #include "access/heapam.h"
 #include "access/table.h"
 #include "access/reloptions.h"
+#include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/namespace.h"
-#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaddress.h"
 #include "catalog/partition.h"
@@ -75,6 +75,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_lsn.h"
 
 /* Hook for plugins to get control in ProcessUtility() */
 ProcessUtility_hook_type ProcessUtility_hook = NULL;
@@ -821,9 +822,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	List	   *target_relpubids = NIL;
 	List	   *target_schemapubids = NIL;
 	List	   *target_ancestors = NIL;
-	Oid			selected_pubid = InvalidOid;
-	StringInfoData publication_list_buf;
-	bool		has_publication = false;
+	List	   *matched_pubids = NIL;
 
 	if (!IsNormalProcessingMode() || IsBootstrapProcessingMode())
 		return;
@@ -871,90 +870,74 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 											 target_ancestors))
 			continue;
 
-		if (!has_publication)
-		{
-			initStringInfo(&publication_list_buf);
-			has_publication = true;
-		}
-		else
-			appendStringInfoChar(&publication_list_buf, ',');
-
-		appendStringInfoString(&publication_list_buf,
-							   quote_identifier(NameStr(pubform->pubname)));
-
-		if (!OidIsValid(selected_pubid) || pubform->oid < selected_pubid)
-			selected_pubid = pubform->oid;
+		matched_pubids = lappend_oid(matched_pubids, pubform->oid);
 	}
 
 	table_endscan(pubscan);
 	table_close(pubrel, AccessShareLock);
 
-	if (OidIsValid(selected_pubid))
+	if (matched_pubids != NIL)
 	{
-		Datum		values[Natts_pg_publication_sync];
-		bool		nulls[Natts_pg_publication_sync];
-		HeapTuple	newtup;
-		Oid			pfsyncoid;
-		ObjectAddress myself;
-		ObjectAddress referenced;
+		ListCell   *lc;
 
 		syncrel = table_open(PublicationSyncRelationId, RowExclusiveLock);
 
-		memset(values, 0, sizeof(values));
-		memset(nulls, false, sizeof(nulls));
+		foreach(lc, matched_pubids)
+		{
+			Datum		values[Natts_pg_publication_sync];
+			bool		nulls[Natts_pg_publication_sync];
+			HeapTuple	newtup;
+			Oid			pubid = lfirst_oid(lc);
+			Oid			pfsyncobjid;
 
-		pfsyncoid = GetNewOidWithIndex(syncrel, PublicationSyncObjectIndexId,
-									   Anum_pg_publication_sync_oid);
-		values[Anum_pg_publication_sync_oid - 1] = ObjectIdGetDatum(pfsyncoid);
-		values[Anum_pg_publication_sync_pfsyncpubid - 1] =
-			ObjectIdGetDatum(selected_pubid);
-		values[Anum_pg_publication_sync_pfsynckind - 1] =
-			CharGetDatum(PFSYNC_KIND_OBJECT);
-		values[Anum_pg_publication_sync_pfsyncnspid - 1] =
-			ObjectIdGetDatum(InvalidOid);
-		values[Anum_pg_publication_sync_pfsyncrelid - 1] =
-			ObjectIdGetDatum(InvalidOid);
-		values[Anum_pg_publication_sync_pfsyncobjid - 1] =
-			ObjectIdGetDatum(pfsyncoid);
-		values[Anum_pg_publication_sync_pfsyncsubid - 1] = Int32GetDatum(0);
-		values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
-		values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
-		values[Anum_pg_publication_sync_message_type - 1] =
-			CStringGetTextDatum("Q");
+			memset(values, 0, sizeof(values));
+			memset(nulls, false, sizeof(nulls));
 
-		if (target_table != NULL)
-			values[Anum_pg_publication_sync_target_table - 1] =
-				CStringGetTextDatum(target_table);
-		else
-			nulls[Anum_pg_publication_sync_target_table - 1] = true;
+			pfsyncobjid = GetNewObjectId();
+			values[Anum_pg_publication_sync_pfsyncpubid - 1] =
+				ObjectIdGetDatum(pubid);
+			values[Anum_pg_publication_sync_pfsyncnspid - 1] =
+				ObjectIdGetDatum(InvalidOid);
+			values[Anum_pg_publication_sync_pfsyncrelid - 1] =
+				ObjectIdGetDatum(InvalidOid);
+			values[Anum_pg_publication_sync_pfsyncobjid - 1] =
+				ObjectIdGetDatum(pfsyncobjid);
+			values[Anum_pg_publication_sync_pfsyncsubid - 1] = Int32GetDatum(0);
+			values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
+			values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
+			values[Anum_pg_publication_sync_pfsynclsn - 1] =
+				LSNGetDatum(GetXLogInsertRecPtr());
+			values[Anum_pg_publication_sync_pfsyncts - 1] =
+				TimestampTzGetDatum(GetCurrentTimestamp());
+			values[Anum_pg_publication_sync_pfsyncmsgtype - 1] =
+				CStringGetTextDatum("Q");
 
-		if (ddl_sql != NULL)
-			values[Anum_pg_publication_sync_ddl_str - 1] =
-				CStringGetTextDatum(ddl_sql);
-		else
-			nulls[Anum_pg_publication_sync_ddl_str - 1] = true;
+			if (target_table != NULL)
+				values[Anum_pg_publication_sync_pfsynctargettable - 1] =
+					CStringGetTextDatum(target_table);
+			else
+				nulls[Anum_pg_publication_sync_pfsynctargettable - 1] = true;
 
-		if (has_publication)
-			values[Anum_pg_publication_sync_publication_list - 1] =
-				CStringGetTextDatum(publication_list_buf.data);
-		else
-			nulls[Anum_pg_publication_sync_publication_list - 1] = true;
+			if (ddl_sql != NULL)
+				values[Anum_pg_publication_sync_pfsyncddlsql - 1] =
+					CStringGetTextDatum(ddl_sql);
+			else
+				nulls[Anum_pg_publication_sync_pfsyncddlsql - 1] = true;
 
-		if (ddl_search_path != NULL && ddl_search_path[0] != '\0')
-			values[Anum_pg_publication_sync_search_path - 1] =
-				CStringGetTextDatum(ddl_search_path);
-		else
-			nulls[Anum_pg_publication_sync_search_path - 1] = true;
+			nulls[Anum_pg_publication_sync_pfsyncpublicationlist - 1] = true;
 
-		nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
+			if (ddl_search_path != NULL && ddl_search_path[0] != '\0')
+				values[Anum_pg_publication_sync_pfsyncsearchpath - 1] =
+					CStringGetTextDatum(ddl_search_path);
+			else
+				nulls[Anum_pg_publication_sync_pfsyncsearchpath - 1] = true;
 
-		newtup = heap_form_tuple(RelationGetDescr(syncrel), values, nulls);
-		CatalogTupleInsert(syncrel, newtup);
-		heap_freetuple(newtup);
+			nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
 
-		ObjectAddressSet(myself, PublicationSyncRelationId, pfsyncoid);
-		ObjectAddressSet(referenced, PublicationRelationId, selected_pubid);
-		recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
+			newtup = heap_form_tuple(RelationGetDescr(syncrel), values, nulls);
+			CatalogTupleInsert(syncrel, newtup);
+			heap_freetuple(newtup);
+		}
 
 		table_close(syncrel, RowExclusiveLock);
 	}
@@ -963,6 +946,7 @@ done:
 	list_free(target_relpubids);
 	list_free(target_schemapubids);
 	list_free(target_ancestors);
+	list_free(matched_pubids);
 
 	if (target_table != NULL)
 		pfree(target_table);
@@ -970,8 +954,6 @@ done:
 		pfree(ddl_sql);
 	if (ddl_search_path != NULL)
 		pfree(ddl_search_path);
-	if (has_publication)
-		pfree(publication_list_buf.data);
 }
 
 /*

@@ -5,213 +5,120 @@
 
 ## 1. 目标
 
-独立验证自动 DDL 同步执行层：
+验证执行层新模型：
 
-1. `Q` 消息：订阅端执行 `ddl_str`。
-2. `A/D` 消息：订阅端维护 `pg_subscription_rel`。
-3. 过滤规则：`pubddl + subddl + publication_list + scope` 生效。
+1. 表内仅 `Q/A/D` 消息；
+2. `Q` 按 publication 粒度展开写入；
+3. 发布端按 `pfsyncpubid` 路由发送；
+4. 订阅端 apply 不依赖 `publication_list`。
 
 ## 2. 前置条件
 
-1. publisher 与 subscriber 两节点已就绪。
-2. 两端均创建测试 schema：`auto_ddl`。
-3. 订阅端已具备与发布端同名基础表（用于 FOR TABLE publication）。
+1. publisher/subscriber 两节点；
+2. 当前分支重新 `initdb`；
+3. 两端均有基础 schema 与基础表。
 
-## 3. 验证步骤
+## 3. 用例
 
-### 3.1 `Q` 消息与 `search_path` 恢复
+### 3.1 `Q` apply + search_path
 
 发布端：
 
 ```sql
 CREATE TABLE auto_ddl.base_q(id int primary key);
-CREATE PUBLICATION pub_auto_q
-FOR TABLE auto_ddl.base_q
-WITH (ddl = 'table');
-```
-
-订阅端：
-
-```sql
-CREATE TABLE auto_ddl.base_q(id int primary key);
-CREATE SUBSCRIPTION sub_auto_q
-CONNECTION 'host=... port=... dbname=... user=... password=...'
-PUBLICATION pub_auto_q
-WITH (copy_data = false, ddl = 'table');
-```
-
-发布端触发 DDL：
-
-```sql
+CREATE PUBLICATION pub_auto_q FOR TABLE auto_ddl.base_q WITH (ddl='table');
 SET search_path = auto_ddl;
 CREATE TABLE q_sync_t(id int primary key);
 ```
 
-订阅端验证：
+订阅端：
 
 ```sql
-SELECT to_regclass('auto_ddl.q_sync_t') IS NOT NULL AS ddl_applied;
+CREATE TABLE auto_ddl.base_q(id int primary key);
+CREATE SUBSCRIPTION sub_auto_q ... PUBLICATION pub_auto_q WITH (copy_data=false, ddl='table');
 
+SELECT to_regclass('auto_ddl.q_sync_t') IS NOT NULL;
 SELECT count(*)
   FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND message_type = 'Q'
-   AND search_path = 'auto_ddl'
-   AND position('CREATE TABLE q_sync_t' in ddl_str) > 0;
+ WHERE pfsyncmsgtype='Q'
+   AND pfsyncsearchpath='auto_ddl'
+   AND position('CREATE TABLE q_sync_t' in pfsyncddlsql) > 0;
 ```
 
-预期：
+预期：DDL 被执行，且消息落表。
 
-1. `ddl_applied = true`。
-2. 存在 `Q` 记录，且 `search_path` 被正确记录。
+### 3.2 `Q` fan-out（同一 DDL 命中多个 publication）
 
-### 3.2 `A/D` 消息驱动 subscription 成员映射
+发布端：
+
+```sql
+CREATE TABLE auto_ddl.fanout_base(id int primary key);
+CREATE PUBLICATION pub_fanout_a FOR TABLE auto_ddl.fanout_base WITH (ddl='table');
+CREATE PUBLICATION pub_fanout_b FOR TABLE auto_ddl.fanout_base WITH (ddl='table');
+CREATE TABLE auto_ddl.fanout_t(id int);
+```
+
+发布端验证：
+
+```sql
+SELECT p.pubname, count(*)
+  FROM pg_publication_sync s
+  JOIN pg_publication p ON p.oid = s.pfsyncpubid
+ WHERE s.pfsyncmsgtype='Q'
+   AND position('CREATE TABLE auto_ddl.fanout_t' in s.pfsyncddlsql) > 0
+ GROUP BY p.pubname
+ ORDER BY p.pubname;
+```
+
+预期：`pub_fanout_a/pub_fanout_b` 各 1 条。
+
+### 3.3 发布端按 `pfsyncpubid` 路由（订阅端不看 publication_list）
+
+订阅端只订阅 `pub_fanout_a`：
+
+```sql
+CREATE SUBSCRIPTION sub_fanout_a ... PUBLICATION pub_fanout_a WITH (copy_data=false, ddl='table');
+```
+
+发布端再执行一条命中 A/B 的 DDL 后，订阅端验证：
+
+```sql
+SELECT count(*)
+  FROM pg_publication_sync
+ WHERE pfsyncmsgtype='Q'
+   AND position('CREATE TABLE auto_ddl.fanout_t2' in pfsyncddlsql) > 0;
+```
+
+预期：仅 1 条（只收到 pub_fanout_a 的消息）。
+
+### 3.4 `A/D` apply
 
 发布端：
 
 ```sql
 CREATE TABLE auto_ddl.ad_base(id int primary key);
 CREATE TABLE auto_ddl.ad_target(id int primary key, v text);
-
-CREATE PUBLICATION pub_auto_ad
-FOR TABLE auto_ddl.ad_base
-WITH (ddl = 'table,index');
-```
-
-订阅端：
-
-```sql
-CREATE TABLE auto_ddl.ad_base(id int primary key);
-CREATE TABLE auto_ddl.ad_target(id int primary key, v text);
-
-CREATE SUBSCRIPTION sub_auto_ad
-CONNECTION 'host=... port=... dbname=... user=... password=...'
-PUBLICATION pub_auto_ad
-WITH (copy_data = false, ddl = 'table,index');
-```
-
-发布端执行：
-
-```sql
-INSERT INTO auto_ddl.ad_target VALUES (1, 'before-add');
+CREATE PUBLICATION pub_auto_ad FOR TABLE auto_ddl.ad_base WITH (ddl='table');
 
 ALTER PUBLICATION pub_auto_ad ADD TABLE auto_ddl.ad_target;
-INSERT INTO auto_ddl.ad_target VALUES (2, 'after-add');
-
 ALTER PUBLICATION pub_auto_ad DROP TABLE auto_ddl.ad_target;
-INSERT INTO auto_ddl.ad_target VALUES (3, 'after-drop');
 ```
 
 订阅端验证：
 
 ```sql
-SELECT count(*) FROM auto_ddl.ad_target WHERE id = 1; -- 预期 0
-SELECT count(*) FROM auto_ddl.ad_target WHERE id = 2; -- 预期 1
-SELECT count(*) FROM auto_ddl.ad_target WHERE id = 3; -- 预期 0
-
-SELECT count(*)
-  FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND target_table = 'auto_ddl.ad_target'
-   AND message_type IN ('A', 'D');
-
-SELECT count(*)
-  FROM pg_subscription_rel sr
-  JOIN pg_subscription s ON s.oid = sr.srsubid
-  JOIN pg_class c ON c.oid = sr.srrelid
-  JOIN pg_namespace n ON n.oid = c.relnamespace
- WHERE s.subname = 'sub_auto_ad'
-   AND n.nspname = 'auto_ddl'
-   AND c.relname = 'ad_target';
+SELECT count(*) FROM pg_publication_sync WHERE pfsyncmsgtype='A' AND pfsynctargettable='auto_ddl.ad_target';
+SELECT count(*) FROM pg_publication_sync WHERE pfsyncmsgtype='D' AND pfsynctargettable='auto_ddl.ad_target';
 ```
 
-预期：
+预期：`A`、`D` 各至少 1 条，且订阅关系映射随之增删。
 
-1. 仅 `id=2` 被复制。
-2. 有 `A` 和 `D` 消息记录。
-3. 最终 `pg_subscription_rel` 中 `ad_target` 映射被移除。
-
-### 3.3 过滤规则验证（scope + ddl + publication_list）
+### 3.5 历史清理
 
 发布端：
 
 ```sql
-CREATE TABLE auto_ddl.scope_tbl(id int primary key);
-CREATE TABLE auto_ddl.scope_tbl2(id int primary key);
-
-CREATE PUBLICATION pub_scope_tbl
-FOR TABLE auto_ddl.scope_tbl
-WITH (ddl = 'table');
-
-CREATE PUBLICATION pub_scope_idx
-FOR TABLE auto_ddl.scope_tbl
-WITH (ddl = 'index');
+SELECT pg_publication_sync_prune();
 ```
 
-订阅端：
-
-```sql
-CREATE TABLE auto_ddl.scope_tbl(id int primary key);
-CREATE TABLE auto_ddl.scope_tbl2(id int primary key);
-
-CREATE SUBSCRIPTION sub_scope_tbl
-CONNECTION 'host=... port=... dbname=... user=... password=...'
-PUBLICATION pub_scope_tbl
-WITH (copy_data = false, ddl = 'table');
-```
-
-发布端执行：
-
-```sql
-ALTER TABLE auto_ddl.scope_tbl ADD COLUMN c1 int;
-ALTER TABLE auto_ddl.scope_tbl2 ADD COLUMN c2 int;
-```
-
-订阅端验证：
-
-```sql
-SELECT EXISTS (
-  SELECT 1 FROM pg_attribute
-   WHERE attrelid = 'auto_ddl.scope_tbl'::regclass
-     AND attname = 'c1' AND NOT attisdropped
-) AS scope_tbl_applied;
-
-SELECT EXISTS (
-  SELECT 1 FROM pg_attribute
-   WHERE attrelid = 'auto_ddl.scope_tbl2'::regclass
-     AND attname = 'c2' AND NOT attisdropped
-) AS scope_tbl2_applied;
-
-SELECT coalesce(bool_or(position('pub_scope_idx' in publication_list) > 0), false)
-  FROM pg_publication_sync
- WHERE pfsynckind = 'o'
-   AND position('ALTER TABLE auto_ddl.scope_tbl ADD COLUMN c1' in ddl_str) > 0;
-```
-
-预期：
-
-1. `scope_tbl_applied = true`。
-2. `scope_tbl2_applied = false`（publication_list 无交集）。
-3. 第三条查询返回 `false`（index-only publication 不捕获 table DDL）。
-
-## 4. 清理
-
-发布端：
-
-```sql
-DROP PUBLICATION IF EXISTS pub_auto_q;
-DROP PUBLICATION IF EXISTS pub_auto_ad;
-DROP PUBLICATION IF EXISTS pub_scope_tbl;
-DROP PUBLICATION IF EXISTS pub_scope_idx;
-DROP SCHEMA IF EXISTS auto_ddl CASCADE;
-```
-
-订阅端：
-
-```sql
-DROP SUBSCRIPTION IF EXISTS sub_auto_q;
-DROP SUBSCRIPTION IF EXISTS sub_auto_ad;
-DROP SUBSCRIPTION IF EXISTS sub_scope_tbl;
-DROP SCHEMA IF EXISTS auto_ddl CASCADE;
-```
-
+预期：返回 `int8` 删除计数，且不会删除仍处于逻辑槽保留窗口内的消息。

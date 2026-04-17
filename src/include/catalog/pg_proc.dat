@@ -12258,6 +12258,11 @@
   proname => 'pg_relation_is_publishable', provolatile => 's',
   prorettype => 'bool', proargtypes => 'regclass',
   prosrc => 'pg_relation_is_publishable' },
+{ oid => '12420',
+  descr => 'prune obsolete rows in pg_publication_sync',
+  proname => 'pg_publication_sync_prune', provolatile => 'v',
+  proparallel => 'u', prorettype => 'int8', proargtypes => '',
+  prosrc => 'pg_publication_sync_prune' },
 
 # rls
 { oid => '3298',

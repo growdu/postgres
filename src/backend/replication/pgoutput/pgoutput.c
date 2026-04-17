@@ -249,6 +249,8 @@ static bool pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 								TupleTableSlot **new_slot_ptr,
 								RelationSyncEntry *entry,
 								ReorderBufferChangeType *action);
+static bool pgoutput_publication_sync_row_matches_pubid(PGOutputData *data,
+														 TupleTableSlot *slot);
 
 /* column list routines */
 static void pgoutput_column_list_init(PGOutputData *data,
@@ -1475,6 +1477,40 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 }
 
 /*
+ * pg_publication_sync rows are routed by source publication OID.
+ *
+ * The sender emits only rows whose pfsyncpubid belongs to one of the
+ * publications requested by the subscriber connection.
+ */
+static bool
+pgoutput_publication_sync_row_matches_pubid(PGOutputData *data,
+											TupleTableSlot *slot)
+{
+	bool		isnull;
+	Datum		pubid_datum;
+	Oid			row_pubid;
+	ListCell   *lc;
+
+	pubid_datum = slot_getattr(slot,
+							   Anum_pg_publication_sync_pfsyncpubid,
+							   &isnull);
+	if (isnull)
+		return false;
+
+	row_pubid = DatumGetObjectId(pubid_datum);
+
+	foreach(lc, data->publications)
+	{
+		Publication *pub = lfirst(lc);
+
+		if (pub->oid == row_pubid)
+			return true;
+	}
+
+	return false;
+}
+
+/*
  * Sends the decoded DML over wire.
  *
  * This is called both in streaming and non-streaming modes.
@@ -1577,6 +1613,19 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 			new_slot = execute_attr_map_slot(relentry->attrmap, new_slot, slot);
 		}
+	}
+
+	/*
+	 * Route pg_publication_sync rows by pfsyncpubid, so each subscriber only
+	 * receives rows from the publications it requested.
+	 */
+	if (RelationGetRelid(targetrel) == PublicationSyncRelationId)
+	{
+		TupleTableSlot *msgslot = new_slot != NULL ? new_slot : old_slot;
+
+		if (msgslot == NULL ||
+			!pgoutput_publication_sync_row_matches_pubid(data, msgslot))
+			goto cleanup;
 	}
 
 	/*
@@ -2200,8 +2249,8 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 
 				/*
 				 * pg_publication_sync is replication metadata and should flow to
-				 * all connected subscribers (subject to their publication list),
-				 * without requiring explicit table membership.
+				 * subscribers without requiring explicit table membership. The
+				 * concrete rows are routed later by pfsyncpubid.
 				 */
 				if (relid == PublicationSyncRelationId)
 					publish = true;

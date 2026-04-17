@@ -1442,8 +1442,7 @@ doDeletion(const ObjectAddress *object, int flags)
 			break;
 
 		case PublicationSyncRelationId:
-			RemovePublicationSyncById(object->objectId);
-			break;
+			elog(ERROR, "publication sync messages cannot be deleted by object address");
 
 		case PublicationRelationId:
 			RemovePublicationById(object->objectId);

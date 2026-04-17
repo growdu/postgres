@@ -4036,26 +4036,8 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 
 		case PublicationSyncRelationId:
 			{
-				HeapTuple	tup;
-				char	   *pubname;
-				Form_pg_publication_sync pfsform;
-
-				tup = SearchSysCache1(PUBLICATIONSYNC,
-									  ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "cache lookup failed for publication sync %u",
-							 object->objectId);
-					break;
-				}
-
-				pfsform = (Form_pg_publication_sync) GETSTRUCT(tup);
-				pubname = get_publication_name(pfsform->pfsyncpubid, false);
-
-				appendStringInfo(&buffer, _("publication sync item in publication %s"),
-								 pubname);
-				ReleaseSysCache(tup);
+				appendStringInfo(&buffer, _("publication sync item %u"),
+								 object->objectId);
 				break;
 			}
 
@@ -5995,31 +5977,13 @@ getObjectIdentityParts(const ObjectAddress *object,
 
 		case PublicationSyncRelationId:
 			{
-				HeapTuple	tup;
-				char	   *pubname;
-				Form_pg_publication_sync pfsform;
+				char	   *syncid = psprintf("%u", object->objectId);
 
-				tup = SearchSysCache1(PUBLICATIONSYNC,
-									  ObjectIdGetDatum(object->objectId));
-				if (!HeapTupleIsValid(tup))
-				{
-					if (!missing_ok)
-						elog(ERROR, "cache lookup failed for publication sync %u",
-							 object->objectId);
-					break;
-				}
-
-				pfsform = (Form_pg_publication_sync) GETSTRUCT(tup);
-				pubname = get_publication_name(pfsform->pfsyncpubid, false);
-
-				appendStringInfo(&buffer, "%s kind %c", pubname,
-								 pfsform->pfsynckind);
+				appendStringInfo(&buffer, "publication sync item %s", syncid);
 				if (objname)
-					*objname = list_make1(pubname);
+					*objname = list_make1(syncid);
 				else
-					pfree(pubname);
-
-				ReleaseSysCache(tup);
+					pfree(syncid);
 				break;
 			}
 

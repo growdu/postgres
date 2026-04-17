@@ -17,9 +17,10 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/catalog.h"
-#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
@@ -42,14 +43,17 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteHandler.h"
+#include "replication/slot.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/varlena.h"
 
 
@@ -66,6 +70,8 @@ typedef struct rf_context
 	Oid			parentid;		/* relid of the parent relation */
 } rf_context;
 
+Datum		pg_publication_sync_prune(PG_FUNCTION_ARGS);
+
 static List *OpenTableList(List *tables);
 static void CloseTableList(List *rels);
 static void LockSchemaList(List *schemalist);
@@ -79,7 +85,6 @@ static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
 static char defGetGeneratedColsOption(DefElem *def);
 static int	parse_publication_ddl_option(ParseState *pstate, DefElem *defel);
-static void upsert_publication_sync_default(Oid pubid, int ddlmask);
 static void insert_publication_sync_relation_message(Oid pubid, Oid relid,
 													 const char *message_type);
 
@@ -259,107 +264,9 @@ parse_publication_ddl_option(ParseState *pstate, DefElem *defel)
 	return ddlmask;
 }
 
-static void
-upsert_publication_sync_default(Oid pubid, int ddlmask)
-{
-	Relation	rel;
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	tup;
-	bool		found = false;
-
-	rel = table_open(PublicationSyncRelationId, RowExclusiveLock);
-
-	ScanKeyInit(&key,
-				Anum_pg_publication_sync_pfsyncpubid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(pubid));
-	scan = systable_beginscan(rel, PublicationSyncPubidIndexId, true,
-							  NULL, 1, &key);
-
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-	{
-		Form_pg_publication_sync form = (Form_pg_publication_sync) GETSTRUCT(tup);
-
-		if (form->pfsynckind != PFSYNC_KIND_PUBLICATION)
-			continue;
-
-		found = true;
-
-		if (form->pfsyncddl != ddlmask || !form->pfsyncenabled)
-		{
-			bool		nulls[Natts_pg_publication_sync];
-			bool		replaces[Natts_pg_publication_sync];
-			Datum		values[Natts_pg_publication_sync];
-			HeapTuple	newtup;
-
-			memset(nulls, false, sizeof(nulls));
-			memset(replaces, false, sizeof(replaces));
-			memset(values, 0, sizeof(values));
-
-			values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
-			replaces[Anum_pg_publication_sync_pfsyncddl - 1] = true;
-			values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
-			replaces[Anum_pg_publication_sync_pfsyncenabled - 1] = true;
-
-			newtup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
-									   replaces);
-			CatalogTupleUpdate(rel, &newtup->t_self, newtup);
-			heap_freetuple(newtup);
-		}
-	}
-
-	systable_endscan(scan);
-
-	if (!found)
-	{
-		Datum		values[Natts_pg_publication_sync];
-		bool		nulls[Natts_pg_publication_sync];
-		HeapTuple	newtup;
-		Oid			pfsyncoid;
-		ObjectAddress myself,
-					referenced;
-
-		memset(values, 0, sizeof(values));
-		memset(nulls, false, sizeof(nulls));
-
-		pfsyncoid = GetNewOidWithIndex(rel, PublicationSyncObjectIndexId,
-									   Anum_pg_publication_sync_oid);
-		values[Anum_pg_publication_sync_oid - 1] = ObjectIdGetDatum(pfsyncoid);
-		values[Anum_pg_publication_sync_pfsyncpubid - 1] = ObjectIdGetDatum(pubid);
-		values[Anum_pg_publication_sync_pfsynckind - 1] =
-			CharGetDatum(PFSYNC_KIND_PUBLICATION);
-		values[Anum_pg_publication_sync_pfsyncnspid - 1] =
-			ObjectIdGetDatum(InvalidOid);
-		values[Anum_pg_publication_sync_pfsyncrelid - 1] =
-			ObjectIdGetDatum(InvalidOid);
-		values[Anum_pg_publication_sync_pfsyncobjid - 1] =
-			ObjectIdGetDatum(InvalidOid);
-		values[Anum_pg_publication_sync_pfsyncsubid - 1] = Int32GetDatum(0);
-		values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
-		values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
-		nulls[Anum_pg_publication_sync_message_type - 1] = true;
-		nulls[Anum_pg_publication_sync_target_table - 1] = true;
-		nulls[Anum_pg_publication_sync_ddl_str - 1] = true;
-		nulls[Anum_pg_publication_sync_publication_list - 1] = true;
-		nulls[Anum_pg_publication_sync_search_path - 1] = true;
-		nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
-
-		newtup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-		CatalogTupleInsert(rel, newtup);
-		heap_freetuple(newtup);
-
-		ObjectAddressSet(myself, PublicationSyncRelationId, pfsyncoid);
-		ObjectAddressSet(referenced, PublicationRelationId, pubid);
-		recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
-	}
-
-	table_close(rel, RowExclusiveLock);
-}
-
 /*
- * Insert one object-level pg_publication_sync message row for relation
- * membership changes (message_type A/D).
+ * Insert one pg_publication_sync message row for relation membership changes
+ * (message_type A/D).
  */
 static void
 insert_publication_sync_relation_message(Oid pubid, Oid relid,
@@ -369,14 +276,10 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid,
 	Datum		values[Natts_pg_publication_sync];
 	bool		nulls[Natts_pg_publication_sync];
 	HeapTuple	newtup;
-	Oid			pfsyncoid;
-	ObjectAddress myself,
-				referenced;
+	Oid			pfsyncobjid;
 	char	   *nspname;
 	char	   *relname;
 	char	   *target_table;
-	char	   *pubname;
-	char	   *publist;
 
 	if (!OidIsValid(relid) || relid == PublicationSyncRelationId)
 		return;
@@ -392,8 +295,6 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid,
 		return;
 	}
 
-	pubname = get_publication_name(pubid, false);
-	publist = pstrdup(quote_identifier(pubname));
 	target_table = quote_qualified_identifier(nspname, relname);
 
 	syncrel = table_open(PublicationSyncRelationId, RowExclusiveLock);
@@ -401,43 +302,36 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid,
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
 
-	pfsyncoid = GetNewOidWithIndex(syncrel, PublicationSyncObjectIndexId,
-								   Anum_pg_publication_sync_oid);
-	values[Anum_pg_publication_sync_oid - 1] = ObjectIdGetDatum(pfsyncoid);
+	pfsyncobjid = GetNewObjectId();
 	values[Anum_pg_publication_sync_pfsyncpubid - 1] = ObjectIdGetDatum(pubid);
-	values[Anum_pg_publication_sync_pfsynckind - 1] =
-		CharGetDatum(PFSYNC_KIND_OBJECT);
 	values[Anum_pg_publication_sync_pfsyncnspid - 1] =
 		ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_publication_sync_pfsyncrelid - 1] =
 		ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_publication_sync_pfsyncobjid - 1] =
-		ObjectIdGetDatum(pfsyncoid);
+		ObjectIdGetDatum(pfsyncobjid);
 	values[Anum_pg_publication_sync_pfsyncsubid - 1] = Int32GetDatum(0);
 	values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
 	values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(PUBDDL_TABLE);
-	values[Anum_pg_publication_sync_message_type - 1] =
+	values[Anum_pg_publication_sync_pfsynclsn - 1] =
+		LSNGetDatum(GetXLogInsertRecPtr());
+	values[Anum_pg_publication_sync_pfsyncts - 1] =
+		TimestampTzGetDatum(GetCurrentTimestamp());
+	values[Anum_pg_publication_sync_pfsyncmsgtype - 1] =
 		CStringGetTextDatum(message_type);
-	values[Anum_pg_publication_sync_target_table - 1] =
+	values[Anum_pg_publication_sync_pfsynctargettable - 1] =
 		CStringGetTextDatum(target_table);
-	nulls[Anum_pg_publication_sync_ddl_str - 1] = true;
-	values[Anum_pg_publication_sync_publication_list - 1] =
-		CStringGetTextDatum(publist);
-	nulls[Anum_pg_publication_sync_search_path - 1] = true;
+	nulls[Anum_pg_publication_sync_pfsyncddlsql - 1] = true;
+	nulls[Anum_pg_publication_sync_pfsyncpublicationlist - 1] = true;
+	nulls[Anum_pg_publication_sync_pfsyncsearchpath - 1] = true;
 	nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
 
 	newtup = heap_form_tuple(RelationGetDescr(syncrel), values, nulls);
 	CatalogTupleInsert(syncrel, newtup);
 	heap_freetuple(newtup);
 
-	ObjectAddressSet(myself, PublicationSyncRelationId, pfsyncoid);
-	ObjectAddressSet(referenced, PublicationRelationId, pubid);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
-
 	table_close(syncrel, RowExclusiveLock);
 
-	pfree(pubname);
-	pfree(publist);
 	pfree(target_table);
 	pfree(nspname);
 	pfree(relname);
@@ -1188,7 +1082,6 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 
 	/* Make the changes visible. */
 	CommandCounterIncrement();
-	upsert_publication_sync_default(puboid, ddlmask);
 
 	/* Associate objects with the publication. */
 	if (stmt->for_all_tables)
@@ -1407,8 +1300,6 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
 
 	CommandCounterIncrement();
-	if (ddl_given)
-		upsert_publication_sync_default(pubform->oid, ddlmask);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
@@ -1926,6 +1817,66 @@ RemovePublicationById(Oid pubid)
 }
 
 /*
+ * Prune historical pg_publication_sync messages that are no longer needed.
+ *
+ * Rows are removable only when both conditions hold:
+ * 1) row LSN is older than the minimum logical slot restart LSN, and
+ * 2) row timestamp is older than a small grace window.
+ */
+Datum
+pg_publication_sync_prune(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	int64		deleted = 0;
+	XLogRecPtr	retain_lsn;
+	TimestampTz cutoff_ts;
+	const TimestampTz grace_usecs = 5 * USECS_PER_MINUTE;
+
+	retain_lsn = ReplicationSlotsComputeLogicalRestartLSN();
+	if (XLogRecPtrIsInvalid(retain_lsn))
+		retain_lsn = GetXLogInsertRecPtr();
+
+	cutoff_ts = GetCurrentTimestamp() - grace_usecs;
+
+	rel = table_open(PublicationSyncRelationId, RowExclusiveLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		lsn_datum;
+		Datum		ts_datum;
+		XLogRecPtr	row_lsn;
+		TimestampTz	row_ts;
+
+		lsn_datum = heap_getattr(tup, Anum_pg_publication_sync_pfsynclsn,
+								 RelationGetDescr(rel), &isnull);
+		if (isnull)
+			continue;
+		row_lsn = DatumGetLSN(lsn_datum);
+
+		ts_datum = heap_getattr(tup, Anum_pg_publication_sync_pfsyncts,
+								RelationGetDescr(rel), &isnull);
+		if (isnull)
+			continue;
+		row_ts = DatumGetTimestampTz(ts_datum);
+
+		if (row_lsn < retain_lsn && row_ts < cutoff_ts)
+		{
+			CatalogTupleDelete(rel, &tup->t_self);
+			deleted++;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(rel, RowExclusiveLock);
+
+	PG_RETURN_INT64(deleted);
+}
+
+/*
  * Remove schema from publication by mapping OID.
  */
 void
@@ -1958,27 +1909,6 @@ RemovePublicationSchemaById(Oid psoid)
 
 	ReleaseSysCache(tup);
 
-	table_close(rel, RowExclusiveLock);
-}
-
-/*
- * Remove publication DDL sync metadata by mapping OID.
- */
-void
-RemovePublicationSyncById(Oid pfoid)
-{
-	Relation	rel;
-	HeapTuple	tup;
-
-	rel = table_open(PublicationSyncRelationId, RowExclusiveLock);
-
-	tup = SearchSysCache1(PUBLICATIONSYNC, ObjectIdGetDatum(pfoid));
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for publication sync %u", pfoid);
-
-	CatalogTupleDelete(rel, &tup->t_self);
-
-	ReleaseSysCache(tup);
 	table_close(rel, RowExclusiveLock);
 }
 

@@ -28,22 +28,22 @@
  */
 CATALOG(pg_publication_sync,9352,PublicationSyncRelationId)
 {
-	Oid			oid;			/* oid */
 	Oid			pfsyncpubid BKI_LOOKUP(pg_publication);	/* publication OID */
-	char		pfsynckind BKI_DEFAULT(p); /* p/r/n/o */
 	Oid			pfsyncnspid BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_namespace);
 	Oid			pfsyncrelid BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_class);
 	Oid			pfsyncobjid BKI_DEFAULT(0);
 	int32		pfsyncsubid BKI_DEFAULT(0);
 	bool		pfsyncenabled BKI_DEFAULT(t);
 	int32		pfsyncddl BKI_DEFAULT(0);
+	XLogRecPtr	pfsynclsn BKI_DEFAULT(0);
+	TimestampTz	pfsyncts BKI_DEFAULT(0);
 
 #ifdef CATALOG_VARLEN
-	text		message_type BKI_DEFAULT(_null_) BKI_FORCE_NULL;
-	text		target_table BKI_DEFAULT(_null_) BKI_FORCE_NULL;
-	text		ddl_str BKI_DEFAULT(_null_) BKI_FORCE_NULL;
-	text		publication_list BKI_DEFAULT(_null_) BKI_FORCE_NULL;
-	text		search_path BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		pfsyncmsgtype BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		pfsynctargettable BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		pfsyncddlsql BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		pfsyncpublicationlist BKI_DEFAULT(_null_) BKI_FORCE_NULL;
+	text		pfsyncsearchpath BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 	text		pfsyncextra BKI_DEFAULT(_null_) BKI_FORCE_NULL;
 #endif
 } FormData_pg_publication_sync;
@@ -55,17 +55,9 @@ CATALOG(pg_publication_sync,9352,PublicationSyncRelationId)
  */
 typedef FormData_pg_publication_sync *Form_pg_publication_sync;
 
-#define PFSYNC_KIND_PUBLICATION	'p'
-#define PFSYNC_KIND_RELATION	'r'
-#define PFSYNC_KIND_NAMESPACE	'n'
-#define PFSYNC_KIND_OBJECT		'o'
-
 DECLARE_TOAST(pg_publication_sync, 9356, 9357);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_publication_sync_oid_index, 9353, PublicationSyncObjectIndexId, pg_publication_sync, btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_publication_sync_map_index, 9354, PublicationSyncMapIndexId, pg_publication_sync, btree(pfsyncpubid oid_ops, pfsynckind char_ops, pfsyncnspid oid_ops, pfsyncrelid oid_ops, pfsyncobjid oid_ops, pfsyncsubid int4_ops));
+DECLARE_UNIQUE_INDEX(pg_publication_sync_map_index, 9354, PublicationSyncMapIndexId, pg_publication_sync, btree(pfsyncpubid oid_ops, pfsyncnspid oid_ops, pfsyncrelid oid_ops, pfsyncobjid oid_ops, pfsyncsubid int4_ops));
 DECLARE_INDEX(pg_publication_sync_pubid_index, 9355, PublicationSyncPubidIndexId, pg_publication_sync, btree(pfsyncpubid oid_ops));
-
-MAKE_SYSCACHE(PUBLICATIONSYNC, pg_publication_sync_oid_index, 64);
 
 #endif							/* PG_PUBLICATION_SYNC_H */
