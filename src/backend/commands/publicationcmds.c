@@ -29,6 +29,7 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -71,18 +72,72 @@ static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 								  AlterPublicationStmt *stmt);
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
 
+static int32
+parse_publication_ddl_option(DefElem *defel)
+{
+	char	   *ddl;
+	List	   *ddl_list;
+	ListCell   *lc;
+	int32		ddl_mask = 0;
+
+	ddl = defGetString(defel);
+
+	if (!SplitIdentifierString(ddl, ',', &ddl_list))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid list syntax in parameter \"%s\"",
+						"ddl")));
+
+	foreach(lc, ddl_list)
+	{
+		char	   *ddl_opt = (char *) lfirst(lc);
+
+		if (strcmp(ddl_opt, "table") == 0)
+			ddl_mask |= PUBLICATION_DDL_TABLE;
+		else if (strcmp(ddl_opt, "index") == 0)
+			ddl_mask |= PUBLICATION_DDL_INDEX;
+		else if (strcmp(ddl_opt, "trigger") == 0)
+			ddl_mask |= PUBLICATION_DDL_TRIGGER;
+		else if (strcmp(ddl_opt, "view") == 0)
+			ddl_mask |= PUBLICATION_DDL_VIEW;
+		else if (strcmp(ddl_opt, "rule") == 0)
+			ddl_mask |= PUBLICATION_DDL_RULE;
+		else if (strcmp(ddl_opt, "schema") == 0)
+			ddl_mask |= PUBLICATION_DDL_SCHEMA;
+		else if (strcmp(ddl_opt, "function") == 0)
+			ddl_mask |= PUBLICATION_DDL_FUNCTION;
+		else if (strcmp(ddl_opt, "type") == 0)
+			ddl_mask |= PUBLICATION_DDL_TYPE;
+		else if (strcmp(ddl_opt, "domain") == 0)
+			ddl_mask |= PUBLICATION_DDL_DOMAIN;
+		else if (strcmp(ddl_opt, "extension") == 0)
+			ddl_mask |= PUBLICATION_DDL_EXTENSION;
+		else if (strcmp(ddl_opt, "all") == 0)
+			ddl_mask |= PUBLICATION_DDL_ALL;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized value for publication option \"%s\": \"%s\"",
+							"ddl", ddl_opt)));
+	}
+
+	return ddl_mask;
+}
 
 static void
 parse_publication_options(ParseState *pstate,
 						  List *options,
 						  bool *publish_given,
 						  PublicationActions *pubactions,
+						  bool *ddl_given,
+						  int32 *pubddl,
 						  bool *publish_via_partition_root_given,
 						  bool *publish_via_partition_root)
 {
 	ListCell   *lc;
 
 	*publish_given = false;
+	*ddl_given = false;
 	*publish_via_partition_root_given = false;
 
 	/* defaults */
@@ -90,6 +145,7 @@ parse_publication_options(ParseState *pstate,
 	pubactions->pubupdate = true;
 	pubactions->pubdelete = true;
 	pubactions->pubtruncate = true;
+	*pubddl = 0;
 	*publish_via_partition_root = false;
 
 	/* Parse options */
@@ -150,6 +206,13 @@ parse_publication_options(ParseState *pstate,
 				errorConflictingDefElem(defel, pstate);
 			*publish_via_partition_root_given = true;
 			*publish_via_partition_root = defGetBoolean(defel);
+		}
+		else if (strcmp(defel->defname, "ddl") == 0)
+		{
+			if (*ddl_given)
+				errorConflictingDefElem(defel, pstate);
+			*ddl_given = true;
+			*pubddl = parse_publication_ddl_option(defel);
 		}
 		else
 			ereport(ERROR,
@@ -735,6 +798,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	HeapTuple	tup;
 	bool		publish_given;
 	PublicationActions pubactions;
+	bool		ddl_given;
+	int32		pubddl;
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
 	AclResult	aclresult;
@@ -775,6 +840,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	parse_publication_options(pstate,
 							  stmt->options,
 							  &publish_given, &pubactions,
+							  &ddl_given, &pubddl,
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root);
 
@@ -793,6 +859,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		BoolGetDatum(pubactions.pubtruncate);
 	values[Anum_pg_publication_pubviaroot - 1] =
 		BoolGetDatum(publish_via_partition_root);
+	values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(pubddl);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -876,6 +943,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	Datum		values[Natts_pg_publication];
 	bool		publish_given;
 	PublicationActions pubactions;
+	bool		ddl_given;
+	int32		pubddl;
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
 	ObjectAddress obj;
@@ -886,6 +955,7 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	parse_publication_options(pstate,
 							  stmt->options,
 							  &publish_given, &pubactions,
+							  &ddl_given, &pubddl,
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root);
 
@@ -995,6 +1065,12 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	{
 		values[Anum_pg_publication_pubviaroot - 1] = BoolGetDatum(publish_via_partition_root);
 		replaces[Anum_pg_publication_pubviaroot - 1] = true;
+	}
+
+	if (ddl_given)
+	{
+		values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(pubddl);
+		replaces[Anum_pg_publication_pubddl - 1] = true;
 	}
 
 	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,

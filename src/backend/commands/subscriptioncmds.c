@@ -25,6 +25,7 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "catalog/pg_type.h"
@@ -51,6 +52,7 @@
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/syscache.h"
+#include "utils/varlena.h"
 
 /*
  * Options that can be specified by the user in CREATE/ALTER SUBSCRIPTION
@@ -72,6 +74,7 @@
 #define SUBOPT_FAILOVER				0x00002000
 #define SUBOPT_LSN					0x00004000
 #define SUBOPT_ORIGIN				0x00008000
+#define SUBOPT_DDL					0x00010000
 
 /* check if the 'val' has 'bits' set */
 #define IsSet(val, bits)  (((val) & (bits)) == (bits))
@@ -97,6 +100,7 @@ typedef struct SubOpts
 	bool		passwordrequired;
 	bool		runasowner;
 	bool		failover;
+	int32		ddl;
 	char	   *origin;
 	XLogRecPtr	lsn;
 } SubOpts;
@@ -109,6 +113,58 @@ static void check_publications_origin(WalReceiverConn *wrconn,
 static void check_duplicates_in_publist(List *publist, Datum *datums);
 static List *merge_publications(List *oldpublist, List *newpublist, bool addpub, const char *subname);
 static void ReportSlotConnectionError(List *rstates, Oid subid, char *slotname, char *err);
+
+static int32
+parse_subscription_ddl_option(DefElem *defel)
+{
+	char	   *ddl;
+	List	   *ddl_list;
+	ListCell   *lc;
+	int32		ddl_mask = 0;
+
+	ddl = defGetString(defel);
+
+	if (!SplitIdentifierString(ddl, ',', &ddl_list))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid list syntax in parameter \"%s\"",
+						"ddl")));
+
+	foreach(lc, ddl_list)
+	{
+		char	   *ddl_opt = (char *) lfirst(lc);
+
+		if (strcmp(ddl_opt, "table") == 0)
+			ddl_mask |= PUBLICATION_DDL_TABLE;
+		else if (strcmp(ddl_opt, "index") == 0)
+			ddl_mask |= PUBLICATION_DDL_INDEX;
+		else if (strcmp(ddl_opt, "trigger") == 0)
+			ddl_mask |= PUBLICATION_DDL_TRIGGER;
+		else if (strcmp(ddl_opt, "view") == 0)
+			ddl_mask |= PUBLICATION_DDL_VIEW;
+		else if (strcmp(ddl_opt, "rule") == 0)
+			ddl_mask |= PUBLICATION_DDL_RULE;
+		else if (strcmp(ddl_opt, "schema") == 0)
+			ddl_mask |= PUBLICATION_DDL_SCHEMA;
+		else if (strcmp(ddl_opt, "function") == 0)
+			ddl_mask |= PUBLICATION_DDL_FUNCTION;
+		else if (strcmp(ddl_opt, "type") == 0)
+			ddl_mask |= PUBLICATION_DDL_TYPE;
+		else if (strcmp(ddl_opt, "domain") == 0)
+			ddl_mask |= PUBLICATION_DDL_DOMAIN;
+		else if (strcmp(ddl_opt, "extension") == 0)
+			ddl_mask |= PUBLICATION_DDL_EXTENSION;
+		else if (strcmp(ddl_opt, "all") == 0)
+			ddl_mask |= PUBLICATION_DDL_ALL;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized value for subscription option \"%s\": \"%s\"",
+							"ddl", ddl_opt)));
+	}
+
+	return ddl_mask;
+}
 
 
 /*
@@ -161,6 +217,8 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 		opts->failover = false;
 	if (IsSet(supported_opts, SUBOPT_ORIGIN))
 		opts->origin = pstrdup(LOGICALREP_ORIGIN_ANY);
+	if (IsSet(supported_opts, SUBOPT_DDL))
+		opts->ddl = 0;
 
 	/* Parse options */
 	foreach(lc, stmt_options)
@@ -338,6 +396,15 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 				ereport(ERROR,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("unrecognized origin value: \"%s\"", opts->origin));
+		}
+		else if (IsSet(supported_opts, SUBOPT_DDL) &&
+				 strcmp(defel->defname, "ddl") == 0)
+		{
+			if (IsSet(opts->specified_opts, SUBOPT_DDL))
+				errorConflictingDefElem(defel, pstate);
+
+			opts->specified_opts |= SUBOPT_DDL;
+			opts->ddl = parse_subscription_ddl_option(defel);
 		}
 		else if (IsSet(supported_opts, SUBOPT_LSN) &&
 				 strcmp(defel->defname, "lsn") == 0)
@@ -603,7 +670,8 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 					  SUBOPT_SYNCHRONOUS_COMMIT | SUBOPT_BINARY |
 					  SUBOPT_STREAMING | SUBOPT_TWOPHASE_COMMIT |
 					  SUBOPT_DISABLE_ON_ERR | SUBOPT_PASSWORD_REQUIRED |
-					  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER | SUBOPT_ORIGIN);
+					  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER | SUBOPT_ORIGIN |
+					  SUBOPT_DDL);
 	parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
 
 	/*
@@ -710,6 +778,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	values[Anum_pg_subscription_subpasswordrequired - 1] = BoolGetDatum(opts.passwordrequired);
 	values[Anum_pg_subscription_subrunasowner - 1] = BoolGetDatum(opts.runasowner);
 	values[Anum_pg_subscription_subfailover - 1] = BoolGetDatum(opts.failover);
+	values[Anum_pg_subscription_subddl - 1] = Int32GetDatum(opts.ddl);
 	values[Anum_pg_subscription_subconninfo - 1] =
 		CStringGetTextDatum(conninfo);
 	if (opts.slot_name)
@@ -1146,7 +1215,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 								  SUBOPT_STREAMING | SUBOPT_DISABLE_ON_ERR |
 								  SUBOPT_PASSWORD_REQUIRED |
 								  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
-								  SUBOPT_ORIGIN);
+								  SUBOPT_ORIGIN | SUBOPT_DDL);
 
 				parse_subscription_options(pstate, stmt->options,
 										   supported_opts, &opts);
@@ -1261,6 +1330,13 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					values[Anum_pg_subscription_suborigin - 1] =
 						CStringGetTextDatum(opts.origin);
 					replaces[Anum_pg_subscription_suborigin - 1] = true;
+				}
+
+				if (IsSet(opts.specified_opts, SUBOPT_DDL))
+				{
+					values[Anum_pg_subscription_subddl - 1] =
+						Int32GetDatum(opts.ddl);
+					replaces[Anum_pg_subscription_subddl - 1] = true;
 				}
 
 				update_tuple = true;

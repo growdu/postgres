@@ -26,7 +26,10 @@ CREATE SUBSCRIPTION regress_testsub CONNECTION 'testconn' PUBLICATION testpub;
 CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION foo, testpub, foo WITH (connect = false);
 
 -- ok
-CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false);
+CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, ddl = 'table,index');
+SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
+ALTER SUBSCRIPTION regress_testsub SET (ddl = 'all');
+SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
 
 COMMENT ON SUBSCRIPTION regress_testsub IS 'test subscription';
 SELECT obj_description(s.oid, 'pg_subscription') FROM pg_subscription s;
@@ -68,6 +71,8 @@ ALTER SUBSCRIPTION regress_testsub3 REFRESH PUBLICATION;
 
 -- fail - origin must be either none or any
 CREATE SUBSCRIPTION regress_testsub4 CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (slot_name = NONE, connect = false, origin = foo);
+-- fail - ddl list includes unsupported token
+CREATE SUBSCRIPTION regress_testsub4 CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (slot_name = NONE, connect = false, ddl = 'table,unknown');
 
 -- now it works
 CREATE SUBSCRIPTION regress_testsub4 CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (slot_name = NONE, connect = false, origin = none);

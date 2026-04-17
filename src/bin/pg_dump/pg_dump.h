@@ -639,6 +639,7 @@ typedef struct _PublicationInfo
 	bool		pubdelete;
 	bool		pubtruncate;
 	bool		pubviaroot;
+	int			pubddl;
 } PublicationInfo;
 
 /*
@@ -683,6 +684,7 @@ typedef struct _SubscriptionInfo
 	char	   *subslotname;
 	char	   *subsynccommit;
 	char	   *subpublications;
+	int			subddl;
 	char	   *suborigin;
 	char	   *suboriginremotelsn;
 	char	   *subfailover;

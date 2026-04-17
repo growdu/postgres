@@ -52,6 +52,7 @@
 #include "catalog/pg_largeobject_d.h"
 #include "catalog/pg_largeobject_metadata_d.h"
 #include "catalog/pg_proc_d.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_trigger_d.h"
 #include "catalog/pg_type_d.h"
@@ -307,6 +308,7 @@ static int	dumpLOs(Archive *fout, const void *arg);
 static void dumpPolicy(Archive *fout, const PolicyInfo *polinfo);
 static void dumpPublication(Archive *fout, const PublicationInfo *pubinfo);
 static void dumpPublicationTable(Archive *fout, const PublicationRelInfo *pubrinfo);
+static void append_ddl_option_string(PQExpBuffer buf, int ddl_mask);
 static void dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo);
 static void dumpSubscriptionTable(Archive *fout, const SubRelInfo *subrinfo);
 static void dumpDatabase(Archive *fout);
@@ -4248,6 +4250,7 @@ getPublications(Archive *fout, int *numPublications)
 	int			i_pubdelete;
 	int			i_pubtruncate;
 	int			i_pubviaroot;
+	int			i_pubddl;
 	int			i,
 				ntups;
 
@@ -4266,19 +4269,22 @@ getPublications(Archive *fout, int *numPublications)
 		appendPQExpBufferStr(query,
 							 "SELECT p.tableoid, p.oid, p.pubname, "
 							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot "
+							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot, "
+							 "COALESCE((to_jsonb(p)->>'pubddl')::int, 0) AS pubddl "
 							 "FROM pg_publication p");
 	else if (fout->remoteVersion >= 110000)
 		appendPQExpBufferStr(query,
 							 "SELECT p.tableoid, p.oid, p.pubname, "
 							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, false AS pubviaroot "
+							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, false AS pubviaroot, "
+							 "COALESCE((to_jsonb(p)->>'pubddl')::int, 0) AS pubddl "
 							 "FROM pg_publication p");
 	else
 		appendPQExpBufferStr(query,
 							 "SELECT p.tableoid, p.oid, p.pubname, "
 							 "p.pubowner, "
-							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, false AS pubtruncate, false AS pubviaroot "
+							 "p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, false AS pubtruncate, false AS pubviaroot, "
+							 "COALESCE((to_jsonb(p)->>'pubddl')::int, 0) AS pubddl "
 							 "FROM pg_publication p");
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
@@ -4295,6 +4301,7 @@ getPublications(Archive *fout, int *numPublications)
 	i_pubdelete = PQfnumber(res, "pubdelete");
 	i_pubtruncate = PQfnumber(res, "pubtruncate");
 	i_pubviaroot = PQfnumber(res, "pubviaroot");
+	i_pubddl = PQfnumber(res, "pubddl");
 
 	pubinfo = pg_malloc(ntups * sizeof(PublicationInfo));
 
@@ -4319,6 +4326,7 @@ getPublications(Archive *fout, int *numPublications)
 			(strcmp(PQgetvalue(res, i, i_pubtruncate), "t") == 0);
 		pubinfo[i].pubviaroot =
 			(strcmp(PQgetvalue(res, i, i_pubviaroot), "t") == 0);
+		pubinfo[i].pubddl = atoi(PQgetvalue(res, i, i_pubddl));
 
 		/* Decide whether we want to dump it */
 		selectDumpableObject(&(pubinfo[i].dobj), fout);
@@ -4335,6 +4343,36 @@ getPublications(Archive *fout, int *numPublications)
  * dumpPublication
  *	  dump the definition of the given publication
  */
+static void
+append_ddl_option_string(PQExpBuffer buf, int ddl_mask)
+{
+	bool		first = true;
+
+#define APPEND_DDL_TOKEN(bit, token) \
+	do { \
+		if ((ddl_mask) & (bit)) \
+		{ \
+			if (!first) \
+				appendPQExpBufferStr((buf), ", "); \
+			appendPQExpBufferStr((buf), (token)); \
+			first = false; \
+		} \
+	} while (0)
+
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_TABLE, "table");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_INDEX, "index");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_TRIGGER, "trigger");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_VIEW, "view");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_RULE, "rule");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_SCHEMA, "schema");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_FUNCTION, "function");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_TYPE, "type");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_DOMAIN, "domain");
+	APPEND_DDL_TOKEN(PUBLICATION_DDL_EXTENSION, "extension");
+
+#undef APPEND_DDL_TOKEN
+}
+
 static void
 dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 {
@@ -4400,6 +4438,12 @@ dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 
 	if (pubinfo->pubviaroot)
 		appendPQExpBufferStr(query, ", publish_via_partition_root = true");
+	if (pubinfo->pubddl != 0)
+	{
+		appendPQExpBufferStr(query, ", ddl = '");
+		append_ddl_option_string(query, pubinfo->pubddl);
+		appendPQExpBufferChar(query, '\'');
+	}
 
 	appendPQExpBufferStr(query, ");\n");
 
@@ -4815,6 +4859,7 @@ getSubscriptions(Archive *fout)
 	int			i_subslotname;
 	int			i_subsynccommit;
 	int			i_subpublications;
+	int			i_subddl;
 	int			i_suborigin;
 	int			i_suboriginremotelsn;
 	int			i_subenabled;
@@ -4849,6 +4894,9 @@ getSubscriptions(Archive *fout)
 						 " s.subowner,\n"
 						 " s.subconninfo, s.subslotname, s.subsynccommit,\n"
 						 " s.subpublications,\n");
+
+	appendPQExpBufferStr(query,
+						 " COALESCE((to_jsonb(s)->>'subddl')::int, 0) AS subddl,\n");
 
 	if (fout->remoteVersion >= 140000)
 		appendPQExpBufferStr(query, " s.subbinary,\n");
@@ -4930,6 +4978,7 @@ getSubscriptions(Archive *fout)
 	i_subslotname = PQfnumber(res, "subslotname");
 	i_subsynccommit = PQfnumber(res, "subsynccommit");
 	i_subpublications = PQfnumber(res, "subpublications");
+	i_subddl = PQfnumber(res, "subddl");
 	i_suborigin = PQfnumber(res, "suborigin");
 	i_suboriginremotelsn = PQfnumber(res, "suboriginremotelsn");
 	i_subenabled = PQfnumber(res, "subenabled");
@@ -4970,6 +5019,7 @@ getSubscriptions(Archive *fout)
 			pg_strdup(PQgetvalue(res, i, i_subsynccommit));
 		subinfo[i].subpublications =
 			pg_strdup(PQgetvalue(res, i, i_subpublications));
+		subinfo[i].subddl = atoi(PQgetvalue(res, i, i_subddl));
 		subinfo[i].suborigin = pg_strdup(PQgetvalue(res, i, i_suborigin));
 		if (PQgetisnull(res, i, i_suboriginremotelsn))
 			subinfo[i].suboriginremotelsn = NULL;
@@ -5222,6 +5272,13 @@ dumpSubscription(Archive *fout, const SubscriptionInfo *subinfo)
 
 	if (strcmp(subinfo->subsynccommit, "off") != 0)
 		appendPQExpBuffer(query, ", synchronous_commit = %s", fmtId(subinfo->subsynccommit));
+
+	if (subinfo->subddl != 0)
+	{
+		appendPQExpBufferStr(query, ", ddl = '");
+		append_ddl_option_string(query, subinfo->subddl);
+		appendPQExpBufferChar(query, '\'');
+	}
 
 	if (pg_strcasecmp(subinfo->suborigin, LOGICALREP_ORIGIN_ANY) != 0)
 		appendPQExpBuffer(query, ", origin = %s", subinfo->suborigin);

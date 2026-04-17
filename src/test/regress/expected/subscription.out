@@ -29,9 +29,22 @@ ERROR:  invalid connection string syntax: missing "=" after "testconn" in connec
 CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION foo, testpub, foo WITH (connect = false);
 ERROR:  publication name "foo" used more than once
 -- ok
-CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false);
+CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, ddl = 'table,index');
 WARNING:  subscription was created, but is not connected
 HINT:  To initiate replication, you must manually create the replication slot, enable the subscription, and refresh the subscription.
+SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
+ subddl 
+--------
+      3
+(1 row)
+
+ALTER SUBSCRIPTION regress_testsub SET (ddl = 'all');
+SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
+ subddl 
+--------
+   1023
+(1 row)
+
 COMMENT ON SUBSCRIPTION regress_testsub IS 'test subscription';
 SELECT obj_description(s.oid, 'pg_subscription') FROM pg_subscription s;
   obj_description  
@@ -111,6 +124,9 @@ ERROR:  ALTER SUBSCRIPTION ... REFRESH is not allowed for disabled subscriptions
 -- fail - origin must be either none or any
 CREATE SUBSCRIPTION regress_testsub4 CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (slot_name = NONE, connect = false, origin = foo);
 ERROR:  unrecognized origin value: "foo"
+-- fail - ddl list includes unsupported token
+CREATE SUBSCRIPTION regress_testsub4 CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (slot_name = NONE, connect = false, ddl = 'table,unknown');
+ERROR:  unrecognized value for subscription option "ddl": "unknown"
 -- now it works
 CREATE SUBSCRIPTION regress_testsub4 CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (slot_name = NONE, connect = false, origin = none);
 WARNING:  subscription was created, but is not connected

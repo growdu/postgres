@@ -29,6 +29,25 @@ CREATE PUBLICATION testpub_xxx WITH (publish_via_partition_root = 'true', publis
 ERROR:  conflicting or redundant options
 LINE 1: ...ub_xxx WITH (publish_via_partition_root = 'true', publish_vi...
                                                              ^
+CREATE PUBLICATION testpub_xxx WITH (ddl = 'table, invalid_ddl');
+ERROR:  unrecognized value for publication option "ddl": "invalid_ddl"
+SET client_min_messages = 'ERROR';
+CREATE PUBLICATION testpub_ddl WITH (ddl = 'table,index');
+RESET client_min_messages;
+SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
+ pubddl 
+--------
+      3
+(1 row)
+
+ALTER PUBLICATION testpub_ddl SET (ddl = 'all');
+SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
+ pubddl 
+--------
+   1023
+(1 row)
+
+DROP PUBLICATION testpub_ddl;
 \dRp
                                               List of publications
         Name        |          Owner           | All tables | Inserts | Updates | Deletes | Truncates | Via root 

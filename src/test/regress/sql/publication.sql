@@ -24,6 +24,15 @@ ALTER PUBLICATION testpub_default SET (publish = update);
 CREATE PUBLICATION testpub_xxx WITH (foo);
 CREATE PUBLICATION testpub_xxx WITH (publish = 'cluster, vacuum');
 CREATE PUBLICATION testpub_xxx WITH (publish_via_partition_root = 'true', publish_via_partition_root = '0');
+CREATE PUBLICATION testpub_xxx WITH (ddl = 'table, invalid_ddl');
+
+SET client_min_messages = 'ERROR';
+CREATE PUBLICATION testpub_ddl WITH (ddl = 'table,index');
+RESET client_min_messages;
+SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
+ALTER PUBLICATION testpub_ddl SET (ddl = 'all');
+SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
+DROP PUBLICATION testpub_ddl;
 
 \dRp
 

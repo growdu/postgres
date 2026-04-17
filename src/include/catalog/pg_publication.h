@@ -54,6 +54,9 @@ CATALOG(pg_publication,6104,PublicationRelationId)
 
 	/* true if partition changes are published using root schema */
 	bool		pubviaroot;
+
+	/* DDL classes published by this publication */
+	int32		pubddl BKI_DEFAULT(0);
 } FormData_pg_publication;
 
 /* ----------------
@@ -103,6 +106,7 @@ typedef struct Publication
 	char	   *name;
 	bool		alltables;
 	bool		pubviaroot;
+	int32		pubddl;
 	PublicationActions pubactions;
 } Publication;
 
