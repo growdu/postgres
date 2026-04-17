@@ -70,14 +70,18 @@ static List *OpenTableList(List *tables);
 static void CloseTableList(List *rels);
 static void LockSchemaList(List *schemalist);
 static void PublicationAddTables(Oid pubid, List *rels, bool if_not_exists,
-								 AlterPublicationStmt *stmt);
-static void PublicationDropTables(Oid pubid, List *rels, bool missing_ok);
+								 AlterPublicationStmt *stmt,
+								 bool emit_add_message);
+static void PublicationDropTables(Oid pubid, List *rels, bool missing_ok,
+								  bool emit_drop_message);
 static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 								  AlterPublicationStmt *stmt);
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
 static char defGetGeneratedColsOption(DefElem *def);
 static int	parse_publication_ddl_option(ParseState *pstate, DefElem *defel);
 static void upsert_publication_sync_default(Oid pubid, int ddlmask);
+static void insert_publication_sync_relation_message(Oid pubid, Oid relid,
+													 const char *message_type);
 
 
 static void
@@ -351,6 +355,92 @@ upsert_publication_sync_default(Oid pubid, int ddlmask)
 	}
 
 	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * Insert one object-level pg_publication_sync message row for relation
+ * membership changes (message_type A/D).
+ */
+static void
+insert_publication_sync_relation_message(Oid pubid, Oid relid,
+										 const char *message_type)
+{
+	Relation	syncrel;
+	Datum		values[Natts_pg_publication_sync];
+	bool		nulls[Natts_pg_publication_sync];
+	HeapTuple	newtup;
+	Oid			pfsyncoid;
+	ObjectAddress myself,
+				referenced;
+	char	   *nspname;
+	char	   *relname;
+	char	   *target_table;
+	char	   *pubname;
+	char	   *publist;
+
+	if (!OidIsValid(relid) || relid == PublicationSyncRelationId)
+		return;
+
+	nspname = get_namespace_name(get_rel_namespace(relid));
+	relname = get_rel_name(relid);
+	if (nspname == NULL || relname == NULL)
+	{
+		if (nspname != NULL)
+			pfree(nspname);
+		if (relname != NULL)
+			pfree(relname);
+		return;
+	}
+
+	pubname = get_publication_name(pubid, false);
+	publist = pstrdup(quote_identifier(pubname));
+	target_table = quote_qualified_identifier(nspname, relname);
+
+	syncrel = table_open(PublicationSyncRelationId, RowExclusiveLock);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	pfsyncoid = GetNewOidWithIndex(syncrel, PublicationSyncObjectIndexId,
+								   Anum_pg_publication_sync_oid);
+	values[Anum_pg_publication_sync_oid - 1] = ObjectIdGetDatum(pfsyncoid);
+	values[Anum_pg_publication_sync_pfsyncpubid - 1] = ObjectIdGetDatum(pubid);
+	values[Anum_pg_publication_sync_pfsynckind - 1] =
+		CharGetDatum(PFSYNC_KIND_OBJECT);
+	values[Anum_pg_publication_sync_pfsyncnspid - 1] =
+		ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_publication_sync_pfsyncrelid - 1] =
+		ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_publication_sync_pfsyncobjid - 1] =
+		ObjectIdGetDatum(pfsyncoid);
+	values[Anum_pg_publication_sync_pfsyncsubid - 1] = Int32GetDatum(0);
+	values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
+	values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(PUBDDL_TABLE);
+	values[Anum_pg_publication_sync_message_type - 1] =
+		CStringGetTextDatum(message_type);
+	values[Anum_pg_publication_sync_target_table - 1] =
+		CStringGetTextDatum(target_table);
+	nulls[Anum_pg_publication_sync_ddl_str - 1] = true;
+	values[Anum_pg_publication_sync_publication_list - 1] =
+		CStringGetTextDatum(publist);
+	nulls[Anum_pg_publication_sync_search_path - 1] = true;
+	nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
+
+	newtup = heap_form_tuple(RelationGetDescr(syncrel), values, nulls);
+	CatalogTupleInsert(syncrel, newtup);
+	heap_freetuple(newtup);
+
+	ObjectAddressSet(myself, PublicationSyncRelationId, pfsyncoid);
+	ObjectAddressSet(referenced, PublicationRelationId, pubid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
+
+	table_close(syncrel, RowExclusiveLock);
+
+	pfree(pubname);
+	pfree(publist);
+	pfree(target_table);
+	pfree(nspname);
+	pfree(relname);
 }
 
 /*
@@ -1129,7 +1219,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 									   schemaidlist != NIL,
 									   publish_via_partition_root);
 
-			PublicationAddTables(puboid, rels, true, NULL);
+			PublicationAddTables(puboid, rels, true, NULL, false);
 			CloseTableList(rels);
 		}
 
@@ -1398,6 +1488,7 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 	List	   *rels = NIL;
 	Form_pg_publication pubform = (Form_pg_publication) GETSTRUCT(tup);
 	Oid			pubid = pubform->oid;
+	bool		emit_membership_messages = ((pubform->pubddl & PUBDDL_TABLE) != 0);
 
 	/*
 	 * Nothing to do if no objects, except in SET: for that it is quite
@@ -1418,10 +1509,12 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 		CheckPubRelationColumnList(stmt->pubname, rels, publish_schema,
 								   pubform->pubviaroot);
 
-		PublicationAddTables(pubid, rels, false, stmt);
+		PublicationAddTables(pubid, rels, false, stmt,
+							 emit_membership_messages);
 	}
 	else if (stmt->action == AP_DropObjects)
-		PublicationDropTables(pubid, rels, false);
+		PublicationDropTables(pubid, rels, false,
+							  emit_membership_messages);
 	else						/* AP_SetObjects */
 	{
 		List	   *oldrelids = GetPublicationRelations(pubid,
@@ -1533,13 +1626,15 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 		}
 
 		/* And drop them. */
-		PublicationDropTables(pubid, delrels, true);
+		PublicationDropTables(pubid, delrels, true,
+							  emit_membership_messages);
 
 		/*
 		 * Don't bother calculating the difference for adding, we'll catch and
 		 * skip existing ones when doing catalog update.
 		 */
-		PublicationAddTables(pubid, rels, true, stmt);
+		PublicationAddTables(pubid, rels, true, stmt,
+							 emit_membership_messages);
 
 		CloseTableList(delrels);
 	}
@@ -1799,6 +1894,25 @@ RemovePublicationById(Oid pubid)
 		elog(ERROR, "cache lookup failed for publication %u", pubid);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
+
+	/*
+	 * Emit relation membership remove messages so subscriber can evict table
+	 * mappings when publication is dropped.
+	 */
+	if ((pubform->pubddl & PUBDDL_TABLE) != 0)
+	{
+		List	   *pubrels = GetPublicationRelations(pubid, PUBLICATION_PART_ALL);
+		ListCell   *lc;
+
+		foreach(lc, pubrels)
+		{
+			Oid			relid = lfirst_oid(lc);
+
+			insert_publication_sync_relation_message(pubid, relid, "D");
+		}
+
+		list_free(pubrels);
+	}
 
 	/* Invalidate relcache so that publication info is rebuilt. */
 	if (pubform->puballtables)
@@ -2073,7 +2187,8 @@ LockSchemaList(List *schemalist)
  */
 static void
 PublicationAddTables(Oid pubid, List *rels, bool if_not_exists,
-					 AlterPublicationStmt *stmt)
+					 AlterPublicationStmt *stmt,
+					 bool emit_add_message)
 {
 	ListCell   *lc;
 
@@ -2091,6 +2206,10 @@ PublicationAddTables(Oid pubid, List *rels, bool if_not_exists,
 						   RelationGetRelationName(rel));
 
 		obj = publication_add_relation(pubid, pub_rel, if_not_exists);
+		if (emit_add_message && OidIsValid(obj.objectId))
+			insert_publication_sync_relation_message(pubid,
+													RelationGetRelid(rel),
+													"A");
 		if (stmt)
 		{
 			EventTriggerCollectSimpleCommand(obj, InvalidObjectAddress,
@@ -2106,7 +2225,8 @@ PublicationAddTables(Oid pubid, List *rels, bool if_not_exists,
  * Remove listed tables from the publication.
  */
 static void
-PublicationDropTables(Oid pubid, List *rels, bool missing_ok)
+PublicationDropTables(Oid pubid, List *rels, bool missing_ok,
+					  bool emit_drop_message)
 {
 	ObjectAddress obj;
 	ListCell   *lc;
@@ -2141,6 +2261,9 @@ PublicationDropTables(Oid pubid, List *rels, bool missing_ok)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("cannot use a WHERE clause when removing a table from a publication")));
+
+		if (emit_drop_message)
+			insert_publication_sync_relation_message(pubid, relid, "D");
 
 		ObjectAddressSet(obj, PublicationRelRelationId, prid);
 		performDeletion(&obj, DROP_CASCADE, 0);

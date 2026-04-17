@@ -126,6 +126,93 @@ SELECT coalesce(bool_or(position('tap_pub_idx' in publication_list) > 0), false)
 is($result, 'f',
 	'capture filters out publications whose ddl option does not include table');
 
+# Verify publication table membership changes are propagated via
+# message_type A/D and applied to subscription relation mapping.
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tap_ad_t (id int primary key, v text)");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE tap_ad_t (id int primary key, v text)");
+
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_pub_ad FOR TABLE tap_sync_base WITH (ddl = 'table')");
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION tap_sub_ad "
+	. "CONNECTION '$publisher_connstr application_name=tap_sub_ad' "
+	. "PUBLICATION tap_pub_ad "
+	. "WITH (copy_data = false, ddl = 'table')");
+$node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub_ad');
+
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tap_ad_t VALUES (1, 'before-add')");
+$node_publisher->wait_for_catchup('tap_sub_ad');
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT count(*) FROM tap_ad_t WHERE id = 1");
+is($result, '0',
+	'before ALTER PUBLICATION ADD TABLE, table changes are not replicated');
+
+$node_publisher->safe_psql('postgres',
+	"ALTER PUBLICATION tap_pub_ad ADD TABLE tap_ad_t");
+$node_publisher->wait_for_catchup('tap_sub_ad');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT count(*)
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND message_type = 'A'
+   AND target_table = 'public.tap_ad_t'
+   AND position('tap_pub_ad' in publication_list) > 0
+));
+is($result, '1',
+	'ALTER PUBLICATION ADD TABLE emits message type A');
+
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tap_ad_t VALUES (2, 'after-add')");
+$node_publisher->wait_for_catchup('tap_sub_ad');
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT count(*) FROM tap_ad_t WHERE id = 2");
+is($result, '1',
+	'after message type A apply, new table changes are replicated');
+
+$node_publisher->safe_psql('postgres',
+	"ALTER PUBLICATION tap_pub_ad DROP TABLE tap_ad_t");
+$node_publisher->wait_for_catchup('tap_sub_ad');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT count(*)
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND message_type = 'D'
+   AND target_table = 'public.tap_ad_t'
+   AND position('tap_pub_ad' in publication_list) > 0
+));
+is($result, '1',
+	'ALTER PUBLICATION DROP TABLE emits message type D');
+
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tap_ad_t VALUES (3, 'after-drop')");
+$node_publisher->wait_for_catchup('tap_sub_ad');
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT count(*) FROM tap_ad_t WHERE id = 3");
+is($result, '0',
+	'after message type D apply, removed table changes are not replicated');
+
+$result = $node_subscriber->safe_psql(
+	'postgres',
+	qq(
+SELECT count(*)
+  FROM pg_subscription_rel sr
+  JOIN pg_subscription s ON s.oid = sr.srsubid
+  JOIN pg_class c ON c.oid = sr.srrelid
+ WHERE s.subname = 'tap_sub_ad'
+   AND c.relname = 'tap_ad_t'
+));
+is($result, '0',
+	'message type D removes table mapping from pg_subscription_rel');
+
 # Verify FOR TABLES IN SCHEMA auto-tracking:
 # 1) CREATE TABLE DDL apply should auto-add pg_subscription_rel state (READY)
 # 2) Subsequent DML for the new table should be applied automatically
@@ -250,6 +337,41 @@ SELECT count(*)
 ));
 is($result, '0',
 	'FOR ALL TABLES: dropped table is removed from pg_subscription_rel');
+
+# Verify publisher-side scope filtering:
+# FOR TABLE publication only captures table/index DDL, while FOR TABLES IN
+# SCHEMA and FOR ALL TABLES can capture function DDL.
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tap_scope_base (id int primary key)");
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_scope_for_table FOR TABLE tap_scope_base "
+	. "WITH (ddl = 'table,index,trigger,view,rule,schema,function,type,domain,extension')");
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_scope_for_schema FOR TABLES IN SCHEMA public "
+	. "WITH (ddl = 'table,index,trigger,view,rule,schema,function,type,domain,extension')");
+$node_publisher->safe_psql('postgres',
+	"CREATE PUBLICATION tap_scope_for_all FOR ALL TABLES "
+	. "WITH (ddl = 'table,index,trigger,view,rule,schema,function,type,domain,extension')");
+
+$node_publisher->safe_psql('postgres',
+	"DROP FUNCTION IF EXISTS tap_scope_filter_fn()");
+$node_publisher->safe_psql('postgres',
+	"CREATE FUNCTION tap_scope_filter_fn() RETURNS int LANGUAGE sql AS 'SELECT 1'");
+
+$result = $node_publisher->safe_psql(
+	'postgres',
+	qq(
+SELECT coalesce(bool_or(position('tap_scope_for_table' in publication_list) > 0), false)::text
+       || '|' ||
+       coalesce(bool_or(position('tap_scope_for_schema' in publication_list) > 0), false)::text
+       || '|' ||
+       coalesce(bool_or(position('tap_scope_for_all' in publication_list) > 0), false)::text
+  FROM pg_publication_sync
+ WHERE pfsynckind = 'o'
+   AND position('CREATE FUNCTION tap_scope_filter_fn' in ddl_str) > 0
+));
+is($result, 'false|true|true',
+	'publisher scope filter: function DDL captured only by schema/all publications');
 
 $node_subscriber->stop('fast');
 $node_publisher->stop('fast');

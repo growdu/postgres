@@ -185,6 +185,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
@@ -2813,23 +2814,83 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 static void
 apply_publication_sync_message_a(TupleTableSlot *newslot)
 {
-	(void) newslot;
+	bool		isnull;
+	Datum		target_datum;
+	char	   *target_table;
+	List	   *name_list;
+	RangeVar   *rv;
+	Oid			relid;
+	char		relstate;
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_publication_sync message type \"A\" is not supported yet"),
-			 errhint("Reserved for ALTER-style apply flow.")));
+	target_datum = slot_getattr(newslot,
+								Anum_pg_publication_sync_target_table,
+								&isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"A\" requires target_table")));
+
+	target_table = TextDatumGetCString(target_datum);
+	if (target_table[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"A\" requires non-empty target_table")));
+
+	name_list = stringToQualifiedNameList(target_table, NULL);
+	rv = makeRangeVarFromNameList(name_list);
+	relid = RangeVarGetRelid(rv, NoLock, false);
+	relstate = GetSubscriptionRelState(MySubscription->oid, relid, NULL);
+	if (relstate == SUBREL_STATE_UNKNOWN)
+	{
+		AddSubscriptionRelState(MySubscription->oid, relid, SUBREL_STATE_READY,
+								InvalidXLogRecPtr, false);
+		CommandCounterIncrement();
+	}
+
+	list_free_deep(name_list);
+	pfree(target_table);
 }
 
 static void
 apply_publication_sync_message_d(TupleTableSlot *newslot)
 {
-	(void) newslot;
+	bool		isnull;
+	Datum		target_datum;
+	char	   *target_table;
+	List	   *name_list;
+	RangeVar   *rv;
+	Oid			relid;
+	char		relstate;
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_publication_sync message type \"D\" is not supported yet"),
-			 errhint("Reserved for DROP-style apply flow.")));
+	target_datum = slot_getattr(newslot,
+								Anum_pg_publication_sync_target_table,
+								&isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"D\" requires target_table")));
+
+	target_table = TextDatumGetCString(target_datum);
+	if (target_table[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"D\" requires non-empty target_table")));
+
+	name_list = stringToQualifiedNameList(target_table, NULL);
+	rv = makeRangeVarFromNameList(name_list);
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	if (OidIsValid(relid))
+	{
+		relstate = GetSubscriptionRelState(MySubscription->oid, relid, NULL);
+		if (relstate != SUBREL_STATE_UNKNOWN)
+		{
+			RemoveSubscriptionRel(MySubscription->oid, relid);
+			CommandCounterIncrement();
+		}
+	}
+
+	list_free_deep(name_list);
+	pfree(target_table);
 }
 
 /*
@@ -2837,8 +2898,8 @@ apply_publication_sync_message_d(TupleTableSlot *newslot)
  *
  * Message dispatch framework:
  *   Q: Execute ddl_str as SQL on subscriber.
- *   A: Reserved (framework branch, not implemented).
- *   D: Reserved (framework branch, not implemented).
+ *   A: Add relation into subscriber subscription mapping.
+ *   D: Drop relation from subscriber subscription mapping.
  */
 static void
 maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
@@ -2897,7 +2958,7 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("unsupported pg_publication_sync message type \"%s\"",
 							message_type),
-					 errhint("Supported message types are Q/A/D; only Q is implemented now.")));
+					 errhint("Supported message types are Q/A/D.")));
 			break;
 	}
 

@@ -96,6 +96,8 @@ static char *UtilityStmtTargetTable(Node *parsetree);
 static RangeVar *UtilityStmtTargetRangeVar(Node *parsetree);
 static Oid UtilityStmtTargetRelid(Node *parsetree);
 static bool UtilityStmtNeedsRelationScopeFilter(int ddlmask);
+static bool PublicationAllowsDDLMaskByScope(Form_pg_publication pubform,
+											int ddlmask);
 static bool PublicationMatchesRelationScope(Form_pg_publication pubform,
 											Oid target_relid,
 											List *target_relpubids,
@@ -746,6 +748,23 @@ UtilityStmtNeedsRelationScopeFilter(int ddlmask)
 }
 
 static bool
+PublicationAllowsDDLMaskByScope(Form_pg_publication pubform, int ddlmask)
+{
+	int			for_table_mask = PUBDDL_TABLE | PUBDDL_INDEX;
+	int			for_schema_or_all_mask = PUBDDL_TABLE | PUBDDL_INDEX |
+		PUBDDL_TRIGGER | PUBDDL_VIEW | PUBDDL_RULE | PUBDDL_SCHEMA |
+		PUBDDL_FUNCTION | PUBDDL_TYPE | PUBDDL_DOMAIN | PUBDDL_EXTENSION;
+	int			allowed_mask;
+
+	if (pubform->puballtables || is_schema_publication(pubform->oid))
+		allowed_mask = for_schema_or_all_mask;
+	else
+		allowed_mask = for_table_mask;
+
+	return (ddlmask & allowed_mask) != 0;
+}
+
+static bool
 PublicationMatchesRelationScope(Form_pg_publication pubform,
 								Oid target_relid,
 								List *target_relpubids,
@@ -842,6 +861,8 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 		if (pubform->pubddl == 0)
 			continue;
 		if (ddlmask != 0 && (pubform->pubddl & ddlmask) == 0)
+			continue;
+		if (!PublicationAllowsDDLMaskByScope(pubform, ddlmask))
 			continue;
 		if (needs_rel_scope_filter &&
 			!PublicationMatchesRelationScope(pubform, target_relid,

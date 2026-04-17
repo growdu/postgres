@@ -248,19 +248,22 @@ SELECT count(*) AS q_rows
 * `q_rows = 1`；
 * 说明订阅端已按 `Q` 消息执行 `ddl_str`，同时保留同步到本地的 `pg_publication_sync` 记录。
 
-### 4.5 `message_type` 分支框架验证（A/D 预留）
+### 4.5 `message_type` 分支验证（A/D 已实现）
 
 当前实现约束：
 
 * apply 分发器支持识别 `Q/A/D` 三种消息类型；
 * 仅 `Q` 已实现（执行 `ddl_str`）；
-* `A`、`D` 为预留分支，当前显式返回 `FEATURE_NOT_SUPPORTED`；
+* `A`、`D` 用于 publication 成员关系同步：
+  * `A`：加入对象发布后，订阅端加入 `pg_subscription_rel`；
+  * `D`：移出对象发布后，订阅端移除 `pg_subscription_rel`；
 * 未知类型也会显式报错，不会被静默吞掉。
 
 验证点：
 
-* 收到 `A` 或 `D` 时，日志/报错包含 “not supported yet”；
-* 收到未知类型时，日志/报错包含 “Supported message types are Q/A/D; only Q is implemented now.”
+* `ALTER PUBLICATION ... ADD TABLE ...` 触发 `A`，并使新表 DML 自动 apply；
+* `ALTER PUBLICATION ... DROP TABLE ...` 触发 `D`，并使后续该表 DML 不再 apply；
+* 收到未知类型时，日志/报错包含 “Supported message types are Q/A/D.”
 
 ### 4.6 过滤规则验证（capture/apply 一致性）
 
