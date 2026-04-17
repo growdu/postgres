@@ -2807,6 +2807,10 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	char	   *message_type;
 	PublicationSyncMessageKind msgkind;
 
+	/* Only leader apply worker is allowed to execute synced DDL messages. */
+	if (!am_leader_apply_worker())
+		return;
+
 	if (RelationGetRelid(localrel) != PublicationSyncRelationId)
 		return;
 
