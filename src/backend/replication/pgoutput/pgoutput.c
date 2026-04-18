@@ -12,10 +12,12 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/tupconvert.h"
 #include "catalog/partition.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "commands/defrem.h"
 #include "commands/subscriptioncmds.h"
@@ -1433,6 +1435,40 @@ pgoutput_row_filter(Relation relation, TupleTableSlot *old_slot,
 }
 
 /*
+ * pg_publication_sync rows are routed by source publication OID.
+ *
+ * The sender emits only rows whose pfsyncpubid belongs to one of the
+ * publications requested by the subscriber connection.
+ */
+static bool
+pgoutput_publication_sync_row_matches_pubid(PGOutputData *data,
+											TupleTableSlot *slot)
+{
+	bool		isnull;
+	Datum		pubid_datum;
+	Oid			row_pubid;
+	ListCell   *lc;
+
+	pubid_datum = slot_getattr(slot,
+							   Anum_pg_publication_sync_pfsyncpubid,
+							   &isnull);
+	if (isnull)
+		return false;
+
+	row_pubid = DatumGetObjectId(pubid_datum);
+
+	foreach(lc, data->publications)
+	{
+		Publication *pub = lfirst(lc);
+
+		if (pub->oid == row_pubid)
+			return true;
+	}
+
+	return false;
+}
+
+/*
  * Sends the decoded DML over wire.
  *
  * This is called both in streaming and non-streaming modes.
@@ -1538,6 +1574,19 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	}
 
 	/*
+	 * Route pg_publication_sync rows by pfsyncpubid, so each subscriber only
+	 * receives rows from the publications it requested.
+	 */
+	if (RelationGetRelid(targetrel) == PublicationSyncRelationId)
+	{
+		TupleTableSlot *msgslot = new_slot != NULL ? new_slot : old_slot;
+
+		if (msgslot == NULL ||
+			!pgoutput_publication_sync_row_matches_pubid(data, msgslot))
+			goto cleanup;
+	}
+
+	/*
 	 * Check row filter.
 	 *
 	 * Updates could be transformed to inserts or deletes based on the results
@@ -1634,6 +1683,9 @@ pgoutput_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		Oid			relid = RelationGetRelid(relation);
 
 		if (!is_publishable_relation(relation))
+			continue;
+
+		if (relid == PublicationSyncRelationId)
 			continue;
 
 		relentry = get_rel_sync_entry(data, relation);
@@ -2153,13 +2205,21 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 			int			ancestor_level = 0;
 
 			/*
+			 * pg_publication_sync is replication metadata and should flow to
+			 * subscribers without requiring explicit table membership. The
+			 * concrete rows are routed later by pfsyncpubid.
+			 */
+			if (relid == PublicationSyncRelationId)
+				publish = true;
+
+			/*
 			 * If this is a FOR ALL TABLES publication, pick the partition
 			 * root and set the ancestor level accordingly.
 			 */
 			if (pub->alltables)
 			{
 				publish = true;
-				if (pub->pubviaroot && am_partition)
+				if (publish && pub->pubviaroot && am_partition)
 				{
 					List	   *ancestors = get_partition_ancestors(relid);
 
@@ -2216,10 +2276,25 @@ get_rel_sync_entry(PGOutputData *data, Relation relation)
 			if (publish &&
 				(relkind != RELKIND_PARTITIONED_TABLE || pub->pubviaroot))
 			{
-				entry->pubactions.pubinsert |= pub->pubactions.pubinsert;
-				entry->pubactions.pubupdate |= pub->pubactions.pubupdate;
-				entry->pubactions.pubdelete |= pub->pubactions.pubdelete;
-				entry->pubactions.pubtruncate |= pub->pubactions.pubtruncate;
+				/*
+				 * pg_publication_sync acts as logical-replication metadata.
+				 * Always publish all row-level actions for it, regardless of
+				 * publication's regular publish=... DML action mask.
+				 */
+				if (relid == PublicationSyncRelationId)
+				{
+					entry->pubactions.pubinsert = true;
+					entry->pubactions.pubupdate = true;
+					entry->pubactions.pubdelete = true;
+					entry->pubactions.pubtruncate = true;
+				}
+				else
+				{
+					entry->pubactions.pubinsert |= pub->pubactions.pubinsert;
+					entry->pubactions.pubupdate |= pub->pubactions.pubupdate;
+					entry->pubactions.pubdelete |= pub->pubactions.pubdelete;
+					entry->pubactions.pubtruncate |= pub->pubactions.pubtruncate;
+				}
 
 				/*
 				 * We want to publish the changes as the top-most ancestor

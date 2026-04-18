@@ -27,6 +27,7 @@
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "replication/logicalrelation.h"
+#include "replication/logicalsysrel.h"
 #include "replication/worker_internal.h"
 #include "utils/inval.h"
 
@@ -400,6 +401,14 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 		entry->localrel = table_open(relid, NoLock);
 		entry->localreloid = relid;
 
+		if (IsCatalogRelation(entry->localrel) &&
+			!IsLogicalRepSystemRelationOid(relid))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot use relation \"%s.%s\" as logical replication target",
+							remoterel->nspname, remoterel->relname),
+					 errdetail("This operation is not supported for system tables.")));
+
 		/* Check for supported relkind. */
 		CheckSubscriptionRelkind(entry->localrel->rd_rel->relkind,
 								 remoterel->nspname, remoterel->relname);
@@ -458,7 +467,16 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 		entry->localrelvalid = true;
 	}
 
-	if (entry->state != SUBREL_STATE_READY)
+	/*
+	 * Whitelisted system relations are replication metadata and are not
+	 * tracked in pg_subscription_rel. Treat them as always ready.
+	 */
+	if (IsLogicalRepSystemRelationOid(entry->localreloid))
+	{
+		entry->state = SUBREL_STATE_READY;
+		entry->statelsn = InvalidXLogRecPtr;
+	}
+	else if (entry->state != SUBREL_STATE_READY)
 		entry->state = GetSubscriptionRelState(MySubscription->oid,
 											   entry->localreloid,
 											   &entry->statelsn);

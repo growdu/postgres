@@ -29,9 +29,11 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_type.h"
 #include "commands/publicationcmds.h"
 #include "funcapi.h"
+#include "replication/logicalsysrel.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -69,11 +71,20 @@ check_publication_add_relation(Relation targetrel)
 
 	/* Can't be system table */
 	if (IsCatalogRelation(targetrel))
+	{
+		if (IsLogicalRepSystemRelationOid(RelationGetRelid(targetrel)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cannot add relation \"%s\" to publication",
+							RelationGetRelationName(targetrel)),
+					 errdetail("This relation is managed implicitly by the publication option \"ddl\".")));
+
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cannot add relation \"%s\" to publication",
 						RelationGetRelationName(targetrel)),
 				 errdetail("This operation is not supported for system tables.")));
+	}
 
 	/* UNLOGGED and TEMP relations cannot be part of publication. */
 	if (targetrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
@@ -121,26 +132,32 @@ check_publication_add_schema(Oid schemaid)
  * Does same checks as check_publication_add_relation() above, but does not
  * need relation to be opened and also does not throw errors.
  *
- * XXX  This also excludes all tables with relid < FirstNormalObjectId,
+ * XXX  This excludes all non-system tables with relid < FirstNormalObjectId,
  * ie all tables created during initdb.  This mainly affects the preinstalled
  * information_schema.  IsCatalogRelationOid() only excludes tables with
- * relid < FirstUnpinnedObjectId, making that test rather redundant,
- * but really we should get rid of the FirstNormalObjectId test not
+ * relid < FirstUnpinnedObjectId, making that test rather redundant, but
+ * really we should get rid of the FirstNormalObjectId test not
  * IsCatalogRelationOid.  We can't do so today because we don't want
- * information_schema tables to be considered publishable; but this test
- * is really inadequate for that, since the information_schema could be
- * dropped and reloaded and then it'll be considered publishable.  The best
- * long-term solution may be to add a "relispublishable" bool to pg_class,
- * and depend on that instead of OID checks.
+ * information_schema tables to be considered publishable; but this test is
+ * really inadequate for that, since the information_schema could be dropped
+ * and reloaded and then it'll be considered publishable.  The best long-term
+ * solution may be to add a "relispublishable" bool to pg_class, and depend on
+ * that instead of OID checks.
  */
 static bool
 is_publishable_class(Oid relid, Form_pg_class reltuple)
 {
-	return (reltuple->relkind == RELKIND_RELATION ||
-			reltuple->relkind == RELKIND_PARTITIONED_TABLE) &&
-		!IsCatalogRelationOid(relid) &&
-		reltuple->relpersistence == RELPERSISTENCE_PERMANENT &&
-		relid >= FirstNormalObjectId;
+	if (reltuple->relkind != RELKIND_RELATION &&
+		reltuple->relkind != RELKIND_PARTITIONED_TABLE)
+		return false;
+
+	if (reltuple->relpersistence != RELPERSISTENCE_PERMANENT)
+		return false;
+
+	if (IsCatalogRelationOid(relid))
+		return IsLogicalRepSystemRelationOid(relid);
+
+	return relid >= FirstNormalObjectId;
 }
 
 /*
@@ -682,6 +699,31 @@ publication_add_schema(Oid pubid, Oid schemaid, bool if_not_exists)
 	return myself;
 }
 
+static List *
+GetDDLPublications(void)
+{
+	List	   *result = NIL;
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+
+	rel = table_open(PublicationRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_publication pubform = (Form_pg_publication) GETSTRUCT(tup);
+
+		if (pubform->pubddl > 0)
+			result = lappend_oid(result, pubform->oid);
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
+}
+
 /* Gets list of publication oids for a relation */
 List *
 GetRelationPublications(Oid relid)
@@ -703,6 +745,12 @@ GetRelationPublications(Oid relid)
 
 	ReleaseSysCacheList(pubrellist);
 
+	if (relid == PublicationSyncRelationId)
+		result = list_concat(result, GetDDLPublications());
+
+	list_sort(result, list_oid_cmp);
+	list_deduplicate_oid(result);
+
 	return result;
 }
 
@@ -716,6 +764,7 @@ List *
 GetPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt)
 {
 	List	   *result;
+	HeapTuple	pubtuple;
 	Relation	pubrelsrel;
 	ScanKeyData scankey;
 	SysScanDesc scan;
@@ -744,6 +793,17 @@ GetPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt)
 
 	systable_endscan(scan);
 	table_close(pubrelsrel, AccessShareLock);
+
+	pubtuple = SearchSysCache1(PUBLICATIONOID, ObjectIdGetDatum(pubid));
+	if (HeapTupleIsValid(pubtuple))
+	{
+		Form_pg_publication pubform = (Form_pg_publication) GETSTRUCT(pubtuple);
+
+		if (pubform->pubddl > 0)
+			result = lappend_oid(result, PublicationSyncRelationId);
+
+		ReleaseSysCache(pubtuple);
+	}
 
 	/* Now sort and de-duplicate the result list */
 	list_sort(result, list_oid_cmp);
@@ -820,6 +880,7 @@ GetAllTablesPublicationRelations(bool pubviaroot)
 		Oid			relid = relForm->oid;
 
 		if (is_publishable_class(relid, relForm) &&
+			!IsLogicalRepSystemRelationOid(relid) &&
 			!(relForm->relispartition && pubviaroot))
 			result = lappend_oid(result, relid);
 	}
@@ -841,6 +902,7 @@ GetAllTablesPublicationRelations(bool pubviaroot)
 			Oid			relid = relForm->oid;
 
 			if (is_publishable_class(relid, relForm) &&
+				!IsLogicalRepSystemRelationOid(relid) &&
 				!relForm->relispartition)
 				result = lappend_oid(result, relid);
 		}
