@@ -147,6 +147,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/genam.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/twophase.h"
@@ -154,6 +155,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_publication_recv.h"
 #include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
@@ -186,6 +188,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/dynahash.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -288,6 +291,13 @@ typedef enum PublicationSyncMessageKind
 	PUBLICATION_SYNC_MSG_D,
 	PUBLICATION_SYNC_MSG_UNKNOWN
 } PublicationSyncMessageKind;
+
+typedef struct PublicationRecvMessageIdentity
+{
+	Oid			subid;
+	int64		remote_msgid;
+	XLogRecPtr	remote_lsn;
+} PublicationRecvMessageIdentity;
 
 /* errcontext tracker */
 ApplyErrorCallbackArg apply_error_callback_arg =
@@ -409,6 +419,14 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
+static void extract_publication_sync_recv_identity(TupleTableSlot *newslot,
+												   PublicationRecvMessageIdentity *recvmsgid);
+static void insert_publication_recv_message(TupleTableSlot *newslot,
+											const PublicationRecvMessageIdentity *recvmsgid);
+static void update_publication_recv_message_state(const PublicationRecvMessageIdentity *recvmsgid,
+												  char state,
+												  bool update_apply_ts,
+												  bool update_finish_ts);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
 static void apply_publication_sync_message_a(TupleTableSlot *newslot);
 static void apply_publication_sync_message_d(TupleTableSlot *newslot);
@@ -2625,6 +2643,258 @@ decode_publication_sync_message_type(char message_type)
 }
 
 static void
+extract_publication_sync_recv_identity(TupleTableSlot *newslot,
+									   PublicationRecvMessageIdentity *recvmsgid)
+{
+	bool		isnull;
+	Datum		datum;
+
+	Assert(MySubscription != NULL);
+
+	recvmsgid->subid = MySubscription->oid;
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncobjid,
+						 &isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message requires pfsyncobjid")));
+	recvmsgid->remote_msgid = DatumGetInt64(datum);
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsynclsn,
+						 &isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message requires pfsynclsn")));
+	recvmsgid->remote_lsn = DatumGetLSN(datum);
+}
+
+static void
+insert_publication_recv_message(TupleTableSlot *newslot,
+								const PublicationRecvMessageIdentity *recvmsgid)
+{
+	Relation	recvrel;
+	Datum		values[Natts_pg_publication_recv];
+	bool		nulls[Natts_pg_publication_recv];
+	HeapTuple	newtup;
+	bool		isnull;
+	Datum		datum;
+	char		originname[NAMEDATALEN];
+	const char *origin;
+	char	   *pubname = NULL;
+	Oid			pubid;
+
+	recvrel = table_open(PublicationRecvRelationId, RowExclusiveLock);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	values[Anum_pg_publication_recv_pfrecvsubid - 1] =
+		ObjectIdGetDatum(recvmsgid->subid);
+	values[Anum_pg_publication_recv_pfrecvremote_msgid - 1] =
+		Int64GetDatum(recvmsgid->remote_msgid);
+	values[Anum_pg_publication_recv_pfrecvremote_lsn - 1] =
+		LSNGetDatum(recvmsgid->remote_lsn);
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncddl,
+						 &isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message requires pfsyncddl")));
+	values[Anum_pg_publication_recv_pfrecvddl - 1] = datum;
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncmsgtype,
+						 &isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message requires pfsyncmsgtype")));
+	values[Anum_pg_publication_recv_pfrecvmsgtype - 1] = datum;
+	values[Anum_pg_publication_recv_pfrecvstate - 1] =
+		CharGetDatum(PUBLICATION_RECV_STATE_RECEIVED);
+	values[Anum_pg_publication_recv_pfretry_count - 1] = Int32GetDatum(0);
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncts,
+						 &isnull);
+	if (isnull)
+		nulls[Anum_pg_publication_recv_pfrecvremote_ts - 1] = true;
+	else
+		values[Anum_pg_publication_recv_pfrecvremote_ts - 1] = datum;
+
+	values[Anum_pg_publication_recv_pfrecvrecvts - 1] =
+		TimestampTzGetDatum(GetCurrentTimestamp());
+	nulls[Anum_pg_publication_recv_pfrecvapplyts - 1] = true;
+	nulls[Anum_pg_publication_recv_pfrecvfinishts - 1] = true;
+	nulls[Anum_pg_publication_recv_pfnext_retry_ts - 1] = true;
+
+	if (apply_error_callback_arg.origin_name != NULL)
+		origin = apply_error_callback_arg.origin_name;
+	else
+	{
+		ReplicationOriginNameForLogicalRep(MySubscription->oid, InvalidOid,
+										   originname, sizeof(originname));
+		origin = originname;
+	}
+	values[Anum_pg_publication_recv_pfrecvorigin - 1] =
+		CStringGetTextDatum(origin);
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncpubid,
+						 &isnull);
+	if (isnull)
+		nulls[Anum_pg_publication_recv_pfrecvpubname - 1] = true;
+	else
+	{
+		pubid = DatumGetObjectId(datum);
+		pubname = get_publication_name(pubid, true);
+		if (pubname == NULL)
+			nulls[Anum_pg_publication_recv_pfrecvpubname - 1] = true;
+		else
+			values[Anum_pg_publication_recv_pfrecvpubname - 1] =
+				CStringGetTextDatum(pubname);
+	}
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsynctargettable,
+						 &isnull);
+	if (isnull)
+		nulls[Anum_pg_publication_recv_pfrecvtargettable - 1] = true;
+	else
+		values[Anum_pg_publication_recv_pfrecvtargettable - 1] = datum;
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncddlsql,
+						 &isnull);
+	if (isnull)
+		nulls[Anum_pg_publication_recv_pfrecvddlsql - 1] = true;
+	else
+		values[Anum_pg_publication_recv_pfrecvddlsql - 1] = datum;
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncsearchpath,
+						 &isnull);
+	if (isnull)
+		nulls[Anum_pg_publication_recv_pfrecvsearchpath - 1] = true;
+	else
+		values[Anum_pg_publication_recv_pfrecvsearchpath - 1] = datum;
+
+	datum = slot_getattr(newslot,
+						 Anum_pg_publication_sync_pfsyncextra,
+						 &isnull);
+	if (isnull)
+		nulls[Anum_pg_publication_recv_pfrecvextra - 1] = true;
+	else
+		values[Anum_pg_publication_recv_pfrecvextra - 1] = datum;
+
+	nulls[Anum_pg_publication_recv_pfrecverrcode - 1] = true;
+	nulls[Anum_pg_publication_recv_pfrecverrmsg - 1] = true;
+	nulls[Anum_pg_publication_recv_pfrecverrdetail - 1] = true;
+
+	newtup = heap_form_tuple(RelationGetDescr(recvrel), values, nulls);
+	CatalogTupleInsert(recvrel, newtup);
+	heap_freetuple(newtup);
+
+	table_close(recvrel, RowExclusiveLock);
+
+	if (pubname != NULL)
+		pfree(pubname);
+}
+
+static void
+update_publication_recv_message_state(const PublicationRecvMessageIdentity *recvmsgid,
+									  char state,
+									  bool update_apply_ts,
+									  bool update_finish_ts)
+{
+	Relation	recvrel;
+	ScanKeyData scankey[3];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	HeapTuple	newtup;
+	Datum		values[Natts_pg_publication_recv];
+	bool		nulls[Natts_pg_publication_recv];
+	bool		replaces[Natts_pg_publication_recv];
+
+	recvrel = table_open(PublicationRecvRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&scankey[0],
+				Anum_pg_publication_recv_pfrecvsubid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(recvmsgid->subid));
+	ScanKeyInit(&scankey[1],
+				Anum_pg_publication_recv_pfrecvremote_lsn,
+				BTEqualStrategyNumber, F_PG_LSN_EQ,
+				LSNGetDatum(recvmsgid->remote_lsn));
+	ScanKeyInit(&scankey[2],
+				Anum_pg_publication_recv_pfrecvremote_msgid,
+				BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum(recvmsgid->remote_msgid));
+
+	scan = systable_beginscan(recvrel,
+							  PublicationRecvSubidRemoteLsnMsgidIndexId,
+							  true, NULL, 3, scankey);
+	tup = systable_getnext(scan);
+	if (!HeapTupleIsValid(tup))
+	{
+		systable_endscan(scan);
+		table_close(recvrel, RowExclusiveLock);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_publication_recv row not found for subscription %u, remote_lsn %X/%X, remote_msgid %lld",
+						recvmsgid->subid,
+						LSN_FORMAT_ARGS(recvmsgid->remote_lsn),
+						(long long) recvmsgid->remote_msgid)));
+	}
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
+
+	values[Anum_pg_publication_recv_pfrecvstate - 1] = CharGetDatum(state);
+	replaces[Anum_pg_publication_recv_pfrecvstate - 1] = true;
+
+	if (update_apply_ts)
+	{
+		values[Anum_pg_publication_recv_pfrecvapplyts - 1] =
+			TimestampTzGetDatum(GetCurrentTimestamp());
+		replaces[Anum_pg_publication_recv_pfrecvapplyts - 1] = true;
+	}
+
+	if (update_finish_ts)
+	{
+		values[Anum_pg_publication_recv_pfrecvfinishts - 1] =
+			TimestampTzGetDatum(GetCurrentTimestamp());
+		replaces[Anum_pg_publication_recv_pfrecvfinishts - 1] = true;
+	}
+
+	if (state == PUBLICATION_RECV_STATE_SUCCESS)
+	{
+		nulls[Anum_pg_publication_recv_pfrecverrcode - 1] = true;
+		replaces[Anum_pg_publication_recv_pfrecverrcode - 1] = true;
+		nulls[Anum_pg_publication_recv_pfrecverrmsg - 1] = true;
+		replaces[Anum_pg_publication_recv_pfrecverrmsg - 1] = true;
+		nulls[Anum_pg_publication_recv_pfrecverrdetail - 1] = true;
+		replaces[Anum_pg_publication_recv_pfrecverrdetail - 1] = true;
+	}
+
+	newtup = heap_modify_tuple(tup, RelationGetDescr(recvrel),
+							   values, nulls, replaces);
+	CatalogTupleUpdate(recvrel, &newtup->t_self, newtup);
+	heap_freetuple(newtup);
+
+	systable_endscan(scan);
+	table_close(recvrel, RowExclusiveLock);
+}
+
+static void
 apply_publication_sync_message_q(TupleTableSlot *newslot)
 {
 	bool		isnull;
@@ -2775,12 +3045,13 @@ apply_publication_sync_message_d(TupleTableSlot *newslot)
 }
 
 /*
- * Execute the message payload carried by pg_publication_sync tuples.
+ * Handle message payload carried by pg_publication_sync tuples.
  *
- * Message dispatch framework:
- *   Q: Execute pfsyncddlsql as SQL on subscriber.
- *   A: Add relation into subscriber subscription mapping.
- *   D: Drop relation from subscriber subscription mapping.
+ * Design 4 behavior:
+ *   1. Persist received message in pg_publication_recv as R.
+ *   2. Move to A before execution.
+ *   3. Execute message payload.
+ *   4. Move to S after successful execution.
  */
 static void
 maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
@@ -2791,6 +3062,7 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	Datum		msgdatum;
 	char		message_type;
 	PublicationSyncMessageKind msgkind;
+	PublicationRecvMessageIdentity recvmsgid;
 
 	/* Only leader apply worker is allowed to execute synced DDL messages. */
 	if (!am_leader_apply_worker())
@@ -2811,6 +3083,17 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	message_type = DatumGetChar(msgdatum);
 	msgkind = decode_publication_sync_message_type(message_type);
 
+	extract_publication_sync_recv_identity(newslot, &recvmsgid);
+
+	insert_publication_recv_message(newslot, &recvmsgid);
+	CommandCounterIncrement();
+
+	update_publication_recv_message_state(&recvmsgid,
+										  PUBLICATION_RECV_STATE_APPLYING,
+										  true,
+										  false);
+	CommandCounterIncrement();
+
 	switch (msgkind)
 	{
 		case PUBLICATION_SYNC_MSG_Q:
@@ -2830,6 +3113,11 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 					 errhint("Supported message types are Q/A/D.")));
 			break;
 	}
+
+	update_publication_recv_message_state(&recvmsgid,
+										  PUBLICATION_RECV_STATE_SUCCESS,
+										  false,
+										  true);
 }
 
 /*
