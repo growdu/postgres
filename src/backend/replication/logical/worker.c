@@ -152,7 +152,9 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
 #include "commands/tablecmds.h"
@@ -178,19 +180,24 @@
 #include "storage/buffile.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#include "tcop/dest.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/dynahash.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/usercontext.h"
+#include "utils/varlena.h"
 
 #define NAPTIME_PER_CYCLE 1000	/* max sleep time between cycles (1s) */
 
@@ -273,6 +280,14 @@ typedef enum
 	TRANS_LEADER_PARTIAL_SERIALIZE,
 	TRANS_PARALLEL_APPLY,
 } TransApplyAction;
+
+typedef enum PublicationSyncMessageKind
+{
+	PUBLICATION_SYNC_MSG_Q,
+	PUBLICATION_SYNC_MSG_A,
+	PUBLICATION_SYNC_MSG_D,
+	PUBLICATION_SYNC_MSG_UNKNOWN
+} PublicationSyncMessageKind;
 
 /* errcontext tracker */
 ApplyErrorCallbackArg apply_error_callback_arg =
@@ -391,6 +406,14 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
+static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
+static void execute_publication_sync_sql_command(const char *sql);
+static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
+static void apply_publication_sync_message_q(TupleTableSlot *newslot);
+static void apply_publication_sync_message_a(TupleTableSlot *newslot);
+static void apply_publication_sync_message_d(TupleTableSlot *newslot);
+static void maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
+												 TupleTableSlot *newslot);
 static bool FindReplTupleInLocalRel(ApplyExecutionData *edata, Relation localrel,
 									LogicalRepRelation *remoterel,
 									Oid localidxoid,
@@ -2475,6 +2498,338 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 	/* Do the insert. */
 	TargetPrivilegesCheck(relinfo->ri_RelationDesc, ACL_INSERT);
 	ExecSimpleRelationInsert(relinfo, estate, remoteslot);
+	maybe_apply_publication_sync_message(relinfo, remoteslot);
+}
+
+static bool
+publication_sync_row_matches_subscription(TupleTableSlot *newslot)
+{
+	bool		isnull;
+	Datum		ddlmask_datum;
+	int32		ddlmask;
+
+	if (MySubscription == NULL)
+		return false;
+
+	ddlmask_datum = slot_getattr(newslot,
+								 Anum_pg_publication_sync_pfsyncddl,
+								 &isnull);
+	if (isnull)
+		return false;
+
+	ddlmask = DatumGetInt32(ddlmask_datum);
+	if (ddlmask == 0 || (MySubscription->ddl & ddlmask) == 0)
+		return false;
+
+	return true;
+}
+
+/*
+ * Parse and execute SQL utility statements one-by-one.
+ *
+ * This follows the same parse-tree execution model used by core SQL script
+ * runners (e.g. extension script execution), instead of handing the raw text
+ * directly to SPI.
+ */
+static void
+execute_publication_sync_sql_command(const char *sql)
+{
+	List	   *raw_parsetree_list;
+	DestReceiver *dest;
+	ListCell   *lc1;
+
+	raw_parsetree_list = pg_parse_query(sql);
+	dest = CreateDestReceiver(DestNone);
+
+	foreach(lc1, raw_parsetree_list)
+	{
+		RawStmt    *parsetree = lfirst_node(RawStmt, lc1);
+		MemoryContext per_parsetree_context;
+		MemoryContext oldcontext;
+		List	   *stmt_list;
+		ListCell   *lc2;
+
+		per_parsetree_context =
+			AllocSetContextCreate(CurrentMemoryContext,
+								  "publication sync apply per-statement context",
+								  ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(per_parsetree_context);
+
+		/* Let parser/planner see any DDL done by previous statements. */
+		CommandCounterIncrement();
+
+		stmt_list = pg_analyze_and_rewrite_fixedparams(parsetree,
+													   sql,
+													   NULL,
+													   0,
+													   NULL);
+		stmt_list = pg_plan_queries(stmt_list, sql, CURSOR_OPT_PARALLEL_OK, NULL);
+
+		foreach(lc2, stmt_list)
+		{
+			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
+			QueryCompletion qc;
+
+			CommandCounterIncrement();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			InitializeQueryCompletion(&qc);
+
+			PG_TRY();
+			{
+				if (stmt->utilityStmt == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("pg_publication_sync message type \"Q\" only supports utility statements")));
+
+				if (IsA(stmt->utilityStmt, TransactionStmt))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("transaction control statements are not allowed in pg_publication_sync pfsyncddlsql")));
+
+				ProcessUtility(stmt,
+							   sql,
+							   false,
+							   PROCESS_UTILITY_QUERY,
+							   NULL,
+							   NULL,
+							   dest,
+							   &qc);
+			}
+			PG_CATCH();
+			{
+				PopActiveSnapshot();
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+
+			PopActiveSnapshot();
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(per_parsetree_context);
+	}
+
+	CommandCounterIncrement();
+}
+
+static PublicationSyncMessageKind
+decode_publication_sync_message_type(char message_type)
+{
+	if (message_type == PUBLICATION_SYNC_MSGTYPE_QUERY)
+		return PUBLICATION_SYNC_MSG_Q;
+	if (message_type == PUBLICATION_SYNC_MSGTYPE_ADD)
+		return PUBLICATION_SYNC_MSG_A;
+	if (message_type == PUBLICATION_SYNC_MSGTYPE_DROP)
+		return PUBLICATION_SYNC_MSG_D;
+	return PUBLICATION_SYNC_MSG_UNKNOWN;
+}
+
+static void
+apply_publication_sync_message_q(TupleTableSlot *newslot)
+{
+	bool		isnull;
+	Datum		ddldatum;
+	Datum		searchpathdatum;
+	char	   *ddl_sql;
+	char	   *captured_search_path;
+	char	   *saved_search_path;
+
+	ddldatum = slot_getattr(newslot,
+							Anum_pg_publication_sync_pfsyncddlsql,
+							&isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires pfsyncddlsql")));
+
+	ddl_sql = TextDatumGetCString(ddldatum);
+	if (ddl_sql[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires non-empty pfsyncddlsql")));
+
+	searchpathdatum = slot_getattr(newslot,
+								   Anum_pg_publication_sync_pfsyncsearchpath,
+								   &isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires pfsyncsearchpath")));
+
+	captured_search_path = TextDatumGetCString(searchpathdatum);
+	if (captured_search_path[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"Q\" requires non-empty pfsyncsearchpath")));
+
+	saved_search_path = GetConfigOptionByName("search_path", NULL, false);
+
+	PG_TRY();
+	{
+		(void) set_config_option("search_path", captured_search_path,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+
+		execute_publication_sync_sql_command(ddl_sql);
+
+		(void) set_config_option("search_path", saved_search_path,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+	}
+	PG_CATCH();
+	{
+		(void) set_config_option("search_path", saved_search_path,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	pfree(saved_search_path);
+	pfree(captured_search_path);
+	pfree(ddl_sql);
+}
+
+static void
+apply_publication_sync_message_a(TupleTableSlot *newslot)
+{
+	bool		isnull;
+	Datum		target_datum;
+	char	   *target_table;
+	List	   *name_list;
+	RangeVar   *rv;
+	Oid			relid;
+	char		relstate;
+	XLogRecPtr	sublsn;
+
+	target_datum = slot_getattr(newslot,
+								Anum_pg_publication_sync_pfsynctargettable,
+								&isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"A\" requires pfsynctargettable")));
+
+	target_table = TextDatumGetCString(target_datum);
+	if (target_table[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"A\" requires non-empty pfsynctargettable")));
+
+	name_list = stringToQualifiedNameList(target_table, NULL);
+	rv = makeRangeVarFromNameList(name_list);
+	relid = RangeVarGetRelid(rv, NoLock, false);
+	relstate = GetSubscriptionRelState(MySubscription->oid, relid, &sublsn);
+	if (relstate == SUBREL_STATE_UNKNOWN)
+	{
+		AddSubscriptionRelState(MySubscription->oid, relid, SUBREL_STATE_READY,
+								InvalidXLogRecPtr, false);
+		CommandCounterIncrement();
+	}
+
+	list_free_deep(name_list);
+	pfree(target_table);
+}
+
+static void
+apply_publication_sync_message_d(TupleTableSlot *newslot)
+{
+	bool		isnull;
+	Datum		target_datum;
+	char	   *target_table;
+	List	   *name_list;
+	RangeVar   *rv;
+	Oid			relid;
+	char		relstate;
+	XLogRecPtr	sublsn;
+
+	target_datum = slot_getattr(newslot,
+								Anum_pg_publication_sync_pfsynctargettable,
+								&isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"D\" requires pfsynctargettable")));
+
+	target_table = TextDatumGetCString(target_datum);
+	if (target_table[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"D\" requires non-empty pfsynctargettable")));
+
+	name_list = stringToQualifiedNameList(target_table, NULL);
+	rv = makeRangeVarFromNameList(name_list);
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	if (OidIsValid(relid))
+	{
+		relstate = GetSubscriptionRelState(MySubscription->oid, relid, &sublsn);
+		if (relstate != SUBREL_STATE_UNKNOWN)
+		{
+			RemoveSubscriptionRel(MySubscription->oid, relid);
+			CommandCounterIncrement();
+		}
+	}
+
+	list_free_deep(name_list);
+	pfree(target_table);
+}
+
+/*
+ * Execute the message payload carried by pg_publication_sync tuples.
+ *
+ * Message dispatch framework:
+ *   Q: Execute pfsyncddlsql as SQL on subscriber.
+ *   A: Add relation into subscriber subscription mapping.
+ *   D: Drop relation from subscriber subscription mapping.
+ */
+static void
+maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
+									 TupleTableSlot *newslot)
+{
+	Relation	localrel = relinfo->ri_RelationDesc;
+	bool		isnull;
+	Datum		msgdatum;
+	char		message_type;
+	PublicationSyncMessageKind msgkind;
+
+	/* Only leader apply worker is allowed to execute synced DDL messages. */
+	if (!am_leader_apply_worker())
+		return;
+
+	if (RelationGetRelid(localrel) != PublicationSyncRelationId)
+		return;
+
+	if (!publication_sync_row_matches_subscription(newslot))
+		return;
+
+	msgdatum = slot_getattr(newslot,
+							Anum_pg_publication_sync_pfsyncmsgtype,
+							&isnull);
+	if (isnull)
+		return;
+
+	message_type = DatumGetChar(msgdatum);
+	msgkind = decode_publication_sync_message_type(message_type);
+
+	switch (msgkind)
+	{
+		case PUBLICATION_SYNC_MSG_Q:
+			apply_publication_sync_message_q(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_A:
+			apply_publication_sync_message_a(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_D:
+			apply_publication_sync_message_d(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_UNKNOWN:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported pg_publication_sync message type \"%c\"",
+							message_type),
+					 errhint("Supported message types are Q/A/D.")));
+			break;
+	}
 }
 
 /*

@@ -16,13 +16,19 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
+#include "access/table.h"
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_publication.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/toasting.h"
 #include "commands/alter.h"
 #include "commands/async.h"
@@ -57,14 +63,17 @@
 #include "commands/vacuum.h"
 #include "commands/view.h"
 #include "miscadmin.h"
+#include "parser/parse_relation.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_lsn.h"
 
 /* Hook for plugins to get control in ProcessUtility() */
 ProcessUtility_hook_type ProcessUtility_hook = NULL;
@@ -80,6 +89,21 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+static bool UtilityStmtShouldCaptureDDL(Node *parsetree);
+static int	UtilityStmtDDLMask(Node *parsetree);
+static char *UtilityStmtTargetTable(Node *parsetree);
+static RangeVar *UtilityStmtTargetRangeVar(Node *parsetree);
+static Oid UtilityStmtTargetRelid(Node *parsetree);
+static bool UtilityStmtNeedsRelationScopeFilter(int ddlmask);
+static bool PublicationAllowsDDLMaskByScope(Form_pg_publication pubform,
+											int ddlmask);
+static bool PublicationMatchesRelationScope(Form_pg_publication pubform,
+											Oid target_relid,
+											List *target_relpubids,
+											List *target_schemapubids,
+											List *target_ancestors);
+static char *UtilityStatementText(PlannedStmt *pstmt, const char *queryString);
+static void CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString);
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -464,6 +488,455 @@ CheckRestrictedOperation(const char *cmdname)
 		/* translator: %s is name of a SQL command, eg PREPARE */
 				 errmsg("cannot execute %s within security-restricted operation",
 						cmdname)));
+}
+
+static int
+DdlMaskFromObjectType(ObjectType objtype)
+{
+	switch (objtype)
+	{
+		case OBJECT_TABLE:
+		case OBJECT_FOREIGN_TABLE:
+			return PUBLICATION_DDL_TABLE;
+		case OBJECT_INDEX:
+			return PUBLICATION_DDL_INDEX;
+		case OBJECT_TRIGGER:
+			return PUBLICATION_DDL_TRIGGER;
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+			return PUBLICATION_DDL_VIEW;
+		case OBJECT_RULE:
+			return PUBLICATION_DDL_RULE;
+		case OBJECT_SCHEMA:
+			return PUBLICATION_DDL_SCHEMA;
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+		case OBJECT_ROUTINE:
+			return PUBLICATION_DDL_FUNCTION;
+		case OBJECT_TYPE:
+			return PUBLICATION_DDL_TYPE;
+		case OBJECT_DOMAIN:
+			return PUBLICATION_DDL_DOMAIN;
+		case OBJECT_EXTENSION:
+			return PUBLICATION_DDL_EXTENSION;
+		default:
+			return 0;
+	}
+}
+
+static bool
+UtilityStmtShouldCaptureDDL(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
+		case T_CreateTableAsStmt:
+		case T_AlterTableStmt:
+		case T_TruncateStmt:
+		case T_IndexStmt:
+		case T_ReindexStmt:
+		case T_CreateTrigStmt:
+		case T_ViewStmt:
+		case T_RuleStmt:
+		case T_CreateSchemaStmt:
+		case T_CreateFunctionStmt:
+		case T_CreateEnumStmt:
+		case T_CreateRangeStmt:
+		case T_AlterTypeStmt:
+		case T_CreateDomainStmt:
+		case T_AlterDomainStmt:
+		case T_CreateExtensionStmt:
+		case T_AlterExtensionStmt:
+		case T_AlterExtensionContentsStmt:
+		case T_DropStmt:
+		case T_RenameStmt:
+		case T_AlterObjectSchemaStmt:
+		case T_AlterOwnerStmt:
+		case T_DefineStmt:
+		case T_CreatePublicationStmt:
+		case T_AlterPublicationStmt:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static int
+UtilityStmtDDLMask(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
+		case T_CreateTableAsStmt:
+		case T_AlterTableStmt:
+		case T_TruncateStmt:
+			return PUBLICATION_DDL_TABLE;
+		case T_IndexStmt:
+		case T_ReindexStmt:
+			return PUBLICATION_DDL_INDEX;
+		case T_CreateTrigStmt:
+			return PUBLICATION_DDL_TRIGGER;
+		case T_ViewStmt:
+			return PUBLICATION_DDL_VIEW;
+		case T_RuleStmt:
+			return PUBLICATION_DDL_RULE;
+		case T_CreateSchemaStmt:
+			return PUBLICATION_DDL_SCHEMA;
+		case T_CreateFunctionStmt:
+			return PUBLICATION_DDL_FUNCTION;
+		case T_CreateEnumStmt:
+		case T_CreateRangeStmt:
+		case T_AlterTypeStmt:
+			return PUBLICATION_DDL_TYPE;
+		case T_CreateDomainStmt:
+		case T_AlterDomainStmt:
+			return PUBLICATION_DDL_DOMAIN;
+		case T_CreateExtensionStmt:
+		case T_AlterExtensionStmt:
+		case T_AlterExtensionContentsStmt:
+			return PUBLICATION_DDL_EXTENSION;
+		case T_DefineStmt:
+			if (((DefineStmt *) parsetree)->kind == OBJECT_TYPE)
+				return PUBLICATION_DDL_TYPE;
+			return 0;
+		case T_DropStmt:
+			return DdlMaskFromObjectType((ObjectType) ((DropStmt *) parsetree)->removeType);
+		case T_RenameStmt:
+			return DdlMaskFromObjectType(((RenameStmt *) parsetree)->renameType);
+		case T_AlterObjectSchemaStmt:
+			return DdlMaskFromObjectType(((AlterObjectSchemaStmt *) parsetree)->objectType);
+		case T_AlterOwnerStmt:
+			return DdlMaskFromObjectType(((AlterOwnerStmt *) parsetree)->objectType);
+		default:
+			return 0;
+	}
+}
+
+static char *
+QuoteRangeVarName(RangeVar *rv)
+{
+	if (rv == NULL || rv->relname == NULL)
+		return NULL;
+
+	return quote_qualified_identifier(rv->schemaname, rv->relname);
+}
+
+static char *
+UtilityStmtTargetTable(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+			return QuoteRangeVarName(((CreateStmt *) parsetree)->relation);
+		case T_CreateForeignTableStmt:
+			return QuoteRangeVarName(((CreateForeignTableStmt *) parsetree)->base.relation);
+		case T_CreateTableAsStmt:
+			return QuoteRangeVarName(((CreateTableAsStmt *) parsetree)->into->rel);
+		case T_AlterTableStmt:
+			return QuoteRangeVarName(((AlterTableStmt *) parsetree)->relation);
+		case T_TruncateStmt:
+			{
+				TruncateStmt *stmt = (TruncateStmt *) parsetree;
+				RangeVar   *rv = stmt->relations ? linitial_node(RangeVar, stmt->relations) : NULL;
+
+				return QuoteRangeVarName(rv);
+			}
+		case T_IndexStmt:
+			return QuoteRangeVarName(((IndexStmt *) parsetree)->relation);
+		case T_CreateTrigStmt:
+			return QuoteRangeVarName(((CreateTrigStmt *) parsetree)->relation);
+		case T_ViewStmt:
+			return QuoteRangeVarName(((ViewStmt *) parsetree)->view);
+		case T_RuleStmt:
+			return QuoteRangeVarName(((RuleStmt *) parsetree)->relation);
+		case T_DropStmt:
+			{
+				DropStmt   *stmt = (DropStmt *) parsetree;
+				Node	   *obj = stmt->objects ? linitial(stmt->objects) : NULL;
+
+				if (obj && IsA(obj, List))
+					return NameListToString((List *) obj);
+				else if (obj && IsA(obj, ObjectWithArgs))
+					return NameListToString(((ObjectWithArgs *) obj)->objname);
+				return NULL;
+			}
+		case T_RenameStmt:
+			return QuoteRangeVarName(((RenameStmt *) parsetree)->relation);
+		default:
+			return NULL;
+	}
+}
+
+static RangeVar *
+UtilityStmtTargetRangeVar(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+			return ((CreateStmt *) parsetree)->relation;
+		case T_CreateForeignTableStmt:
+			return ((CreateForeignTableStmt *) parsetree)->base.relation;
+		case T_CreateTableAsStmt:
+			return ((CreateTableAsStmt *) parsetree)->into->rel;
+		case T_AlterTableStmt:
+			return ((AlterTableStmt *) parsetree)->relation;
+		case T_TruncateStmt:
+			{
+				TruncateStmt *stmt = (TruncateStmt *) parsetree;
+
+				return stmt->relations ? linitial_node(RangeVar, stmt->relations) : NULL;
+			}
+		case T_IndexStmt:
+			return ((IndexStmt *) parsetree)->relation;
+		case T_ReindexStmt:
+			{
+				ReindexStmt *stmt = (ReindexStmt *) parsetree;
+
+				if (stmt->kind == REINDEX_OBJECT_TABLE)
+					return stmt->relation;
+				return NULL;
+			}
+		case T_CreateTrigStmt:
+			return ((CreateTrigStmt *) parsetree)->relation;
+		case T_ViewStmt:
+			return ((ViewStmt *) parsetree)->view;
+		case T_RuleStmt:
+			return ((RuleStmt *) parsetree)->relation;
+		case T_RenameStmt:
+			return ((RenameStmt *) parsetree)->relation;
+		default:
+			return NULL;
+	}
+}
+
+static Oid
+UtilityStmtTargetRelid(Node *parsetree)
+{
+	RangeVar   *rv = UtilityStmtTargetRangeVar(parsetree);
+
+	if (rv == NULL)
+		return InvalidOid;
+
+	return RangeVarGetRelid(rv, NoLock, true);
+}
+
+static bool
+UtilityStmtNeedsRelationScopeFilter(int ddlmask)
+{
+	int			relscope_mask = PUBLICATION_DDL_TABLE |
+		PUBLICATION_DDL_INDEX |
+		PUBLICATION_DDL_TRIGGER |
+		PUBLICATION_DDL_VIEW |
+		PUBLICATION_DDL_RULE;
+
+	return (ddlmask & relscope_mask) != 0;
+}
+
+static bool
+PublicationAllowsDDLMaskByScope(Form_pg_publication pubform, int ddlmask)
+{
+	int			for_table_mask = PUBLICATION_DDL_TABLE | PUBLICATION_DDL_INDEX;
+	int			for_schema_or_all_mask = PUBLICATION_DDL_ALL;
+	int			allowed_mask;
+
+	if (pubform->puballtables || is_schema_publication(pubform->oid))
+		allowed_mask = for_schema_or_all_mask;
+	else
+		allowed_mask = for_table_mask;
+
+	return (ddlmask & allowed_mask) != 0;
+}
+
+static bool
+PublicationMatchesRelationScope(Form_pg_publication pubform,
+								Oid target_relid,
+								List *target_relpubids,
+								List *target_schemapubids,
+								List *target_ancestors)
+{
+	if (pubform->puballtables)
+		return true;
+
+	if (list_member_oid(target_relpubids, pubform->oid))
+		return true;
+
+	if (list_member_oid(target_schemapubids, pubform->oid))
+		return true;
+
+	if (target_ancestors != NIL &&
+		OidIsValid(GetTopMostAncestorInPublication(pubform->oid,
+												   target_ancestors,
+												   NULL)))
+		return true;
+
+	return false;
+}
+
+static char *
+UtilityStatementText(PlannedStmt *pstmt, const char *queryString)
+{
+	if (queryString == NULL)
+		return NULL;
+
+	if (pstmt->stmt_location < 0)
+		return pstrdup(queryString);
+
+	if (pstmt->stmt_len <= 0)
+		return pstrdup(queryString + pstmt->stmt_location);
+
+	return pnstrdup(queryString + pstmt->stmt_location, pstmt->stmt_len);
+}
+
+static void
+CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
+{
+	Node	   *parsetree = pstmt->utilityStmt;
+	Relation	syncrel;
+	Relation	pubrel;
+	TableScanDesc pubscan;
+	HeapTuple	pubtup;
+	char	   *ddl_sql;
+	char	   *target_table;
+	char	   *ddl_search_path;
+	int			ddlmask;
+	bool		needs_rel_scope_filter;
+	Oid			target_relid = InvalidOid;
+	List	   *target_relpubids = NIL;
+	List	   *target_schemapubids = NIL;
+	List	   *target_ancestors = NIL;
+	List	   *matched_pubids = NIL;
+
+	if (!IsNormalProcessingMode() || IsBootstrapProcessingMode())
+		return;
+
+	/* Only capture user-issued utility commands from client backends. */
+	if (MyProcPort == NULL)
+		return;
+
+	if (!UtilityStmtShouldCaptureDDL(parsetree))
+		return;
+
+	ddl_sql = UtilityStatementText(pstmt, queryString);
+	target_table = UtilityStmtTargetTable(parsetree);
+	ddl_search_path = GetConfigOptionByName("search_path", NULL, false);
+	ddlmask = UtilityStmtDDLMask(parsetree);
+	if (ddlmask == 0)
+		goto done;
+
+	needs_rel_scope_filter = UtilityStmtNeedsRelationScopeFilter(ddlmask);
+	if (needs_rel_scope_filter)
+	{
+		target_relid = UtilityStmtTargetRelid(parsetree);
+		if (!OidIsValid(target_relid))
+			goto done;
+
+		target_relpubids = GetRelationPublications(target_relid);
+		target_schemapubids = GetSchemaPublications(get_rel_namespace(target_relid));
+		if (get_rel_relispartition(target_relid))
+			target_ancestors = get_partition_ancestors(target_relid);
+	}
+
+	pubrel = table_open(PublicationRelationId, AccessShareLock);
+	pubscan = table_beginscan_catalog(pubrel, 0, NULL);
+
+	while ((pubtup = heap_getnext(pubscan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_publication pubform = (Form_pg_publication) GETSTRUCT(pubtup);
+
+		if (pubform->pubddl == 0)
+			continue;
+		if ((pubform->pubddl & ddlmask) == 0)
+			continue;
+		if (!PublicationAllowsDDLMaskByScope(pubform, ddlmask))
+			continue;
+		if (needs_rel_scope_filter &&
+			!PublicationMatchesRelationScope(pubform, target_relid,
+											 target_relpubids,
+											 target_schemapubids,
+											 target_ancestors))
+			continue;
+
+		matched_pubids = lappend_oid(matched_pubids, pubform->oid);
+	}
+
+	table_endscan(pubscan);
+	table_close(pubrel, AccessShareLock);
+
+	if (matched_pubids != NIL)
+	{
+		ListCell   *lc;
+
+		syncrel = table_open(PublicationSyncRelationId, RowExclusiveLock);
+
+		foreach(lc, matched_pubids)
+		{
+			Datum		values[Natts_pg_publication_sync];
+			bool		nulls[Natts_pg_publication_sync];
+			HeapTuple	newtup;
+			Oid			pubid = lfirst_oid(lc);
+			int64		pfsyncobjid;
+
+			memset(values, 0, sizeof(values));
+			memset(nulls, false, sizeof(nulls));
+
+			pfsyncobjid = (int64) GetNewObjectId();
+			values[Anum_pg_publication_sync_pfsyncpubid - 1] =
+				ObjectIdGetDatum(pubid);
+			values[Anum_pg_publication_sync_pfsyncobjid - 1] =
+				Int64GetDatum(pfsyncobjid);
+			values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
+			values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
+			values[Anum_pg_publication_sync_pfsynclsn - 1] =
+				LSNGetDatum(GetXLogInsertRecPtr());
+			values[Anum_pg_publication_sync_pfsyncts - 1] =
+				TimestampTzGetDatum(GetCurrentTimestamp());
+			values[Anum_pg_publication_sync_pfsyncmsgtype - 1] =
+				CharGetDatum(PUBLICATION_SYNC_MSGTYPE_QUERY);
+
+			if (target_table != NULL)
+				values[Anum_pg_publication_sync_pfsynctargettable - 1] =
+					CStringGetTextDatum(target_table);
+			else
+				nulls[Anum_pg_publication_sync_pfsynctargettable - 1] = true;
+
+			if (ddl_sql != NULL)
+				values[Anum_pg_publication_sync_pfsyncddlsql - 1] =
+					CStringGetTextDatum(ddl_sql);
+			else
+				nulls[Anum_pg_publication_sync_pfsyncddlsql - 1] = true;
+
+			nulls[Anum_pg_publication_sync_pfsyncpublicationlist - 1] = true;
+
+			if (ddl_search_path != NULL && ddl_search_path[0] != '\0')
+				values[Anum_pg_publication_sync_pfsyncsearchpath - 1] =
+					CStringGetTextDatum(ddl_search_path);
+			else
+				nulls[Anum_pg_publication_sync_pfsyncsearchpath - 1] = true;
+
+			nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
+
+			newtup = heap_form_tuple(RelationGetDescr(syncrel), values, nulls);
+			CatalogTupleInsert(syncrel, newtup);
+			heap_freetuple(newtup);
+		}
+
+		table_close(syncrel, RowExclusiveLock);
+	}
+
+done:
+	list_free(target_relpubids);
+	list_free(target_schemapubids);
+	list_free(target_ancestors);
+	list_free(matched_pubids);
+
+	if (target_table != NULL)
+		pfree(target_table);
+	if (ddl_sql != NULL)
+		pfree(ddl_sql);
+	if (ddl_search_path != NULL)
+		pfree(ddl_search_path);
 }
 
 /*
@@ -1071,6 +1544,9 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	}
 
 	free_parsestate(pstate);
+
+	if (context != PROCESS_UTILITY_SUBCOMMAND)
+		CapturePublicationSyncDDL(pstmt, queryString);
 
 	/*
 	 * Make effects of commands visible, for instance so that
