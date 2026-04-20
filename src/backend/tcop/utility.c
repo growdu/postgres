@@ -707,6 +707,27 @@ UtilityStmtTargetRangeVar(Node *parsetree)
 			return ((RuleStmt *) parsetree)->relation;
 		case T_RenameStmt:
 			return ((RenameStmt *) parsetree)->relation;
+		case T_DropStmt:
+			{
+				DropStmt   *stmt = (DropStmt *) parsetree;
+				Node	   *obj = stmt->objects ? linitial(stmt->objects) : NULL;
+
+				if (obj && IsA(obj, List))
+				{
+					switch (stmt->removeType)
+					{
+						case OBJECT_TABLE:
+						case OBJECT_FOREIGN_TABLE:
+						case OBJECT_VIEW:
+						case OBJECT_MATVIEW:
+							return makeRangeVarFromNameList((List *) obj);
+						default:
+							break;
+					}
+				}
+
+				return NULL;
+			}
 		default:
 			return NULL;
 	}
@@ -746,6 +767,10 @@ UtilityStmtTargetNspid(Node *parsetree, Oid target_relid)
 		case T_CreateTableAsStmt:
 		case T_ViewStmt:
 			return RangeVarGetCreationNamespace(rv);
+		case T_DropStmt:
+			if (rv->schemaname != NULL)
+				return get_namespace_oid(rv->schemaname, true);
+			return InvalidOid;
 		default:
 			return InvalidOid;
 	}
@@ -860,8 +885,6 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	{
 		target_relid = UtilityStmtTargetRelid(parsetree);
 		target_nspid = UtilityStmtTargetNspid(parsetree, target_relid);
-		if (!OidIsValid(target_relid) && !OidIsValid(target_nspid))
-			goto done;
 
 		if (OidIsValid(target_relid))
 		{
@@ -870,7 +893,8 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 				target_ancestors = get_partition_ancestors(target_relid);
 		}
 
-		target_schemapubids = GetSchemaPublications(target_nspid);
+		if (OidIsValid(target_nspid))
+			target_schemapubids = GetSchemaPublications(target_nspid);
 	}
 
 	pubrel = table_open(PublicationRelationId, AccessShareLock);

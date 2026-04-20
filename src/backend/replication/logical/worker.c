@@ -413,6 +413,9 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
 static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
+static Oid publication_sync_lookup_target_relid(TupleTableSlot *newslot,
+												bool missing_ok,
+												bool *has_target);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -2631,6 +2634,46 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 }
 
 /*
+ * Resolve target relation OID from pfsynctargettable when present.
+ */
+static Oid
+publication_sync_lookup_target_relid(TupleTableSlot *newslot,
+									 bool missing_ok,
+									 bool *has_target)
+{
+	bool		isnull;
+	Datum		target_datum;
+	char	   *target_table;
+	List	   *name_list;
+	RangeVar   *rv;
+	Oid			relid;
+
+	*has_target = false;
+
+	target_datum = slot_getattr(newslot,
+								Anum_pg_publication_sync_pfsynctargettable,
+								&isnull);
+	if (isnull)
+		return InvalidOid;
+
+	target_table = TextDatumGetCString(target_datum);
+	if (target_table[0] == '\0')
+	{
+		pfree(target_table);
+		return InvalidOid;
+	}
+
+	name_list = stringToQualifiedNameList(target_table, NULL);
+	rv = makeRangeVarFromNameList(name_list);
+	relid = RangeVarGetRelid(rv, NoLock, missing_ok);
+	list_free_deep(name_list);
+	pfree(target_table);
+
+	*has_target = true;
+	return relid;
+}
+
+/*
  * Parse and execute SQL utility statements one-by-one.
  *
  * This follows the same parse-tree execution model used by core SQL script
@@ -2735,10 +2778,17 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 {
 	bool		isnull;
 	Datum		ddldatum;
+	Datum		ddlmaskdatum;
 	Datum		searchpathdatum;
 	char	   *ddl_sql;
 	char	   *captured_search_path;
 	char	   *saved_search_path;
+	int32		ddlmask = 0;
+	bool		has_target = false;
+	Oid			relid_before = InvalidOid;
+	Oid			relid_after = InvalidOid;
+	char		relstate;
+	XLogRecPtr	sublsn;
 
 	ddldatum = slot_getattr(newslot,
 							Anum_pg_publication_sync_pfsyncddlsql,
@@ -2768,6 +2818,16 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("pg_publication_sync message type \"Q\" requires non-empty pfsyncsearchpath")));
 
+	ddlmaskdatum = slot_getattr(newslot,
+								Anum_pg_publication_sync_pfsyncddl,
+								&isnull);
+	if (!isnull)
+		ddlmask = DatumGetInt32(ddlmaskdatum);
+
+	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
+		relid_before = publication_sync_lookup_target_relid(newslot, true,
+															&has_target);
+
 	saved_search_path = GetConfigOptionByName("search_path", NULL, false);
 
 	PG_TRY();
@@ -2790,6 +2850,50 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	/*
+	 * Keep subscription relation lifecycle aligned with replicated TABLE DDL:
+	 * when a table appears, register it for synchronization; when it
+	 * disappears, remove its mapping and stop any per-table worker.
+	 */
+	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0 && has_target)
+	{
+		bool		relid_before_still_exists = false;
+
+		relid_after = publication_sync_lookup_target_relid(newslot, true,
+														   &has_target);
+		if (OidIsValid(relid_before))
+			relid_before_still_exists =
+				SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid_before));
+
+		if (!OidIsValid(relid_before) && OidIsValid(relid_after))
+		{
+			relstate = GetSubscriptionRelState(MySubscription->oid,
+											   relid_after, &sublsn);
+			if (relstate == SUBREL_STATE_UNKNOWN)
+			{
+				AddSubscriptionRelState(MySubscription->oid, relid_after,
+										SUBREL_STATE_INIT,
+										InvalidXLogRecPtr, false);
+				LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+				CommandCounterIncrement();
+			}
+		}
+		else if (OidIsValid(relid_before) && !OidIsValid(relid_after) &&
+				 !relid_before_still_exists)
+		{
+			relstate = GetSubscriptionRelState(MySubscription->oid,
+											   relid_before, &sublsn);
+			if (relstate != SUBREL_STATE_UNKNOWN)
+			{
+				RemoveSubscriptionRel(MySubscription->oid, relid_before);
+				CommandCounterIncrement();
+			}
+
+			logicalrep_worker_stop(MySubscription->oid, relid_before);
+			LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+		}
+	}
 
 	pfree(saved_search_path);
 	pfree(captured_search_path);
@@ -2828,8 +2932,9 @@ apply_publication_sync_message_a(TupleTableSlot *newslot)
 	relstate = GetSubscriptionRelState(MySubscription->oid, relid, &sublsn);
 	if (relstate == SUBREL_STATE_UNKNOWN)
 	{
-		AddSubscriptionRelState(MySubscription->oid, relid, SUBREL_STATE_READY,
+		AddSubscriptionRelState(MySubscription->oid, relid, SUBREL_STATE_INIT,
 								InvalidXLogRecPtr, false);
+		LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
 		CommandCounterIncrement();
 	}
 
@@ -2874,6 +2979,9 @@ apply_publication_sync_message_d(TupleTableSlot *newslot)
 			RemoveSubscriptionRel(MySubscription->oid, relid);
 			CommandCounterIncrement();
 		}
+
+		logicalrep_worker_stop(MySubscription->oid, relid);
+		LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
 	}
 
 	list_free_deep(name_list);
