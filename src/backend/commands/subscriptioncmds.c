@@ -847,8 +847,20 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 			{
 				RangeVar   *rv = (RangeVar *) lfirst(lc);
 				Oid			relid;
+				bool		allow_missing_rel = (opts.ddl & PUBLICATION_DDL_TABLE) != 0;
 
-				relid = RangeVarGetRelid(rv, AccessShareLock, false);
+				relid = RangeVarGetRelid(rv, AccessShareLock, true);
+				if (!OidIsValid(relid))
+				{
+					if (!allow_missing_rel)
+						relid = RangeVarGetRelid(rv, AccessShareLock, false);
+
+					ereport(WARNING,
+							(errmsg("relation \"%s.%s\" does not exist on subscriber; skipping subscription table state initialization",
+									rv->schemaname, rv->relname),
+							 errhint("Create the table on subscriber (for example via replicated DDL) and then run ALTER SUBSCRIPTION ... REFRESH PUBLICATION.")));
+					continue;
+				}
 
 				/* Check for supported relkind. */
 				CheckSubscriptionRelkind(get_rel_relkind(relid),
@@ -1011,8 +1023,20 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 		{
 			RangeVar   *rv = (RangeVar *) lfirst(lc);
 			Oid			relid;
+			bool		allow_missing_rel = (sub->ddl & PUBLICATION_DDL_TABLE) != 0;
 
-			relid = RangeVarGetRelid(rv, AccessShareLock, false);
+			relid = RangeVarGetRelid(rv, AccessShareLock, true);
+			if (!OidIsValid(relid))
+			{
+				if (!allow_missing_rel)
+					relid = RangeVarGetRelid(rv, AccessShareLock, false);
+
+				ereport(WARNING,
+						(errmsg("relation \"%s.%s\" does not exist on subscriber; skipping subscription table state initialization",
+								rv->schemaname, rv->relname),
+						 errhint("Create the table on subscriber (for example via replicated DDL) and then run ALTER SUBSCRIPTION ... REFRESH PUBLICATION.")));
+				continue;
+			}
 
 			/* Check for supported relkind. */
 			CheckSubscriptionRelkind(get_rel_relkind(relid),
@@ -1036,7 +1060,7 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 		 * Next remove state for tables we should not care about anymore using
 		 * the data we collected above
 		 */
-		qsort(pubrel_local_oids, list_length(pubrel_names),
+		qsort(pubrel_local_oids, off,
 			  sizeof(Oid), oid_cmp);
 
 		remove_rel_len = 0;
@@ -1045,7 +1069,7 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 			Oid			relid = subrel_local_oids[off];
 
 			if (!bsearch(&relid, pubrel_local_oids,
-						 list_length(pubrel_names), sizeof(Oid), oid_cmp))
+						 off, sizeof(Oid), oid_cmp))
 			{
 				char		state;
 				XLogRecPtr	statelsn;
