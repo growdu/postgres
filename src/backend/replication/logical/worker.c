@@ -147,6 +147,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/genam.h"
+#include "access/skey.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/twophase.h"
@@ -186,6 +188,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/dynahash.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -397,6 +400,9 @@ static void apply_handle_commit_internal(LogicalRepCommitData *commit_data);
 static void apply_handle_insert_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot);
+static bool publication_sync_message_already_exists(Relation rel,
+													Oid pubid,
+													int64 msgid);
 static void apply_handle_update_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
@@ -2489,6 +2495,7 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 							 TupleTableSlot *remoteslot)
 {
 	EState	   *estate = edata->estate;
+	bool		inserted = true;
 
 	/* Caller should have opened indexes already. */
 	Assert(relinfo->ri_IndexRelationDescs != NULL ||
@@ -2497,8 +2504,107 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 
 	/* Do the insert. */
 	TargetPrivilegesCheck(relinfo->ri_RelationDesc, ACL_INSERT);
-	ExecSimpleRelationInsert(relinfo, estate, remoteslot);
+
+	/*
+	 * Keep pg_publication_sync apply idempotent when workers restart and see
+	 * duplicate rows; treat unique conflicts as already-applied messages.
+	 */
+	if (RelationGetRelid(relinfo->ri_RelationDesc) == PublicationSyncRelationId)
+	{
+		bool		isnull;
+		Oid			pubid;
+		int64		msgid;
+		Datum		pubid_datum;
+		Datum		objid_datum;
+
+		pubid_datum = slot_getattr(remoteslot,
+								   Anum_pg_publication_sync_pfsyncpubid,
+								   &isnull);
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("pg_publication_sync message requires pfsyncpubid")));
+		pubid = DatumGetObjectId(pubid_datum);
+
+		objid_datum = slot_getattr(remoteslot,
+								   Anum_pg_publication_sync_pfsyncobjid,
+								   &isnull);
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("pg_publication_sync message requires pfsyncobjid")));
+		msgid = DatumGetInt64(objid_datum);
+
+		/*
+		 * Replay/restart can encounter rows that are already present. Skip
+		 * early instead of relying solely on unique-index errors.
+		 */
+		if (publication_sync_message_already_exists(relinfo->ri_RelationDesc,
+													pubid, msgid))
+			inserted = false;
+
+		if (!inserted)
+			return;
+
+		PG_TRY();
+		{
+			ExecSimpleRelationInsert(relinfo, estate, remoteslot);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			MemoryContext oldcontext;
+
+			oldcontext = MemoryContextSwitchTo(ApplyMessageContext != NULL ?
+											   ApplyMessageContext :
+											   CurrentMemoryContext);
+			edata = CopyErrorData();
+			MemoryContextSwitchTo(oldcontext);
+			FlushErrorState();
+
+			if (edata->sqlerrcode == ERRCODE_UNIQUE_VIOLATION)
+			{
+				inserted = false;
+				FreeErrorData(edata);
+			}
+			else
+				ReThrowError(edata);
+		}
+		PG_END_TRY();
+	}
+	else
+		ExecSimpleRelationInsert(relinfo, estate, remoteslot);
+
+	if (!inserted)
+		return;
+
 	maybe_apply_publication_sync_message(relinfo, remoteslot);
+}
+
+static bool
+publication_sync_message_already_exists(Relation rel, Oid pubid, int64 msgid)
+{
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	bool		found;
+
+	Assert(RelationGetRelid(rel) == PublicationSyncRelationId);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_publication_sync_pfsyncpubid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(pubid));
+	ScanKeyInit(&key[1],
+				Anum_pg_publication_sync_pfsyncobjid,
+				BTEqualStrategyNumber, F_INT8EQ,
+				Int64GetDatum(msgid));
+
+	scan = systable_beginscan(rel, PublicationSyncPubidObjidIndexId,
+							  true, NULL, 2, key);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+
+	return found;
 }
 
 static bool
@@ -2789,7 +2895,11 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	Relation	localrel = relinfo->ri_RelationDesc;
 	bool		isnull;
 	Datum		msgdatum;
+	Datum		pubid_datum;
+	Datum		objid_datum;
 	char		message_type;
+	Oid			pubid = InvalidOid;
+	int64		msgid = 0;
 	PublicationSyncMessageKind msgkind;
 
 	/* Only leader apply worker is allowed to execute synced DDL messages. */
@@ -2808,28 +2918,79 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	if (isnull)
 		return;
 
+	pubid_datum = slot_getattr(newslot,
+							   Anum_pg_publication_sync_pfsyncpubid,
+							   &isnull);
+	if (!isnull)
+		pubid = DatumGetObjectId(pubid_datum);
+
+	objid_datum = slot_getattr(newslot,
+							   Anum_pg_publication_sync_pfsyncobjid,
+							   &isnull);
+	if (!isnull)
+		msgid = DatumGetInt64(objid_datum);
+
 	message_type = DatumGetChar(msgdatum);
 	msgkind = decode_publication_sync_message_type(message_type);
 
-	switch (msgkind)
+	PG_TRY();
 	{
-		case PUBLICATION_SYNC_MSG_Q:
-			apply_publication_sync_message_q(newslot);
-			break;
-		case PUBLICATION_SYNC_MSG_A:
-			apply_publication_sync_message_a(newslot);
-			break;
-		case PUBLICATION_SYNC_MSG_D:
-			apply_publication_sync_message_d(newslot);
-			break;
-		case PUBLICATION_SYNC_MSG_UNKNOWN:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("unsupported pg_publication_sync message type \"%c\"",
-							message_type),
-					 errhint("Supported message types are Q/A/D.")));
-			break;
+		switch (msgkind)
+		{
+			case PUBLICATION_SYNC_MSG_Q:
+				apply_publication_sync_message_q(newslot);
+				break;
+			case PUBLICATION_SYNC_MSG_A:
+				apply_publication_sync_message_a(newslot);
+				break;
+			case PUBLICATION_SYNC_MSG_D:
+				apply_publication_sync_message_d(newslot);
+				break;
+			case PUBLICATION_SYNC_MSG_UNKNOWN:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("unsupported pg_publication_sync message type \"%c\"",
+								message_type),
+						 errhint("Supported message types are Q/A/D.")));
+				break;
+		}
 	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		MemoryContext oldcontext;
+
+		oldcontext = MemoryContextSwitchTo(ApplyMessageContext != NULL ?
+										   ApplyMessageContext :
+										   CurrentMemoryContext);
+		edata = CopyErrorData();
+		MemoryContextSwitchTo(oldcontext);
+		FlushErrorState();
+
+		/*
+		 * Subscription option disable_on_error=false now acts as skip mode for
+		 * pg_publication_sync payload apply errors, so one bad message doesn't
+		 * stop the whole apply worker.
+		 */
+		if (MySubscription != NULL && !MySubscription->disableonerr)
+		{
+			ereport(WARNING,
+					(errmsg("skipping pg_publication_sync message apply after error"),
+					 errdetail("subscription \"%s\" (%u), publication %u, message %lld, type \"%c\": %s",
+							   MySubscription->name,
+							   MySubscription->oid,
+							   pubid,
+							   (long long) msgid,
+							   message_type,
+							   edata->message ? edata->message : "unknown error"),
+					 errhint("Set subscription option disable_on_error=true to stop on first DDL apply error.")));
+			FreeErrorData(edata);
+			return;
+		}
+
+		ReThrowError(edata);
+	}
+	PG_END_TRY();
 }
 
 /*

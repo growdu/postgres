@@ -94,6 +94,7 @@ static int	UtilityStmtDDLMask(Node *parsetree);
 static char *UtilityStmtTargetTable(Node *parsetree);
 static RangeVar *UtilityStmtTargetRangeVar(Node *parsetree);
 static Oid UtilityStmtTargetRelid(Node *parsetree);
+static Oid UtilityStmtTargetNspid(Node *parsetree, Oid target_relid);
 static bool UtilityStmtNeedsRelationScopeFilter(int ddlmask);
 static bool PublicationAllowsDDLMaskByScope(Form_pg_publication pubform,
 											int ddlmask);
@@ -722,6 +723,34 @@ UtilityStmtTargetRelid(Node *parsetree)
 	return RangeVarGetRelid(rv, NoLock, true);
 }
 
+/*
+ * Resolve target schema for statements whose target relation may not yet be
+ * visible in catalogs (e.g. CREATE TABLE/VIEW).
+ */
+static Oid
+UtilityStmtTargetNspid(Node *parsetree, Oid target_relid)
+{
+	RangeVar   *rv;
+
+	if (OidIsValid(target_relid))
+		return get_rel_namespace(target_relid);
+
+	rv = UtilityStmtTargetRangeVar(parsetree);
+	if (rv == NULL)
+		return InvalidOid;
+
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
+		case T_CreateTableAsStmt:
+		case T_ViewStmt:
+			return RangeVarGetCreationNamespace(rv);
+		default:
+			return InvalidOid;
+	}
+}
+
 static bool
 UtilityStmtNeedsRelationScopeFilter(int ddlmask)
 {
@@ -803,6 +832,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	int			ddlmask;
 	bool		needs_rel_scope_filter;
 	Oid			target_relid = InvalidOid;
+	Oid			target_nspid = InvalidOid;
 	List	   *target_relpubids = NIL;
 	List	   *target_schemapubids = NIL;
 	List	   *target_ancestors = NIL;
@@ -829,13 +859,18 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	if (needs_rel_scope_filter)
 	{
 		target_relid = UtilityStmtTargetRelid(parsetree);
-		if (!OidIsValid(target_relid))
+		target_nspid = UtilityStmtTargetNspid(parsetree, target_relid);
+		if (!OidIsValid(target_relid) && !OidIsValid(target_nspid))
 			goto done;
 
-		target_relpubids = GetRelationPublications(target_relid);
-		target_schemapubids = GetSchemaPublications(get_rel_namespace(target_relid));
-		if (get_rel_relispartition(target_relid))
-			target_ancestors = get_partition_ancestors(target_relid);
+		if (OidIsValid(target_relid))
+		{
+			target_relpubids = GetRelationPublications(target_relid);
+			if (get_rel_relispartition(target_relid))
+				target_ancestors = get_partition_ancestors(target_relid);
+		}
+
+		target_schemapubids = GetSchemaPublications(target_nspid);
 	}
 
 	pubrel = table_open(PublicationRelationId, AccessShareLock);
@@ -851,12 +886,27 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 			continue;
 		if (!PublicationAllowsDDLMaskByScope(pubform, ddlmask))
 			continue;
-		if (needs_rel_scope_filter &&
-			!PublicationMatchesRelationScope(pubform, target_relid,
-											 target_relpubids,
-											 target_schemapubids,
-											 target_ancestors))
-			continue;
+		if (needs_rel_scope_filter)
+		{
+			if (OidIsValid(target_relid))
+			{
+				if (!PublicationMatchesRelationScope(pubform, target_relid,
+													 target_relpubids,
+													 target_schemapubids,
+													 target_ancestors))
+					continue;
+			}
+			else
+			{
+				/*
+				 * Target relation may be unresolved for CREATE statements at
+				 * this stage; fallback to publication mode + target schema.
+				 */
+				if (!pubform->puballtables &&
+					!list_member_oid(target_schemapubids, pubform->oid))
+					continue;
+			}
+		}
 
 		matched_pubids = lappend_oid(matched_pubids, pubform->oid);
 	}
