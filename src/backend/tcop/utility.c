@@ -828,6 +828,47 @@ PublicationMatchesRelationScope(Form_pg_publication pubform,
 	return false;
 }
 
+typedef struct PublicationSyncCaptureMatch
+{
+	Oid			pubid;
+	int32		msg_ddlmask;
+} PublicationSyncCaptureMatch;
+
+/*
+ * Compute per-publication message mask and whether the statement should be
+ * captured for that publication.
+ *
+ * In FOR ALL TABLES mode, ddl='table' must also carry schema bootstrap DDL,
+ * so CREATE SCHEMA can arrive before CREATE TABLE in that schema.
+ */
+static bool
+PublicationShouldCaptureDDL(Form_pg_publication pubform,
+							int ddlmask,
+							int32 *msg_ddlmask)
+{
+	bool		schema_stmt;
+	bool		carry_schema_as_table = false;
+	int			effective_pubddl = pubform->pubddl;
+
+	schema_stmt = (ddlmask & PUBLICATION_DDL_SCHEMA) != 0;
+	if (schema_stmt &&
+		pubform->puballtables &&
+		(pubform->pubddl & PUBLICATION_DDL_TABLE) != 0)
+	{
+		carry_schema_as_table = true;
+		effective_pubddl |= PUBLICATION_DDL_SCHEMA;
+	}
+
+	if ((effective_pubddl & ddlmask) == 0)
+		return false;
+
+	*msg_ddlmask = ddlmask & pubform->pubddl;
+	if (carry_schema_as_table)
+		*msg_ddlmask |= PUBLICATION_DDL_TABLE;
+
+	return *msg_ddlmask != 0;
+}
+
 static char *
 UtilityStatementText(PlannedStmt *pstmt, const char *queryString)
 {
@@ -861,7 +902,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	List	   *target_relpubids = NIL;
 	List	   *target_schemapubids = NIL;
 	List	   *target_ancestors = NIL;
-	List	   *matched_pubids = NIL;
+	List	   *matched_pubs = NIL;
 
 	if (!IsNormalProcessingMode() || IsBootstrapProcessingMode())
 		return;
@@ -903,10 +944,11 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	while ((pubtup = heap_getnext(pubscan, ForwardScanDirection)) != NULL)
 	{
 		Form_pg_publication pubform = (Form_pg_publication) GETSTRUCT(pubtup);
+		int32		msg_ddlmask;
 
 		if (pubform->pubddl == 0)
 			continue;
-		if ((pubform->pubddl & ddlmask) == 0)
+		if (!PublicationShouldCaptureDDL(pubform, ddlmask, &msg_ddlmask))
 			continue;
 		if (!PublicationAllowsDDLMaskByScope(pubform, ddlmask))
 			continue;
@@ -932,24 +974,32 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 			}
 		}
 
-		matched_pubids = lappend_oid(matched_pubids, pubform->oid);
+		{
+			PublicationSyncCaptureMatch *match;
+
+			match = palloc(sizeof(PublicationSyncCaptureMatch));
+			match->pubid = pubform->oid;
+			match->msg_ddlmask = msg_ddlmask;
+			matched_pubs = lappend(matched_pubs, match);
+		}
 	}
 
 	table_endscan(pubscan);
 	table_close(pubrel, AccessShareLock);
 
-	if (matched_pubids != NIL)
+	if (matched_pubs != NIL)
 	{
 		ListCell   *lc;
 
 		syncrel = table_open(PublicationSyncRelationId, RowExclusiveLock);
 
-		foreach(lc, matched_pubids)
+		foreach(lc, matched_pubs)
 		{
+			PublicationSyncCaptureMatch *match =
+				(PublicationSyncCaptureMatch *) lfirst(lc);
 			Datum		values[Natts_pg_publication_sync];
 			bool		nulls[Natts_pg_publication_sync];
 			HeapTuple	newtup;
-			Oid			pubid = lfirst_oid(lc);
 			int64		pfsyncobjid;
 
 			memset(values, 0, sizeof(values));
@@ -957,10 +1007,11 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 
 			pfsyncobjid = (int64) GetNewObjectId();
 			values[Anum_pg_publication_sync_pfsyncpubid - 1] =
-				ObjectIdGetDatum(pubid);
+				ObjectIdGetDatum(match->pubid);
 			values[Anum_pg_publication_sync_pfsyncobjid - 1] =
 				Int64GetDatum(pfsyncobjid);
-			values[Anum_pg_publication_sync_pfsyncddl - 1] = Int32GetDatum(ddlmask);
+			values[Anum_pg_publication_sync_pfsyncddl - 1] =
+				Int32GetDatum(match->msg_ddlmask);
 			values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
 			values[Anum_pg_publication_sync_pfsynclsn - 1] =
 				LSNGetDatum(GetXLogInsertRecPtr());
@@ -1003,7 +1054,7 @@ done:
 	list_free(target_relpubids);
 	list_free(target_schemapubids);
 	list_free(target_ancestors);
-	list_free(matched_pubids);
+	list_free_deep(matched_pubs);
 
 	if (target_table != NULL)
 		pfree(target_table);

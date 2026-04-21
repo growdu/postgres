@@ -147,8 +147,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "access/genam.h"
-#include "access/skey.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/twophase.h"
@@ -188,7 +186,6 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/dynahash.h"
-#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -400,9 +397,6 @@ static void apply_handle_commit_internal(LogicalRepCommitData *commit_data);
 static void apply_handle_insert_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot);
-static bool publication_sync_message_already_exists(Relation rel,
-													Oid pubid,
-													int64 msgid);
 static void apply_handle_update_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
@@ -2498,116 +2492,24 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 							 TupleTableSlot *remoteslot)
 {
 	EState	   *estate = edata->estate;
-	bool		inserted = true;
 
 	/* Caller should have opened indexes already. */
 	Assert(relinfo->ri_IndexRelationDescs != NULL ||
 		   !relinfo->ri_RelationDesc->rd_rel->relhasindex ||
 		   RelationGetIndexList(relinfo->ri_RelationDesc) == NIL);
 
-	/* Do the insert. */
-	TargetPrivilegesCheck(relinfo->ri_RelationDesc, ACL_INSERT);
-
-	/*
-	 * Keep pg_publication_sync apply idempotent when workers restart and see
-	 * duplicate rows; treat unique conflicts as already-applied messages.
-	 */
+	/* Design3 path: subscription side does not persist pg_publication_sync. */
 	if (RelationGetRelid(relinfo->ri_RelationDesc) == PublicationSyncRelationId)
 	{
-		bool		isnull;
-		Oid			pubid;
-		int64		msgid;
-		Datum		pubid_datum;
-		Datum		objid_datum;
-
-		pubid_datum = slot_getattr(remoteslot,
-								   Anum_pg_publication_sync_pfsyncpubid,
-								   &isnull);
-		if (isnull)
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("pg_publication_sync message requires pfsyncpubid")));
-		pubid = DatumGetObjectId(pubid_datum);
-
-		objid_datum = slot_getattr(remoteslot,
-								   Anum_pg_publication_sync_pfsyncobjid,
-								   &isnull);
-		if (isnull)
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("pg_publication_sync message requires pfsyncobjid")));
-		msgid = DatumGetInt64(objid_datum);
-
-		/*
-		 * Replay/restart can encounter rows that are already present. Skip
-		 * early instead of relying solely on unique-index errors.
-		 */
-		if (publication_sync_message_already_exists(relinfo->ri_RelationDesc,
-													pubid, msgid))
-			inserted = false;
-
-		if (!inserted)
-			return;
-
-		PG_TRY();
-		{
-			ExecSimpleRelationInsert(relinfo, estate, remoteslot);
-		}
-		PG_CATCH();
-		{
-			ErrorData  *edata;
-			MemoryContext oldcontext;
-
-			oldcontext = MemoryContextSwitchTo(ApplyMessageContext != NULL ?
-											   ApplyMessageContext :
-											   CurrentMemoryContext);
-			edata = CopyErrorData();
-			MemoryContextSwitchTo(oldcontext);
-			FlushErrorState();
-
-			if (edata->sqlerrcode == ERRCODE_UNIQUE_VIOLATION)
-			{
-				inserted = false;
-				FreeErrorData(edata);
-			}
-			else
-				ReThrowError(edata);
-		}
-		PG_END_TRY();
-	}
-	else
-		ExecSimpleRelationInsert(relinfo, estate, remoteslot);
-
-	if (!inserted)
+		maybe_apply_publication_sync_message(relinfo, remoteslot);
 		return;
+	}
+
+	/* Do the insert. */
+	TargetPrivilegesCheck(relinfo->ri_RelationDesc, ACL_INSERT);
+	ExecSimpleRelationInsert(relinfo, estate, remoteslot);
 
 	maybe_apply_publication_sync_message(relinfo, remoteslot);
-}
-
-static bool
-publication_sync_message_already_exists(Relation rel, Oid pubid, int64 msgid)
-{
-	ScanKeyData key[2];
-	SysScanDesc scan;
-	bool		found;
-
-	Assert(RelationGetRelid(rel) == PublicationSyncRelationId);
-
-	ScanKeyInit(&key[0],
-				Anum_pg_publication_sync_pfsyncpubid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(pubid));
-	ScanKeyInit(&key[1],
-				Anum_pg_publication_sync_pfsyncobjid,
-				BTEqualStrategyNumber, F_INT8EQ,
-				Int64GetDatum(msgid));
-
-	scan = systable_beginscan(rel, PublicationSyncPubidObjidIndexId,
-							  true, NULL, 2, key);
-	found = HeapTupleIsValid(systable_getnext(scan));
-	systable_endscan(scan);
-
-	return found;
 }
 
 static bool
