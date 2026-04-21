@@ -20,9 +20,9 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_publication.h"
+#include "catalog/pg_publication_sync.h"
 #include "nodes/bitmapset.h"
 #include "partitioning/partdefs.h"
-#include "replication/logicalsysrel.h"
 #include "rewrite/prs2lock.h"
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
@@ -686,6 +686,16 @@ RelationCloseSmgr(Relation relation)
 	(XLogLogicalInfoActive() && \
 	 RelationNeedsWAL(relation) && \
 	 (IsCatalogRelation(relation) || RelationIsUsedAsCatalogTable(relation)))
+
+/*
+ * Whitelist checks for system relations that are allowed in logical
+ * replication.
+ */
+static inline bool
+IsLogicalRepSystemRelationOid(Oid relid)
+{
+	return relid == PublicationSyncRelationId;
+}
 
 /*
  * RelationIsLogicallyLogged

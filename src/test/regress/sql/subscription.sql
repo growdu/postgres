@@ -28,8 +28,10 @@ CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUB
 -- ok
 CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, ddl = 'table,index');
 SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
+SELECT pg_get_ddl_options(subddl) FROM pg_subscription WHERE subname = 'regress_testsub';
 ALTER SUBSCRIPTION regress_testsub SET (ddl = 'all');
 SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
+SELECT pg_get_ddl_options(subddl) FROM pg_subscription WHERE subname = 'regress_testsub';
 
 COMMENT ON SUBSCRIPTION regress_testsub IS 'test subscription';
 SELECT obj_description(s.oid, 'pg_subscription') FROM pg_subscription s;

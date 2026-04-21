@@ -30,8 +30,10 @@ SET client_min_messages = 'ERROR';
 CREATE PUBLICATION testpub_ddl WITH (ddl = 'table,index');
 RESET client_min_messages;
 SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
+SELECT pg_get_ddl_options(pubddl) FROM pg_publication WHERE pubname = 'testpub_ddl';
 ALTER PUBLICATION testpub_ddl SET (ddl = 'all');
 SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
+SELECT pg_get_ddl_options(pubddl) FROM pg_publication WHERE pubname = 'testpub_ddl';
 DROP PUBLICATION testpub_ddl;
 
 \dRp

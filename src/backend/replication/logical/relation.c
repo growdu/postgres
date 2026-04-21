@@ -23,13 +23,14 @@
 #include "access/genam.h"
 #include "access/table.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription_rel.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "replication/logicalrelation.h"
-#include "replication/logicalsysrel.h"
 #include "replication/worker_internal.h"
 #include "utils/inval.h"
+#include "utils/rel.h"
 
 
 static MemoryContext LogicalRepRelMapContext = NULL;
@@ -394,10 +395,22 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 											  remoterel->relname, -1),
 								 lockmode, true);
 		if (!OidIsValid(relid))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("logical replication target relation \"%s.%s\" does not exist",
-							remoterel->nspname, remoterel->relname)));
+		{
+			if (MySubscription != NULL &&
+				(MySubscription->ddl & PUBLICATION_DDL_TABLE) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("logical replication target relation \"%s.%s\" does not exist",
+								remoterel->nspname, remoterel->relname),
+						 errdetail("Subscription \"%s\" has ddl synchronization enabled for tables.",
+								   MySubscription->name),
+						 errhint("The apply worker will restart and retry after the required DDL is applied.")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("logical replication target relation \"%s.%s\" does not exist",
+								remoterel->nspname, remoterel->relname)));
+		}
 		entry->localrel = table_open(relid, NoLock);
 		entry->localreloid = relid;
 

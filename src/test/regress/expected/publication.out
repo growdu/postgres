@@ -40,11 +40,23 @@ SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
       3
 (1 row)
 
+SELECT pg_get_ddl_options(pubddl) FROM pg_publication WHERE pubname = 'testpub_ddl';
+ pg_get_ddl_options 
+--------------------------------
+ table,index
+(1 row)
+
 ALTER PUBLICATION testpub_ddl SET (ddl = 'all');
 SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
  pubddl 
 --------
    1023
+(1 row)
+
+SELECT pg_get_ddl_options(pubddl) FROM pg_publication WHERE pubname = 'testpub_ddl';
+                  pg_get_ddl_options                   
+-------------------------------------------------------------------
+ table,index,trigger,view,rule,schema,function,type,domain,extension
 (1 row)
 
 DROP PUBLICATION testpub_ddl;

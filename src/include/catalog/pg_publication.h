@@ -120,6 +120,7 @@ typedef struct PublicationRelInfo
 extern Publication *GetPublication(Oid pubid);
 extern Publication *GetPublicationByName(const char *pubname, bool missing_ok);
 extern List *GetRelationPublications(Oid relid);
+extern char *PublicationDDLMaskToString(int64 ddlmask);
 
 /*---------
  * Expected values for pub_partopt parameter of GetRelationPublications(),

@@ -23,6 +23,7 @@
 #include "commands/subscriptioncmds.h"
 #include "executor/executor.h"
 #include "fmgr.h"
+#include "libpq/pqformat.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
 #include "replication/logical.h"
@@ -99,6 +100,13 @@ static void send_relation_and_attrs(Relation relation, TransactionId xid,
 static void send_repl_origin(LogicalDecodingContext *ctx,
 							 RepOriginId origin_id, XLogRecPtr origin_lsn,
 							 bool send_origin);
+static bool pgoutput_write_publication_sync_message(LogicalDecodingContext *ctx,
+													TransactionId xid,
+													XLogRecPtr lsn,
+													TupleTableSlot *slot);
+
+#define PUBLICATION_SYNC_WIRE_PREFIX "pg_publication_sync"
+#define PUBLICATION_SYNC_WIRE_VERSION 1
 
 /*
  * Only 3 publication actions are used for row filtering ("insert", "update",
@@ -1469,6 +1477,101 @@ pgoutput_publication_sync_row_matches_pubid(PGOutputData *data,
 }
 
 /*
+ * Encode pg_publication_sync tuple as a dedicated logical replication DDL.
+ */
+static bool
+pgoutput_write_publication_sync_message(LogicalDecodingContext *ctx,
+										TransactionId xid,
+										XLogRecPtr lsn,
+										TupleTableSlot *slot)
+{
+	bool		isnull;
+	Datum		datum;
+	StringInfoData payload;
+	char	   *target_table = NULL;
+	char	   *ddl_sql = NULL;
+	char	   *search_path = NULL;
+	Oid			pubid;
+	int64		objid;
+	int64		ddlmask;
+	char		msgtype;
+
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsyncpubid, &isnull);
+	if (isnull)
+		return false;
+	pubid = DatumGetObjectId(datum);
+
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsyncobjid, &isnull);
+	if (isnull)
+		return false;
+	objid = DatumGetInt64(datum);
+
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsyncddl, &isnull);
+	if (isnull)
+		return false;
+	ddlmask = DatumGetInt64(datum);
+
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsyncmsgtype, &isnull);
+	if (isnull)
+		return false;
+	msgtype = DatumGetChar(datum);
+
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsynctargettable,
+						 &isnull);
+	if (!isnull)
+		target_table = TextDatumGetCString(datum);
+
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsyncddlsql,
+						 &isnull);
+	if (!isnull)
+		ddl_sql = TextDatumGetCString(datum);
+
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsyncsearchpath,
+						 &isnull);
+	if (!isnull)
+		search_path = TextDatumGetCString(datum);
+
+	initStringInfo(&payload);
+	pq_sendbyte(&payload, PUBLICATION_SYNC_WIRE_VERSION);
+	pq_sendint32(&payload, pubid);
+	pq_sendint64(&payload, objid);
+	pq_sendint64(&payload, ddlmask);
+	pq_sendbyte(&payload, msgtype);
+
+	pq_sendbyte(&payload, target_table != NULL);
+	if (target_table != NULL)
+		pq_sendstring(&payload, target_table);
+
+	pq_sendbyte(&payload, ddl_sql != NULL);
+	if (ddl_sql != NULL)
+		pq_sendstring(&payload, ddl_sql);
+
+	pq_sendbyte(&payload, search_path != NULL);
+	if (search_path != NULL)
+		pq_sendstring(&payload, search_path);
+
+	OutputPluginPrepareWrite(ctx, true);
+	logicalrep_write_ddl(ctx->out,
+						 xid,
+						 lsn,
+						 true,
+						 PUBLICATION_SYNC_WIRE_PREFIX,
+						 payload.len,
+						 payload.data);
+	OutputPluginWrite(ctx, true);
+
+	if (target_table != NULL)
+		pfree(target_table);
+	if (ddl_sql != NULL)
+		pfree(ddl_sql);
+	if (search_path != NULL)
+		pfree(search_path);
+	pfree(payload.data);
+
+	return true;
+}
+
+/*
  * Sends the decoded DML over wire.
  *
  * This is called both in streaming and non-streaming modes.
@@ -1584,6 +1687,18 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		if (msgslot == NULL ||
 			!pgoutput_publication_sync_row_matches_pubid(data, msgslot))
 			goto cleanup;
+
+		/* pg_publication_sync is emitted as dedicated MESSAGE, not row INSERT. */
+		if (action != REORDER_BUFFER_CHANGE_INSERT || new_slot == NULL)
+			goto cleanup;
+
+		/* Send BEGIN if we haven't yet. */
+		if (txndata && !txndata->sent_begin_txn)
+			pgoutput_send_begin(ctx, txn);
+
+		(void) pgoutput_write_publication_sync_message(ctx, xid,
+													   change->lsn, msgslot);
+		goto cleanup;
 	}
 
 	/*

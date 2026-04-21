@@ -154,6 +154,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_publication.h"
 #include "catalog/pg_publication_sync.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
@@ -201,6 +202,9 @@
 #include "utils/varlena.h"
 
 #define NAPTIME_PER_CYCLE 1000	/* max sleep time between cycles (1s) */
+#define MESSAGE_TRANSACTIONAL_FLAG (1 << 0)
+#define PUBLICATION_SYNC_WIRE_PREFIX "pg_publication_sync"
+#define PUBLICATION_SYNC_WIRE_VERSION 1
 
 typedef struct FlushPosition
 {
@@ -407,11 +411,11 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
 										 Oid localindexoid);
+static void apply_handle_ddl(StringInfo s);
 static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
 static Oid publication_sync_lookup_target_relid(TupleTableSlot *newslot,
 												bool missing_ok,
 												bool *has_target);
-static char *publication_ddl_mask_to_string(int64 ddlmask);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -419,6 +423,7 @@ static void apply_publication_sync_message_a(TupleTableSlot *newslot);
 static void apply_publication_sync_message_d(TupleTableSlot *newslot);
 static void maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 												 TupleTableSlot *newslot);
+static bool maybe_apply_publication_sync_wire_message(StringInfo s);
 static bool FindReplTupleInLocalRel(ApplyExecutionData *edata, Relation localrel,
 									LogicalRepRelation *remoterel,
 									Oid localidxoid,
@@ -2514,46 +2519,6 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 	maybe_apply_publication_sync_message(relinfo, remoteslot);
 }
 
-static char *
-publication_ddl_mask_to_string(int64 ddlmask)
-{
-	StringInfoData buf;
-	bool		first = true;
-	struct
-	{
-		int64		mask;
-		const char *name;
-	} ddl_names[] = {
-		{PUBLICATION_DDL_TABLE, "table"},
-		{PUBLICATION_DDL_INDEX, "index"},
-		{PUBLICATION_DDL_TRIGGER, "trigger"},
-		{PUBLICATION_DDL_VIEW, "view"},
-		{PUBLICATION_DDL_RULE, "rule"},
-		{PUBLICATION_DDL_SCHEMA, "schema"},
-		{PUBLICATION_DDL_FUNCTION, "function"},
-		{PUBLICATION_DDL_TYPE, "type"},
-		{PUBLICATION_DDL_DOMAIN, "domain"},
-		{PUBLICATION_DDL_EXTENSION, "extension"}
-	};
-	int			i;
-
-	initStringInfo(&buf);
-
-	for (i = 0; i < lengthof(ddl_names); i++)
-	{
-		if ((ddlmask & ddl_names[i].mask) == 0)
-			continue;
-		appendStringInfoString(&buf, first ? "" : ",");
-		appendStringInfoString(&buf, ddl_names[i].name);
-		first = false;
-	}
-
-	if (first)
-		appendStringInfoString(&buf, "none");
-
-	return buf.data;
-}
-
 static bool
 publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 {
@@ -2573,8 +2538,8 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 	ddlmask = DatumGetInt64(ddlmask_datum);
 	if (ddlmask == 0 || (MySubscription->ddl & ddlmask) == 0)
 	{
-		char	   *subddl_text = publication_ddl_mask_to_string(MySubscription->ddl);
-		char	   *msgddl_text = publication_ddl_mask_to_string(ddlmask);
+		char	   *subddl_text = PublicationDDLMaskToString(MySubscription->ddl);
+		char	   *msgddl_text = PublicationDDLMaskToString(ddlmask);
 
 		ereport(DEBUG2,
 				(errmsg_internal("skipping pg_publication_sync message by ddl mask"),
@@ -3002,6 +2967,137 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 					 errhint("Supported message types are Q/A/D.")));
 			break;
 	}
+}
+
+/*
+ * Decode and apply publication-sync wire payload.
+ *
+ * Returns true if the message prefix belongs to pg_publication_sync and was
+ * processed (or skipped by local filters), false for unrelated payloads.
+ */
+static bool
+maybe_apply_publication_sync_wire_message(StringInfo s)
+{
+	uint8		flags;
+	XLogRecPtr	lsn;
+	const char *prefix;
+	int			sz;
+	const char *payload_data;
+	StringInfoData payload;
+	uint8		version;
+	Oid			pubid;
+	int64		objid;
+	int64		ddlmask;
+	char		msgtype;
+	char	   *target_table = NULL;
+	char	   *ddl_sql = NULL;
+	char	   *search_path = NULL;
+	Relation	syncrel;
+	ResultRelInfo relinfo;
+	Datum		values[Natts_pg_publication_sync];
+	bool		nulls[Natts_pg_publication_sync];
+	HeapTuple	tuple;
+	TupleTableSlot *slot;
+
+	flags = pq_getmsgint(s, 1);
+	lsn = pq_getmsgint64(s);
+	prefix = pq_getmsgstring(s);
+	sz = pq_getmsgint(s, 4);
+	payload_data = pq_getmsgbytes(s, sz);
+	pq_getmsgend(s);
+
+	if (strcmp(prefix, PUBLICATION_SYNC_WIRE_PREFIX) != 0)
+		return false;
+
+	if ((flags & MESSAGE_TRANSACTIONAL_FLAG) == 0)
+		return true;
+
+	payload.data = unconstify(char *, payload_data);
+	payload.len = sz;
+	payload.maxlen = sz;
+	payload.cursor = 0;
+
+	version = pq_getmsgint(&payload, 1);
+	if (version != PUBLICATION_SYNC_WIRE_VERSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("unsupported pg_publication_sync wire version %u",
+						version)));
+
+	pubid = pq_getmsgint(&payload, 4);
+	objid = pq_getmsgint64(&payload);
+	ddlmask = pq_getmsgint64(&payload);
+	msgtype = pq_getmsgint(&payload, 1);
+
+	if (pq_getmsgint(&payload, 1) != 0)
+		target_table = pstrdup(pq_getmsgstring(&payload));
+	if (pq_getmsgint(&payload, 1) != 0)
+		ddl_sql = pstrdup(pq_getmsgstring(&payload));
+	if (pq_getmsgint(&payload, 1) != 0)
+		search_path = pstrdup(pq_getmsgstring(&payload));
+	pq_getmsgend(&payload);
+
+	syncrel = table_open(PublicationSyncRelationId, AccessShareLock);
+	MemSet(&relinfo, 0, sizeof(relinfo));
+	relinfo.ri_RelationDesc = syncrel;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	values[Anum_pg_publication_sync_pfsyncpubid - 1] =
+		ObjectIdGetDatum(pubid);
+	values[Anum_pg_publication_sync_pfsyncobjid - 1] =
+		Int64GetDatum(objid);
+	values[Anum_pg_publication_sync_pfsyncddl - 1] =
+		Int64GetDatum(ddlmask);
+	values[Anum_pg_publication_sync_pfsyncenabled - 1] =
+		BoolGetDatum(true);
+	values[Anum_pg_publication_sync_pfsynclsn - 1] =
+		LSNGetDatum(lsn);
+	values[Anum_pg_publication_sync_pfsyncmsgtype - 1] =
+		CharGetDatum(msgtype);
+	values[Anum_pg_publication_sync_pfsyncts - 1] =
+		TimestampTzGetDatum(GetCurrentTimestamp());
+
+	if (target_table != NULL)
+		values[Anum_pg_publication_sync_pfsynctargettable - 1] =
+			CStringGetTextDatum(target_table);
+	else
+		nulls[Anum_pg_publication_sync_pfsynctargettable - 1] = true;
+
+	if (ddl_sql != NULL)
+		values[Anum_pg_publication_sync_pfsyncddlsql - 1] =
+			CStringGetTextDatum(ddl_sql);
+	else
+		nulls[Anum_pg_publication_sync_pfsyncddlsql - 1] = true;
+
+	if (search_path != NULL)
+		values[Anum_pg_publication_sync_pfsyncsearchpath - 1] =
+			CStringGetTextDatum(search_path);
+	else
+		nulls[Anum_pg_publication_sync_pfsyncsearchpath - 1] = true;
+
+	nulls[Anum_pg_publication_sync_pfsyncpublicationlist - 1] = true;
+	nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
+
+	tuple = heap_form_tuple(RelationGetDescr(syncrel), values, nulls);
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(syncrel),
+									&TTSOpsHeapTuple);
+	ExecStoreHeapTuple(tuple, slot, true);
+
+	maybe_apply_publication_sync_message(&relinfo, slot);
+
+	ExecDropSingleTupleTableSlot(slot);
+	table_close(syncrel, AccessShareLock);
+
+	if (target_table != NULL)
+		pfree(target_table);
+	if (ddl_sql != NULL)
+		pfree(ddl_sql);
+	if (search_path != NULL)
+		pfree(search_path);
+
+	return true;
 }
 
 /*
@@ -3804,6 +3900,20 @@ apply_handle_truncate(StringInfo s)
 	end_replication_step();
 }
 
+/*
+ * Handle DDL message.
+ */
+static void
+apply_handle_ddl(StringInfo s)
+{
+	if (handle_streamed_transaction(LOGICAL_REP_MSG_DDL, s))
+		return;
+
+	begin_replication_step();
+	(void) maybe_apply_publication_sync_wire_message(s);
+	end_replication_step();
+}
+
 
 /*
  * Logical replication protocol message dispatcher.
@@ -3860,13 +3970,8 @@ apply_dispatch(StringInfo s)
 			apply_handle_origin(s);
 			break;
 
-		case LOGICAL_REP_MSG_MESSAGE:
-
-			/*
-			 * Logical replication does not use generic logical messages yet.
-			 * Although, it could be used by other applications that use this
-			 * output plugin.
-			 */
+		case LOGICAL_REP_MSG_DDL:
+			apply_handle_ddl(s);
 			break;
 
 		case LOGICAL_REP_MSG_STREAM_START:

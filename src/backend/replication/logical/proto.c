@@ -664,6 +664,33 @@ logicalrep_write_message(StringInfo out, TransactionId xid, XLogRecPtr lsn,
 }
 
 /*
+ * Write DDL message to stream.
+ */
+void
+logicalrep_write_ddl(StringInfo out, TransactionId xid, XLogRecPtr lsn,
+					 bool transactional, const char *prefix, Size sz,
+					 const char *message)
+{
+	uint8		flags = 0;
+
+	pq_sendbyte(out, LOGICAL_REP_MSG_DDL);
+
+	/* encode and send message flags */
+	if (transactional)
+		flags |= MESSAGE_TRANSACTIONAL;
+
+	/* transaction ID (if not valid, we're not streaming) */
+	if (TransactionIdIsValid(xid))
+		pq_sendint32(out, xid);
+
+	pq_sendint8(out, flags);
+	pq_sendint64(out, lsn);
+	pq_sendstring(out, prefix);
+	pq_sendint32(out, sz);
+	pq_sendbytes(out, message, sz);
+}
+
+/*
  * Write relation description to the output stream.
  */
 void
@@ -1240,6 +1267,8 @@ logicalrep_message_type(LogicalRepMsgType action)
 			return "TYPE";
 		case LOGICAL_REP_MSG_MESSAGE:
 			return "MESSAGE";
+		case LOGICAL_REP_MSG_DDL:
+			return "DDL";
 		case LOGICAL_REP_MSG_BEGIN_PREPARE:
 			return "BEGIN PREPARE";
 		case LOGICAL_REP_MSG_PREPARE:

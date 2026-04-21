@@ -38,11 +38,23 @@ SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
       3
 (1 row)
 
+SELECT pg_get_ddl_options(subddl) FROM pg_subscription WHERE subname = 'regress_testsub';
+ pg_get_ddl_options 
+--------------------------------
+ table,index
+(1 row)
+
 ALTER SUBSCRIPTION regress_testsub SET (ddl = 'all');
 SELECT subddl FROM pg_subscription WHERE subname = 'regress_testsub';
  subddl 
 --------
    1023
+(1 row)
+
+SELECT pg_get_ddl_options(subddl) FROM pg_subscription WHERE subname = 'regress_testsub';
+                  pg_get_ddl_options                   
+-------------------------------------------------------------------
+ table,index,trigger,view,rule,schema,function,type,domain,extension
 (1 row)
 
 COMMENT ON SUBSCRIPTION regress_testsub IS 'test subscription';

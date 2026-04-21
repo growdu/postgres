@@ -11942,6 +11942,11 @@
   proname => 'pg_relation_is_publishable', provolatile => 's',
   prorettype => 'bool', proargtypes => 'regclass',
   prosrc => 'pg_relation_is_publishable' },
+{ oid => '6122',
+  descr => 'converts logical replication ddl bitmask to readable options',
+  proname => 'pg_get_ddl_options', provolatile => 'i',
+  proparallel => 's', prorettype => 'text', proargtypes => 'int8',
+  prosrc => 'pg_get_ddl_options' },
 
 # rls
 { oid => '3298',

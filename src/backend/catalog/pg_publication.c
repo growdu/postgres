@@ -33,7 +33,7 @@
 #include "catalog/pg_type.h"
 #include "commands/publicationcmds.h"
 #include "funcapi.h"
-#include "replication/logicalsysrel.h"
+#include "lib/stringinfo.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -52,6 +52,57 @@ typedef struct
 
 static void publication_translate_columns(Relation targetrel, List *columns,
 										  int *natts, AttrNumber **attrs);
+
+char *
+PublicationDDLMaskToString(int64 ddlmask)
+{
+	StringInfoData buf;
+	bool		first = true;
+	struct
+	{
+		int64		mask;
+		const char *name;
+	} ddl_names[] = {
+		{PUBLICATION_DDL_TABLE, "table"},
+		{PUBLICATION_DDL_INDEX, "index"},
+		{PUBLICATION_DDL_TRIGGER, "trigger"},
+		{PUBLICATION_DDL_VIEW, "view"},
+		{PUBLICATION_DDL_RULE, "rule"},
+		{PUBLICATION_DDL_SCHEMA, "schema"},
+		{PUBLICATION_DDL_FUNCTION, "function"},
+		{PUBLICATION_DDL_TYPE, "type"},
+		{PUBLICATION_DDL_DOMAIN, "domain"},
+		{PUBLICATION_DDL_EXTENSION, "extension"}
+	};
+	int64		unknown_mask = ddlmask;
+	int			i;
+
+	initStringInfo(&buf);
+
+	for (i = 0; i < lengthof(ddl_names); i++)
+	{
+		if ((ddlmask & ddl_names[i].mask) == 0)
+			continue;
+
+		appendStringInfoString(&buf, first ? "" : ",");
+		appendStringInfoString(&buf, ddl_names[i].name);
+		first = false;
+		unknown_mask &= ~ddl_names[i].mask;
+	}
+
+	if (unknown_mask != 0)
+	{
+		appendStringInfo(&buf, "%sunknown(0x%llx)",
+						 first ? "" : ",",
+						 (unsigned long long) unknown_mask);
+		first = false;
+	}
+
+	if (first)
+		appendStringInfoString(&buf, "none");
+
+	return buf.data;
+}
 
 /*
  * Check if relation can be in given publication and throws appropriate
@@ -195,6 +246,18 @@ pg_relation_is_publishable(PG_FUNCTION_ARGS)
 	result = is_publishable_class(relid, (Form_pg_class) GETSTRUCT(tuple));
 	ReleaseSysCache(tuple);
 	PG_RETURN_BOOL(result);
+}
+
+Datum
+pg_get_ddl_options(PG_FUNCTION_ARGS)
+{
+	int64		ddlmask = PG_GETARG_INT64(0);
+	char	   *ddl_text = PublicationDDLMaskToString(ddlmask);
+	text	   *result = cstring_to_text(ddl_text);
+
+	pfree(ddl_text);
+
+	PG_RETURN_TEXT_P(result);
 }
 
 /*
