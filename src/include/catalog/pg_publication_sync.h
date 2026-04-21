@@ -30,7 +30,7 @@ CATALOG(pg_publication_sync,9352,PublicationSyncRelationId)
 {
 	Oid			pfsyncpubid BKI_LOOKUP(pg_publication);	/* publication oid */
 	int64		pfsyncobjid;	/* publication-scoped message id */
-	int32		pfsyncddl;		/* ddl class bitmask */
+	int64		pfsyncddl;		/* ddl class bitmask */
 	bool		pfsyncenabled BKI_DEFAULT(t);
 	XLogRecPtr	pfsynclsn;		/* message ordering key */
 	char		pfsyncmsgtype;	/* Q/A/D */
@@ -60,16 +60,16 @@ DECLARE_INDEX(pg_publication_sync_pfsyncmsgtype_index, 9357, PublicationSyncMsgT
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 
-#define PUBLICATION_DDL_TABLE		(1 << 0)
-#define PUBLICATION_DDL_INDEX		(1 << 1)
-#define PUBLICATION_DDL_TRIGGER		(1 << 2)
-#define PUBLICATION_DDL_VIEW		(1 << 3)
-#define PUBLICATION_DDL_RULE		(1 << 4)
-#define PUBLICATION_DDL_SCHEMA		(1 << 5)
-#define PUBLICATION_DDL_FUNCTION	(1 << 6)
-#define PUBLICATION_DDL_TYPE		(1 << 7)
-#define PUBLICATION_DDL_DOMAIN		(1 << 8)
-#define PUBLICATION_DDL_EXTENSION	(1 << 9)
+#define PUBLICATION_DDL_TABLE		(INT64CONST(1) << 0)
+#define PUBLICATION_DDL_INDEX		(INT64CONST(1) << 1)
+#define PUBLICATION_DDL_TRIGGER		(INT64CONST(1) << 2)
+#define PUBLICATION_DDL_VIEW		(INT64CONST(1) << 3)
+#define PUBLICATION_DDL_RULE		(INT64CONST(1) << 4)
+#define PUBLICATION_DDL_SCHEMA		(INT64CONST(1) << 5)
+#define PUBLICATION_DDL_FUNCTION	(INT64CONST(1) << 6)
+#define PUBLICATION_DDL_TYPE		(INT64CONST(1) << 7)
+#define PUBLICATION_DDL_DOMAIN		(INT64CONST(1) << 8)
+#define PUBLICATION_DDL_EXTENSION	(INT64CONST(1) << 9)
 
 #define PUBLICATION_DDL_ALL \
 	(PUBLICATION_DDL_TABLE | \

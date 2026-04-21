@@ -100,7 +100,7 @@ typedef struct SubOpts
 	bool		passwordrequired;
 	bool		runasowner;
 	bool		failover;
-	int32		ddl;
+	int64		ddl;
 	char	   *origin;
 	XLogRecPtr	lsn;
 } SubOpts;
@@ -114,13 +114,13 @@ static void check_duplicates_in_publist(List *publist, Datum *datums);
 static List *merge_publications(List *oldpublist, List *newpublist, bool addpub, const char *subname);
 static void ReportSlotConnectionError(List *rstates, Oid subid, char *slotname, char *err);
 
-static int32
+static int64
 parse_subscription_ddl_option(DefElem *defel)
 {
 	char	   *ddl;
 	List	   *ddl_list;
 	ListCell   *lc;
-	int32		ddl_mask = 0;
+	int64		ddl_mask = 0;
 
 	ddl = defGetString(defel);
 
@@ -778,7 +778,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	values[Anum_pg_subscription_subpasswordrequired - 1] = BoolGetDatum(opts.passwordrequired);
 	values[Anum_pg_subscription_subrunasowner - 1] = BoolGetDatum(opts.runasowner);
 	values[Anum_pg_subscription_subfailover - 1] = BoolGetDatum(opts.failover);
-	values[Anum_pg_subscription_subddl - 1] = Int32GetDatum(opts.ddl);
+	values[Anum_pg_subscription_subddl - 1] = Int64GetDatum(opts.ddl);
 	values[Anum_pg_subscription_subconninfo - 1] =
 		CStringGetTextDatum(conninfo);
 	if (opts.slot_name)
@@ -1359,7 +1359,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				if (IsSet(opts.specified_opts, SUBOPT_DDL))
 				{
 					values[Anum_pg_subscription_subddl - 1] =
-						Int32GetDatum(opts.ddl);
+						Int64GetDatum(opts.ddl);
 					replaces[Anum_pg_subscription_subddl - 1] = true;
 				}
 

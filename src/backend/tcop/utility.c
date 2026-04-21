@@ -90,14 +90,14 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
 static bool UtilityStmtShouldCaptureDDL(Node *parsetree);
-static int	UtilityStmtDDLMask(Node *parsetree);
+static int64 UtilityStmtDDLMask(Node *parsetree);
 static char *UtilityStmtTargetTable(Node *parsetree);
 static RangeVar *UtilityStmtTargetRangeVar(Node *parsetree);
 static Oid UtilityStmtTargetRelid(Node *parsetree);
 static Oid UtilityStmtTargetNspid(Node *parsetree, Oid target_relid);
-static bool UtilityStmtNeedsRelationScopeFilter(int ddlmask);
+static bool UtilityStmtNeedsRelationScopeFilter(int64 ddlmask);
 static bool PublicationAllowsDDLMaskByScope(Form_pg_publication pubform,
-											int ddlmask);
+											int64 ddlmask);
 static bool PublicationMatchesRelationScope(Form_pg_publication pubform,
 											Oid target_relid,
 											List *target_relpubids,
@@ -491,7 +491,7 @@ CheckRestrictedOperation(const char *cmdname)
 						cmdname)));
 }
 
-static int
+static int64
 DdlMaskFromObjectType(ObjectType objtype)
 {
 	switch (objtype)
@@ -563,7 +563,7 @@ UtilityStmtShouldCaptureDDL(Node *parsetree)
 	}
 }
 
-static int
+static int64
 UtilityStmtDDLMask(Node *parsetree)
 {
 	switch (nodeTag(parsetree))
@@ -777,9 +777,9 @@ UtilityStmtTargetNspid(Node *parsetree, Oid target_relid)
 }
 
 static bool
-UtilityStmtNeedsRelationScopeFilter(int ddlmask)
+UtilityStmtNeedsRelationScopeFilter(int64 ddlmask)
 {
-	int			relscope_mask = PUBLICATION_DDL_TABLE |
+	int64		relscope_mask = PUBLICATION_DDL_TABLE |
 		PUBLICATION_DDL_INDEX |
 		PUBLICATION_DDL_TRIGGER |
 		PUBLICATION_DDL_VIEW |
@@ -789,11 +789,11 @@ UtilityStmtNeedsRelationScopeFilter(int ddlmask)
 }
 
 static bool
-PublicationAllowsDDLMaskByScope(Form_pg_publication pubform, int ddlmask)
+PublicationAllowsDDLMaskByScope(Form_pg_publication pubform, int64 ddlmask)
 {
-	int			for_table_mask = PUBLICATION_DDL_TABLE | PUBLICATION_DDL_INDEX;
-	int			for_schema_or_all_mask = PUBLICATION_DDL_ALL;
-	int			allowed_mask;
+	int64		for_table_mask = PUBLICATION_DDL_TABLE | PUBLICATION_DDL_INDEX;
+	int64		for_schema_or_all_mask = PUBLICATION_DDL_ALL;
+	int64		allowed_mask;
 
 	if (pubform->puballtables || is_schema_publication(pubform->oid))
 		allowed_mask = for_schema_or_all_mask;
@@ -831,7 +831,7 @@ PublicationMatchesRelationScope(Form_pg_publication pubform,
 typedef struct PublicationSyncCaptureMatch
 {
 	Oid			pubid;
-	int32		msg_ddlmask;
+	int64		msg_ddlmask;
 } PublicationSyncCaptureMatch;
 
 /*
@@ -843,12 +843,12 @@ typedef struct PublicationSyncCaptureMatch
  */
 static bool
 PublicationShouldCaptureDDL(Form_pg_publication pubform,
-							int ddlmask,
-							int32 *msg_ddlmask)
+							int64 ddlmask,
+							int64 *msg_ddlmask)
 {
 	bool		schema_stmt;
 	bool		carry_schema_as_table = false;
-	int			effective_pubddl = pubform->pubddl;
+	int64		effective_pubddl = pubform->pubddl;
 
 	schema_stmt = (ddlmask & PUBLICATION_DDL_SCHEMA) != 0;
 	if (schema_stmt &&
@@ -895,7 +895,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	char	   *ddl_sql;
 	char	   *target_table;
 	char	   *ddl_search_path;
-	int			ddlmask;
+	int64		ddlmask;
 	bool		needs_rel_scope_filter;
 	Oid			target_relid = InvalidOid;
 	Oid			target_nspid = InvalidOid;
@@ -944,7 +944,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	while ((pubtup = heap_getnext(pubscan, ForwardScanDirection)) != NULL)
 	{
 		Form_pg_publication pubform = (Form_pg_publication) GETSTRUCT(pubtup);
-		int32		msg_ddlmask;
+		int64		msg_ddlmask;
 
 		if (pubform->pubddl == 0)
 			continue;
@@ -1011,7 +1011,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 			values[Anum_pg_publication_sync_pfsyncobjid - 1] =
 				Int64GetDatum(pfsyncobjid);
 			values[Anum_pg_publication_sync_pfsyncddl - 1] =
-				Int32GetDatum(match->msg_ddlmask);
+				Int64GetDatum(match->msg_ddlmask);
 			values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
 			values[Anum_pg_publication_sync_pfsynclsn - 1] =
 				LSNGetDatum(GetXLogInsertRecPtr());

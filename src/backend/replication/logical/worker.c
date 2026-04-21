@@ -161,6 +161,7 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/execPartition.h"
+#include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
@@ -410,6 +411,7 @@ static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
 static Oid publication_sync_lookup_target_relid(TupleTableSlot *newslot,
 												bool missing_ok,
 												bool *has_target);
+static char *publication_ddl_mask_to_string(int64 ddlmask);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -2512,12 +2514,52 @@ apply_handle_insert_internal(ApplyExecutionData *edata,
 	maybe_apply_publication_sync_message(relinfo, remoteslot);
 }
 
+static char *
+publication_ddl_mask_to_string(int64 ddlmask)
+{
+	StringInfoData buf;
+	bool		first = true;
+	struct
+	{
+		int64		mask;
+		const char *name;
+	} ddl_names[] = {
+		{PUBLICATION_DDL_TABLE, "table"},
+		{PUBLICATION_DDL_INDEX, "index"},
+		{PUBLICATION_DDL_TRIGGER, "trigger"},
+		{PUBLICATION_DDL_VIEW, "view"},
+		{PUBLICATION_DDL_RULE, "rule"},
+		{PUBLICATION_DDL_SCHEMA, "schema"},
+		{PUBLICATION_DDL_FUNCTION, "function"},
+		{PUBLICATION_DDL_TYPE, "type"},
+		{PUBLICATION_DDL_DOMAIN, "domain"},
+		{PUBLICATION_DDL_EXTENSION, "extension"}
+	};
+	int			i;
+
+	initStringInfo(&buf);
+
+	for (i = 0; i < lengthof(ddl_names); i++)
+	{
+		if ((ddlmask & ddl_names[i].mask) == 0)
+			continue;
+		appendStringInfoString(&buf, first ? "" : ",");
+		appendStringInfoString(&buf, ddl_names[i].name);
+		first = false;
+	}
+
+	if (first)
+		appendStringInfoString(&buf, "none");
+
+	return buf.data;
+}
+
 static bool
 publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 {
 	bool		isnull;
 	Datum		ddlmask_datum;
-	int32		ddlmask;
+	int64		ddlmask;
 
 	if (MySubscription == NULL)
 		return false;
@@ -2528,9 +2570,20 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 	if (isnull)
 		return false;
 
-	ddlmask = DatumGetInt32(ddlmask_datum);
+	ddlmask = DatumGetInt64(ddlmask_datum);
 	if (ddlmask == 0 || (MySubscription->ddl & ddlmask) == 0)
+	{
+		char	   *subddl_text = publication_ddl_mask_to_string(MySubscription->ddl);
+		char	   *msgddl_text = publication_ddl_mask_to_string(ddlmask);
+
+		ereport(DEBUG2,
+				(errmsg_internal("skipping pg_publication_sync message by ddl mask"),
+				 errdetail_internal("subscription ddl=\"%s\", message ddl=\"%s\"",
+								   subddl_text, msgddl_text)));
+		pfree(subddl_text);
+		pfree(msgddl_text);
 		return false;
+	}
 
 	return true;
 }
@@ -2637,6 +2690,7 @@ execute_publication_sync_sql_command(const char *sql)
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("transaction control statements are not allowed in pg_publication_sync pfsyncddlsql")));
 
+				/* Keep plugin hooks (for example dialect extensions) in path. */
 				ProcessUtility(stmt,
 							   sql,
 							   false,
@@ -2685,7 +2739,7 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 	char	   *ddl_sql;
 	char	   *captured_search_path;
 	char	   *saved_search_path;
-	int32		ddlmask = 0;
+	int64		ddlmask = 0;
 	bool		has_target = false;
 	Oid			relid_before = InvalidOid;
 	Oid			relid_after = InvalidOid;
@@ -2724,7 +2778,7 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 								Anum_pg_publication_sync_pfsyncddl,
 								&isnull);
 	if (!isnull)
-		ddlmask = DatumGetInt32(ddlmaskdatum);
+		ddlmask = DatumGetInt64(ddlmaskdatum);
 
 	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
 		relid_before = publication_sync_lookup_target_relid(newslot, true,
@@ -2905,15 +2959,13 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	Relation	localrel = relinfo->ri_RelationDesc;
 	bool		isnull;
 	Datum		msgdatum;
-	Datum		pubid_datum;
-	Datum		objid_datum;
 	char		message_type;
-	Oid			pubid = InvalidOid;
-	int64		msgid = 0;
 	PublicationSyncMessageKind msgkind;
 
-	/* Only leader apply worker is allowed to execute synced DDL messages. */
-	if (!am_leader_apply_worker())
+	/* DDL sync payload can run in leader/parallel apply workers, never tablesync. */
+	if (am_tablesync_worker())
+		return;
+	if (!am_leader_apply_worker() && !am_parallel_apply_worker())
 		return;
 
 	if (RelationGetRelid(localrel) != PublicationSyncRelationId)
@@ -2928,79 +2980,28 @@ maybe_apply_publication_sync_message(ResultRelInfo *relinfo,
 	if (isnull)
 		return;
 
-	pubid_datum = slot_getattr(newslot,
-							   Anum_pg_publication_sync_pfsyncpubid,
-							   &isnull);
-	if (!isnull)
-		pubid = DatumGetObjectId(pubid_datum);
-
-	objid_datum = slot_getattr(newslot,
-							   Anum_pg_publication_sync_pfsyncobjid,
-							   &isnull);
-	if (!isnull)
-		msgid = DatumGetInt64(objid_datum);
-
 	message_type = DatumGetChar(msgdatum);
 	msgkind = decode_publication_sync_message_type(message_type);
 
-	PG_TRY();
+	switch (msgkind)
 	{
-		switch (msgkind)
-		{
-			case PUBLICATION_SYNC_MSG_Q:
-				apply_publication_sync_message_q(newslot);
-				break;
-			case PUBLICATION_SYNC_MSG_A:
-				apply_publication_sync_message_a(newslot);
-				break;
-			case PUBLICATION_SYNC_MSG_D:
-				apply_publication_sync_message_d(newslot);
-				break;
-			case PUBLICATION_SYNC_MSG_UNKNOWN:
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("unsupported pg_publication_sync message type \"%c\"",
-								message_type),
-						 errhint("Supported message types are Q/A/D.")));
-				break;
-		}
+		case PUBLICATION_SYNC_MSG_Q:
+			apply_publication_sync_message_q(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_A:
+			apply_publication_sync_message_a(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_D:
+			apply_publication_sync_message_d(newslot);
+			break;
+		case PUBLICATION_SYNC_MSG_UNKNOWN:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported pg_publication_sync message type \"%c\"",
+							message_type),
+					 errhint("Supported message types are Q/A/D.")));
+			break;
 	}
-	PG_CATCH();
-	{
-		ErrorData  *edata;
-		MemoryContext oldcontext;
-
-		oldcontext = MemoryContextSwitchTo(ApplyMessageContext != NULL ?
-										   ApplyMessageContext :
-										   CurrentMemoryContext);
-		edata = CopyErrorData();
-		MemoryContextSwitchTo(oldcontext);
-		FlushErrorState();
-
-		/*
-		 * Subscription option disable_on_error=false now acts as skip mode for
-		 * pg_publication_sync payload apply errors, so one bad message doesn't
-		 * stop the whole apply worker.
-		 */
-		if (MySubscription != NULL && !MySubscription->disableonerr)
-		{
-			ereport(WARNING,
-					(errmsg("skipping pg_publication_sync message apply after error"),
-					 errdetail("subscription \"%s\" (%u), publication %u, message %lld, type \"%c\": %s",
-							   MySubscription->name,
-							   MySubscription->oid,
-							   pubid,
-							   (long long) msgid,
-							   message_type,
-							   edata->message ? edata->message : "unknown error"),
-					 errhint("Set subscription option disable_on_error=true to stop on first DDL apply error.")));
-			FreeErrorData(edata);
-			return;
-		}
-
-		ReThrowError(edata);
-	}
-	PG_END_TRY();
 }
 
 /*

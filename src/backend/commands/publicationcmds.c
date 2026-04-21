@@ -120,7 +120,7 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid, char message_type
 	values[Anum_pg_publication_sync_pfsyncpubid - 1] = ObjectIdGetDatum(pubid);
 	values[Anum_pg_publication_sync_pfsyncobjid - 1] = Int64GetDatum(pfsyncobjid);
 	values[Anum_pg_publication_sync_pfsyncddl - 1] =
-		Int32GetDatum(PUBLICATION_DDL_TABLE);
+		Int64GetDatum(PUBLICATION_DDL_TABLE);
 	values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
 	values[Anum_pg_publication_sync_pfsynclsn - 1] =
 		LSNGetDatum(GetXLogInsertRecPtr());
@@ -146,13 +146,13 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid, char message_type
 	pfree(relname);
 }
 
-static int32
+static int64
 parse_publication_ddl_option(DefElem *defel)
 {
 	char	   *ddl;
 	List	   *ddl_list;
 	ListCell   *lc;
-	int32		ddl_mask = 0;
+	int64		ddl_mask = 0;
 
 	ddl = defGetString(defel);
 
@@ -204,7 +204,7 @@ parse_publication_options(ParseState *pstate,
 						  bool *publish_given,
 						  PublicationActions *pubactions,
 						  bool *ddl_given,
-						  int32 *pubddl,
+						  int64 *pubddl,
 						  bool *publish_via_partition_root_given,
 						  bool *publish_via_partition_root)
 {
@@ -873,7 +873,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	bool		publish_given;
 	PublicationActions pubactions;
 	bool		ddl_given;
-	int32		pubddl;
+	int64		pubddl;
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
 	AclResult	aclresult;
@@ -933,7 +933,7 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		BoolGetDatum(pubactions.pubtruncate);
 	values[Anum_pg_publication_pubviaroot - 1] =
 		BoolGetDatum(publish_via_partition_root);
-	values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(pubddl);
+	values[Anum_pg_publication_pubddl - 1] = Int64GetDatum(pubddl);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -1018,7 +1018,7 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	bool		publish_given;
 	PublicationActions pubactions;
 	bool		ddl_given;
-	int32		pubddl;
+	int64		pubddl;
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
 	ObjectAddress obj;
@@ -1143,7 +1143,7 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 
 	if (ddl_given)
 	{
-		values[Anum_pg_publication_pubddl - 1] = Int32GetDatum(pubddl);
+		values[Anum_pg_publication_pubddl - 1] = Int64GetDatum(pubddl);
 		replaces[Anum_pg_publication_pubddl - 1] = true;
 	}
 

@@ -14,7 +14,12 @@
 #define LOGICALSYSREL_H
 
 #include "postgres.h"
+#include "catalog/pg_publication_sync.h"
 
-extern bool IsLogicalRepSystemRelationOid(Oid relid);
+static inline bool
+IsLogicalRepSystemRelationOid(Oid relid)
+{
+	return relid == PublicationSyncRelationId;
+}
 
 #endif							/* LOGICALSYSREL_H */

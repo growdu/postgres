@@ -702,8 +702,8 @@ RelationCloseSmgr(Relation relation)
 	(XLogLogicalInfoActive() && \
 	 RelationNeedsWAL(relation) && \
 	 (relation)->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&	\
-	 (!IsCatalogRelation(relation) || \
-	  IsLogicalRepSystemRelationOid(RelationGetRelid(relation))))
+	 (IsLogicalRepSystemRelationOid(RelationGetRelid(relation)) || \
+	  !IsCatalogRelation(relation)))
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);

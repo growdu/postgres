@@ -69,16 +69,19 @@ check_publication_add_relation(Relation targetrel)
 						RelationGetRelationName(targetrel)),
 				 errdetail_relkind_not_supported(RelationGetForm(targetrel)->relkind)));
 
+	/* pg_publication_sync is handled by ddl option implicit membership only. */
+	if (IsLogicalRepSystemRelationOid(RelationGetRelid(targetrel)))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot add relation \"%s\" to publication",
+						RelationGetRelationName(targetrel)),
+				 errdetail("This relation is managed implicitly by the publication option \"ddl\".")));
+	}
+
 	/* Can't be system table */
 	if (IsCatalogRelation(targetrel))
 	{
-		if (IsLogicalRepSystemRelationOid(RelationGetRelid(targetrel)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("cannot add relation \"%s\" to publication",
-							RelationGetRelationName(targetrel)),
-					 errdetail("This relation is managed implicitly by the publication option \"ddl\".")));
-
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cannot add relation \"%s\" to publication",
@@ -154,8 +157,11 @@ is_publishable_class(Oid relid, Form_pg_class reltuple)
 	if (reltuple->relpersistence != RELPERSISTENCE_PERMANENT)
 		return false;
 
+	if (IsLogicalRepSystemRelationOid(relid))
+		return true;
+
 	if (IsCatalogRelationOid(relid))
-		return IsLogicalRepSystemRelationOid(relid);
+		return false;
 
 	return relid >= FirstNormalObjectId;
 }

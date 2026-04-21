@@ -98,7 +98,7 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 								 * slots) in the upstream database are enabled
 								 * to be synchronized to the standbys. */
 
-	int32		subddl BKI_DEFAULT(0);	/* DDL classes accepted by this
+	int64		subddl BKI_DEFAULT(0);	/* DDL classes accepted by this
 										 * subscription */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
@@ -154,7 +154,7 @@ typedef struct Subscription
 								 * (i.e. the main slot and the table sync
 								 * slots) in the upstream database are enabled
 								 * to be synchronized to the standbys. */
-	int32		ddl;			/* Accepted DDL classes */
+	int64		ddl;			/* Accepted DDL classes */
 	char	   *conninfo;		/* Connection string to the publisher */
 	char	   *slotname;		/* Name of the replication slot */
 	char	   *synccommit;		/* Synchronous commit setting for worker */
