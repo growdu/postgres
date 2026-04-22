@@ -534,7 +534,6 @@ UtilityStmtShouldCaptureDDL(Node *parsetree)
 		case T_CreateForeignTableStmt:
 		case T_CreateTableAsStmt:
 		case T_AlterTableStmt:
-		case T_TruncateStmt:
 		case T_IndexStmt:
 		case T_ReindexStmt:
 		case T_CreateTrigStmt:
@@ -572,7 +571,6 @@ UtilityStmtDDLMask(Node *parsetree)
 		case T_CreateForeignTableStmt:
 		case T_CreateTableAsStmt:
 		case T_AlterTableStmt:
-		case T_TruncateStmt:
 			return PUBLICATION_DDL_TABLE;
 		case T_IndexStmt:
 		case T_ReindexStmt:
@@ -658,9 +656,9 @@ UtilityStmtTargetTable(Node *parsetree)
 				Node	   *obj = stmt->objects ? linitial(stmt->objects) : NULL;
 
 				if (obj && IsA(obj, List))
-					return NameListToString((List *) obj);
+					return NameListToQuotedString((List *) obj);
 				else if (obj && IsA(obj, ObjectWithArgs))
-					return NameListToString(((ObjectWithArgs *) obj)->objname);
+					return NameListToQuotedString(((ObjectWithArgs *) obj)->objname);
 				return NULL;
 			}
 		case T_RenameStmt:

@@ -3970,6 +3970,13 @@ apply_dispatch(StringInfo s)
 			apply_handle_origin(s);
 			break;
 
+		case LOGICAL_REP_MSG_MESSAGE:
+			/*
+			 * Logical replication apply does not consume generic MESSAGE
+			 * payloads. Ignore them to preserve protocol compatibility.
+			 */
+			break;
+
 		case LOGICAL_REP_MSG_DDL:
 			apply_handle_ddl(s);
 			break;
