@@ -295,6 +295,29 @@ parse_publication_options(ParseState *pstate,
 	}
 }
 
+static void
+warn_missing_table_ddl_for_broad_scope(const char *pubname, int64 pubddl,
+									   bool for_all_tables,
+									   bool has_schema_scope)
+{
+	const char *scope = NULL;
+
+	if (pubddl == 0 || (pubddl & PUBLICATION_DDL_TABLE) != 0)
+		return;
+
+	if (for_all_tables)
+		scope = "FOR ALL TABLES";
+	else if (has_schema_scope)
+		scope = "FOR TABLES IN SCHEMA";
+	else
+		return;
+
+	ereport(NOTICE,
+			(errmsg("publication \"%s\" enables ddl without \"table\" in %s scope",
+					pubname, scope),
+			 errhint("It is recommended to include \"table\" in ddl options to keep table DDL and DML consistent.")));
+}
+
 /*
  * Convert the PublicationObjSpecType list into schema oid list and
  * PublicationTable list.
@@ -918,6 +941,15 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root);
 
+	if (!stmt->for_all_tables)
+		ObjectsInPublicationToOids(stmt->pubobjects, pstate, &relations,
+								   &schemaidlist);
+
+	if (ddl_given)
+		warn_missing_table_ddl_for_broad_scope(stmt->pubname, pubddl,
+											   stmt->for_all_tables,
+											   schemaidlist != NIL);
+
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
 	values[Anum_pg_publication_oid - 1] = ObjectIdGetDatum(puboid);
@@ -956,9 +988,6 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	}
 	else
 	{
-		ObjectsInPublicationToOids(stmt->pubobjects, pstate, &relations,
-								   &schemaidlist);
-
 		/* FOR TABLES IN SCHEMA requires superuser */
 		if (schemaidlist != NIL && !superuser())
 			ereport(ERROR,
@@ -1034,6 +1063,11 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 							  &publish_via_partition_root);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
+	if (ddl_given)
+		warn_missing_table_ddl_for_broad_scope(NameStr(pubform->pubname),
+											   pubddl,
+											   pubform->puballtables,
+											   is_schema_publication(pubform->oid));
 
 	/*
 	 * If the publication doesn't publish changes via the root partitioned

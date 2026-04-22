@@ -294,6 +294,11 @@ typedef enum PublicationSyncMessageKind
 	PUBLICATION_SYNC_MSG_UNKNOWN
 } PublicationSyncMessageKind;
 
+typedef struct MissingTargetRelEntry
+{
+	LogicalRepRelId remoteid;
+} MissingTargetRelEntry;
+
 /* errcontext tracker */
 ApplyErrorCallbackArg apply_error_callback_arg =
 {
@@ -355,6 +360,11 @@ bool		InitializingApplyWorker = false;
 static XLogRecPtr skip_xact_finish_lsn = InvalidXLogRecPtr;
 #define is_skipping_changes() (unlikely(!XLogRecPtrIsInvalid(skip_xact_finish_lsn)))
 
+/* Relations paused on this worker due to missing local target table. */
+static HTAB *MissingTargetRelMap = NULL;
+#define MISSING_TARGET_REL_MAX_ENTRIES 10000
+static bool MissingTargetRelMapCapWarned = false;
+
 /* BufFile handle of the current streaming file */
 static BufFile *stream_fd = NULL;
 
@@ -399,6 +409,12 @@ static void stream_close_file(void);
 static void send_feedback(XLogRecPtr recvpos, bool force, bool requestReply);
 
 static void apply_handle_commit_internal(LogicalRepCommitData *commit_data);
+static bool logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
+													LOCKMODE lockmode,
+													LogicalRepRelMapEntry **rel);
+static bool logicalrep_rel_is_paused(LogicalRepRelId relid);
+static void logicalrep_rel_pause(LogicalRepRelId relid);
+static void logicalrep_rel_resume(LogicalRepRelId relid);
 static void apply_handle_insert_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot);
@@ -416,6 +432,8 @@ static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
 static Oid publication_sync_lookup_target_relid(TupleTableSlot *newslot,
 												bool missing_ok,
 												bool *has_target);
+static bool publication_sync_should_ignore_ddl_error(Node *utility_stmt,
+													  int sqlerrcode);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -530,6 +548,125 @@ should_apply_changes_for_rel(LogicalRepRelMapEntry *rel)
 	}
 
 	return false;				/* dummy for compiler */
+}
+
+/*
+ * Try opening target relation. If subscription ddl excludes table-class DDL
+ * and relation is missing locally, skip this change so other relations can
+ * continue applying.
+ */
+static bool
+logicalrep_rel_is_paused(LogicalRepRelId relid)
+{
+	MissingTargetRelEntry *entry;
+
+	if (MissingTargetRelMap == NULL)
+		return false;
+
+	entry = hash_search(MissingTargetRelMap, &relid, HASH_FIND, NULL);
+	return entry != NULL;
+}
+
+static void
+logicalrep_rel_pause(LogicalRepRelId relid)
+{
+	MissingTargetRelEntry *entry;
+	long		nentries;
+	HASHCTL		ctl;
+
+	if (MissingTargetRelMap == NULL)
+	{
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(LogicalRepRelId);
+		ctl.entrysize = sizeof(MissingTargetRelEntry);
+		ctl.hcxt = TopMemoryContext;
+		MissingTargetRelMap = hash_create("paused logical replication relations",
+										  32,
+										  &ctl,
+										  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	entry = hash_search(MissingTargetRelMap, &relid, HASH_FIND, NULL);
+	if (entry != NULL)
+		return;
+
+	nentries = hash_get_num_entries(MissingTargetRelMap);
+	if (nentries >= MISSING_TARGET_REL_MAX_ENTRIES)
+	{
+		HASH_SEQ_STATUS status;
+		MissingTargetRelEntry *victim;
+		LogicalRepRelId victim_relid;
+
+		hash_seq_init(&status, MissingTargetRelMap);
+		victim = (MissingTargetRelEntry *) hash_seq_search(&status);
+		if (victim == NULL)
+			return;
+		victim_relid = victim->remoteid;
+		hash_seq_term(&status);
+		(void) hash_search(MissingTargetRelMap, &victim_relid, HASH_REMOVE, NULL);
+
+		if (!MissingTargetRelMapCapWarned)
+		{
+			ereport(WARNING,
+					(errmsg("paused-relation cache reached capacity in logical replication apply worker"),
+					 errdetail("Maximum entries: %d.", MISSING_TARGET_REL_MAX_ENTRIES),
+					 errhint("Increase the subscriber's schema consistency or include ddl option \"table\" to reduce paused relation churn.")));
+			MissingTargetRelMapCapWarned = true;
+		}
+	}
+
+	(void) hash_search(MissingTargetRelMap, &relid, HASH_ENTER, NULL);
+}
+
+static void
+logicalrep_rel_resume(LogicalRepRelId relid)
+{
+	if (MissingTargetRelMap == NULL)
+		return;
+
+	(void) hash_search(MissingTargetRelMap, &relid, HASH_REMOVE, NULL);
+}
+
+static bool
+logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
+									   LOCKMODE lockmode,
+									   LogicalRepRelMapEntry **rel)
+{
+	if (logicalrep_rel_is_paused(relid))
+		return false;
+
+	*rel = NULL;
+
+	PG_TRY();
+	{
+		*rel = logicalrep_rel_open(relid, lockmode);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata = CopyErrorData();
+
+		FlushErrorState();
+
+		if (MySubscription != NULL &&
+			(MySubscription->ddl & PUBLICATION_DDL_TABLE) == 0 &&
+			(edata->sqlerrcode == ERRCODE_UNDEFINED_TABLE ||
+			 edata->sqlerrcode == ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE))
+		{
+			logicalrep_rel_pause(relid);
+			ereport(WARNING,
+					(errmsg("pausing replicated apply for missing target relation"),
+					 errdetail("subscription \"%s\", remote relation id %u",
+							   MySubscription->name, relid),
+					 errhint("Enable ddl option \"table\" or create the table manually, then refresh relation metadata to resume this relation.")));
+			FreeErrorData(edata);
+			return false;
+		}
+
+		ReThrowError(edata);
+	}
+	PG_END_TRY();
+
+	return true;
 }
 
 /*
@@ -2342,6 +2479,7 @@ apply_handle_relation(StringInfo s)
 
 	rel = logicalrep_read_rel(s);
 	logicalrep_relmap_update(rel);
+	logicalrep_rel_resume(rel->remoteid);
 
 	/* Also reset all entries in the partition map that refer to remoterel. */
 	logicalrep_partmap_reset_relmap(rel);
@@ -2426,7 +2564,11 @@ apply_handle_insert(StringInfo s)
 	begin_replication_step();
 
 	relid = logicalrep_read_insert(s, &newtup);
-	rel = logicalrep_rel_open(relid, RowExclusiveLock);
+	if (!logicalrep_rel_open_maybe_skip_missing(relid, RowExclusiveLock, &rel))
+	{
+		end_replication_step();
+		return;
+	}
 	if (!should_apply_changes_for_rel(rel))
 	{
 		/*
@@ -2594,6 +2736,25 @@ publication_sync_lookup_target_relid(TupleTableSlot *newslot,
 }
 
 /*
+ * Multi-subscription deployments can replay the same schema bootstrap DDL
+ * concurrently. Treat duplicate CREATE SCHEMA as idempotent so follower
+ * workers don't crash-loop on "schema already exists".
+ */
+static bool
+publication_sync_should_ignore_ddl_error(Node *utility_stmt, int sqlerrcode)
+{
+	if (utility_stmt == NULL)
+		return false;
+
+	if (IsA(utility_stmt, CreateSchemaStmt) &&
+		(sqlerrcode == ERRCODE_DUPLICATE_SCHEMA ||
+		 sqlerrcode == ERRCODE_DUPLICATE_OBJECT))
+		return true;
+
+	return false;
+}
+
+/*
  * Parse and execute SQL utility statements one-by-one.
  *
  * This follows the same parse-tree execution model used by core SQL script
@@ -2667,8 +2828,24 @@ execute_publication_sync_sql_command(const char *sql)
 			}
 			PG_CATCH();
 			{
+				ErrorData  *edata;
+
 				PopActiveSnapshot();
-				PG_RE_THROW();
+				edata = CopyErrorData();
+				FlushErrorState();
+
+				if (publication_sync_should_ignore_ddl_error(stmt->utilityStmt,
+															 edata->sqlerrcode))
+				{
+					ereport(DEBUG1,
+							(errmsg_internal("skipping idempotent publication-sync DDL error"),
+							 errdetail_internal("statement type: %d, sqlstate: %s",
+												nodeTag(stmt->utilityStmt),
+												unpack_sql_state(edata->sqlerrcode))));
+					FreeErrorData(edata);
+				}
+				else
+					ReThrowError(edata);
 			}
 			PG_END_TRY();
 
@@ -3173,7 +3350,11 @@ apply_handle_update(StringInfo s)
 
 	relid = logicalrep_read_update(s, &has_oldtup, &oldtup,
 								   &newtup);
-	rel = logicalrep_rel_open(relid, RowExclusiveLock);
+	if (!logicalrep_rel_open_maybe_skip_missing(relid, RowExclusiveLock, &rel))
+	{
+		end_replication_step();
+		return;
+	}
 	if (!should_apply_changes_for_rel(rel))
 	{
 		/*
@@ -3353,7 +3534,11 @@ apply_handle_delete(StringInfo s)
 	begin_replication_step();
 
 	relid = logicalrep_read_delete(s, &oldtup);
-	rel = logicalrep_rel_open(relid, RowExclusiveLock);
+	if (!logicalrep_rel_open_maybe_skip_missing(relid, RowExclusiveLock, &rel))
+	{
+		end_replication_step();
+		return;
+	}
 	if (!should_apply_changes_for_rel(rel))
 	{
 		/*
@@ -3803,13 +3988,14 @@ apply_handle_truncate(StringInfo s)
 	remote_relids = logicalrep_read_truncate(s, &cascade, &restart_seqs);
 
 	foreach(lc, remote_relids)
-	{
-		LogicalRepRelId relid = lfirst_oid(lc);
-		LogicalRepRelMapEntry *rel;
-
-		rel = logicalrep_rel_open(relid, lockmode);
-		if (!should_apply_changes_for_rel(rel))
 		{
+			LogicalRepRelId relid = lfirst_oid(lc);
+			LogicalRepRelMapEntry *rel;
+
+			if (!logicalrep_rel_open_maybe_skip_missing(relid, lockmode, &rel))
+				continue;
+			if (!should_apply_changes_for_rel(rel))
+			{
 			/*
 			 * The relation can't become interesting in the middle of the
 			 * transaction so it's safe to unlock it.
