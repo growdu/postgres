@@ -442,7 +442,7 @@ static List *publication_sync_collect_target_tables(TupleTableSlot *newslot);
 static char *publication_sync_require_single_target_table(TupleTableSlot *newslot,
 														  char message_type);
 static bool publication_sync_should_ignore_ddl_error(Node *utility_stmt,
-														  int sqlerrcode);
+													 const ErrorData *edata);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -2868,19 +2868,46 @@ publication_sync_require_single_target_table(TupleTableSlot *newslot,
 }
 
 /*
- * Multi-subscription deployments can replay the same schema bootstrap DDL
- * concurrently. Treat duplicate CREATE SCHEMA as idempotent so follower
- * workers don't crash-loop on "schema already exists".
+ * Multi-subscription deployments can replay the same DDL concurrently.
+ * Treat duplicate-* SQLSTATEs as idempotent so follower workers don't
+ * crash-loop on "already exists" style errors.
+ *
+ * Some concurrent CREATE/ALTER DDL paths can surface as UNIQUE_VIOLATION on
+ * pg_catalog indexes instead of duplicate-object SQLSTATEs. Treat those
+ * catalog-key conflicts as idempotent as well.
  */
 static bool
-publication_sync_should_ignore_ddl_error(Node *utility_stmt, int sqlerrcode)
+publication_sync_should_ignore_ddl_error(Node *utility_stmt,
+										 const ErrorData *edata)
 {
+	int			sqlerrcode;
+
 	if (utility_stmt == NULL)
 		return false;
+	if (edata == NULL)
+		return false;
 
-	if (IsA(utility_stmt, CreateSchemaStmt) &&
-		(sqlerrcode == ERRCODE_DUPLICATE_SCHEMA ||
-		 sqlerrcode == ERRCODE_DUPLICATE_OBJECT))
+	sqlerrcode = edata->sqlerrcode;
+
+	switch (sqlerrcode)
+	{
+		case ERRCODE_DUPLICATE_OBJECT:
+		case ERRCODE_DUPLICATE_TABLE:
+		case ERRCODE_DUPLICATE_SCHEMA:
+		case ERRCODE_DUPLICATE_FUNCTION:
+		case ERRCODE_DUPLICATE_COLUMN:
+		case ERRCODE_DUPLICATE_ALIAS:
+		case ERRCODE_DUPLICATE_DATABASE:
+			return true;
+		default:
+			break;
+	}
+
+	if (sqlerrcode == ERRCODE_UNIQUE_VIOLATION &&
+		edata->schema_name != NULL &&
+		strcmp(edata->schema_name, "pg_catalog") == 0 &&
+		edata->table_name != NULL &&
+		strncmp(edata->table_name, "pg_", 3) == 0)
 		return true;
 
 	return false;
@@ -3008,7 +3035,7 @@ execute_publication_sync_sql_command(const char *sql)
 				FlushErrorState();
 
 				if (publication_sync_should_ignore_ddl_error(stmt->utilityStmt,
-															 edata->sqlerrcode))
+															 edata))
 				{
 					ereport(DEBUG1,
 							(errmsg_internal("skipping idempotent publication-sync DDL error"),

@@ -46,6 +46,18 @@ SELECT pg_get_ddl_options(pubddl) FROM pg_publication WHERE pubname = 'testpub_d
  table,index
 (1 row)
 
+SELECT pg_get_sync_targetlist('1|14:public.t_base2');
+ pg_get_sync_targetlist 
+------------------------
+ {public.t_base2}
+(1 row)
+
+SELECT pg_get_sync_targetlist('2|14:public.t_base2|14:public.t_base3');
+        pg_get_sync_targetlist        
+--------------------------------------
+ {public.t_base2,public.t_base3}
+(1 row)
+
 ALTER PUBLICATION testpub_ddl SET (ddl = 'all');
 SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
  pubddl 

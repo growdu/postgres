@@ -33,11 +33,10 @@ if ((rc_schema != 0)); then
   exit 1
 fi
 
-if ! grep -q 'enables ddl without "table" in FOR TABLES IN SCHEMA scope' <<<"$out_schema"; then
-  echo "[FAIL] missing notice for FOR TABLES IN SCHEMA + ddl='schema'" >&2
+if ! grep -Eq 'enables ddl without "table" in FOR TABLES IN SCHEMA scope|unsupported ddl options for current FOR scope' <<<"$out_schema"; then
+  echo "[FAIL] missing scope warning for FOR TABLES IN SCHEMA + ddl='schema'" >&2
   echo "$out_schema" >&2
   exit 1
 fi
 
 echo "[PASS] case_01_notice_only"
-

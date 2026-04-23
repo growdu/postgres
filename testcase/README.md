@@ -59,3 +59,5 @@ cd testcase
 1. `FOR ALL TABLES` / `FOR TABLES IN SCHEMA` 且 `ddl` 未包含 `table` 时仅提示（NOTICE）。
 2. 订阅端缺表时只暂停该远端表，不影响其他表继续 apply。
 3. 收到该表新的 `RELATION` 元数据后可恢复该表 apply。
+4. 多对象 `DROP` 混合范围（部分在发布范围内、部分不在）时跳过捕获并告警；全在范围内时正常捕获，并写入编码后的 `pfsynctargetlist`。
+5. 多订阅并发回放同一 publication DDL 时（`schema/table/index`），重复对象错误会被忽略，worker 不崩溃循环。

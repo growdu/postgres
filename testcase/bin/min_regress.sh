@@ -8,6 +8,8 @@ cases=(
   "$CASE_DIR/case_01_notice_only.sh"
   "$CASE_DIR/case_02_missing_table_isolation.sh"
   "$CASE_DIR/case_03_resume_on_relation_refresh.sh"
+  "$CASE_DIR/case_04_mixed_scope_drop_skip.sh"
+  "$CASE_DIR/case_05_multi_sub_duplicate_ddl.sh"
 )
 
 for c in "${cases[@]}"; do
@@ -16,4 +18,3 @@ for c in "${cases[@]}"; do
 done
 
 echo "[PASS] min_regress suite"
-

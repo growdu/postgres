@@ -31,6 +31,8 @@ CREATE PUBLICATION testpub_ddl WITH (ddl = 'table,index');
 RESET client_min_messages;
 SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
 SELECT pg_get_ddl_options(pubddl) FROM pg_publication WHERE pubname = 'testpub_ddl';
+SELECT pg_get_sync_targetlist('1|14:public.t_base2');
+SELECT pg_get_sync_targetlist('2|14:public.t_base2|14:public.t_base3');
 ALTER PUBLICATION testpub_ddl SET (ddl = 'all');
 SELECT pubddl FROM pg_publication WHERE pubname = 'testpub_ddl';
 SELECT pg_get_ddl_options(pubddl) FROM pg_publication WHERE pubname = 'testpub_ddl';

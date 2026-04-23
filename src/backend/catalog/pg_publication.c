@@ -260,6 +260,102 @@ pg_get_ddl_options(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(result);
 }
 
+static uint32
+pg_sync_parse_uint(const char **cursor, const char *end, const char *context)
+{
+	const char *ptr = *cursor;
+	uint64		value = 0;
+
+	if (ptr >= end || *ptr < '0' || *ptr > '9')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid pfsynctargetlist encoding"),
+				 errdetail("Failed to parse %s.", context)));
+
+	while (ptr < end && *ptr >= '0' && *ptr <= '9')
+	{
+		value = (value * 10) + (*ptr - '0');
+		if (value > UINT_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid pfsynctargetlist encoding"),
+					 errdetail("Value overflow while parsing %s.", context)));
+		ptr++;
+	}
+
+	*cursor = ptr;
+	return (uint32) value;
+}
+
+Datum
+pg_get_sync_targetlist(PG_FUNCTION_ARGS)
+{
+	text	   *encoded_text = PG_GETARG_TEXT_PP(0);
+	char	   *encoded = text_to_cstring(encoded_text);
+	const char *ptr = encoded;
+	const char *end = encoded + strlen(encoded);
+	uint32		ntargets;
+	uint32		i;
+	ArrayBuildState *astate = NULL;
+
+	if (encoded[0] == '\0')
+	{
+		pfree(encoded);
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+	}
+
+	ntargets = pg_sync_parse_uint(&ptr, end, "target count");
+
+	for (i = 0; i < ntargets; i++)
+	{
+		uint32		target_len;
+		char	   *target;
+
+		if (ptr >= end || *ptr != '|')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid pfsynctargetlist encoding"),
+					 errdetail("Missing target separator.")));
+		ptr++;
+
+		target_len = pg_sync_parse_uint(&ptr, end, "target length");
+		if (ptr >= end || *ptr != ':')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid pfsynctargetlist encoding"),
+					 errdetail("Missing target payload separator.")));
+		ptr++;
+
+		if (end - ptr < target_len)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid pfsynctargetlist encoding"),
+					 errdetail("Target payload length exceeds input size.")));
+
+		target = pnstrdup(ptr, target_len);
+		astate = accumArrayResult(astate,
+								  CStringGetTextDatum(target),
+								  false,
+								  TEXTOID,
+								  CurrentMemoryContext);
+		pfree(target);
+		ptr += target_len;
+	}
+
+	if (ptr != end)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid pfsynctargetlist encoding"),
+				 errdetail("Unexpected trailing payload found.")));
+
+	pfree(encoded);
+
+	if (astate == NULL)
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+
+	PG_RETURN_DATUM(makeArrayResult(astate, CurrentMemoryContext));
+}
+
 /*
  * Returns true if the ancestor is in the list of published relations.
  * Otherwise, returns false.

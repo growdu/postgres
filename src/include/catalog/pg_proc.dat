@@ -11947,6 +11947,11 @@
   proname => 'pg_get_ddl_options', provolatile => 'i',
   proparallel => 's', prorettype => 'text', proargtypes => 'int8',
   prosrc => 'pg_get_ddl_options' },
+{ oid => '6123',
+  descr => 'decodes publication sync target list text into target array',
+  proname => 'pg_get_sync_targetlist', provolatile => 'i',
+  proparallel => 's', prorettype => '_text', proargtypes => 'text',
+  prosrc => 'pg_get_sync_targetlist' },
 
 # rls
 { oid => '3298',
