@@ -78,6 +78,21 @@ static void PublicationAddSchemas(Oid pubid, List *schemas, bool if_not_exists,
 static void PublicationDropSchemas(Oid pubid, List *schemas, bool missing_ok);
 static void insert_publication_sync_relation_message(Oid pubid, Oid relid,
 													 char message_type);
+static char *publication_sync_encode_single_target_table(const char *target_table);
+
+static char *
+publication_sync_encode_single_target_table(const char *target_table)
+{
+	StringInfoData buf;
+	int			target_len;
+
+	target_len = strlen(target_table);
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "1|%d:", target_len);
+	appendBinaryStringInfo(&buf, target_table, target_len);
+
+	return buf.data;
+}
 
 /*
  * Insert one pg_publication_sync message row for relation membership changes
@@ -94,6 +109,7 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid, char message_type
 	char	   *nspname;
 	char	   *relname;
 	char	   *target_table;
+	char	   *target_table_list;
 
 	if (!OidIsValid(relid) || relid == PublicationSyncRelationId)
 		return;
@@ -110,6 +126,7 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid, char message_type
 	}
 
 	target_table = quote_qualified_identifier(nspname, relname);
+	target_table_list = publication_sync_encode_single_target_table(target_table);
 
 	syncrel = table_open(PublicationSyncRelationId, RowExclusiveLock);
 
@@ -128,8 +145,8 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid, char message_type
 		CharGetDatum(message_type);
 	values[Anum_pg_publication_sync_pfsyncts - 1] =
 		TimestampTzGetDatum(GetCurrentTimestamp());
-	values[Anum_pg_publication_sync_pfsynctargettable - 1] =
-		CStringGetTextDatum(target_table);
+	values[Anum_pg_publication_sync_pfsynctargetlist - 1] =
+		CStringGetTextDatum(target_table_list);
 	nulls[Anum_pg_publication_sync_pfsyncddlsql - 1] = true;
 	nulls[Anum_pg_publication_sync_pfsyncsearchpath - 1] = true;
 	nulls[Anum_pg_publication_sync_pfsyncpublicationlist - 1] = true;
@@ -141,6 +158,7 @@ insert_publication_sync_relation_message(Oid pubid, Oid relid, char message_type
 
 	table_close(syncrel, RowExclusiveLock);
 
+	pfree(target_table_list);
 	pfree(target_table);
 	pfree(nspname);
 	pfree(relname);
@@ -297,25 +315,58 @@ parse_publication_options(ParseState *pstate,
 
 static void
 warn_missing_table_ddl_for_broad_scope(const char *pubname, int64 pubddl,
-									   bool for_all_tables,
-									   bool has_schema_scope)
+									   bool for_all_tables)
 {
 	const char *scope = NULL;
 
 	if (pubddl == 0 || (pubddl & PUBLICATION_DDL_TABLE) != 0)
 		return;
 
-	if (for_all_tables)
-		scope = "FOR ALL TABLES";
-	else if (has_schema_scope)
-		scope = "FOR TABLES IN SCHEMA";
-	else
+	/* Keep this guidance for FOR ALL TABLES only. */
+	if (!for_all_tables)
 		return;
+	scope = "FOR ALL TABLES";
 
 	ereport(NOTICE,
 			(errmsg("publication \"%s\" enables ddl without \"table\" in %s scope",
 					pubname, scope),
-			 errhint("It is recommended to include \"table\" in ddl options to keep table DDL and DML consistent.")));
+				 errhint("It is recommended to include \"table\" in ddl options to keep table DDL and DML consistent.")));
+}
+
+/*
+ * Scope rules:
+ * - FOR TABLE / FOR TABLES IN SCHEMA: only table,index are synchronized.
+ * - FOR ALL TABLES: all ddl classes are supported.
+ *
+ * Emit WARNING at command interface when unsupported options are configured.
+ */
+static void
+warn_unsupported_ddl_by_scope(const char *pubname, int64 pubddl,
+							  bool for_all_tables)
+{
+	int64		allowed_mask;
+	int64		unsupported_mask;
+	char	   *unsupported_text;
+
+	if (pubddl == 0)
+		return;
+
+	allowed_mask = for_all_tables ?
+		PUBLICATION_DDL_ALL :
+		(PUBLICATION_DDL_TABLE | PUBLICATION_DDL_INDEX);
+	unsupported_mask = pubddl & ~allowed_mask;
+	if (unsupported_mask == 0)
+		return;
+
+	unsupported_text = PublicationDDLMaskToString(unsupported_mask);
+
+	ereport(WARNING,
+			(errmsg("publication \"%s\" has unsupported ddl options for current FOR scope: \"%s\"",
+					pubname, unsupported_text),
+			 errdetail("FOR TABLE and FOR TABLES IN SCHEMA synchronize only ddl options \"table,index\"."),
+			 errhint("Use FOR ALL TABLES if you need ddl options outside \"table,index\".")));
+
+	pfree(unsupported_text);
 }
 
 /*
@@ -946,9 +997,11 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 								   &schemaidlist);
 
 	if (ddl_given)
+		warn_unsupported_ddl_by_scope(stmt->pubname, pubddl,
+									  stmt->for_all_tables);
+	if (ddl_given)
 		warn_missing_table_ddl_for_broad_scope(stmt->pubname, pubddl,
-											   stmt->for_all_tables,
-											   schemaidlist != NIL);
+											   stmt->for_all_tables);
 
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
@@ -1064,10 +1117,13 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 	if (ddl_given)
+		warn_unsupported_ddl_by_scope(NameStr(pubform->pubname),
+									  pubddl,
+									  pubform->puballtables);
+	if (ddl_given)
 		warn_missing_table_ddl_for_broad_scope(NameStr(pubform->pubname),
 											   pubddl,
-											   pubform->puballtables,
-											   is_schema_publication(pubform->oid));
+											   pubform->puballtables);
 
 	/*
 	 * If the publication doesn't publish changes via the root partitioned

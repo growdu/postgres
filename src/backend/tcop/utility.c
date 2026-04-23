@@ -92,6 +92,7 @@ static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
 static bool UtilityStmtShouldCaptureDDL(Node *parsetree);
 static int64 UtilityStmtDDLMask(Node *parsetree);
 static char *UtilityStmtTargetTable(Node *parsetree);
+static List *UtilityStmtTargetTableList(Node *parsetree);
 static RangeVar *UtilityStmtTargetRangeVar(Node *parsetree);
 static Oid UtilityStmtTargetRelid(Node *parsetree);
 static Oid UtilityStmtTargetNspid(Node *parsetree, Oid target_relid);
@@ -103,6 +104,11 @@ static bool PublicationMatchesRelationScope(Form_pg_publication pubform,
 											List *target_relpubids,
 											List *target_schemapubids,
 											List *target_ancestors);
+static void PublicationClassifyDropStmtTargets(Form_pg_publication pubform,
+											   DropStmt *stmt,
+											   bool *has_match,
+											   bool *has_unmatched);
+static char *EncodeTargetTableList(List *target_tables);
 static char *UtilityStatementText(PlannedStmt *pstmt, const char *queryString);
 static void CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString);
 
@@ -603,7 +609,25 @@ UtilityStmtDDLMask(Node *parsetree)
 		case T_DropStmt:
 			return DdlMaskFromObjectType((ObjectType) ((DropStmt *) parsetree)->removeType);
 		case T_RenameStmt:
-			return DdlMaskFromObjectType(((RenameStmt *) parsetree)->renameType);
+			{
+				RenameStmt *stmt = (RenameStmt *) parsetree;
+
+				/*
+				 * RENAME COLUMN/ATTRIBUTE semantics depend on owning relation
+				 * kind (table/view/type), not the generic renameType token.
+				 */
+				if (stmt->renameType == OBJECT_COLUMN ||
+					stmt->renameType == OBJECT_ATTRIBUTE)
+					return DdlMaskFromObjectType(stmt->relationType);
+
+				/*
+				 * Table constraint rename belongs to table DDL class.
+				 */
+				if (stmt->renameType == OBJECT_TABCONSTRAINT)
+					return PUBLICATION_DDL_TABLE;
+
+				return DdlMaskFromObjectType(stmt->renameType);
+			}
 		case T_AlterObjectSchemaStmt:
 			return DdlMaskFromObjectType(((AlterObjectSchemaStmt *) parsetree)->objectType);
 		case T_AlterOwnerStmt:
@@ -666,6 +690,39 @@ UtilityStmtTargetTable(Node *parsetree)
 		default:
 			return NULL;
 	}
+}
+
+static List *
+UtilityStmtTargetTableList(Node *parsetree)
+{
+	List	   *targets = NIL;
+	char	   *target_table;
+
+	if (IsA(parsetree, DropStmt))
+	{
+		DropStmt   *stmt = (DropStmt *) parsetree;
+		ListCell   *lc;
+
+		foreach(lc, stmt->objects)
+		{
+			Node	   *obj = lfirst(lc);
+
+			if (obj && IsA(obj, List))
+				targets = lappend(targets,
+								  NameListToQuotedString((List *) obj));
+			else if (obj && IsA(obj, ObjectWithArgs))
+				targets = lappend(targets,
+								  NameListToQuotedString(((ObjectWithArgs *) obj)->objname));
+		}
+
+		return targets;
+	}
+
+	target_table = UtilityStmtTargetTable(parsetree);
+	if (target_table != NULL)
+		targets = lappend(targets, target_table);
+
+	return targets;
 }
 
 static RangeVar *
@@ -731,6 +788,110 @@ UtilityStmtTargetRangeVar(Node *parsetree)
 	}
 }
 
+static void
+PublicationClassifyDropStmtTargets(Form_pg_publication pubform,
+								   DropStmt *stmt,
+								   bool *has_match,
+								   bool *has_unmatched)
+{
+	ListCell   *lc;
+
+	*has_match = false;
+	*has_unmatched = false;
+
+	switch (stmt->removeType)
+	{
+		case OBJECT_TABLE:
+		case OBJECT_FOREIGN_TABLE:
+		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
+			break;
+		default:
+			return;
+	}
+
+	foreach(lc, stmt->objects)
+	{
+		Node	   *obj = lfirst(lc);
+		RangeVar   *rv;
+		Oid			relid;
+		Oid			nspid = InvalidOid;
+		List	   *relpubids = NIL;
+		List	   *schemapubids = NIL;
+		List	   *ancestors = NIL;
+		bool		matched = false;
+
+		if (!(obj && IsA(obj, List)))
+			continue;
+
+		rv = makeRangeVarFromNameList((List *) obj);
+		relid = RangeVarGetRelid(rv, NoLock, true);
+
+		if (OidIsValid(relid))
+		{
+			nspid = get_rel_namespace(relid);
+			relpubids = GetRelationPublications(relid);
+			if (get_rel_relispartition(relid))
+				ancestors = get_partition_ancestors(relid);
+			if (OidIsValid(nspid))
+				schemapubids = GetSchemaPublications(nspid);
+
+			matched = PublicationMatchesRelationScope(pubform, relid,
+													 relpubids,
+													 schemapubids,
+													 ancestors);
+		}
+		else
+		{
+			if (rv->schemaname != NULL)
+				nspid = get_namespace_oid(rv->schemaname, true);
+
+			if (pubform->puballtables)
+				matched = true;
+			else if (OidIsValid(nspid))
+			{
+				schemapubids = GetSchemaPublications(nspid);
+				matched = list_member_oid(schemapubids, pubform->oid);
+			}
+			else
+				matched = false;
+		}
+
+		list_free(relpubids);
+		list_free(schemapubids);
+		list_free(ancestors);
+
+		if (matched)
+			*has_match = true;
+		else
+			*has_unmatched = true;
+
+		if (*has_match && *has_unmatched)
+			return;
+	}
+}
+
+static char *
+EncodeTargetTableList(List *target_tables)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "%d", list_length(target_tables));
+
+	foreach(lc, target_tables)
+	{
+		char	   *target_table = (char *) lfirst(lc);
+		int			target_len = strlen(target_table);
+
+		appendStringInfo(&buf, "|%d:", target_len);
+		appendBinaryStringInfo(&buf, target_table, target_len);
+	}
+
+	return buf.data;
+}
+
 static Oid
 UtilityStmtTargetRelid(Node *parsetree)
 {
@@ -790,11 +951,10 @@ static bool
 PublicationAllowsDDLMaskByScope(Form_pg_publication pubform, int64 ddlmask)
 {
 	int64		for_table_mask = PUBLICATION_DDL_TABLE | PUBLICATION_DDL_INDEX;
-	int64		for_schema_or_all_mask = PUBLICATION_DDL_ALL;
 	int64		allowed_mask;
 
-	if (pubform->puballtables || is_schema_publication(pubform->oid))
-		allowed_mask = for_schema_or_all_mask;
+	if (pubform->puballtables)
+		allowed_mask = PUBLICATION_DDL_ALL;
 	else
 		allowed_mask = for_table_mask;
 
@@ -835,35 +995,16 @@ typedef struct PublicationSyncCaptureMatch
 /*
  * Compute per-publication message mask and whether the statement should be
  * captured for that publication.
- *
- * In FOR ALL TABLES mode, ddl='table' must also carry schema bootstrap DDL,
- * so CREATE SCHEMA can arrive before CREATE TABLE in that schema.
  */
 static bool
 PublicationShouldCaptureDDL(Form_pg_publication pubform,
 							int64 ddlmask,
 							int64 *msg_ddlmask)
 {
-	bool		schema_stmt;
-	bool		carry_schema_as_table = false;
-	int64		effective_pubddl = pubform->pubddl;
-
-	schema_stmt = (ddlmask & PUBLICATION_DDL_SCHEMA) != 0;
-	if (schema_stmt &&
-		pubform->puballtables &&
-		(pubform->pubddl & PUBLICATION_DDL_TABLE) != 0)
-	{
-		carry_schema_as_table = true;
-		effective_pubddl |= PUBLICATION_DDL_SCHEMA;
-	}
-
-	if ((effective_pubddl & ddlmask) == 0)
+	if ((pubform->pubddl & ddlmask) == 0)
 		return false;
 
 	*msg_ddlmask = ddlmask & pubform->pubddl;
-	if (carry_schema_as_table)
-		*msg_ddlmask |= PUBLICATION_DDL_TABLE;
-
 	return *msg_ddlmask != 0;
 }
 
@@ -891,7 +1032,8 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	TableScanDesc pubscan;
 	HeapTuple	pubtup;
 	char	   *ddl_sql;
-	char	   *target_table;
+	List	   *target_tables = NIL;
+	char	   *target_tables_encoded = NULL;
 	char	   *ddl_search_path;
 	int64		ddlmask;
 	bool		needs_rel_scope_filter;
@@ -901,6 +1043,7 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	List	   *target_schemapubids = NIL;
 	List	   *target_ancestors = NIL;
 	List	   *matched_pubs = NIL;
+	bool		multi_drop_scope_filter = false;
 
 	if (!IsNormalProcessingMode() || IsBootstrapProcessingMode())
 		return;
@@ -912,28 +1055,53 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	if (!UtilityStmtShouldCaptureDDL(parsetree))
 		return;
 
+	/*
+	 * CREATE/ALTER EXTENSION execute installation scripts internally through
+	 * ProcessUtility(). Only capture the top-level extension statement, not
+	 * the script's internal SQL commands.
+	 */
+	if (creating_extension)
+		return;
+
 	ddl_sql = UtilityStatementText(pstmt, queryString);
-	target_table = UtilityStmtTargetTable(parsetree);
+	target_tables = UtilityStmtTargetTableList(parsetree);
+	if (target_tables != NIL)
+		target_tables_encoded = EncodeTargetTableList(target_tables);
 	ddl_search_path = GetConfigOptionByName("search_path", NULL, false);
 	ddlmask = UtilityStmtDDLMask(parsetree);
 	if (ddlmask == 0)
 		goto done;
 
 	needs_rel_scope_filter = UtilityStmtNeedsRelationScopeFilter(ddlmask);
+	if (IsA(parsetree, DropStmt) &&
+		list_length(target_tables) > 1)
+	{
+		DropStmt   *drop_stmt = (DropStmt *) parsetree;
+
+		if (drop_stmt->removeType == OBJECT_TABLE ||
+			drop_stmt->removeType == OBJECT_FOREIGN_TABLE ||
+			drop_stmt->removeType == OBJECT_VIEW ||
+			drop_stmt->removeType == OBJECT_MATVIEW)
+			multi_drop_scope_filter = true;
+	}
+
 	if (needs_rel_scope_filter)
 	{
-		target_relid = UtilityStmtTargetRelid(parsetree);
-		target_nspid = UtilityStmtTargetNspid(parsetree, target_relid);
-
-		if (OidIsValid(target_relid))
+		if (!multi_drop_scope_filter)
 		{
-			target_relpubids = GetRelationPublications(target_relid);
-			if (get_rel_relispartition(target_relid))
-				target_ancestors = get_partition_ancestors(target_relid);
-		}
+			target_relid = UtilityStmtTargetRelid(parsetree);
+			target_nspid = UtilityStmtTargetNspid(parsetree, target_relid);
 
-		if (OidIsValid(target_nspid))
-			target_schemapubids = GetSchemaPublications(target_nspid);
+			if (OidIsValid(target_relid))
+			{
+				target_relpubids = GetRelationPublications(target_relid);
+				if (get_rel_relispartition(target_relid))
+					target_ancestors = get_partition_ancestors(target_relid);
+			}
+
+			if (OidIsValid(target_nspid))
+				target_schemapubids = GetSchemaPublications(target_nspid);
+		}
 	}
 
 	pubrel = table_open(PublicationRelationId, AccessShareLock);
@@ -952,7 +1120,28 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 			continue;
 		if (needs_rel_scope_filter)
 		{
-			if (OidIsValid(target_relid))
+			if (multi_drop_scope_filter)
+			{
+				bool		has_match = false;
+				bool		has_unmatched = false;
+
+				PublicationClassifyDropStmtTargets(pubform,
+												   (DropStmt *) parsetree,
+												   &has_match,
+												   &has_unmatched);
+				if (has_match && has_unmatched)
+				{
+					ereport(WARNING,
+							(errmsg("skipping mixed-scope multi-object DROP for publication \"%s\"",
+									NameStr(pubform->pubname)),
+							 errdetail("The statement contains both relations inside and outside the publication scope."),
+							 errhint("Split DROP into separate statements per publication scope to avoid accidental replay.")));
+					continue;
+				}
+				if (!has_match)
+					continue;
+			}
+			else if (OidIsValid(target_relid))
 			{
 				if (!PublicationMatchesRelationScope(pubform, target_relid,
 													 target_relpubids,
@@ -1013,22 +1202,16 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 			values[Anum_pg_publication_sync_pfsyncenabled - 1] = BoolGetDatum(true);
 			values[Anum_pg_publication_sync_pfsynclsn - 1] =
 				LSNGetDatum(GetXLogInsertRecPtr());
-			values[Anum_pg_publication_sync_pfsyncts - 1] =
-				TimestampTzGetDatum(GetCurrentTimestamp());
-			values[Anum_pg_publication_sync_pfsyncmsgtype - 1] =
-				CharGetDatum(PUBLICATION_SYNC_MSGTYPE_QUERY);
+				values[Anum_pg_publication_sync_pfsyncts - 1] =
+					TimestampTzGetDatum(GetCurrentTimestamp());
+				values[Anum_pg_publication_sync_pfsyncmsgtype - 1] =
+					CharGetDatum(PUBLICATION_SYNC_MSGTYPE_QUERY);
 
-			if (target_table != NULL)
-				values[Anum_pg_publication_sync_pfsynctargettable - 1] =
-					CStringGetTextDatum(target_table);
-			else
-				nulls[Anum_pg_publication_sync_pfsynctargettable - 1] = true;
-
-			if (ddl_sql != NULL)
-				values[Anum_pg_publication_sync_pfsyncddlsql - 1] =
-					CStringGetTextDatum(ddl_sql);
-			else
-				nulls[Anum_pg_publication_sync_pfsyncddlsql - 1] = true;
+				if (ddl_sql != NULL)
+					values[Anum_pg_publication_sync_pfsyncddlsql - 1] =
+						CStringGetTextDatum(ddl_sql);
+				else
+					nulls[Anum_pg_publication_sync_pfsyncddlsql - 1] = true;
 
 			nulls[Anum_pg_publication_sync_pfsyncpublicationlist - 1] = true;
 
@@ -1037,6 +1220,12 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 					CStringGetTextDatum(ddl_search_path);
 			else
 				nulls[Anum_pg_publication_sync_pfsyncsearchpath - 1] = true;
+
+			if (target_tables_encoded != NULL)
+				values[Anum_pg_publication_sync_pfsynctargetlist - 1] =
+					CStringGetTextDatum(target_tables_encoded);
+			else
+				nulls[Anum_pg_publication_sync_pfsynctargetlist - 1] = true;
 
 			nulls[Anum_pg_publication_sync_pfsyncextra - 1] = true;
 
@@ -1052,10 +1241,11 @@ done:
 	list_free(target_relpubids);
 	list_free(target_schemapubids);
 	list_free(target_ancestors);
+	list_free_deep(target_tables);
 	list_free_deep(matched_pubs);
 
-	if (target_table != NULL)
-		pfree(target_table);
+	if (target_tables_encoded != NULL)
+		pfree(target_tables_encoded);
 	if (ddl_sql != NULL)
 		pfree(ddl_sql);
 	if (ddl_search_path != NULL)

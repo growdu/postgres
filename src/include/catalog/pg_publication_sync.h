@@ -37,7 +37,7 @@ CATALOG(pg_publication_sync,9352,PublicationSyncRelationId)
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	timestamptz pfsyncts BKI_FORCE_NOT_NULL;	/* source timestamp */
-	text		pfsynctargettable BKI_FORCE_NULL;
+	text		pfsynctargetlist BKI_FORCE_NULL;	/* encoded target list */
 	text		pfsyncddlsql BKI_FORCE_NULL;
 	text		pfsyncsearchpath BKI_FORCE_NULL;
 	text		pfsyncpublicationlist BKI_FORCE_NULL;

@@ -1488,7 +1488,7 @@ pgoutput_write_publication_sync_message(LogicalDecodingContext *ctx,
 	bool		isnull;
 	Datum		datum;
 	StringInfoData payload;
-	char	   *target_table = NULL;
+	char	   *target_list = NULL;
 	char	   *ddl_sql = NULL;
 	char	   *search_path = NULL;
 	Oid			pubid;
@@ -1516,10 +1516,10 @@ pgoutput_write_publication_sync_message(LogicalDecodingContext *ctx,
 		return false;
 	msgtype = DatumGetChar(datum);
 
-	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsynctargettable,
+	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsynctargetlist,
 						 &isnull);
 	if (!isnull)
-		target_table = TextDatumGetCString(datum);
+		target_list = TextDatumGetCString(datum);
 
 	datum = slot_getattr(slot, Anum_pg_publication_sync_pfsyncddlsql,
 						 &isnull);
@@ -1538,9 +1538,9 @@ pgoutput_write_publication_sync_message(LogicalDecodingContext *ctx,
 	pq_sendint64(&payload, ddlmask);
 	pq_sendbyte(&payload, msgtype);
 
-	pq_sendbyte(&payload, target_table != NULL);
-	if (target_table != NULL)
-		pq_sendstring(&payload, target_table);
+	pq_sendbyte(&payload, target_list != NULL);
+	if (target_list != NULL)
+		pq_sendstring(&payload, target_list);
 
 	pq_sendbyte(&payload, ddl_sql != NULL);
 	if (ddl_sql != NULL)
@@ -1560,12 +1560,12 @@ pgoutput_write_publication_sync_message(LogicalDecodingContext *ctx,
 						 payload.data);
 	OutputPluginWrite(ctx, true);
 
-	if (target_table != NULL)
-		pfree(target_table);
 	if (ddl_sql != NULL)
 		pfree(ddl_sql);
 	if (search_path != NULL)
 		pfree(search_path);
+	if (target_list != NULL)
+		pfree(target_list);
 	pfree(payload.data);
 
 	return true;

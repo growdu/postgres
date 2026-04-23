@@ -299,6 +299,12 @@ typedef struct MissingTargetRelEntry
 	LogicalRepRelId remoteid;
 } MissingTargetRelEntry;
 
+typedef struct PublicationSyncLifecycleTarget
+{
+	char	   *target_table;
+	Oid			relid_before;
+} PublicationSyncLifecycleTarget;
+
 /* errcontext tracker */
 ApplyErrorCallbackArg apply_error_callback_arg =
 {
@@ -429,11 +435,14 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 Oid localindexoid);
 static void apply_handle_ddl(StringInfo s);
 static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
-static Oid publication_sync_lookup_target_relid(TupleTableSlot *newslot,
-												bool missing_ok,
-												bool *has_target);
+static Oid publication_sync_lookup_target_relid_by_name(const char *target_table,
+														   bool missing_ok);
+static List *publication_sync_decode_target_table_list(const char *encoded);
+static List *publication_sync_collect_target_tables(TupleTableSlot *newslot);
+static char *publication_sync_require_single_target_table(TupleTableSlot *newslot,
+														  char message_type);
 static bool publication_sync_should_ignore_ddl_error(Node *utility_stmt,
-													  int sqlerrcode);
+														  int sqlerrcode);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -647,20 +656,26 @@ logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
 
 		FlushErrorState();
 
-		if (MySubscription != NULL &&
-			(MySubscription->ddl & PUBLICATION_DDL_TABLE) == 0 &&
-			(edata->sqlerrcode == ERRCODE_UNDEFINED_TABLE ||
-			 edata->sqlerrcode == ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE))
-		{
-			logicalrep_rel_pause(relid);
-			ereport(WARNING,
-					(errmsg("pausing replicated apply for missing target relation"),
-					 errdetail("subscription \"%s\", remote relation id %u",
-							   MySubscription->name, relid),
-					 errhint("Enable ddl option \"table\" or create the table manually, then refresh relation metadata to resume this relation.")));
-			FreeErrorData(edata);
-			return false;
-		}
+			if (MySubscription != NULL &&
+				(edata->sqlerrcode == ERRCODE_UNDEFINED_TABLE ||
+				 edata->sqlerrcode == ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE))
+			{
+				char	   *hint;
+
+				if ((MySubscription->ddl & PUBLICATION_DDL_TABLE) != 0)
+					hint = "Fix failed table DDL prerequisites (for example missing schema/tablespace) or create the table manually, then refresh relation metadata to resume this relation.";
+				else
+					hint = "Enable ddl option \"table\" or create the table manually, then refresh relation metadata to resume this relation.";
+
+				logicalrep_rel_pause(relid);
+				ereport(WARNING,
+						(errmsg("pausing replicated apply for missing target relation"),
+						 errdetail("subscription \"%s\", remote relation id %u",
+								   MySubscription->name, relid),
+						 errhint("%s", hint)));
+				FreeErrorData(edata);
+				return false;
+			}
 
 		ReThrowError(edata);
 	}
@@ -2695,44 +2710,161 @@ publication_sync_row_matches_subscription(TupleTableSlot *newslot)
 	return true;
 }
 
-/*
- * Resolve target relation OID from pfsynctargettable when present.
- */
 static Oid
-publication_sync_lookup_target_relid(TupleTableSlot *newslot,
-									 bool missing_ok,
-									 bool *has_target)
+publication_sync_lookup_target_relid_by_name(const char *target_table,
+											  bool missing_ok)
 {
-	bool		isnull;
-	Datum		target_datum;
-	char	   *target_table;
 	List	   *name_list;
 	RangeVar   *rv;
 	Oid			relid;
 
-	*has_target = false;
-
-	target_datum = slot_getattr(newslot,
-								Anum_pg_publication_sync_pfsynctargettable,
-								&isnull);
-	if (isnull)
+	if (target_table == NULL || target_table[0] == '\0')
 		return InvalidOid;
-
-	target_table = TextDatumGetCString(target_datum);
-	if (target_table[0] == '\0')
-	{
-		pfree(target_table);
-		return InvalidOid;
-	}
 
 	name_list = stringToQualifiedNameList(target_table, NULL);
 	rv = makeRangeVarFromNameList(name_list);
 	relid = RangeVarGetRelid(rv, NoLock, missing_ok);
 	list_free_deep(name_list);
-	pfree(target_table);
 
-	*has_target = true;
 	return relid;
+}
+
+static uint32
+publication_sync_parse_uint(const char **cursor, const char *end,
+							const char *context)
+{
+	const char *ptr = *cursor;
+	uint64		value = 0;
+
+	if (ptr >= end || *ptr < '0' || *ptr > '9')
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid pg_publication_sync target table list"),
+				 errdetail("Failed to parse %s in pfsynctargetlist.", context)));
+
+	while (ptr < end && *ptr >= '0' && *ptr <= '9')
+	{
+		value = (value * 10) + (*ptr - '0');
+		if (value > UINT_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid pg_publication_sync target table list"),
+					 errdetail("Value overflow while parsing %s in pfsynctargetlist.",
+							   context)));
+		ptr++;
+	}
+
+	*cursor = ptr;
+	return (uint32) value;
+}
+
+static List *
+publication_sync_decode_target_table_list(const char *encoded)
+{
+	List	   *targets = NIL;
+	const char *ptr;
+	const char *end;
+	uint32		ntargets;
+	uint32		i;
+
+	if (encoded == NULL || encoded[0] == '\0')
+		return NIL;
+
+	ptr = encoded;
+	end = encoded + strlen(encoded);
+	ntargets = publication_sync_parse_uint(&ptr, end, "target count");
+
+	for (i = 0; i < ntargets; i++)
+	{
+		uint32		target_len;
+		char	   *target_table;
+
+		if (ptr >= end || *ptr != '|')
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid pg_publication_sync target table list"),
+					 errdetail("Missing target separator in pfsynctargetlist.")));
+		ptr++;
+
+		target_len = publication_sync_parse_uint(&ptr, end, "target length");
+		if (ptr >= end || *ptr != ':')
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid pg_publication_sync target table list"),
+					 errdetail("Missing target payload separator in pfsynctargetlist.")));
+		ptr++;
+
+		if (end - ptr < target_len)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid pg_publication_sync target table list"),
+					 errdetail("Target payload length exceeds pfsynctargetlist size.")));
+
+		target_table = pnstrdup(ptr, target_len);
+		targets = lappend(targets, target_table);
+		ptr += target_len;
+	}
+
+	if (ptr != end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid pg_publication_sync target table list"),
+				 errdetail("Unexpected trailing payload found in pfsynctargetlist.")));
+
+	return targets;
+}
+
+static List *
+publication_sync_collect_target_tables(TupleTableSlot *newslot)
+{
+	bool		isnull;
+	Datum		targetlist_datum;
+	char	   *targetlist_payload;
+	List	   *targets = NIL;
+
+	targetlist_datum = slot_getattr(newslot,
+									Anum_pg_publication_sync_pfsynctargetlist,
+									&isnull);
+	if (!isnull)
+	{
+		targetlist_payload = TextDatumGetCString(targetlist_datum);
+		targets = publication_sync_decode_target_table_list(targetlist_payload);
+		pfree(targetlist_payload);
+	}
+
+	return targets;
+}
+
+static char *
+publication_sync_require_single_target_table(TupleTableSlot *newslot,
+											 char message_type)
+{
+	List	   *targets;
+	char	   *target_table;
+
+	targets = publication_sync_collect_target_tables(newslot);
+	if (targets == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"%c\" requires pfsynctargetlist",
+						message_type)));
+
+	if (list_length(targets) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pg_publication_sync message type \"%c\" requires exactly one target in pfsynctargetlist",
+						message_type)));
+
+	target_table = (char *) linitial(targets);
+	list_free(targets);
+
+	if (target_table[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("pg_publication_sync message type \"%c\" requires non-empty target in pfsynctargetlist",
+						message_type)));
+
+	return target_table;
 }
 
 /*
@@ -2750,6 +2882,45 @@ publication_sync_should_ignore_ddl_error(Node *utility_stmt, int sqlerrcode)
 		(sqlerrcode == ERRCODE_DUPLICATE_SCHEMA ||
 		 sqlerrcode == ERRCODE_DUPLICATE_OBJECT))
 		return true;
+
+	return false;
+}
+
+/*
+ * CREATE EXTENSION can legitimately fail on subscriber when local extension
+ * artifacts/environment differ from publisher. Skip to avoid endless apply
+ * worker crash/restart loops on the same DDL payload.
+ */
+static bool
+publication_sync_should_skip_extension_error(Node *utility_stmt)
+{
+	if (utility_stmt == NULL)
+		return false;
+
+	if (IsA(utility_stmt, CreateExtensionStmt))
+		return true;
+
+	return false;
+}
+
+/*
+ * Keep apply worker alive on DDL prerequisite mismatches (for example schema
+ * not present locally). This matches DML-side tolerance where one broken
+ * relation should not block other relations from applying.
+ */
+static bool
+publication_sync_should_skip_ddl_precondition_error(int sqlerrcode)
+{
+	switch (sqlerrcode)
+	{
+		case ERRCODE_INVALID_SCHEMA_NAME:
+		case ERRCODE_UNDEFINED_TABLE:
+		case ERRCODE_UNDEFINED_OBJECT:
+		case ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE:
+			return true;
+		default:
+			break;
+	}
 
 	return false;
 }
@@ -2799,6 +2970,7 @@ execute_publication_sync_sql_command(const char *sql)
 		{
 			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
 			QueryCompletion qc;
+			bool		snapshot_popped = false;
 
 			CommandCounterIncrement();
 			PushActiveSnapshot(GetTransactionSnapshot());
@@ -2831,6 +3003,7 @@ execute_publication_sync_sql_command(const char *sql)
 				ErrorData  *edata;
 
 				PopActiveSnapshot();
+				snapshot_popped = true;
 				edata = CopyErrorData();
 				FlushErrorState();
 
@@ -2844,12 +3017,34 @@ execute_publication_sync_sql_command(const char *sql)
 												unpack_sql_state(edata->sqlerrcode))));
 					FreeErrorData(edata);
 				}
+				else if (publication_sync_should_skip_extension_error(stmt->utilityStmt))
+				{
+					ereport(WARNING,
+							(errmsg("skipping failed CREATE EXTENSION from publication-sync"),
+							 errdetail("sqlstate: %s, message: %s",
+									   unpack_sql_state(edata->sqlerrcode),
+									   edata->message ? edata->message : "unknown"),
+							 errhint("Install required extension files on subscriber and run CREATE EXTENSION manually if needed.")));
+					FreeErrorData(edata);
+				}
+				else if (publication_sync_should_skip_ddl_precondition_error(edata->sqlerrcode))
+				{
+					ereport(WARNING,
+							(errmsg("skipping publication-sync DDL due to unmet prerequisite"),
+							 errdetail("statement type: %d, sqlstate: %s, message: %s",
+									   nodeTag(stmt->utilityStmt),
+									   unpack_sql_state(edata->sqlerrcode),
+									   edata->message ? edata->message : "unknown"),
+							 errhint("Ensure subscriber schema objects exist or adjust publication ddl options if this DDL should be replicated.")));
+					FreeErrorData(edata);
+				}
 				else
 					ReThrowError(edata);
 			}
 			PG_END_TRY();
 
-			PopActiveSnapshot();
+			if (!snapshot_popped)
+				PopActiveSnapshot();
 		}
 
 		MemoryContextSwitchTo(oldcontext);
@@ -2882,11 +3077,10 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 	char	   *captured_search_path;
 	char	   *saved_search_path;
 	int64		ddlmask = 0;
-	bool		has_target = false;
-	Oid			relid_before = InvalidOid;
-	Oid			relid_after = InvalidOid;
 	char		relstate;
 	XLogRecPtr	sublsn;
+	List	   *lifecycle_targets = NIL;
+	ListCell   *lc;
 
 	ddldatum = slot_getattr(newslot,
 							Anum_pg_publication_sync_pfsyncddlsql,
@@ -2923,8 +3117,24 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 		ddlmask = DatumGetInt64(ddlmaskdatum);
 
 	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
-		relid_before = publication_sync_lookup_target_relid(newslot, true,
-															&has_target);
+	{
+		List	   *target_tables = publication_sync_collect_target_tables(newslot);
+
+		foreach(lc, target_tables)
+		{
+			char	   *target_table = (char *) lfirst(lc);
+			PublicationSyncLifecycleTarget *target;
+
+			target = palloc(sizeof(PublicationSyncLifecycleTarget));
+			target->target_table = target_table;
+			target->relid_before =
+				publication_sync_lookup_target_relid_by_name(target_table, true);
+			lifecycle_targets = lappend(lifecycle_targets, target);
+		}
+
+		/* target_table ownership moved to lifecycle_targets entries. */
+		list_free(target_tables);
+	}
 
 	saved_search_path = GetConfigOptionByName("search_path", NULL, false);
 
@@ -2954,44 +3164,64 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 	 * when a table appears, register it for synchronization; when it
 	 * disappears, remove its mapping and stop any per-table worker.
 	 */
-	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0 && has_target)
+	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
 	{
-		bool		relid_before_still_exists = false;
-
-		relid_after = publication_sync_lookup_target_relid(newslot, true,
-														   &has_target);
-		if (OidIsValid(relid_before))
-			relid_before_still_exists =
-				SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid_before));
-
-		if (!OidIsValid(relid_before) && OidIsValid(relid_after))
+		foreach(lc, lifecycle_targets)
 		{
-			relstate = GetSubscriptionRelState(MySubscription->oid,
-											   relid_after, &sublsn);
-			if (relstate == SUBREL_STATE_UNKNOWN)
+			PublicationSyncLifecycleTarget *target =
+				(PublicationSyncLifecycleTarget *) lfirst(lc);
+			Oid			relid_after;
+			bool		relid_before_still_exists = false;
+
+			relid_after = publication_sync_lookup_target_relid_by_name(target->target_table,
+																	   true);
+			if (OidIsValid(target->relid_before))
+				relid_before_still_exists =
+					SearchSysCacheExists1(RELOID,
+										  ObjectIdGetDatum(target->relid_before));
+
+			if (!OidIsValid(target->relid_before) && OidIsValid(relid_after))
 			{
-				AddSubscriptionRelState(MySubscription->oid, relid_after,
-										SUBREL_STATE_INIT,
-										InvalidXLogRecPtr, false);
+				relstate = GetSubscriptionRelState(MySubscription->oid,
+												   relid_after, &sublsn);
+				if (relstate == SUBREL_STATE_UNKNOWN)
+				{
+					AddSubscriptionRelState(MySubscription->oid, relid_after,
+											SUBREL_STATE_INIT,
+											InvalidXLogRecPtr, false);
+					LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+					CommandCounterIncrement();
+				}
+			}
+			else if (OidIsValid(target->relid_before) &&
+					 !OidIsValid(relid_after) &&
+					 !relid_before_still_exists)
+			{
+				relstate = GetSubscriptionRelState(MySubscription->oid,
+												   target->relid_before, &sublsn);
+				if (relstate != SUBREL_STATE_UNKNOWN)
+				{
+					RemoveSubscriptionRel(MySubscription->oid,
+										  target->relid_before);
+					CommandCounterIncrement();
+				}
+
+				logicalrep_worker_stop(MySubscription->oid,
+									   target->relid_before);
 				LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
-				CommandCounterIncrement();
 			}
-		}
-		else if (OidIsValid(relid_before) && !OidIsValid(relid_after) &&
-				 !relid_before_still_exists)
-		{
-			relstate = GetSubscriptionRelState(MySubscription->oid,
-											   relid_before, &sublsn);
-			if (relstate != SUBREL_STATE_UNKNOWN)
-			{
-				RemoveSubscriptionRel(MySubscription->oid, relid_before);
-				CommandCounterIncrement();
-			}
-
-			logicalrep_worker_stop(MySubscription->oid, relid_before);
-			LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
 		}
 	}
+
+	foreach(lc, lifecycle_targets)
+	{
+		PublicationSyncLifecycleTarget *target =
+			(PublicationSyncLifecycleTarget *) lfirst(lc);
+
+		pfree(target->target_table);
+		pfree(target);
+	}
+	list_free(lifecycle_targets);
 
 	pfree(saved_search_path);
 	pfree(captured_search_path);
@@ -3001,8 +3231,6 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 static void
 apply_publication_sync_message_a(TupleTableSlot *newslot)
 {
-	bool		isnull;
-	Datum		target_datum;
 	char	   *target_table;
 	List	   *name_list;
 	RangeVar   *rv;
@@ -3010,19 +3238,7 @@ apply_publication_sync_message_a(TupleTableSlot *newslot)
 	char		relstate;
 	XLogRecPtr	sublsn;
 
-	target_datum = slot_getattr(newslot,
-								Anum_pg_publication_sync_pfsynctargettable,
-								&isnull);
-	if (isnull)
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"A\" requires pfsynctargettable")));
-
-	target_table = TextDatumGetCString(target_datum);
-	if (target_table[0] == '\0')
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"A\" requires non-empty pfsynctargettable")));
+	target_table = publication_sync_require_single_target_table(newslot, 'A');
 
 	name_list = stringToQualifiedNameList(target_table, NULL);
 	rv = makeRangeVarFromNameList(name_list);
@@ -3043,8 +3259,6 @@ apply_publication_sync_message_a(TupleTableSlot *newslot)
 static void
 apply_publication_sync_message_d(TupleTableSlot *newslot)
 {
-	bool		isnull;
-	Datum		target_datum;
 	char	   *target_table;
 	List	   *name_list;
 	RangeVar   *rv;
@@ -3052,19 +3266,7 @@ apply_publication_sync_message_d(TupleTableSlot *newslot)
 	char		relstate;
 	XLogRecPtr	sublsn;
 
-	target_datum = slot_getattr(newslot,
-								Anum_pg_publication_sync_pfsynctargettable,
-								&isnull);
-	if (isnull)
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"D\" requires pfsynctargettable")));
-
-	target_table = TextDatumGetCString(target_datum);
-	if (target_table[0] == '\0')
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("pg_publication_sync message type \"D\" requires non-empty pfsynctargettable")));
+	target_table = publication_sync_require_single_target_table(newslot, 'D');
 
 	name_list = stringToQualifiedNameList(target_table, NULL);
 	rv = makeRangeVarFromNameList(name_list);
@@ -3166,7 +3368,7 @@ maybe_apply_publication_sync_wire_message(StringInfo s)
 	int64		objid;
 	int64		ddlmask;
 	char		msgtype;
-	char	   *target_table = NULL;
+	char	   *target_list = NULL;
 	char	   *ddl_sql = NULL;
 	char	   *search_path = NULL;
 	Relation	syncrel;
@@ -3207,7 +3409,7 @@ maybe_apply_publication_sync_wire_message(StringInfo s)
 	msgtype = pq_getmsgint(&payload, 1);
 
 	if (pq_getmsgint(&payload, 1) != 0)
-		target_table = pstrdup(pq_getmsgstring(&payload));
+		target_list = pstrdup(pq_getmsgstring(&payload));
 	if (pq_getmsgint(&payload, 1) != 0)
 		ddl_sql = pstrdup(pq_getmsgstring(&payload));
 	if (pq_getmsgint(&payload, 1) != 0)
@@ -3236,11 +3438,11 @@ maybe_apply_publication_sync_wire_message(StringInfo s)
 	values[Anum_pg_publication_sync_pfsyncts - 1] =
 		TimestampTzGetDatum(GetCurrentTimestamp());
 
-	if (target_table != NULL)
-		values[Anum_pg_publication_sync_pfsynctargettable - 1] =
-			CStringGetTextDatum(target_table);
+	if (target_list != NULL)
+		values[Anum_pg_publication_sync_pfsynctargetlist - 1] =
+			CStringGetTextDatum(target_list);
 	else
-		nulls[Anum_pg_publication_sync_pfsynctargettable - 1] = true;
+		nulls[Anum_pg_publication_sync_pfsynctargetlist - 1] = true;
 
 	if (ddl_sql != NULL)
 		values[Anum_pg_publication_sync_pfsyncddlsql - 1] =
@@ -3267,12 +3469,12 @@ maybe_apply_publication_sync_wire_message(StringInfo s)
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(syncrel, AccessShareLock);
 
-	if (target_table != NULL)
-		pfree(target_table);
 	if (ddl_sql != NULL)
 		pfree(ddl_sql);
 	if (search_path != NULL)
 		pfree(search_path);
+	if (target_list != NULL)
+		pfree(target_list);
 
 	return true;
 }
