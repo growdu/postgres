@@ -641,36 +641,20 @@ logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
 									   LOCKMODE lockmode,
 									   LogicalRepRelMapEntry **rel)
 {
-	MemoryContext oldcontext = CurrentMemoryContext;
-	ResourceOwner oldowner = CurrentResourceOwner;
-
 	if (logicalrep_rel_is_paused(relid))
 		return false;
 
 	*rel = NULL;
 
-	/*
-	 * Run relation-open in an internal subxact so skipped errors don't leak
-	 * partially acquired relcache/resources into the outer apply transaction.
-	 */
-	BeginInternalSubTransaction("logical replication relation open");
-	MemoryContextSwitchTo(oldcontext);
-
 	PG_TRY();
 	{
 		*rel = logicalrep_rel_open(relid, lockmode);
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *edata = CopyErrorData();
 
 		FlushErrorState();
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
 
 			if (MySubscription != NULL &&
 				(edata->sqlerrcode == ERRCODE_UNDEFINED_TABLE ||

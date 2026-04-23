@@ -331,6 +331,8 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 	LogicalRepRelMapEntry *entry;
 	bool		found;
 	LogicalRepRelation *remoterel;
+	bool		localrel_opened = false;
+	LOCKMODE	localrel_lockmode = NoLock;
 
 	if (LogicalRepRelMap == NULL)
 		logicalrep_relmap_init();
@@ -349,150 +351,175 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 	if (entry->localrel)
 		elog(ERROR, "remote relation ID %u is already open", remoteid);
 
-	/*
-	 * When opening and locking a relation, pending invalidation messages are
-	 * processed which can invalidate the relation.  Hence, if the entry is
-	 * currently considered valid, try to open the local relation by OID and
-	 * see if invalidation ensues.
-	 */
-	if (entry->localrelvalid)
+	PG_TRY();
 	{
-		entry->localrel = try_table_open(entry->localreloid, lockmode);
-		if (!entry->localrel)
+		/*
+		 * When opening and locking a relation, pending invalidation messages are
+		 * processed which can invalidate the relation.  Hence, if the entry is
+		 * currently considered valid, try to open the local relation by OID and
+		 * see if invalidation ensues.
+		 */
+		if (entry->localrelvalid)
 		{
-			/* Table was renamed or dropped. */
-			entry->localrelvalid = false;
-		}
-		else if (!entry->localrelvalid)
-		{
-			/* Note we release the no-longer-useful lock here. */
-			table_close(entry->localrel, lockmode);
-			entry->localrel = NULL;
-		}
-	}
-
-	/*
-	 * If the entry has been marked invalid since we last had lock on it,
-	 * re-open the local relation by name and rebuild all derived data.
-	 */
-	if (!entry->localrelvalid)
-	{
-		Oid			relid;
-		TupleDesc	desc;
-		MemoryContext oldctx;
-		int			i;
-		Bitmapset  *missingatts;
-
-		/* Release the no-longer-useful attrmap, if any. */
-		if (entry->attrmap)
-		{
-			free_attrmap(entry->attrmap);
-			entry->attrmap = NULL;
-		}
-
-		/* Try to find and lock the relation by name. */
-		relid = RangeVarGetRelid(makeRangeVar(remoterel->nspname,
-											  remoterel->relname, -1),
-								 lockmode, true);
-		if (!OidIsValid(relid))
-		{
-			if (MySubscription != NULL &&
-				(MySubscription->ddl & PUBLICATION_DDL_TABLE) != 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("logical replication target relation \"%s.%s\" does not exist",
-								remoterel->nspname, remoterel->relname),
-						 errdetail("Subscription \"%s\" has ddl synchronization enabled for tables.",
-								   MySubscription->name),
-						 errhint("The apply worker will restart and retry after the required DDL is applied.")));
+			entry->localrel = try_table_open(entry->localreloid, lockmode);
+			if (!entry->localrel)
+			{
+				/* Table was renamed or dropped. */
+				entry->localrelvalid = false;
+			}
+			else if (!entry->localrelvalid)
+			{
+				/* Note we release the no-longer-useful lock here. */
+				table_close(entry->localrel, lockmode);
+				entry->localrel = NULL;
+			}
 			else
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("logical replication target relation \"%s.%s\" does not exist",
-								remoterel->nspname, remoterel->relname)));
+			{
+				localrel_opened = true;
+				localrel_lockmode = lockmode;
+			}
 		}
-		entry->localrel = table_open(relid, NoLock);
-		entry->localreloid = relid;
-
-		if (IsCatalogRelation(entry->localrel) &&
-			!IsLogicalRepSystemRelationOid(relid))
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("cannot use relation \"%s.%s\" as logical replication target",
-							remoterel->nspname, remoterel->relname),
-					 errdetail("This operation is not supported for system tables.")));
-
-		/* Check for supported relkind. */
-		CheckSubscriptionRelkind(entry->localrel->rd_rel->relkind,
-								 remoterel->nspname, remoterel->relname);
 
 		/*
-		 * Build the mapping of local attribute numbers to remote attribute
-		 * numbers and validate that we don't miss any replicated columns as
-		 * that would result in potentially unwanted data loss.
+		 * If the entry has been marked invalid since we last had lock on it,
+		 * re-open the local relation by name and rebuild all derived data.
 		 */
-		desc = RelationGetDescr(entry->localrel);
-		oldctx = MemoryContextSwitchTo(LogicalRepRelMapContext);
-		entry->attrmap = make_attrmap(desc->natts);
-		MemoryContextSwitchTo(oldctx);
-
-		/* check and report missing attrs, if any */
-		missingatts = bms_add_range(NULL, 0, remoterel->natts - 1);
-		for (i = 0; i < desc->natts; i++)
+		if (!entry->localrelvalid)
 		{
-			int			attnum;
-			Form_pg_attribute attr = TupleDescAttr(desc, i);
+			Oid			relid;
+			TupleDesc	desc;
+			MemoryContext oldctx;
+			int			i;
+			Bitmapset  *missingatts;
 
-			if (attr->attisdropped || attr->attgenerated)
+			/* Release the no-longer-useful attrmap, if any. */
+			if (entry->attrmap)
 			{
-				entry->attrmap->attnums[i] = -1;
-				continue;
+				free_attrmap(entry->attrmap);
+				entry->attrmap = NULL;
 			}
 
-			attnum = logicalrep_rel_att_by_name(remoterel,
-												NameStr(attr->attname));
+			/* Try to find and lock the relation by name. */
+			relid = RangeVarGetRelid(makeRangeVar(remoterel->nspname,
+												  remoterel->relname, -1),
+									 lockmode, true);
+			if (!OidIsValid(relid))
+			{
+				if (MySubscription != NULL &&
+					(MySubscription->ddl & PUBLICATION_DDL_TABLE) != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("logical replication target relation \"%s.%s\" does not exist",
+									remoterel->nspname, remoterel->relname),
+							 errdetail("Subscription \"%s\" has ddl synchronization enabled for tables.",
+									   MySubscription->name),
+							 errhint("The apply worker will restart and retry after the required DDL is applied.")));
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("logical replication target relation \"%s.%s\" does not exist",
+									remoterel->nspname, remoterel->relname)));
+			}
+			entry->localrel = table_open(relid, NoLock);
+			localrel_opened = true;
+			localrel_lockmode = NoLock;
+			entry->localreloid = relid;
 
-			entry->attrmap->attnums[i] = attnum;
-			if (attnum >= 0)
-				missingatts = bms_del_member(missingatts, attnum);
+			if (IsCatalogRelation(entry->localrel) &&
+				!IsLogicalRepSystemRelationOid(relid))
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("cannot use relation \"%s.%s\" as logical replication target",
+								remoterel->nspname, remoterel->relname),
+						 errdetail("This operation is not supported for system tables.")));
+
+			/* Check for supported relkind. */
+			CheckSubscriptionRelkind(entry->localrel->rd_rel->relkind,
+									 remoterel->nspname, remoterel->relname);
+
+			/*
+			 * Build the mapping of local attribute numbers to remote attribute
+			 * numbers and validate that we don't miss any replicated columns as
+			 * that would result in potentially unwanted data loss.
+			 */
+			desc = RelationGetDescr(entry->localrel);
+			oldctx = MemoryContextSwitchTo(LogicalRepRelMapContext);
+			entry->attrmap = make_attrmap(desc->natts);
+			MemoryContextSwitchTo(oldctx);
+
+			/* check and report missing attrs, if any */
+			missingatts = bms_add_range(NULL, 0, remoterel->natts - 1);
+			for (i = 0; i < desc->natts; i++)
+			{
+				int			attnum;
+				Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+				if (attr->attisdropped || attr->attgenerated)
+				{
+					entry->attrmap->attnums[i] = -1;
+					continue;
+				}
+
+				attnum = logicalrep_rel_att_by_name(remoterel,
+													NameStr(attr->attname));
+
+				entry->attrmap->attnums[i] = attnum;
+				if (attnum >= 0)
+					missingatts = bms_del_member(missingatts, attnum);
+			}
+
+			logicalrep_report_missing_attrs(remoterel, missingatts);
+
+			/* be tidy */
+			bms_free(missingatts);
+
+			/*
+			 * Set if the table's replica identity is enough to apply
+			 * update/delete.
+			 */
+			logicalrep_rel_mark_updatable(entry);
+
+			/*
+			 * Finding a usable index is an infrequent task. It occurs when an
+			 * operation is first performed on the relation, or after invalidation
+			 * of the relation cache entry (such as ANALYZE or CREATE/DROP index
+			 * on the relation).
+			 */
+			entry->localindexoid = FindLogicalRepLocalIndex(entry->localrel, remoterel,
+															entry->attrmap);
+
+			entry->localrelvalid = true;
 		}
 
-		logicalrep_report_missing_attrs(remoterel, missingatts);
-
-		/* be tidy */
-		bms_free(missingatts);
-
 		/*
-		 * Set if the table's replica identity is enough to apply
-		 * update/delete.
+		 * Whitelisted system relations are replication metadata and are not
+		 * tracked in pg_subscription_rel. Treat them as always ready.
 		 */
-		logicalrep_rel_mark_updatable(entry);
-
-		/*
-		 * Finding a usable index is an infrequent task. It occurs when an
-		 * operation is first performed on the relation, or after invalidation
-		 * of the relation cache entry (such as ANALYZE or CREATE/DROP index
-		 * on the relation).
-		 */
-		entry->localindexoid = FindLogicalRepLocalIndex(entry->localrel, remoterel,
-														entry->attrmap);
-
-		entry->localrelvalid = true;
+		if (IsLogicalRepSystemRelationOid(entry->localreloid))
+		{
+			entry->state = SUBREL_STATE_READY;
+			entry->statelsn = InvalidXLogRecPtr;
+		}
+		else if (entry->state != SUBREL_STATE_READY)
+			entry->state = GetSubscriptionRelState(MySubscription->oid,
+												   entry->localreloid,
+												   &entry->statelsn);
 	}
-
-	/*
-	 * Whitelisted system relations are replication metadata and are not
-	 * tracked in pg_subscription_rel. Treat them as always ready.
-	 */
-	if (IsLogicalRepSystemRelationOid(entry->localreloid))
+	PG_CATCH();
 	{
-		entry->state = SUBREL_STATE_READY;
-		entry->statelsn = InvalidXLogRecPtr;
+		/*
+		 * If relation-open fails midway, don't leave a dangling cached pointer.
+		 * The next caller will rebuild from catalog state.
+		 */
+		if (localrel_opened && entry->localrel != NULL)
+		{
+			table_close(entry->localrel, localrel_lockmode);
+			entry->localrel = NULL;
+		}
+		entry->localrelvalid = false;
+		PG_RE_THROW();
 	}
-	else if (entry->state != SUBREL_STATE_READY)
-		entry->state = GetSubscriptionRelState(MySubscription->oid,
-											   entry->localreloid,
-											   &entry->statelsn);
+	PG_END_TRY();
 
 	return entry;
 }
