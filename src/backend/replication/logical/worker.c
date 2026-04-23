@@ -641,20 +641,36 @@ logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
 									   LOCKMODE lockmode,
 									   LogicalRepRelMapEntry **rel)
 {
+	MemoryContext oldcontext = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+
 	if (logicalrep_rel_is_paused(relid))
 		return false;
 
 	*rel = NULL;
 
+	/*
+	 * Run relation-open in an internal subxact so skipped errors don't leak
+	 * partially acquired relcache/resources into the outer apply transaction.
+	 */
+	BeginInternalSubTransaction("logical replication relation open");
+	MemoryContextSwitchTo(oldcontext);
+
 	PG_TRY();
 	{
 		*rel = logicalrep_rel_open(relid, lockmode);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *edata = CopyErrorData();
 
 		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
 
 			if (MySubscription != NULL &&
 				(edata->sqlerrcode == ERRCODE_UNDEFINED_TABLE ||
@@ -2997,7 +3013,18 @@ execute_publication_sync_sql_command(const char *sql)
 		{
 			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
 			QueryCompletion qc;
+			MemoryContext stmtcontext = CurrentMemoryContext;
+			ResourceOwner oldowner = CurrentResourceOwner;
 			bool		snapshot_popped = false;
+
+			/*
+			 * Run each DDL utility statement in its own internal subxact. If
+			 * we decide to ignore a duplicate/conflict error and continue, the
+			 * rollback path must still release relations, catcache refs, tupdescs,
+			 * and other resources opened by ProcessUtility.
+			 */
+			BeginInternalSubTransaction("publication sync apply statement");
+			MemoryContextSwitchTo(stmtcontext);
 
 			CommandCounterIncrement();
 			PushActiveSnapshot(GetTransactionSnapshot());
@@ -3024,15 +3051,29 @@ execute_publication_sync_sql_command(const char *sql)
 							   NULL,
 							   dest,
 							   &qc);
+
+				PopActiveSnapshot();
+				snapshot_popped = true;
+				ReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(stmtcontext);
+				CurrentResourceOwner = oldowner;
 			}
 			PG_CATCH();
 			{
 				ErrorData  *edata;
 
-				PopActiveSnapshot();
-				snapshot_popped = true;
+				if (!snapshot_popped && ActiveSnapshotSet())
+				{
+					PopActiveSnapshot();
+					snapshot_popped = true;
+				}
+
+				MemoryContextSwitchTo(stmtcontext);
 				edata = CopyErrorData();
 				FlushErrorState();
+				RollbackAndReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(stmtcontext);
+				CurrentResourceOwner = oldowner;
 
 				if (publication_sync_should_ignore_ddl_error(stmt->utilityStmt,
 															 edata))
