@@ -1044,6 +1044,8 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	List	   *target_ancestors = NIL;
 	List	   *matched_pubs = NIL;
 	bool		multi_drop_scope_filter = false;
+	Oid			renamed_schema_nspid = InvalidOid;
+	char	   *renamed_schema_name = NULL;
 
 	if (!IsNormalProcessingMode() || IsBootstrapProcessingMode())
 		return;
@@ -1071,6 +1073,18 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 	ddlmask = UtilityStmtDDLMask(parsetree);
 	if (ddlmask == 0)
 		goto done;
+
+	if (IsA(parsetree, RenameStmt) &&
+		((RenameStmt *) parsetree)->renameType == OBJECT_SCHEMA)
+	{
+		renamed_schema_nspid =
+			get_namespace_oid(((RenameStmt *) parsetree)->subname, true);
+		if (OidIsValid(renamed_schema_nspid))
+		{
+			target_schemapubids = GetSchemaPublications(renamed_schema_nspid);
+			renamed_schema_name = get_namespace_name(renamed_schema_nspid);
+		}
+	}
 
 	needs_rel_scope_filter = UtilityStmtNeedsRelationScopeFilter(ddlmask);
 	if (IsA(parsetree, DropStmt) &&
@@ -1117,7 +1131,20 @@ CapturePublicationSyncDDL(PlannedStmt *pstmt, const char *queryString)
 		if (!PublicationShouldCaptureDDL(pubform, ddlmask, &msg_ddlmask))
 			continue;
 		if (!PublicationAllowsDDLMaskByScope(pubform, ddlmask))
+		{
+			if (OidIsValid(renamed_schema_nspid) &&
+				!pubform->puballtables &&
+				list_member_oid(target_schemapubids, pubform->oid))
+			{
+				ereport(WARNING,
+						(errmsg("ALTER SCHEMA on \"%s\" is not synchronized by publication \"%s\" in current FOR scope",
+								renamed_schema_name != NULL ? renamed_schema_name : "<unknown>",
+								NameStr(pubform->pubname)),
+						 errdetail("FOR TABLE and FOR TABLES IN SCHEMA synchronize only ddl options \"table,index\"."),
+						 errhint("Apply ALTER SCHEMA manually on subscribers, or use FOR ALL TABLES with ddl option \"schema\".")));
+			}
 			continue;
+		}
 		if (needs_rel_scope_filter)
 		{
 			if (multi_drop_scope_filter)
@@ -1250,6 +1277,8 @@ done:
 		pfree(ddl_sql);
 	if (ddl_search_path != NULL)
 		pfree(ddl_search_path);
+	if (renamed_schema_name != NULL)
+		pfree(renamed_schema_name);
 }
 
 /*

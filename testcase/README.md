@@ -61,3 +61,5 @@ cd testcase
 3. 收到该表新的 `RELATION` 元数据后可恢复该表 apply。
 4. 多对象 `DROP` 混合范围（部分在发布范围内、部分不在）时跳过捕获并告警；全在范围内时正常捕获，并写入编码后的 `pfsynctargetlist`。
 5. 多订阅并发回放同一 publication DDL 时（`schema/table/index`），重复对象错误会被忽略，worker 不崩溃循环。
+6. 缺表进入 pause 后，后续 `Q` 消息成功创建该表可恢复该表的 DML apply（无需额外刷新）。
+7. `FOR TABLES IN SCHEMA` 场景执行 `ALTER SCHEMA` 会产生显式 warning（提示当前 FOR 范围不自动同步该类 DDL）。

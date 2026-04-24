@@ -203,6 +203,33 @@ logicalrep_relmap_update(LogicalRepRelation *remoterel)
 }
 
 /*
+ * Fetch cached remote namespace/relation names for a remote relation id.
+ *
+ * Returns false when no relation metadata has been cached yet for remoteid.
+ */
+bool
+logicalrep_get_remote_relation_name(LogicalRepRelId remoteid,
+									const char **nspname,
+									const char **relname)
+{
+	LogicalRepRelMapEntry *entry;
+
+	if (LogicalRepRelMap == NULL)
+		return false;
+
+	entry = hash_search(LogicalRepRelMap, &remoteid, HASH_FIND, NULL);
+	if (entry == NULL)
+		return false;
+
+	if (nspname != NULL)
+		*nspname = entry->remoterel.nspname;
+	if (relname != NULL)
+		*relname = entry->remoterel.relname;
+
+	return true;
+}
+
+/*
  * Find attribute index in TupleDesc struct by attribute name.
  *
  * Returns -1 if not found.

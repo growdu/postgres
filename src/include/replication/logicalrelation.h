@@ -48,6 +48,9 @@ extern LogicalRepRelMapEntry *logicalrep_partition_open(LogicalRepRelMapEntry *r
 														Relation partrel, AttrMap *map);
 extern void logicalrep_rel_close(LogicalRepRelMapEntry *rel,
 								 LOCKMODE lockmode);
+extern bool logicalrep_get_remote_relation_name(LogicalRepRelId remoteid,
+												const char **nspname,
+												const char **relname);
 extern bool IsIndexUsableForReplicaIdentityFull(IndexInfo *indexInfo, AttrMap *attrmap);
 extern Oid	GetRelationIdentityOrPK(Relation rel);
 

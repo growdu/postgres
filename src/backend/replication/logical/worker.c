@@ -297,6 +297,9 @@ typedef enum PublicationSyncMessageKind
 typedef struct MissingTargetRelEntry
 {
 	LogicalRepRelId remoteid;
+	char		nspname[NAMEDATALEN];
+	char		relname[NAMEDATALEN];
+	bool		name_valid;
 } MissingTargetRelEntry;
 
 typedef struct PublicationSyncLifecycleTarget
@@ -421,6 +424,9 @@ static bool logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
 static bool logicalrep_rel_is_paused(LogicalRepRelId relid);
 static void logicalrep_rel_pause(LogicalRepRelId relid);
 static void logicalrep_rel_resume(LogicalRepRelId relid);
+static void logicalrep_rel_resume_by_name(const char *nspname,
+											const char *relname);
+static void logicalrep_rel_resume_by_local_relid(Oid localrelid);
 static void apply_handle_insert_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot);
@@ -582,6 +588,8 @@ logicalrep_rel_pause(LogicalRepRelId relid)
 	MissingTargetRelEntry *entry;
 	long		nentries;
 	HASHCTL		ctl;
+	const char *nspname = NULL;
+	const char *relname = NULL;
 
 	if (MissingTargetRelMap == NULL)
 	{
@@ -624,7 +632,22 @@ logicalrep_rel_pause(LogicalRepRelId relid)
 		}
 	}
 
-	(void) hash_search(MissingTargetRelMap, &relid, HASH_ENTER, NULL);
+	entry = hash_search(MissingTargetRelMap, &relid, HASH_ENTER, NULL);
+	if (entry == NULL)
+		return;
+
+	entry->remoteid = relid;
+	entry->name_valid = false;
+	entry->nspname[0] = '\0';
+	entry->relname[0] = '\0';
+
+	if (logicalrep_get_remote_relation_name(relid, &nspname, &relname) &&
+		nspname != NULL && relname != NULL)
+	{
+		strlcpy(entry->nspname, nspname, sizeof(entry->nspname));
+		strlcpy(entry->relname, relname, sizeof(entry->relname));
+		entry->name_valid = true;
+	}
 }
 
 static void
@@ -634,6 +657,69 @@ logicalrep_rel_resume(LogicalRepRelId relid)
 		return;
 
 	(void) hash_search(MissingTargetRelMap, &relid, HASH_REMOVE, NULL);
+}
+
+static void
+logicalrep_rel_resume_by_name(const char *nspname, const char *relname)
+{
+	HASH_SEQ_STATUS status;
+	MissingTargetRelEntry *entry;
+	List	   *resume_relids = NIL;
+	ListCell   *lc;
+
+	if (MissingTargetRelMap == NULL || nspname == NULL || relname == NULL)
+		return;
+
+	hash_seq_init(&status, MissingTargetRelMap);
+	while ((entry = (MissingTargetRelEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (!entry->name_valid)
+			continue;
+
+		if (strcmp(entry->nspname, nspname) == 0 &&
+			strcmp(entry->relname, relname) == 0)
+			resume_relids = lappend_oid(resume_relids, (Oid) entry->remoteid);
+	}
+	hash_seq_term(&status);
+
+	foreach(lc, resume_relids)
+	{
+		LogicalRepRelId remoteid = (LogicalRepRelId) lfirst_oid(lc);
+
+		(void) hash_search(MissingTargetRelMap, &remoteid, HASH_REMOVE, NULL);
+	}
+
+	list_free(resume_relids);
+}
+
+static void
+logicalrep_rel_resume_by_local_relid(Oid localrelid)
+{
+	Oid			nspid;
+	char	   *nspname;
+	char	   *relname;
+
+	if (!OidIsValid(localrelid))
+		return;
+
+	nspid = get_rel_namespace(localrelid);
+	if (!OidIsValid(nspid))
+		return;
+
+	nspname = get_namespace_name(nspid);
+	relname = get_rel_name(localrelid);
+	if (nspname == NULL || relname == NULL)
+	{
+		if (nspname != NULL)
+			pfree(nspname);
+		if (relname != NULL)
+			pfree(relname);
+		return;
+	}
+
+	logicalrep_rel_resume_by_name(nspname, relname);
+	pfree(nspname);
+	pfree(relname);
 }
 
 static bool
@@ -2975,7 +3061,10 @@ execute_publication_sync_sql_command(const char *sql)
 		MemoryContext per_parsetree_context;
 		MemoryContext oldcontext;
 		List	   *stmt_list;
-		ListCell   *lc2;
+		MemoryContext stmtcontext;
+		ResourceOwner oldowner;
+		bool		snapshot_popped = false;
+		Node	   *failed_utility_stmt = NULL;
 
 		per_parsetree_context =
 			AllocSetContextCreate(CurrentMemoryContext,
@@ -2993,33 +3082,37 @@ execute_publication_sync_sql_command(const char *sql)
 													   NULL);
 		stmt_list = pg_plan_queries(stmt_list, sql, CURSOR_OPT_PARALLEL_OK, NULL);
 
-		foreach(lc2, stmt_list)
+		stmtcontext = CurrentMemoryContext;
+		oldowner = CurrentResourceOwner;
+
+		/*
+		 * Execute the whole raw DDL statement in one internal subtransaction,
+		 * so partially-failed multi-target rewrites can be rolled back as a
+		 * single unit.
+		 */
+		BeginInternalSubTransaction("publication sync apply statement");
+		MemoryContextSwitchTo(stmtcontext);
+
+		PG_TRY();
 		{
-			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
-			QueryCompletion qc;
-			MemoryContext stmtcontext = CurrentMemoryContext;
-			ResourceOwner oldowner = CurrentResourceOwner;
-			bool		snapshot_popped = false;
+			ListCell   *lc2;
 
-			/*
-			 * Run each DDL utility statement in its own internal subxact. If
-			 * we decide to ignore a duplicate/conflict error and continue, the
-			 * rollback path must still release relations, catcache refs, tupdescs,
-			 * and other resources opened by ProcessUtility.
-			 */
-			BeginInternalSubTransaction("publication sync apply statement");
-			MemoryContextSwitchTo(stmtcontext);
-
-			CommandCounterIncrement();
 			PushActiveSnapshot(GetTransactionSnapshot());
-			InitializeQueryCompletion(&qc);
+			CommandCounterIncrement();
 
-			PG_TRY();
+			foreach(lc2, stmt_list)
 			{
+				PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
+				QueryCompletion qc;
+
+				InitializeQueryCompletion(&qc);
+
 				if (stmt->utilityStmt == NULL)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("pg_publication_sync message type \"Q\" only supports utility statements")));
+
+				failed_utility_stmt = stmt->utilityStmt;
 
 				if (IsA(stmt->utilityStmt, TransactionStmt))
 					ereport(ERROR,
@@ -3035,69 +3128,69 @@ execute_publication_sync_sql_command(const char *sql)
 							   NULL,
 							   dest,
 							   &qc);
+			}
 
+				PopActiveSnapshot();
+			snapshot_popped = true;
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(stmtcontext);
+			CurrentResourceOwner = oldowner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			if (!snapshot_popped && ActiveSnapshotSet())
+			{
 				PopActiveSnapshot();
 				snapshot_popped = true;
-				ReleaseCurrentSubTransaction();
-				MemoryContextSwitchTo(stmtcontext);
-				CurrentResourceOwner = oldowner;
 			}
-			PG_CATCH();
+
+			MemoryContextSwitchTo(stmtcontext);
+			edata = CopyErrorData();
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(stmtcontext);
+			CurrentResourceOwner = oldowner;
+
+			if (publication_sync_should_ignore_ddl_error(failed_utility_stmt,
+														 edata))
 			{
-				ErrorData  *edata;
-
-				if (!snapshot_popped && ActiveSnapshotSet())
-				{
-					PopActiveSnapshot();
-					snapshot_popped = true;
-				}
-
-				MemoryContextSwitchTo(stmtcontext);
-				edata = CopyErrorData();
-				FlushErrorState();
-				RollbackAndReleaseCurrentSubTransaction();
-				MemoryContextSwitchTo(stmtcontext);
-				CurrentResourceOwner = oldowner;
-
-				if (publication_sync_should_ignore_ddl_error(stmt->utilityStmt,
-															 edata))
-				{
-					ereport(DEBUG1,
-							(errmsg_internal("skipping idempotent publication-sync DDL error"),
-							 errdetail_internal("statement type: %d, sqlstate: %s",
-												nodeTag(stmt->utilityStmt),
-												unpack_sql_state(edata->sqlerrcode))));
-					FreeErrorData(edata);
-				}
-				else if (publication_sync_should_skip_extension_error(stmt->utilityStmt))
-				{
-					ereport(WARNING,
-							(errmsg("skipping failed CREATE EXTENSION from publication-sync"),
-							 errdetail("sqlstate: %s, message: %s",
-									   unpack_sql_state(edata->sqlerrcode),
-									   edata->message ? edata->message : "unknown"),
-							 errhint("Install required extension files on subscriber and run CREATE EXTENSION manually if needed.")));
-					FreeErrorData(edata);
-				}
-				else if (publication_sync_should_skip_ddl_precondition_error(edata->sqlerrcode))
-				{
-					ereport(WARNING,
-							(errmsg("skipping publication-sync DDL due to unmet prerequisite"),
-							 errdetail("statement type: %d, sqlstate: %s, message: %s",
-									   nodeTag(stmt->utilityStmt),
-									   unpack_sql_state(edata->sqlerrcode),
-									   edata->message ? edata->message : "unknown"),
-							 errhint("Ensure subscriber schema objects exist or adjust publication ddl options if this DDL should be replicated.")));
-					FreeErrorData(edata);
-				}
-				else
-					ReThrowError(edata);
+				ereport(DEBUG1,
+						(errmsg_internal("skipping idempotent publication-sync DDL error"),
+						 errdetail_internal("statement type: %d, sqlstate: %s",
+											failed_utility_stmt ? nodeTag(failed_utility_stmt) : 0,
+											unpack_sql_state(edata->sqlerrcode))));
+				FreeErrorData(edata);
 			}
-			PG_END_TRY();
-
-			if (!snapshot_popped)
-				PopActiveSnapshot();
+			else if (publication_sync_should_skip_extension_error(failed_utility_stmt))
+			{
+				ereport(WARNING,
+						(errmsg("skipping failed CREATE EXTENSION from publication-sync"),
+						 errdetail("sqlstate: %s, message: %s",
+								   unpack_sql_state(edata->sqlerrcode),
+								   edata->message ? edata->message : "unknown"),
+						 errhint("Install required extension files on subscriber and run CREATE EXTENSION manually if needed.")));
+				FreeErrorData(edata);
+			}
+			else if (publication_sync_should_skip_ddl_precondition_error(edata->sqlerrcode))
+			{
+				ereport(WARNING,
+						(errmsg("skipping publication-sync DDL due to unmet prerequisite"),
+						 errdetail("statement type: %d, sqlstate: %s, message: %s",
+								   failed_utility_stmt ? nodeTag(failed_utility_stmt) : 0,
+								   unpack_sql_state(edata->sqlerrcode),
+								   edata->message ? edata->message : "unknown"),
+						 errhint("Ensure subscriber schema objects exist or adjust publication ddl options if this DDL should be replicated.")));
+				FreeErrorData(edata);
+			}
+			else
+				ReThrowError(edata);
 		}
+		PG_END_TRY();
+
+		if (!snapshot_popped && ActiveSnapshotSet())
+			PopActiveSnapshot();
 
 		MemoryContextSwitchTo(oldcontext);
 		MemoryContextDelete(per_parsetree_context);
@@ -3168,26 +3261,6 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 	if (!isnull)
 		ddlmask = DatumGetInt64(ddlmaskdatum);
 
-	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
-	{
-		List	   *target_tables = publication_sync_collect_target_tables(newslot);
-
-		foreach(lc, target_tables)
-		{
-			char	   *target_table = (char *) lfirst(lc);
-			PublicationSyncLifecycleTarget *target;
-
-			target = palloc(sizeof(PublicationSyncLifecycleTarget));
-			target->target_table = target_table;
-			target->relid_before =
-				publication_sync_lookup_target_relid_by_name(target_table, true);
-			lifecycle_targets = lappend(lifecycle_targets, target);
-		}
-
-		/* target_table ownership moved to lifecycle_targets entries. */
-		list_free(target_tables);
-	}
-
 	saved_search_path = GetConfigOptionByName("search_path", NULL, false);
 
 	PG_TRY();
@@ -3196,7 +3269,84 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 								 PGC_USERSET, PGC_S_SESSION,
 								 GUC_ACTION_SET, true, 0, false);
 
+		if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
+		{
+			List	   *target_tables = publication_sync_collect_target_tables(newslot);
+
+			foreach(lc, target_tables)
+			{
+				char	   *target_table = (char *) lfirst(lc);
+				PublicationSyncLifecycleTarget *target;
+
+				target = palloc(sizeof(PublicationSyncLifecycleTarget));
+				target->target_table = target_table;
+				target->relid_before =
+					publication_sync_lookup_target_relid_by_name(target_table, true);
+				lifecycle_targets = lappend(lifecycle_targets, target);
+			}
+
+			/* target_table ownership moved to lifecycle_targets entries. */
+			list_free(target_tables);
+		}
+
 		execute_publication_sync_sql_command(ddl_sql);
+
+		/*
+		 * Keep subscription relation lifecycle aligned with replicated TABLE DDL:
+		 * when a table appears, register it for synchronization; when it
+		 * disappears, remove its mapping and stop any per-table worker.
+		 */
+		if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
+		{
+			foreach(lc, lifecycle_targets)
+			{
+				PublicationSyncLifecycleTarget *target =
+					(PublicationSyncLifecycleTarget *) lfirst(lc);
+				Oid			relid_after;
+				bool		relid_before_still_exists = false;
+
+				relid_after = publication_sync_lookup_target_relid_by_name(target->target_table,
+																		   true);
+				if (OidIsValid(target->relid_before))
+					relid_before_still_exists =
+						SearchSysCacheExists1(RELOID,
+											  ObjectIdGetDatum(target->relid_before));
+
+				if (!OidIsValid(target->relid_before) && OidIsValid(relid_after))
+				{
+					relstate = GetSubscriptionRelState(MySubscription->oid,
+													   relid_after, &sublsn);
+					if (relstate == SUBREL_STATE_UNKNOWN)
+					{
+						AddSubscriptionRelState(MySubscription->oid, relid_after,
+												SUBREL_STATE_INIT,
+												InvalidXLogRecPtr, false);
+						LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+						CommandCounterIncrement();
+					}
+
+					/* Resume per-relation DML apply paused on missing target. */
+					logicalrep_rel_resume_by_local_relid(relid_after);
+				}
+				else if (OidIsValid(target->relid_before) &&
+						 !OidIsValid(relid_after) &&
+						 !relid_before_still_exists)
+				{
+					relstate = GetSubscriptionRelState(MySubscription->oid,
+													   target->relid_before, &sublsn);
+					if (relstate != SUBREL_STATE_UNKNOWN)
+					{
+						RemoveSubscriptionRel(MySubscription->oid,
+											  target->relid_before);
+						CommandCounterIncrement();
+					}
+
+					logicalrep_worker_stop(MySubscription->oid,
+										   target->relid_before);
+					LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+				}
+			}
+		}
 
 		(void) set_config_option("search_path", saved_search_path,
 								 PGC_USERSET, PGC_S_SESSION,
@@ -3210,60 +3360,6 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
-	/*
-	 * Keep subscription relation lifecycle aligned with replicated TABLE DDL:
-	 * when a table appears, register it for synchronization; when it
-	 * disappears, remove its mapping and stop any per-table worker.
-	 */
-	if ((ddlmask & PUBLICATION_DDL_TABLE) != 0)
-	{
-		foreach(lc, lifecycle_targets)
-		{
-			PublicationSyncLifecycleTarget *target =
-				(PublicationSyncLifecycleTarget *) lfirst(lc);
-			Oid			relid_after;
-			bool		relid_before_still_exists = false;
-
-			relid_after = publication_sync_lookup_target_relid_by_name(target->target_table,
-																	   true);
-			if (OidIsValid(target->relid_before))
-				relid_before_still_exists =
-					SearchSysCacheExists1(RELOID,
-										  ObjectIdGetDatum(target->relid_before));
-
-			if (!OidIsValid(target->relid_before) && OidIsValid(relid_after))
-			{
-				relstate = GetSubscriptionRelState(MySubscription->oid,
-												   relid_after, &sublsn);
-				if (relstate == SUBREL_STATE_UNKNOWN)
-				{
-					AddSubscriptionRelState(MySubscription->oid, relid_after,
-											SUBREL_STATE_INIT,
-											InvalidXLogRecPtr, false);
-					LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
-					CommandCounterIncrement();
-				}
-			}
-			else if (OidIsValid(target->relid_before) &&
-					 !OidIsValid(relid_after) &&
-					 !relid_before_still_exists)
-			{
-				relstate = GetSubscriptionRelState(MySubscription->oid,
-												   target->relid_before, &sublsn);
-				if (relstate != SUBREL_STATE_UNKNOWN)
-				{
-					RemoveSubscriptionRel(MySubscription->oid,
-										  target->relid_before);
-					CommandCounterIncrement();
-				}
-
-				logicalrep_worker_stop(MySubscription->oid,
-									   target->relid_before);
-				LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
-			}
-		}
-	}
 
 	foreach(lc, lifecycle_targets)
 	{
@@ -3295,6 +3391,7 @@ apply_publication_sync_message_a(TupleTableSlot *newslot)
 	name_list = stringToQualifiedNameList(target_table, NULL);
 	rv = makeRangeVarFromNameList(name_list);
 	relid = RangeVarGetRelid(rv, NoLock, false);
+	logicalrep_rel_resume_by_local_relid(relid);
 	relstate = GetSubscriptionRelState(MySubscription->oid, relid, &sublsn);
 	if (relstate == SUBREL_STATE_UNKNOWN)
 	{

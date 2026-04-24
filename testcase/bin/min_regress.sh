@@ -10,6 +10,8 @@ cases=(
   "$CASE_DIR/case_03_resume_on_relation_refresh.sh"
   "$CASE_DIR/case_04_mixed_scope_drop_skip.sh"
   "$CASE_DIR/case_05_multi_sub_duplicate_ddl.sh"
+  "$CASE_DIR/case_06_resume_on_q_create.sh"
+  "$CASE_DIR/case_07_alter_schema_warning.sh"
 )
 
 for c in "${cases[@]}"; do
