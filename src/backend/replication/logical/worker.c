@@ -294,6 +294,21 @@ typedef enum PublicationSyncMessageKind
 	PUBLICATION_SYNC_MSG_UNKNOWN
 } PublicationSyncMessageKind;
 
+typedef enum PublicationSyncDdlErrorAction
+{
+	/* Re-throw the original error and let apply worker follow normal failure path. */
+	PUBLICATION_SYNC_DDL_ERROR_RETHROW = 0,
+	/* Ignore idempotent duplicate replay errors caused by concurrent DDL. */
+	PUBLICATION_SYNC_DDL_ERROR_IGNORE_IDEMPOTENT,
+	/* Skip prerequisite-missing errors to keep other relations applying. */
+	PUBLICATION_SYNC_DDL_ERROR_SKIP_PRECONDITION,
+	/*
+	 * Skip non-critical environment/dialect mismatch errors that are safe to
+	 * handle as best-effort. CREATE EXTENSION mismatch is one instance.
+	 */
+	PUBLICATION_SYNC_DDL_ERROR_SKIP_NONCRITICAL
+} PublicationSyncDdlErrorAction;
+
 typedef struct MissingTargetRelEntry
 {
 	LogicalRepRelId remoteid;
@@ -306,6 +321,7 @@ typedef struct PublicationSyncLifecycleTarget
 {
 	char	   *target_table;
 	Oid			relid_before;
+	bool		subrel_removed_before_exec;
 } PublicationSyncLifecycleTarget;
 
 /* errcontext tracker */
@@ -419,13 +435,14 @@ static void send_feedback(XLogRecPtr recvpos, bool force, bool requestReply);
 
 static void apply_handle_commit_internal(LogicalRepCommitData *commit_data);
 static bool logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
-													LOCKMODE lockmode,
-													LogicalRepRelMapEntry **rel);
+														LOCKMODE lockmode,
+														LogicalRepRelMapEntry **rel);
 static bool logicalrep_rel_is_paused(LogicalRepRelId relid);
 static void logicalrep_rel_pause(LogicalRepRelId relid);
 static void logicalrep_rel_resume(LogicalRepRelId relid);
+static bool logicalrep_rel_target_missing_locally(LogicalRepRelId relid);
 static void logicalrep_rel_resume_by_name(const char *nspname,
-											const char *relname);
+												const char *relname);
 static void logicalrep_rel_resume_by_local_relid(Oid localrelid);
 static void apply_handle_insert_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
@@ -443,12 +460,13 @@ static void apply_handle_ddl(StringInfo s);
 static bool publication_sync_row_matches_subscription(TupleTableSlot *newslot);
 static Oid publication_sync_lookup_target_relid_by_name(const char *target_table,
 														   bool missing_ok);
+static bool publication_sync_sql_has_drop_table(const char *sql);
 static List *publication_sync_decode_target_table_list(const char *encoded);
 static List *publication_sync_collect_target_tables(TupleTableSlot *newslot);
 static char *publication_sync_require_single_target_table(TupleTableSlot *newslot,
-														  char message_type);
-static bool publication_sync_should_ignore_ddl_error(Node *utility_stmt,
-													 const ErrorData *edata);
+															  char message_type);
+static PublicationSyncDdlErrorAction publication_sync_classify_ddl_error(const ErrorData *edata,
+																		  Node *utility_stmt);
 static void execute_publication_sync_sql_command(const char *sql);
 static PublicationSyncMessageKind decode_publication_sync_message_type(char message_type);
 static void apply_publication_sync_message_q(TupleTableSlot *newslot);
@@ -722,6 +740,35 @@ logicalrep_rel_resume_by_local_relid(Oid localrelid)
 	pfree(relname);
 }
 
+/*
+ * Best-effort probe to detect whether the remote relation currently has no
+ * local target relation. We intentionally avoid swallowing relation-open
+ * ERROR in apply path without an internal subtransaction, because continuing
+ * after that can leave relation resources with broken ownership.
+ */
+static bool
+logicalrep_rel_target_missing_locally(LogicalRepRelId relid)
+{
+	const char *nspname = NULL;
+	const char *relname = NULL;
+	Oid			nspid;
+	Oid			localrelid;
+
+	if (!logicalrep_get_remote_relation_name(relid, &nspname, &relname))
+		return false;
+
+	if (nspname == NULL || relname == NULL ||
+		nspname[0] == '\0' || relname[0] == '\0')
+		return false;
+
+	nspid = get_namespace_oid(nspname, true);
+	if (!OidIsValid(nspid))
+		return true;
+
+	localrelid = get_relname_relid(relname, nspid);
+	return !OidIsValid(localrelid);
+}
+
 static bool
 logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
 									   LOCKMODE lockmode,
@@ -732,40 +779,26 @@ logicalrep_rel_open_maybe_skip_missing(LogicalRepRelId relid,
 
 	*rel = NULL;
 
-	PG_TRY();
+	if (MySubscription != NULL &&
+		logicalrep_rel_target_missing_locally(relid))
 	{
-		*rel = logicalrep_rel_open(relid, lockmode);
+		char	   *hint;
+
+		if ((MySubscription->ddl & PUBLICATION_DDL_TABLE) != 0)
+			hint = "Fix failed table DDL prerequisites (for example missing schema/tablespace) or create the table manually, then refresh relation metadata to resume this relation.";
+		else
+			hint = "Enable ddl option \"table\" or create the table manually, then refresh relation metadata to resume this relation.";
+
+		logicalrep_rel_pause(relid);
+		ereport(WARNING,
+				(errmsg("pausing replicated apply for missing target relation"),
+				 errdetail("subscription \"%s\", remote relation id %u",
+						   MySubscription->name, relid),
+				 errhint("%s", hint)));
+		return false;
 	}
-	PG_CATCH();
-	{
-		ErrorData  *edata = CopyErrorData();
 
-		FlushErrorState();
-
-			if (MySubscription != NULL &&
-				(edata->sqlerrcode == ERRCODE_UNDEFINED_TABLE ||
-				 edata->sqlerrcode == ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE))
-			{
-				char	   *hint;
-
-				if ((MySubscription->ddl & PUBLICATION_DDL_TABLE) != 0)
-					hint = "Fix failed table DDL prerequisites (for example missing schema/tablespace) or create the table manually, then refresh relation metadata to resume this relation.";
-				else
-					hint = "Enable ddl option \"table\" or create the table manually, then refresh relation metadata to resume this relation.";
-
-				logicalrep_rel_pause(relid);
-				ereport(WARNING,
-						(errmsg("pausing replicated apply for missing target relation"),
-						 errdetail("subscription \"%s\", remote relation id %u",
-								   MySubscription->name, relid),
-						 errhint("%s", hint)));
-				FreeErrorData(edata);
-				return false;
-			}
-
-		ReThrowError(edata);
-	}
-	PG_END_TRY();
+	*rel = logicalrep_rel_open(relid, lockmode);
 
 	return true;
 }
@@ -2815,6 +2848,41 @@ publication_sync_lookup_target_relid_by_name(const char *target_table,
 	return relid;
 }
 
+/*
+ * Detect whether the captured DDL SQL contains DROP of relation-like objects.
+ * This is used to pre-remove pg_subscription_rel mapping before DROP executes,
+ * so heap.c's relation-drop path won't fail on non-ready tablesync states.
+ */
+static bool
+publication_sync_sql_has_drop_table(const char *sql)
+{
+	List	   *raw_parsetree_list;
+	ListCell   *lc;
+
+	if (sql == NULL || sql[0] == '\0')
+		return false;
+
+	raw_parsetree_list = pg_parse_query(sql);
+	foreach(lc, raw_parsetree_list)
+	{
+		RawStmt    *rawstmt = lfirst_node(RawStmt, lc);
+		Node	   *stmt = rawstmt->stmt;
+
+		if (IsA(stmt, DropStmt))
+		{
+			DropStmt   *drop_stmt = (DropStmt *) stmt;
+
+			if (drop_stmt->removeType == OBJECT_TABLE ||
+				drop_stmt->removeType == OBJECT_FOREIGN_TABLE ||
+				drop_stmt->removeType == OBJECT_VIEW ||
+				drop_stmt->removeType == OBJECT_MATVIEW)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 static uint32
 publication_sync_parse_uint(const char **cursor, const char *end,
 							const char *context)
@@ -2953,30 +3021,54 @@ publication_sync_require_single_target_table(TupleTableSlot *newslot,
 	return target_table;
 }
 
-/*
- * Multi-subscription deployments can replay the same DDL concurrently.
- * Treat duplicate-* SQLSTATEs as idempotent so follower workers don't
- * crash-loop on "already exists" style errors.
- *
- * Some concurrent CREATE/ALTER DDL paths can surface as UNIQUE_VIOLATION on
- * pg_catalog indexes instead of duplicate-object SQLSTATEs. Treat those
- * catalog-key conflicts as idempotent as well.
- */
 static bool
-publication_sync_should_ignore_ddl_error(Node *utility_stmt,
-										 const ErrorData *edata)
+publication_sync_name_has_pg_prefix(const char *name)
+{
+	if (name == NULL)
+		return false;
+
+	return strncmp(name, "pg_", 3) == 0;
+}
+
+static bool
+publication_sync_is_catalog_unique_violation(const ErrorData *edata)
+{
+	if (edata == NULL)
+		return false;
+
+	if (edata->schema_name == NULL ||
+		strcmp(edata->schema_name, "pg_catalog") != 0)
+		return false;
+
+	return publication_sync_name_has_pg_prefix(edata->table_name) ||
+		publication_sync_name_has_pg_prefix(edata->constraint_name);
+}
+
+/*
+ * Centralized switch-case classifier for DDL apply errors.
+ *
+ * - IGNORE_IDEMPOTENT: safe duplicate replay in multi-subscription concurrency.
+ * - SKIP_PRECONDITION: prerequisite missing locally; keep worker alive.
+ * - SKIP_NONCRITICAL: best-effort skip for non-critical environment mismatch.
+ * - RETHROW: all other errors.
+ */
+static PublicationSyncDdlErrorAction
+publication_sync_classify_ddl_error(const ErrorData *edata, Node *utility_stmt)
 {
 	int			sqlerrcode;
 
-	if (utility_stmt == NULL)
-		return false;
 	if (edata == NULL)
-		return false;
+		return PUBLICATION_SYNC_DDL_ERROR_RETHROW;
 
 	sqlerrcode = edata->sqlerrcode;
 
 	switch (sqlerrcode)
 	{
+		/*
+		 * Multi-subscription deployments can replay the same DDL concurrently.
+		 * Treat duplicate-* SQLSTATEs as idempotent so follower workers don't
+		 * crash-loop on "already exists" style errors.
+		 */
 		case ERRCODE_DUPLICATE_OBJECT:
 		case ERRCODE_DUPLICATE_TABLE:
 		case ERRCODE_DUPLICATE_SCHEMA:
@@ -2984,58 +3076,43 @@ publication_sync_should_ignore_ddl_error(Node *utility_stmt,
 		case ERRCODE_DUPLICATE_COLUMN:
 		case ERRCODE_DUPLICATE_ALIAS:
 		case ERRCODE_DUPLICATE_DATABASE:
-			return true;
-		default:
-			break;
-	}
+		case ERRCODE_DUPLICATE_FILE:
+			return PUBLICATION_SYNC_DDL_ERROR_IGNORE_IDEMPOTENT;
 
-	if (sqlerrcode == ERRCODE_UNIQUE_VIOLATION &&
-		edata->schema_name != NULL &&
-		strcmp(edata->schema_name, "pg_catalog") == 0 &&
-		edata->table_name != NULL &&
-		strncmp(edata->table_name, "pg_", 3) == 0)
-		return true;
-
-	return false;
-}
-
-/*
- * CREATE EXTENSION can legitimately fail on subscriber when local extension
- * artifacts/environment differ from publisher. Skip to avoid endless apply
- * worker crash/restart loops on the same DDL payload.
- */
-static bool
-publication_sync_should_skip_extension_error(Node *utility_stmt)
-{
-	if (utility_stmt == NULL)
-		return false;
-
-	if (IsA(utility_stmt, CreateExtensionStmt))
-		return true;
-
-	return false;
-}
-
-/*
- * Keep apply worker alive on DDL prerequisite mismatches (for example schema
- * not present locally). This matches DML-side tolerance where one broken
- * relation should not block other relations from applying.
- */
-static bool
-publication_sync_should_skip_ddl_precondition_error(int sqlerrcode)
-{
-	switch (sqlerrcode)
-	{
+		/*
+		 * Keep apply worker alive on DDL prerequisite mismatches (for example
+		 * schema/table/function not present locally). This matches DML-side
+		 * tolerance where one broken relation should not block others.
+		 */
 		case ERRCODE_INVALID_SCHEMA_NAME:
 		case ERRCODE_UNDEFINED_TABLE:
+		case ERRCODE_UNDEFINED_COLUMN:
+		case ERRCODE_UNDEFINED_FUNCTION:
 		case ERRCODE_UNDEFINED_OBJECT:
 		case ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE:
-			return true;
+			return PUBLICATION_SYNC_DDL_ERROR_SKIP_PRECONDITION;
+
+		/*
+		 * Some concurrent CREATE/ALTER DDL paths can surface as UNIQUE_VIOLATION
+		 * on pg_catalog indexes instead of duplicate-object SQLSTATEs.
+		 */
+		case ERRCODE_UNIQUE_VIOLATION:
+			if (publication_sync_is_catalog_unique_violation(edata))
+				return PUBLICATION_SYNC_DDL_ERROR_IGNORE_IDEMPOTENT;
+			break;
+
 		default:
 			break;
 	}
 
-	return false;
+	/*
+	 * CREATE EXTENSION can legitimately fail on subscriber when local extension
+	 * artifacts/environment differ from publisher.
+	 */
+	if (utility_stmt != NULL && IsA(utility_stmt, CreateExtensionStmt))
+		return PUBLICATION_SYNC_DDL_ERROR_SKIP_NONCRITICAL;
+
+	return PUBLICATION_SYNC_DDL_ERROR_RETHROW;
 }
 
 /*
@@ -3060,27 +3137,16 @@ execute_publication_sync_sql_command(const char *sql)
 		RawStmt    *parsetree = lfirst_node(RawStmt, lc1);
 		MemoryContext per_parsetree_context;
 		MemoryContext oldcontext;
-		List	   *stmt_list;
 		MemoryContext stmtcontext;
 		ResourceOwner oldowner;
 		bool		snapshot_popped = false;
-		Node	   *failed_utility_stmt = NULL;
+		Node	   *failed_utility_stmt = parsetree->stmt;
 
 		per_parsetree_context =
 			AllocSetContextCreate(CurrentMemoryContext,
 								  "publication sync apply per-statement context",
 								  ALLOCSET_DEFAULT_SIZES);
 		oldcontext = MemoryContextSwitchTo(per_parsetree_context);
-
-		/* Let parser/planner see any DDL done by previous statements. */
-		CommandCounterIncrement();
-
-		stmt_list = pg_analyze_and_rewrite_fixedparams(parsetree,
-													   sql,
-													   NULL,
-													   0,
-													   NULL);
-		stmt_list = pg_plan_queries(stmt_list, sql, CURSOR_OPT_PARALLEL_OK, NULL);
 
 		stmtcontext = CurrentMemoryContext;
 		oldowner = CurrentResourceOwner;
@@ -3095,7 +3161,18 @@ execute_publication_sync_sql_command(const char *sql)
 
 		PG_TRY();
 		{
+			List	   *stmt_list;
 			ListCell   *lc2;
+
+			/* Let parser/planner see any DDL done by previous statements. */
+			CommandCounterIncrement();
+
+			stmt_list = pg_analyze_and_rewrite_fixedparams(parsetree,
+														   sql,
+														   NULL,
+														   0,
+														   NULL);
+			stmt_list = pg_plan_queries(stmt_list, sql, CURSOR_OPT_PARALLEL_OK, NULL);
 
 			PushActiveSnapshot(GetTransactionSnapshot());
 			CommandCounterIncrement();
@@ -3139,6 +3216,7 @@ execute_publication_sync_sql_command(const char *sql)
 		PG_CATCH();
 		{
 			ErrorData  *edata;
+			PublicationSyncDdlErrorAction action;
 
 			if (!snapshot_popped && ActiveSnapshotSet())
 			{
@@ -3153,39 +3231,53 @@ execute_publication_sync_sql_command(const char *sql)
 			MemoryContextSwitchTo(stmtcontext);
 			CurrentResourceOwner = oldowner;
 
-			if (publication_sync_should_ignore_ddl_error(failed_utility_stmt,
-														 edata))
+			action = publication_sync_classify_ddl_error(edata, failed_utility_stmt);
+			switch (action)
 			{
-				ereport(DEBUG1,
-						(errmsg_internal("skipping idempotent publication-sync DDL error"),
-						 errdetail_internal("statement type: %d, sqlstate: %s",
-											failed_utility_stmt ? nodeTag(failed_utility_stmt) : 0,
-											unpack_sql_state(edata->sqlerrcode))));
-				FreeErrorData(edata);
+				case PUBLICATION_SYNC_DDL_ERROR_IGNORE_IDEMPOTENT:
+					ereport(DEBUG1,
+							(errmsg_internal("skipping idempotent publication-sync DDL error"),
+							 errdetail_internal("statement type: %d, sqlstate: %s",
+												failed_utility_stmt ? nodeTag(failed_utility_stmt) : 0,
+												unpack_sql_state(edata->sqlerrcode))));
+					FreeErrorData(edata);
+					break;
+
+				case PUBLICATION_SYNC_DDL_ERROR_SKIP_NONCRITICAL:
+					if (failed_utility_stmt != NULL &&
+						IsA(failed_utility_stmt, CreateExtensionStmt))
+						ereport(WARNING,
+								(errmsg("skipping failed CREATE EXTENSION from publication-sync"),
+								 errdetail("sqlstate: %s, message: %s",
+										   unpack_sql_state(edata->sqlerrcode),
+										   edata->message ? edata->message : "unknown"),
+								 errhint("Install required extension files on subscriber and run CREATE EXTENSION manually if needed.")));
+					else
+						ereport(WARNING,
+								(errmsg("skipping non-critical publication-sync DDL error"),
+								 errdetail("statement type: %d, sqlstate: %s, message: %s",
+										   failed_utility_stmt ? nodeTag(failed_utility_stmt) : 0,
+										   unpack_sql_state(edata->sqlerrcode),
+										   edata->message ? edata->message : "unknown")));
+					FreeErrorData(edata);
+					break;
+
+				case PUBLICATION_SYNC_DDL_ERROR_SKIP_PRECONDITION:
+					ereport(WARNING,
+							(errmsg("skipping publication-sync DDL due to unmet prerequisite"),
+							 errdetail("statement type: %d, sqlstate: %s, message: %s",
+									   failed_utility_stmt ? nodeTag(failed_utility_stmt) : 0,
+									   unpack_sql_state(edata->sqlerrcode),
+									   edata->message ? edata->message : "unknown"),
+							 errhint("Ensure subscriber schema objects exist or adjust publication ddl options if this DDL should be replicated.")));
+					FreeErrorData(edata);
+					break;
+
+				case PUBLICATION_SYNC_DDL_ERROR_RETHROW:
+				default:
+					ReThrowError(edata);
+					break;
 			}
-			else if (publication_sync_should_skip_extension_error(failed_utility_stmt))
-			{
-				ereport(WARNING,
-						(errmsg("skipping failed CREATE EXTENSION from publication-sync"),
-						 errdetail("sqlstate: %s, message: %s",
-								   unpack_sql_state(edata->sqlerrcode),
-								   edata->message ? edata->message : "unknown"),
-						 errhint("Install required extension files on subscriber and run CREATE EXTENSION manually if needed.")));
-				FreeErrorData(edata);
-			}
-			else if (publication_sync_should_skip_ddl_precondition_error(edata->sqlerrcode))
-			{
-				ereport(WARNING,
-						(errmsg("skipping publication-sync DDL due to unmet prerequisite"),
-						 errdetail("statement type: %d, sqlstate: %s, message: %s",
-								   failed_utility_stmt ? nodeTag(failed_utility_stmt) : 0,
-								   unpack_sql_state(edata->sqlerrcode),
-								   edata->message ? edata->message : "unknown"),
-						 errhint("Ensure subscriber schema objects exist or adjust publication ddl options if this DDL should be replicated.")));
-				FreeErrorData(edata);
-			}
-			else
-				ReThrowError(edata);
 		}
 		PG_END_TRY();
 
@@ -3225,6 +3317,7 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 	char		relstate;
 	XLogRecPtr	sublsn;
 	List	   *lifecycle_targets = NIL;
+	bool		has_drop_table_stmt = false;
 	ListCell   *lc;
 
 	ddldatum = slot_getattr(newslot,
@@ -3282,11 +3375,49 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 				target->target_table = target_table;
 				target->relid_before =
 					publication_sync_lookup_target_relid_by_name(target_table, true);
+				target->subrel_removed_before_exec = false;
 				lifecycle_targets = lappend(lifecycle_targets, target);
 			}
 
 			/* target_table ownership moved to lifecycle_targets entries. */
 			list_free(target_tables);
+
+			/*
+			 * For DROP TABLE-style statements, pre-remove subscription mapping
+			 * so heap.c relation-drop path won't error on non-ready tablesync
+			 * states via RemoveSubscriptionRel(InvalidOid, relid).
+			 */
+			has_drop_table_stmt = publication_sync_sql_has_drop_table(ddl_sql);
+			if (has_drop_table_stmt)
+			{
+				bool		wakeup_needed = false;
+
+				foreach(lc, lifecycle_targets)
+				{
+					PublicationSyncLifecycleTarget *target =
+						(PublicationSyncLifecycleTarget *) lfirst(lc);
+
+					if (!OidIsValid(target->relid_before))
+						continue;
+
+					relstate = GetSubscriptionRelState(MySubscription->oid,
+													   target->relid_before,
+													   &sublsn);
+					if (relstate == SUBREL_STATE_UNKNOWN)
+						continue;
+
+					logicalrep_worker_stop(MySubscription->oid,
+										   target->relid_before);
+					RemoveSubscriptionRel(MySubscription->oid,
+										  target->relid_before);
+					target->subrel_removed_before_exec = true;
+					wakeup_needed = true;
+					CommandCounterIncrement();
+				}
+
+				if (wakeup_needed)
+					LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+			}
 		}
 
 		execute_publication_sync_sql_command(ddl_sql);
@@ -3332,23 +3463,26 @@ apply_publication_sync_message_q(TupleTableSlot *newslot)
 						 !OidIsValid(relid_after) &&
 						 !relid_before_still_exists)
 				{
-					relstate = GetSubscriptionRelState(MySubscription->oid,
-													   target->relid_before, &sublsn);
-					if (relstate != SUBREL_STATE_UNKNOWN)
+					if (!target->subrel_removed_before_exec)
 					{
-						RemoveSubscriptionRel(MySubscription->oid,
-											  target->relid_before);
-						CommandCounterIncrement();
-					}
+						relstate = GetSubscriptionRelState(MySubscription->oid,
+														   target->relid_before, &sublsn);
+						if (relstate != SUBREL_STATE_UNKNOWN)
+						{
+							RemoveSubscriptionRel(MySubscription->oid,
+												  target->relid_before);
+							CommandCounterIncrement();
+						}
 
-					logicalrep_worker_stop(MySubscription->oid,
-										   target->relid_before);
-					LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+						logicalrep_worker_stop(MySubscription->oid,
+											   target->relid_before);
+						LogicalRepWorkersWakeupAtCommit(MySubscription->oid);
+					}
 				}
 			}
 		}
 
-		(void) set_config_option("search_path", saved_search_path,
+			(void) set_config_option("search_path", saved_search_path,
 								 PGC_USERSET, PGC_S_SESSION,
 								 GUC_ACTION_SET, true, 0, false);
 	}

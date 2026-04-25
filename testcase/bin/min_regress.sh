@@ -12,6 +12,8 @@ cases=(
   "$CASE_DIR/case_05_multi_sub_duplicate_ddl.sh"
   "$CASE_DIR/case_06_resume_on_q_create.sh"
   "$CASE_DIR/case_07_alter_schema_warning.sh"
+  "$CASE_DIR/case_08_multi_sub_schema_duplicate.sh"
+  "$CASE_DIR/case_09_preexisting_table_duplicate.sh"
 )
 
 for c in "${cases[@]}"; do

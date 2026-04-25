@@ -63,3 +63,5 @@ cd testcase
 5. 多订阅并发回放同一 publication DDL 时（`schema/table/index`），重复对象错误会被忽略，worker 不崩溃循环。
 6. 缺表进入 pause 后，后续 `Q` 消息成功创建该表可恢复该表的 DML apply（无需额外刷新）。
 7. `FOR TABLES IN SCHEMA` 场景执行 `ALTER SCHEMA` 会产生显式 warning（提示当前 FOR 范围不自动同步该类 DDL）。
+8. 双订阅并发回放同一 `CREATE SCHEMA` 时，后执行者遇到 `schema already exists` 不应崩溃重启。
+9. 订阅端预先存在同名表时，发布端 `CREATE TABLE` 触发 `relation already exists` 不应导致 apply worker 崩溃循环。
