@@ -3044,6 +3044,53 @@ publication_sync_is_catalog_unique_violation(const ErrorData *edata)
 		publication_sync_name_has_pg_prefix(edata->constraint_name);
 }
 
+static bool
+publication_sync_is_relation_ddl_stmt(Node *utility_stmt)
+{
+	if (utility_stmt == NULL)
+		return false;
+
+	switch (nodeTag(utility_stmt))
+	{
+		case T_AlterTableStmt:
+		case T_IndexStmt:
+		case T_ReindexStmt:
+		case T_CreateTrigStmt:
+		case T_RenameStmt:
+		case T_AlterObjectSchemaStmt:
+		case T_AlterOwnerStmt:
+		case T_DropStmt:
+		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
+		case T_CreateTableAsStmt:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+publication_sync_should_rethrow_relation_prereq_error(int sqlerrcode, Node *utility_stmt)
+{
+	if (MySubscription == NULL)
+		return false;
+
+	if ((MySubscription->ddl & PUBLICATION_DDL_TABLE) == 0)
+		return false;
+
+	if (!publication_sync_is_relation_ddl_stmt(utility_stmt))
+		return false;
+
+	switch (sqlerrcode)
+	{
+		case ERRCODE_INVALID_SCHEMA_NAME:
+		case ERRCODE_UNDEFINED_TABLE:
+			return true;
+		default:
+			return false;
+	}
+}
+
 /*
  * Centralized switch-case classifier for DDL apply errors.
  *
@@ -3090,6 +3137,9 @@ publication_sync_classify_ddl_error(const ErrorData *edata, Node *utility_stmt)
 		case ERRCODE_UNDEFINED_FUNCTION:
 		case ERRCODE_UNDEFINED_OBJECT:
 		case ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE:
+			if (publication_sync_should_rethrow_relation_prereq_error(sqlerrcode,
+																	  utility_stmt))
+				return PUBLICATION_SYNC_DDL_ERROR_RETHROW;
 			return PUBLICATION_SYNC_DDL_ERROR_SKIP_PRECONDITION;
 
 		/*
