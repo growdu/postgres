@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL 查询解析流程</title>
+<style>
+:root {
+  --bg: #0f1419;
+  --card-bg: #1a1f2e;
+  --border: #2d3548;
+  --text: #e6edf3;
+  --muted: #7d8590;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --orange: #d29922;
+  --purple: #a371f7;
+  --red: #f85149;
+  --cyan: #39c5cf;
+  --yellow: #e3b341;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; }
+h1 { text-align: center; margin-bottom: 2rem; color: var(--accent); font-size: 1.8rem; }
+h2 { font-size: 1.2rem; margin-bottom: 1rem; color: var(--green); }
+
+.flow { max-width: 1100px; margin: 0 auto; }
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin: 0.6rem 0;
+}
+.row.sub { margin-left: 2rem; }
+
+.box {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1.25rem;
+  text-align: center;
+  min-width: 200px;
+  max-width: 260px;
+  position: relative;
+}
+.box.func { border-left: 3px solid var(--accent); }
+.box.data { border-left: 3px solid var(--green); }
+.box.step { border-left: 3px solid var(--orange); }
+.box code { color: var(--cyan); font-size: 0.85rem; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+.box .fn { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+.box .detail { font-size: 0.7rem; color: var(--muted); margin-top: 0.25rem; max-width: 240px; }
+
+.arrow { color: var(--accent); font-size: 1.2rem; padding: 0 0.4rem; }
+.arrow-down { display: block; text-align: center; font-size: 1.4rem; color: var(--accent); padding: 0.2rem 0; }
+
+.section { margin: 2rem 0; padding: 1.5rem; background: var(--card-bg); border-radius: 12px; border: 1px solid var(--border); }
+.section-title { font-size: 1rem; color: var(--yellow); margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
+
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem; }
+
+.info-box { background: #1a2634; border: 1px solid var(--accent); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+.info-box h3 { color: var(--accent); font-size: 0.9rem; margin-bottom: 0.5rem; }
+.info-box ul { margin-left: 1.2rem; font-size: 0.85rem; color: var(--muted); }
+.info-box li { margin: 0.3rem 0; }
+
+.legend { display: flex; gap: 1.5rem; justify-content: center; margin: 1rem 0; flex-wrap: wrap; }
+.legend-item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+.legend-dot.accent { background: var(--accent); }
+.legend-dot.green { background: var(--green); }
+.legend-dot.orange { background: var(--orange); }
+.legend-dot.purple { background: var(--purple); }
+
+.backup { background: #1c2a1c; border: 1px solid var(--green); border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0.3rem 0; font-size: 0.8rem; }
+.backup code { color: var(--green); font-family: monospace; }
+</style>
+</head>
+<body>
+
+<h1>PostgreSQL 查询解析流程 (pg_parse_query → Query)</h1>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot accent"></div> 函数/处理</div>
+  <div class="legend-item"><div class="legend-dot green"></div> 数据结构</div>
+  <div class="legend-item"><div class="legend-dot orange"></div> 关键步骤</div>
+  <div class="legend-item"><div class="legend-dot purple"></div> 分支/特殊情况</div>
+</div>
+
+<!-- Phase 1: 词法/语法解析 -->
+<div class="section">
+  <div class="section-title">阶段一：词法分析 + 语法解析 (Parsing)</div>
+  <div class="flow">
+    <div class="row">
+      <div class="box data"><code>SQL 字符串</code><div class="fn">用户输入</div></div>
+      <div class="arrow">→</div>
+      <div class="box func"><code>raw_parser()</code><div class="fn">parser.c:42</div><div class="detail">初始化 flex 词法扫描器和 bison 语法解析器</div></div>
+      <div class="arrow">→</div>
+      <div class="box data"><code>List&lt;RawStmt&gt;</code><div class="fn">原始语法树列表</div><div class="detail">未经语义分析，包含 stmt + location/len</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="info-box">
+      <h3>内部处理流程</h3>
+      <ul>
+        <li><code>scanner_init()</code> → 初始化 flex 词法分析器 (scan.l)</li>
+        <li><code>base_yyparse()</code> → 调用 bison 解析器 (gram.y)</li>
+        <li><code>base_yylex()</code> → 词法过滤器，处理多 token 向前看和大小写转换</li>
+        <li>gram.y 定义所有 SQL 语法规则，产出 RawStmt 节点</li>
+        <li><code>RAW_PARSE_DEFAULT</code> 模式：标准 SQL 解析；还支持 TYPE_NAME / PL/PGSQL_EXPR 等特殊模式</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- Phase 2: 语义分析 -->
+<div class="section">
+  <div class="section-title">阶段二：语义分析 (Parse Analysis / Transformation)</div>
+  <div class="flow">
+    <div class="row">
+      <div class="box data"><code>RawStmt</code><div class="fn">单条语法树</div></div>
+      <div class="arrow">→</div>
+      <div class="box func"><code>parse_analyze_*()</code><div class="fn">analyze.c:105/145/186</div><div class="detail">三种变体：固定参数 / 推断参数 / 回调</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="row">
+      <div class="box func"><code>make_parsestate()</code><div class="fn">创建解析状态</div></div>
+      <div class="arrow">→</div>
+      <div class="box func"><code>setup_parse_*</code><div class="fn">设置参数类型</div><div class="detail">fixed: 已知类型; variable: 推断类型</div></div>
+      <div class="arrow">→</div>
+      <div class="box func"><code>transformTopLevelStmt()</code><div class="fn">analyze.c:249</div><div class="detail">入口函数，处理 SELECT INTO 转换</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="row">
+      <div class="box step"><code>transformStmt()</code><div class="fn">核心变换</div><div class="detail">递归遍历语法树，产出 Query</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="row sub">
+      <div class="box func"><code>transformSelectStmt()</code><div class="fn">SELECT 语句</div></div>
+      <div style="width:20px"></div>
+      <div class="box func"><code>transformInsertStmt()</code><div class="fn">INSERT 语句</div></div>
+      <div style="width:20px"></div>
+      <div class="box func"><code>transformUpdateStmt()</code><div class="fn">UPDATE 语句</div></div>
+      <div style="width:20px"></div>
+      <div class="box func"><code>transformDeleteStmt()</code><div class="fn">DELETE 语句</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="row">
+      <div class="box func"><code>JumbleQuery()</code><div class="fn">计算 Query ID</div><div class="detail">生成查询归一化标识用于统计</div></div>
+      <div class="arrow">→</div>
+      <div class="box func"><code>post_parse_analyze_hook</code><div class="fn">钩子回调</div><div class="detail">可扩展的钩子点</div></div>
+      <div class="arrow">→</div>
+      <div class="box data"><code>Query</code><div class="fn">语义树</div><div class="detail">完成语义分析，缺少重写规则应用</div></div>
+    </div>
+  </div>
+  <div class="info-box" style="margin-top:1rem;">
+    <h3>三种 parse_analyze 变体</h3>
+    <ul>
+      <li><code>parse_analyze_fixedparams</code> — 参数类型已知（如 prepared statement）</li>
+      <li><code>parse_analyze_varparams</code> — 参数类型需从上下文推断（最常用，如 simple query）</li>
+      <li><code>parse_analyze_withcb</code> — 自定义解析回调（如某些扩展场景）</li>
+    </ul>
+  </div>
+</div>
+
+<!-- Phase 3: 重写 -->
+<div class="section">
+  <div class="section-title">阶段三：规则重写 (Rewrite)</div>
+  <div class="flow">
+    <div class="row">
+      <div class="box data"><code>Query</code><div class="fn">语义分析结果</div></div>
+      <div class="arrow">→</div>
+      <div class="box func"><code>pg_rewrite_query()</code><div class="fn">postgres.c:799</div></div>
+      <div class="arrow">→</div>
+      <div class="box step"><code>QueryRewrite()</code><div class="fn">rewriteHandler.c:4566</div><div class="detail">两步重写</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="row">
+      <div class="box func"><code>RewriteQuery()</code><div class="fn">Step 1: 应用表/视图规则</div><div class="detail">处理 INSTEAD/QUAL_INSTEAD 等规则</div></div>
+      <div class="arrow">→</div>
+      <div class="box func"><code>fireRIRrules()</code><div class="fn">Step 2: RULE FOR EACH ROW</div><div class="detail">应用行级规则，展开 RULE ... DO INSTEAD</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="row">
+      <div class="box step"><code>标记 canSetTag</code><div class="fn">确定命令结果归属</div><div class="detail">原始查询或最后一个 INSTEAD 查询</div></div>
+    </div>
+    <div class="arrow-down">↓</div>
+    <div class="info-box">
+      <h3>重写结果</h3>
+      <ul>
+        <li>一个输入 Query 可能展开为多个输出 Query（规则展开）</li>
+        <li>CMD_UTILITY 语句跳过重写，直接返回</li>
+        <li>RIR (Rule Instead of Row) 处理每个-qualified 行级规则</li>
+        <li>重写后保留 <code>queryId</code> 用于 pg_stat_statements</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- 调用关系总览 -->
+<div class="section">
+  <div class="section-title">完整流程总览</div>
+  <div class="flow">
+    <div class="row" style="gap:0.5rem;">
+      <div class="box data" style="min-width:120px;"><code>SQL</code></div>
+      <div class="arrow">→</div>
+      <div class="box func" style="min-width:180px;"><code>pg_parse_query</code><div class="fn">postgres:604</div></div>
+      <div class="arrow">→</div>
+      <div class="box data" style="min-width:160px;"><code>List&lt;RawStmt&gt;</code></div>
+      <div class="arrow">→</div>
+      <div class="box func" style="min-width:210px;"><code>pg_analyze_and_rewrite_*</code><div class="fn">postgres:666/705/759</div></div>
+      <div class="arrow">→</div>
+      <div class="box data" style="min-width:130px;"><code>Query</code></div>
+      <div class="arrow">→</div>
+      <div class="box func" style="min-width:160px;"><code>pg_rewrite_query</code><div class="fn">postgres:799</div></div>
+      <div class="arrow">→</div>
+      <div class="box data" style="min-width:160px;"><code>List&lt;Query&gt;</code></div>
+    </div>
+    <div style="text-align:center; margin-top:0.5rem; color: var(--muted); font-size: 0.8rem;">
+      raw_parser · parse_analyze · transformTopLevelStmt · transformStmt · QueryRewrite · RewriteQuery · fireRIRrules
+    </div>
+  </div>
+
+  <div class="info-box" style="margin-top:1.5rem;">
+    <h3>关键文件对应关系</h3>
+    <ul>
+      <li><code>postgres.c:604</code> — pg_parse_query() 入口</li>
+      <li><code>parser.c:42</code> — raw_parser() 词法/语法解析</li>
+      <li><code>analyze.c:105</code> — parse_analyze_fixedparams() 语义分析</li>
+      <li><code>analyze.c:249</code> — transformTopLevelStmt() 顶层语句变换</li>
+      <li><code>rewriteHandler.c:4566</code> — QueryRewrite() 规则重写</li>
+      <li><code>postgres.c:799</code> — pg_rewrite_query() 重写入口</li>
+    </ul>
+  </div>
+
+  <div class="grid-3" style="margin-top:1.5rem;">
+    <div class="backup"><code>pg_parse_query</code><br>raw_parser → List&lt;RawStmt&gt;</div>
+    <div class="backup"><code>pg_analyze_and_rewrite_*</code><br>parse_analyze → transformTopLevelStmt → Query</div>
+    <div class="backup"><code>pg_rewrite_query</code><br>QueryRewrite → RewriteQuery + fireRIRrules → List&lt;Query&gt;</div>
+  </div>
+</div>
+
+</body>
+</html>

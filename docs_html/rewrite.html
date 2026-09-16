@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>阶段三：规则重写</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #e6edf3; --muted: #8b949e;
+  --accent: #58a6ff; --green: #3fb950;
+  --orange: #d29922; --purple: #a371f7;
+  --red: #f85149; --cyan: #39c5cf; --yellow: #e3b341;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 1.5rem; }
+h1 { color: var(--purple); font-size: 1.5rem; margin-bottom: 0.3rem; }
+.back { color: var(--accent); font-size: 0.85rem; margin-bottom: 1.5rem; display: block; text-decoration: none; }
+.back:hover { text-decoration: underline; }
+h2 { font-size: 1rem; color: var(--green); margin: 1.5rem 0 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+h3 { font-size: 0.9rem; color: var(--yellow); margin: 1rem 0 0.5rem; }
+
+.section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; margin-bottom: 1.2rem; }
+
+.box { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem 1rem; margin: 0.5rem 0; }
+.code { color: var(--cyan); font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+.fn { font-size: 0.7rem; color: var(--muted); }
+.desc { font-size: 0.78rem; color: var(--muted); margin-top: 0.2rem; }
+
+.diagram { display: flex; align-items: center; justify-content: center; gap: 0.3rem; flex-wrap: wrap; margin: 0.8rem 0; }
+.node { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--purple); border-radius: 6px; padding: 0.5rem 0.8rem; text-align: center; min-width: 100px; }
+.node.arrow { border: none; background: none; min-width: 20px; color: var(--accent); font-size: 1.1rem; }
+
+ul { margin-left: 1.2rem; font-size: 0.82rem; color: var(--muted); }
+li { margin: 0.35rem 0; }
+li code { color: var(--cyan); font-size: 0.78rem; }
+
+.key { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--orange); border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0.4rem 0; font-size: 0.8rem; }
+.key code { color: var(--orange); }
+.key .note { color: var(--muted); font-size: 0.72rem; }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media(max-width:600px){.two-col{grid-template-columns:1fr}}
+
+.step-block { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--green); border-radius: 8px; padding: 0.8rem 1rem; margin: 0.6rem 0; }
+.step-block h4 { color: var(--green); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<a class="back" href="query.html">← 返回总览</a>
+<h1>阶段三：规则重写 (Rewrite)</h1>
+<p class="desc" style="margin-bottom:1rem">应用表/视图规则和 RIR 行级规则，展开为 List&lt;Query&gt;</p>
+
+<!-- 核心流程图 -->
+<div class="section">
+  <h2>重写流水线</h2>
+  <div class="diagram">
+    <div class="node"><div class="code">Query</div><div class="fn">语义树</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">pg_rewrite_query()</div><div class="fn">postgres.c:799</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">QueryRewrite()</div><div class="fn">rewriteHandler.c:4566</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">RewriteQuery()</div><div class="fn">Step 1: 表/视图规则</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">fireRIRrules()</div><div class="fn">Step 2: RIR 行级</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">List&lt;Query&gt;</div><div class="fn">重写后列表</div></div>
+  </div>
+</div>
+
+<!-- pg_rewrite_query -->
+<div class="section">
+  <h2>pg_rewrite_query() (postgres.c:799)</h2>
+  <div class="key">
+    <code>pg_rewrite_query(Query *query)</code>
+    <div class="note">区分 CMD_UTILITY 和普通查询的重写路径</div>
+  </div>
+  <ul>
+    <li><code>CMD_UTILITY</code> → 直接返回 <code>list_make1(query)</code>（不重写）</li>
+    <li>普通查询 → <code>QueryRewrite(query)</code></li>
+    <li>支持 <code>Debug_print_parse</code> 打印 parse tree</li>
+    <li>支持 <code>Debug_copy_parse_plan_trees</code> / <code>Debug_write_read_parse_plan_trees</code> 调试</li>
+  </ul>
+</div>
+
+<!-- QueryRewrite -->
+<div class="section">
+  <h2>QueryRewrite() — 三步重写 (rewriteHandler.c:4566)</h2>
+
+  <div class="step-block">
+    <h4>Step 1: RewriteQuery — 应用非 SELECT 规则</h4>
+    <div class="key"><code>RewriteQuery(parsetree, NIL, 0, 0)</code> <span class="note">rewriteHandler.c:3882</span></div>
+    <ul>
+      <li>扫描 Query.rtable 中每个表的规则（pg_rewrite 系统表）</li>
+      <li>处理 <code>INSTEAD</code> / <code>QUAL_INSTEAD</code> / <code>ALSO</code> 规则</li>
+      <li>INSTEAD 规则完全替代原操作；ALSO 规则附加执行</li>
+      <li>一个查询可能被展开为多个（规则展开）</li>
+    </ul>
+  </div>
+
+  <div class="step-block">
+    <h4>Step 2: fireRIRrules — 应用 RIR (Rule Instead of Row) 规则</h4>
+    <div class="key"><code>fireRIRrules(query, NIL)</code> <span class="note">rewriteHandler.c</span></div>
+    <ul>
+      <li>对每个 rewritten query 应用行级 INSTEAD 规则</li>
+      <li>遍历 jointree 找到每个 base relation 应用 RIR 规则</li>
+      <li>适用于 <code>CREATE RULE ... DO INSTEAD</code> 针对单行的规则</li>
+      <li>每个 Qualified 规则展开为独立 subquery</li>
+    </ul>
+  </div>
+
+  <div class="step-block">
+    <h4>Step 3: 标记 canSetTag</h4>
+    <ul>
+      <li>如果原始查询仍在结果列表中 → 原始查询设置标签</li>
+      <li>如果原始查询不在 → 最后一个同类型 INSTEAD 查询设置标签</li>
+      <li>确保命令完成标签正确归属</li>
+    </ul>
+  </div>
+</div>
+
+<!-- RewriteQuery 详解 -->
+<div class="section">
+  <h2>RewriteQuery() 详解 (rewriteHandler.c:3882)</h2>
+  <div class="key"><code>RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length, int rt_index)</code></div>
+  <ul>
+    <li>遍历 parsetree 的每个 RangeTblEntry，查找 pg_rewrite 中的规则</li>
+    <li>对于每个规则，生成 rule action 并展开到 query</li>
+    <li>规则条件（WHERE clause）被合并到规则动作中</li>
+    <li>递归处理子查询（subquery 中的规则）</li>
+    <li>使用 <code>AcquireRewriteLocks()</code> 确保规则引用的表被正确锁定</li>
+  </ul>
+</div>
+
+<!-- 规则类型 -->
+<div class="section">
+  <h2>规则类型</h2>
+  <div class="two-col">
+    <div>
+      <div class="key" style="border-left-color:var(--cyan)"><code>INSTEAD</code> — 完全替代</div>
+      <ul>
+        <li>原语句被完全替换为规则动作</li>
+        <li>常用于实现自动更新视图</li>
+      </ul>
+      <div class="key" style="border-left-color:var(--orange)"><code>ALSO</code> — 附加执行</div>
+      <ul>
+        <li>原语句正常执行，规则动作额外执行</li>
+        <li>可用于审计、触发器模拟</li>
+      </ul>
+    </div>
+    <div>
+      <div class="key" style="border-left-color:var(--purple)"><code>QUAL_INSTEAD</code> — 条件替代</div>
+      <ul>
+        <li>满足条件时替代，否则执行原语句</li>
+        <li>条件通过 AND 合并到规则动作的 WHERE 中</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- 重要约束 -->
+<div class="section">
+  <h2>重要约束与特性</h2>
+  <ul>
+    <li><code>QueryRewrite()</code> 仅应用于 <code>QSRC_ORIGINAL</code> 查询（来自解析器）</li>
+    <li>重写后保留 <code>queryId</code> 用于 pg_stat_statements</li>
+    <li>多语句 SQL（分号分隔）各自独立重写，但共享事务</li>
+    <li>规则展开可能导致单查询 → 多查询（需返回 List）</li>
+    <li>CMD_UTILITY 跳过重写（CREATE INDEX / VACUUM / GRANT 等）</li>
+  </ul>
+</div>
+
+<a class="back" href="query.html">← 返回总览</a>
+</body>
+</html>

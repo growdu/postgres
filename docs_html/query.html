@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL SQL 执行流程总览</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --orange: #d29922;
+  --purple: #a371f7;
+  --red: #f85149;
+  --cyan: #39c5cf;
+  --yellow: #e3b341;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; }
+h1 { text-align: center; margin-bottom: 0.5rem; color: var(--accent); font-size: 1.8rem; }
+.subtitle { text-align: center; color: var(--muted); font-size: 0.9rem; margin-bottom: 2rem; }
+
+.toc { max-width: 900px; margin: 0 auto 2rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; }
+.toc-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; text-decoration: none; color: var(--text); display: block; transition: border-color 0.2s, transform 0.15s; }
+.toc-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.toc-card h3 { color: var(--accent); margin-bottom: 0.4rem; font-size: 1rem; }
+.toc-card p { font-size: 0.8rem; color: var(--muted); }
+.toc-card .card-num { display: inline-block; background: var(--accent); color: var(--bg); border-radius: 50%; width: 24px; height: 24px; text-align: center; line-height: 24px; font-size: 0.75rem; font-weight: bold; margin-bottom: 0.5rem; }
+
+.flow-section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; max-width: 900px; margin-left: auto; margin-right: auto; }
+.flow-section h2 { font-size: 1.1rem; color: var(--green); margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+
+.main-flow { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 0.3rem; margin: 1rem 0; }
+.step { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 0.6rem 1rem; min-width: 120px; max-width: 160px; text-align: center; }
+.step.parser { border-left-color: var(--cyan); }
+.step.analysis { border-left-color: var(--green); }
+.step.rewrite { border-left-color: var(--purple); }
+.step.planning { border-left-color: var(--orange); }
+.step.execution { border-left-color: var(--red); }
+.step code { font-size: 0.8rem; color: var(--cyan); font-family: 'JetBrains Mono', monospace; }
+.step .fn { font-size: 0.68rem; color: var(--muted); }
+.step.arrow { border: none; background: none; min-width: 20px; color: var(--accent); font-size: 1.2rem; }
+
+.legend { display: flex; gap: 1.5rem; justify-content: center; margin: 1rem 0; flex-wrap: wrap; }
+.legend-item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.78rem; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+.key-file { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.8rem; font-size: 0.75rem; margin: 0.25rem 0; }
+.key-file code { color: var(--cyan); font-family: monospace; }
+.key-file .desc { color: var(--muted); }
+
+.detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+@media (max-width: 600px) { .detail-grid { grid-template-columns: 1fr; } }
+
+.detail-block { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+.detail-block h4 { font-size: 0.85rem; margin-bottom: 0.5rem; }
+.detail-block ul { margin-left: 1rem; font-size: 0.78rem; color: var(--muted); }
+.detail-block li { margin: 0.3rem 0; }
+.detail-block code { color: var(--cyan); font-size: 0.75rem; font-family: monospace; }
+
+.nav-bottom { max-width: 900px; margin: 2rem auto 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+.nav-btn { background: var(--card); border: 1px solid var(--accent); border-radius: 8px; padding: 0.8rem 1rem; text-align: center; text-decoration: none; color: var(--accent); font-size: 0.85rem; transition: background 0.2s; }
+.nav-btn:hover { background: #1f3a5f; }
+.nav-btn span { display: block; font-size: 0.7rem; color: var(--muted); margin-top: 0.2rem; }
+</style>
+</head>
+<body>
+
+<h1>PostgreSQL SQL 执行流程</h1>
+<p class="subtitle">从 pg_parse_query 到 ExecutorRun 的完整过程 — 基于 REL_18_STABLE</p>
+
+<!-- TOC -->
+<div class="toc">
+  <a class="toc-card" href="parsing.html">
+    <div class="card-num">1</div>
+    <h3>词法/语法解析</h3>
+    <p>raw_parser → flex + bison → List&lt;RawStmt&gt;</p>
+  </a>
+  <a class="toc-card" href="analysis.html">
+    <div class="card-num">2</div>
+    <h3>语义分析</h3>
+    <p>parse_analyze → transformStmt → Query</p>
+  </a>
+  <a class="toc-card" href="rewrite.html">
+    <div class="card-num">3</div>
+    <h3>规则重写</h3>
+    <p>QueryRewrite → RewriteQuery + fireRIRrules</p>
+  </a>
+  <a class="toc-card" href="planning.html">
+    <div class="card-num">4</div>
+    <h3>查询规划</h3>
+    <p>planner → standard_planner → create_plan</p>
+  </a>
+  <a class="toc-card" href="execution.html">
+    <div class="card-num">5</div>
+    <h3>执行器</h3>
+    <p>PortalRun → ProcessQuery → ExecutorStart/Run/End</p>
+  </a>
+</div>
+
+<!-- Main Flow -->
+<div class="flow-section">
+  <h2>完整执行流水线</h2>
+  <div class="main-flow">
+    <div class="step parser"><code>SQL</code><div class="fn">输入</div></div>
+    <div class="step arrow">→</div>
+    <div class="step parser"><code>pg_parse_query</code><div class="fn">postgres:604</div></div>
+    <div class="step arrow">→</div>
+    <div class="step parser"><code>raw_parser</code><div class="fn">parser:42</div></div>
+    <div class="step arrow">→</div>
+    <div class="step analysis"><code>parse_analyze_*</code><div class="fn">postgres:666</div></div>
+    <div class="step arrow">→</div>
+    <div class="step rewrite"><code>pg_rewrite_query</code><div class="fn">postgres:799</div></div>
+    <div class="step arrow">→</div>
+    <div class="step planning"><code>pg_plan_queries</code><div class="fn">postgres:971</div></div>
+    <div class="step arrow">→</div>
+    <div class="step execution"><code>PortalRun</code><div class="fn">pquery:685</div></div>
+    <div class="step arrow">→</div>
+    <div class="step execution"><code>ExecutorRun</code><div class="fn">executor/execExpr.c</div></div>
+  </div>
+  <p style="text-align:center; font-size:0.78rem; color:var(--muted); margin-top:0.5rem;">SELECT * FROM users WHERE id = 1;</p>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--cyan)"></div> 词法/语法解析</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> 语义分析</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--purple)"></div> 规则重写</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div> 查询规划</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> 执行器</div>
+  </div>
+</div>
+
+<!-- exec_simple_query detail -->
+<div class="flow-section">
+  <h2>核心入口：exec_simple_query (postgres.c:1012)</h2>
+  <div class="detail-grid">
+    <div class="detail-block">
+      <h4>事务控制</h4>
+      <ul>
+        <li><code>start_xact_command()</code> 开启事务命令</li>
+        <li><code>use_implicit_block</code> 多语句自动开启隐式事务块</li>
+        <li><code>finish_xact_command()</code> 结束事务命令</li>
+        <li><code>CommandCounterIncrement()</code> 命令计数器递增</li>
+      </ul>
+    </div>
+    <div class="detail-block">
+      <h4>每条语句的处理循环</h4>
+      <ul>
+        <li><code>pg_parse_query()</code> → 解析 SQL 字符串为 RawStmt 列表</li>
+        <li><code>analyze_requires_snapshot()</code> 判断是否需要快照</li>
+        <li><code>pg_analyze_and_rewrite_fixedparams()</code> → Query</li>
+        <li><code>pg_plan_queries()</code> → PlannedStmt</li>
+        <li><code>CreatePortal()</code> 创建 Portal (游标)</li>
+        <li><code>PortalStart()</code> 启动 Portal</li>
+        <li><code>PortalRun()</code> 执行查询</li>
+      </ul>
+    </div>
+    <div class="detail-block">
+      <h4>状态检查</h4>
+      <ul>
+        <li>abort 状态只允许 COMMIT/ABORT</li>
+        <li><code>CHECK_FOR_INTERRUPTS()</code> 在各阶段检查信号</li>
+        <li>多语句间重置 statement timeout</li>
+      </ul>
+    </div>
+    <div class="detail-block">
+      <h4>输出控制</h4>
+      <ul>
+        <li><code>CreateCommandTag()</code> 生成命令标签</li>
+        <li><code>DestReceiver</code> 决定结果发送目标</li>
+        <li><code>EndCommand()</code> 发送命令完成消息</li>
+        <li><code>check_log_duration()</code> 日志记录耗时</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- Key files -->
+<div class="flow-section">
+  <h2>关键文件索引</h2>
+  <div class="detail-grid">
+    <div>
+      <div class="key-file"><code>postgres.c</code> <span class="desc">— exec_simple_query (1012), pg_parse_query (604), pg_analyze_and_rewrite_* (666/705/759), pg_plan_queries (971)</span></div>
+      <div class="key-file"><code>parser.c</code> <span class="desc">— raw_parser (42), base_yylex 词法过滤器</span></div>
+      <div class="key-file"><code>parser/analyze.c</code> <span class="desc">— parse_analyze_* (105/145/186), transformTopLevelStmt (249)</span></div>
+      <div class="key-file"><code>rewrite/rewriteHandler.c</code> <span class="desc">— QueryRewrite (4566), RewriteQuery, fireRIRrules</span></div>
+    </div>
+    <div>
+      <div class="key-file"><code>optimizer/plan/planner.c</code> <span class="desc">— planner (287), standard_planner (303), subquery_planner</span></div>
+      <div class="key-file"><code>tcop/pquery.c</code> <span class="desc">— PortalRun (685), PortalRunMulti (1185), ProcessQuery (137)</span></div>
+      <div class="key-file"><code>executor/execExpr.c</code> <span class="desc">— ExecutorStart/Run/Finish/End</span></div>
+      <div class="key-file"><code>executor/execMain.c</code> <span class="desc">— ExecSelect, ExecInitNode, ExecutePlan</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- Sub-page navigation -->
+<div class="nav-bottom">
+  <a class="nav-btn" href="parsing.html">词法/语法解析 <span>raw_parser + flex/bison</span></a>
+  <a class="nav-btn" href="analysis.html">语义分析 <span>parse_analyze + transformStmt</span></a>
+  <a class="nav-btn" href="rewrite.html">规则重写 <span>QueryRewrite + RIR</span></a>
+  <a class="nav-btn" href="planning.html">查询规划 <span>planner + create_plan</span></a>
+  <a class="nav-btn" href="execution.html">执行器 <span>PortalRun + Executor</span></a>
+</div>
+
+</body>
+</html>

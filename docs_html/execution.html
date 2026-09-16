@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>阶段五：执行器</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #e6edf3; --muted: #8b949e;
+  --accent: #58a6ff; --green: #3fb950;
+  --orange: #d29922; --purple: #a371f7;
+  --red: #f85149; --cyan: #39c5cf; --yellow: #e3b341;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 1.5rem; }
+h1 { color: var(--red); font-size: 1.5rem; margin-bottom: 0.3rem; }
+.back { color: var(--accent); font-size: 0.85rem; margin-bottom: 1.5rem; display: block; text-decoration: none; }
+.back:hover { text-decoration: underline; }
+h2 { font-size: 1rem; color: var(--green); margin: 1.5rem 0 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+h3 { font-size: 0.9rem; color: var(--yellow); margin: 1rem 0 0.5rem; }
+
+.section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; margin-bottom: 1.2rem; }
+
+.box { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem 1rem; margin: 0.5rem 0; }
+.code { color: var(--cyan); font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+.fn { font-size: 0.7rem; color: var(--muted); }
+.desc { font-size: 0.78rem; color: var(--muted); margin-top: 0.2rem; }
+
+.diagram { display: flex; align-items: center; justify-content: center; gap: 0.3rem; flex-wrap: wrap; margin: 0.8rem 0; }
+.node { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--red); border-radius: 6px; padding: 0.5rem 0.8rem; text-align: center; min-width: 100px; }
+.node.arrow { border: none; background: none; min-width: 20px; color: var(--accent); font-size: 1.1rem; }
+
+ul { margin-left: 1.2rem; font-size: 0.82rem; color: var(--muted); }
+li { margin: 0.35rem 0; }
+li code { color: var(--cyan); font-size: 0.78rem; }
+
+.key { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--orange); border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0.4rem 0; font-size: 0.8rem; }
+.key code { color: var(--orange); }
+.key .note { color: var(--muted); font-size: 0.72rem; }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media(max-width:600px){.two-col{grid-template-columns:1fr}}
+
+.step-block { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--red); border-radius: 8px; padding: 0.8rem 1rem; margin: 0.6rem 0; }
+.step-block h4 { color: var(--red); font-size: 0.85rem; }
+
+.strategy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.8rem; margin-top: 0.8rem; }
+.strat-card { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--purple); border-radius: 8px; padding: 0.7rem; }
+.strat-card h4 { color: var(--purple); font-size: 0.8rem; }
+.strat-card .code { font-size: 0.72rem; }
+.strat-card .note { font-size: 0.68rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<a class="back" href="query.html">← 返回总览</a>
+<h1>阶段五：执行器 (Executor)</h1>
+<p class="desc" style="margin-bottom:1rem">通过 Portal 执行 PlannedStmt，返回结果给客户端</p>
+
+<!-- 核心流程图 -->
+<div class="section">
+  <h2>执行流水线</h2>
+  <div class="diagram">
+    <div class="node"><div class="code">PlannedStmt</div><div class="fn">执行计划</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">CreatePortal()</div><div class="fn">创建 Portal</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">PortalStart()</div><div class="fn">启动 Portal</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">PortalRun()</div><div class="fn">pquery.c:685</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">ProcessQuery()</div><div class="fn">pquery.c:137</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">ExecutorStart/Run/End</div><div class="fn">执行引擎</div></div>
+  </div>
+</div>
+
+<!-- Portal -->
+<div class="section">
+  <h2>Portal — 查询执行上下文</h2>
+  <div class="key"><code>Portal</code> — 游标/执行上下文，封装一条或多条语句的执行状态</div>
+  <ul>
+    <li><code>CreatePortal("", true,true)</code> — 创建无名 Portal（exec_simple_query 用）</li>
+    <li><code>visible = false</code> — 不在 pg_cursors 中显示</li>
+    <li><code>strategy</code> — 决定执行模式（PORTAL_ONE_SELECT / PORTAL_MULTI_QUERY 等）</li>
+    <li><code>stmts</code> — List&lt;PlannedStmt&gt; 要执行的语句列表</li>
+    <li><code>portalContext</code> — Portal 私有内存上下文</li>
+    <li><code>holdStore / holdSnapshot</code> — WITH HOLD 游标保留数据</li>
+  </ul>
+</div>
+
+<!-- PortalRun -->
+<div class="section">
+  <h2>PortalRun() — 分发执行 (pquery.c:685)</h2>
+  <div class="key"><code>PortalRun(Portal portal, long count, bool isTopLevel, DestReceiver *dest, DestReceiver *altdest, QueryCompletion *qc)</code></div>
+  <ul>
+    <li>设置 Portal 激活状态和资源所有者</li>
+    <li>根据 portal->strategy 分发到不同执行路径</li>
+    <li>TRACE_POSTGRESQL_QUERY_EXECUTE_START/DONE 追踪点</li>
+    <li>log_executor_stats 统计执行耗时</li>
+  </ul>
+
+  <div class="strategy-grid">
+    <div class="strat-card">
+      <h4>PORTAL_ONE_SELECT</h4>
+      <div class="code">PortalRunSelect</div>
+      <div class="note">单条 SELECT，使用 tuplestore 缓冲结果</div>
+    </div>
+    <div class="strat-card">
+      <h4>PORTAL_ONE_RETURNING</h4>
+      <div class="code">FillPortalStore + RunSelect</div>
+      <div class="note">带 RETURNING 的单条语句（INSERT/UPDATE/DELETE）</div>
+    </div>
+    <div class="strat-card">
+      <h4>PORTAL_ONE_MOD_WITH</h4>
+      <div class="code">FillPortalStore + RunSelect</div>
+      <div class="note">带 CTE 的单条修改语句</div>
+    </div>
+    <div class="strat-card">
+      <h4>PORTAL_MULTI_QUERY</h4>
+      <div class="code">PortalRunMulti</div>
+      <div class="note">多语句或非 SELECT 类查询（最常用）</div>
+    </div>
+  </div>
+</div>
+
+<!-- PortalRunMulti -->
+<div class="section">
+  <h2>PortalRunMulti() — 多语句执行 (pquery.c:1185)</h2>
+  <div class="step-block">
+    <h4>遍历 portal->stmts 列表</h4>
+    <ul>
+      <li>每条 PlannedStmt 单独处理</li>
+      <li>CHECK_FOR_INTERRUPTS() 中断检查</li>
+    </ul>
+  </div>
+  <div class="step-block">
+    <h4>plannable query（utilityStmt == NULL）</h4>
+    <ul>
+      <li>GetTransactionSnapshot() 获取事务快照（首次）或 UpdateActiveSnapshotCommandId()（后续）</li>
+      <li>ProcessQuery(pstmt, sourceText, params, dest, qc)</li>
+      <li>log_executor_stats 记录耗时</li>
+    </ul>
+  </div>
+  <div class="step-block">
+    <h4>utility query（CMD_UTILITY）</h4>
+    <ul>
+      <li>PortalRunUtility() 处理（不设置快照）</li>
+      <li>VACUUM / CREATE INDEX / GRANT 等直接执行</li>
+    </ul>
+  </div>
+  <div class="step-block">
+    <h4>收尾</h4>
+    <ul>
+      <li>CommandCounterIncrement() 命令计数递增</li>
+      <li>MemoryContextDeleteChildren() 清理临时内存</li>
+      <li>PopActiveSnapshot() 弹出快照</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ProcessQuery -->
+<div class="section">
+  <h2>ProcessQuery() — 单查询执行 (pquery.c:137)</h2>
+  <div class="key"><code>ProcessQuery(PlannedStmt *plan, const char *sourceText, ParamListInfo params, DestReceiver *dest, QueryCompletion *qc)</code></div>
+  <ul>
+    <li><code>CreateQueryDesc()</code> — 创建 QueryDesc（封装 plan + snapshot + dest）</li>
+    <li><code>ExecutorStart()</code> — 初始化执行器状态（ExecInitNode 树）</li>
+    <li><code>ExecutorRun()</code> — 驱动执行（ForwardScanDirection 扫描）</li>
+    <li><code>ExecutorFinish()</code> — 完成处理（FINAL 扫描）</li>
+    <li><code>ExecutorEnd()</code> — 清理资源（ExecEndNode 树）</li>
+    <li><code>SetQueryCompletion()</code> — 设置命令完成标签（SELECT/INSERT/UPDATE/DELETE）</li>
+  </ul>
+</div>
+
+<!-- ExecutorStart/Run/End -->
+<div class="section">
+  <h2>执行器核心 API (executor/execExpr.c / execMain.c)</h2>
+  <div class="two-col">
+    <div>
+      <div class="key"><code>ExecutorStart(QueryDesc *queryDesc, int eflags)</code></div>
+      <ul>
+        <li>创建 EState（执行器状态）</li>
+        <li>调用 ExecInitNode() 递归初始化 Plan 树</li>
+        <li>建立 tuple table / scan descriptor / 聚合状态</li>
+        <li>eflags 控制是否启用模糊游标/只读</li>
+      </ul>
+    </div>
+    <div>
+      <div class="key"><code>ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)</code></div>
+      <ul>
+        <li>从根节点向下驱动执行树</li>
+        <li>ScanDirection: ForwardScanDirection / BackwardScanDirection</li>
+        <li>count = 0 表示全部执行</li>
+        <li>结果通过 DestReceiver 输出到客户端</li>
+      </ul>
+    </div>
+  </div>
+  <div class="key" style="margin-top:0.8rem;"><code>ExecutorFinish()</code> / <code>ExecutorEnd()</code></div>
+  <ul>
+    <li>Finish: 执行器后处理（FINAL 节点处理）</li>
+    <li>End: 调用 ExecEndNode() 逐层清理，释放资源</li>
+  </ul>
+</div>
+
+<!-- DestReceiver -->
+<div class="section">
+  <h2>DestReceiver — 结果输出目标</h2>
+  <div class="key"><code>DestReceiver</code> — 接口，将执行结果路由到不同目的地</div>
+  <ul>
+    <li><code>DestRemote</code> — 通过扩展协议发送给客户端</li>
+    <li><code>DestSimple</code> — 简单输出（psql 控制台）</li>
+    <li><code>DestNone</code> — 丢弃结果（如规则展开的附加查询）</li>
+    <li><code>DestSPI</code> — SPI（存储过程/函数）内部调用</li>
+    <li><code>DestTuplestore</code> — 结果存入 tuplestore（游标）</li>
+  </ul>
+</div>
+
+<!-- 执行节点树 -->
+<div class="section">
+  <h2>执行计划节点树</h2>
+  <div class="key"><code>PlannedStmt.planTree</code> — Plan 节点树，递归执行</div>
+  <ul>
+    <li><strong>扫描节点</strong>：SeqScan / IndexScan / IndexOnlyScan / BitmapScan / TidScan / SubqueryScan</li>
+    <li><strong>连接节点</strong>：NestedLoop / HashJoin / MergeJoin</li>
+    <li><strong>聚集节点</strong>：Aggregate / HashAggregate / GroupAggregate / WindowAgg</li>
+    <li><strong>结果节点</strong>：Result / Append / MergeAppend</li>
+    <li><strong>修改节点</strong>：ModifyTable / Insert / Update / Delete / Merge</li>
+    <li><strong>控制节点</strong>：Sort / Limit / Unique / Material / Memoize / Gather</li>
+  </ul>
+</div>
+
+<a class="back" href="query.html">← 返回总览</a>
+</body>
+</html>

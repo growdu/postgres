@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>阶段二：语义分析</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #e6edf3; --muted: #8b949e;
+  --accent: #58a6ff; --green: #3fb950;
+  --orange: #d29922; --purple: #a371f7;
+  --red: #f85149; --cyan: #39c5cf; --yellow: #e3b341;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 1.5rem; }
+h1 { color: var(--green); font-size: 1.5rem; margin-bottom: 0.3rem; }
+.back { color: var(--accent); font-size: 0.85rem; margin-bottom: 1.5rem; display: block; text-decoration: none; }
+.back:hover { text-decoration: underline; }
+h2 { font-size: 1rem; color: var(--green); margin: 1.5rem 0 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+h3 { font-size: 0.9rem; color: var(--yellow); margin: 1rem 0 0.5rem; }
+
+.section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.2rem; margin-bottom: 1.2rem; }
+
+.box { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem 1rem; margin: 0.5rem 0; }
+.code { color: var(--cyan); font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+.fn { font-size: 0.7rem; color: var(--muted); }
+.desc { font-size: 0.78rem; color: var(--muted); margin-top: 0.2rem; }
+
+.diagram { display: flex; align-items: center; justify-content: center; gap: 0.3rem; flex-wrap: wrap; margin: 0.8rem 0; }
+.node { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--green); border-radius: 6px; padding: 0.5rem 0.8rem; text-align: center; min-width: 100px; }
+.node.arrow { border: none; background: none; min-width: 20px; color: var(--accent); font-size: 1.1rem; }
+
+ul { margin-left: 1.2rem; font-size: 0.82rem; color: var(--muted); }
+li { margin: 0.35rem 0; }
+li code { color: var(--cyan); font-size: 0.78rem; }
+
+.key { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--orange); border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0.4rem 0; font-size: 0.8rem; }
+.key code { color: var(--orange); }
+.key .note { color: var(--muted); font-size: 0.72rem; }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media(max-width:600px){.two-col{grid-template-columns:1fr}}
+
+.variants { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0.8rem; margin-top: 0.8rem; }
+.var-card { background: #0d1117; border: 1px solid var(--border); border-left: 3px solid var(--purple); border-radius: 8px; padding: 0.8rem; }
+.var-card h4 { color: var(--purple); font-size: 0.82rem; margin-bottom: 0.3rem; }
+.var-card .code { font-size: 0.72rem; }
+.var-card .note { font-size: 0.7rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<a class="back" href="query.html">← 返回总览</a>
+<h1>阶段二：语义分析 (Parse Analysis)</h1>
+<p class="desc" style="margin-bottom:1rem">将 RawStmt 转换为带语义信息的 Query 树</p>
+
+<!-- 核心流程图 -->
+<div class="section">
+  <h2>分析流水线</h2>
+  <div class="diagram">
+    <div class="node"><div class="code">RawStmt</div><div class="fn">语法树</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">make_parsestate()</div><div class="fn">创建 ParseState</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">setup_parse_*</div><div class="fn">设置参数类型</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">transformTopLevelStmt()</div><div class="fn">analyze.c:249</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">transformStmt()</div><div class="fn">递归变换</div></div>
+    <div class="node arrow">→</div>
+    <div class="node"><div class="code">Query</div><div class="fn">语义树</div></div>
+  </div>
+</div>
+
+<!-- 三种变体 -->
+<div class="section">
+  <h2>三种 parse_analyze 变体</h2>
+  <div class="variants">
+    <div class="var-card">
+      <h4>parse_analyze_fixedparams</h4>
+      <div class="code">analyze.c:105</div>
+      <div class="note">参数类型已知（如 prepared statement）直接使用</div>
+      <ul style="margin-top:0.4rem; font-size:0.72rem;">
+        <li>paramTypes[] 数组由调用者提供</li>
+        <li>最简单，无类型推断</li>
+      </ul>
+    </div>
+    <div class="var-card">
+      <h4>parse_analyze_varparams</h4>
+      <div class="code">analyze.c:145</div>
+      <div class="note">参数类型需从上下文推断（最常用）</div>
+      <ul style="margin-top:0.4rem; font-size:0.72rem;">
+        <li>用于 simple query 协议（SELECT * FROM t WHERE id = $1）</li>
+        <li><code>check_variable_parameters()</code> 验证推断结果</li>
+        <li>遇到 UNKNOWNOID 或 InvalidOid 则报错</li>
+      </ul>
+    </div>
+    <div class="var-card">
+      <h4>parse_analyze_withcb</h4>
+      <div class="code">analyze.c:186</div>
+      <div class="note">自定义 ParserSetupHook 解析参数</div>
+      <ul style="margin-top:0.4rem; font-size:0.72rem;">
+        <li>允许外部扩展介入参数类型解析</li>
+        <li>如某些 FDW 或定制化场景</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ParseState -->
+<div class="section">
+  <h2>ParseState — 分析上下文</h2>
+  <div class="key">
+    <code>ParseState</code> — 贯穿整个分析阶段的上下文结构
+  </div>
+  <ul>
+    <li><code>p_sourcetext</code> — 原始 SQL 字符串（用于错误定位）</li>
+    <li><code>p_queryEnv</code> — 查询环境（搜索路径、DDL 配置等）</li>
+    <li><code>p_param_types[]</code> / <code>p_num_params</code> — 参数类型信息</li>
+    <li><code>p_rtable</code> — 范围表（RangeTblEntry 列表，记录 FROM 子句）</li>
+    <li><code>p_joinlist</code> — JOIN 构建过程中的临时结构</li>
+    <li><code>p_namespace</code> — 当前名字空间（表/视图别名解析）</li>
+    <li><code>p_exprsubtype</code> — 表达式类型（用于区分不同解析上下文）</li>
+  </ul>
+</div>
+
+<!-- transformTopLevelStmt -->
+<div class="section">
+  <h2>transformTopLevelStmt() (analyze.c:249)</h2>
+  <div class="key">
+    <code>transformTopLevelStmt(ParseState *pstate, RawStmt *parseTree)</code>
+    <div class="note">调用 transformOptionalSelectInto 处理 SELECT INTO 转换</div>
+  </div>
+  <ul>
+    <li>顶层入口，设置 stmt_location 和 stmt_len 到结果 Query</li>
+    <li>处理 <code>SELECT ... INTO</code> → <code>CREATE TABLE AS</code> 转换</li>
+    <li>调用链：transformTopLevelStmt → transformOptionalSelectInto → transformStmt</li>
+  </ul>
+</div>
+
+<!-- transformStmt -->
+<div class="section">
+  <h2>transformStmt() — 核心递归变换</h2>
+  <div class="two-col">
+    <div>
+      <div class="key"><code>transformStmt() — analyze.c</code></div>
+      <ul>
+        <li>根据 stmt 类型分发到具体 transform 函数</li>
+        <li><code>transformSelectStmt()</code> — SELECT 处理</li>
+        <li><code>transformInsertStmt()</code> — INSERT 处理</li>
+        <li><code>transformUpdateStmt()</code> — UPDATE 处理</li>
+        <li><code>transformDeleteStmt()</code> — DELETE 处理</li>
+        <li><code>transformCreateStmt()</code> — DDL 处理</li>
+      </ul>
+    </div>
+    <div>
+      <div class="key">transformSelectStmt 分支</div>
+      <ul>
+        <li><code>transformTargetList()</code> — SELECT 列表解析</li>
+        <li><code>transformFromClause()</code> — FROM 子句解析</li>
+        <li><code>transformWhereClause()</code> — WHERE 条件解析</li>
+        <li><code>transformGroupClause()</code> — GROUP BY</li>
+        <li><code>transformWindowClause()</code> — WINDOW 子句</li>
+        <li><code>transformSortClause()</code> — ORDER BY</li>
+        <li><code>transformLimitClause()</code> — LIMIT</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- 语义分析内容 -->
+<div class="section">
+  <h2>语义分析做了什么</h2>
+  <ul>
+    <li><strong>表/列解析</strong>：将标识符解析为具体表、列、函数，验证是否存在</li>
+    <li><strong>类型推导</strong>：推断 $1 等参数的具体数据类型</li>
+    <li><strong>权限检查</strong>：验证用户是否有权访问引用的对象</li>
+    <li><strong>语法糖展开</strong>：SELECT * 展开为具体列，DEFAULT 表达式求值</li>
+    <li><strong>语义校验</strong>：JOIN 条件完整性、聚合函数合法性、GROUP BY 验证</li>
+    <li><strong>查询重写规则引用</strong>：建立规则查找的内部数据结构</li>
+    <li><strong>CTE/子查询处理</strong>：WITH RECURSIVE 展开，flatten 之子查询</li>
+  </ul>
+</div>
+
+<!-- 输出 -->
+<div class="section">
+  <h2>输出：Query</h2>
+  <div class="key"><code>Query</code> — 语义树，包含 cmdType / rtable / targetList / jointree / ...</div>
+  <ul>
+    <li><code>commandType</code> — CMD_SELECT / CMD_INSERT / CMD_UPDATE / CMD_DELETE / CMD_UTILITY</li>
+    <li><code>querySource</code> — QSRC_ORIGINAL（来自解析器）</li>
+    <li><code>canSetTag</code> — 是否可设置命令标签</li>
+    <li><code>rtable</code> — 范围表（所有引用的表/视图）</li>
+    <li><code>targetList</code> — 目标列列表</li>
+    <li><code>jointree</code> — JOIN 树结构</li>
+    <li><code>groupBy</code> / <code>having</code> — GROUP BY 及 HAVING</li>
+    <li><code>sortClause</code> — ORDER BY</li>
+    <li><code>limitOffset</code> / <code>limitCount</code> — LIMIT/OFFSET</li>
+    <li><code>returningList</code> — RETURNING 子句</li>
+  </ul>
+</div>
+
+<!-- JumbleQuery 和钩子 -->
+<div class="section">
+  <h2>附加处理</h2>
+  <div class="key"><code>JumbleQuery(query)</code> — 计算 queryId 用于 pg_stat_statements</div>
+  <ul>
+    <li>生成查询的归一化指纹（去除 literals 参数化）</li>
+    <li>归一化后相同结构的查询有相同 queryId</li>
+  </ul>
+  <div class="key"><code>post_parse_analyze_hook</code> — 可扩展钩子</div>
+  <ul>
+    <li>在 parse_analyze 完成之后、返回之前调用</li>
+    <li>允许扩展（如 pg_stat_statements）注入处理逻辑</li>
+  </ul>
+</div>
+
+<a class="back" href="query.html">← 返回总览</a>
+</body>
+</html>
