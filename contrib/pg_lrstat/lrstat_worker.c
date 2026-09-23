@@ -416,12 +416,17 @@ sample_subscriber(TimestampTz now, int *nsubs)
 					 NAMEDATALEN);
 			col_text(tup, td, FN(td, "worker_type"), m.worker_type,
 					 LR_STATE_LEN);
-			/* full copy: conninfo may exceed any sane stack buffer */
+			/*
+			 * Full copy: conninfo may exceed any sane stack buffer, and
+			 * TextDatumGetCString() may return a pointer straight into
+			 * the SPI tupletable (zero-copy for short varlenas), which
+			 * dies at SPI_finish() -- subs[] outlives it.
+			 */
 			(void) col_val(tup, td, FN(td, "subconninfo"), &isnull);
 			if (!isnull)
-				conninfo = TextDatumGetCString(col_val(tup, td,
+				conninfo = pstrdup(TextDatumGetCString(col_val(tup, td,
 											   FN(td, "subconninfo"),
-											   &isnull));
+											   &isnull)));
 
 			relid = DatumGetObjectId(col_val(tup, td, FN(td, "relid"), &isnull));
 			if (isnull)
@@ -468,10 +473,18 @@ sample_subscriber(TimestampTz now, int *nsubs)
 					continue;
 			}
 
+			/*
+			 * Note: repalloc() requires a non-NULL chunk (it reads the
+			 * chunk header unconditionally), so the first allocation
+			 * must go through palloc().
+			 */
 			if (n >= nalloc)
 			{
 				nalloc = nalloc == 0 ? 8 : nalloc * 2;
-				subs = repalloc(subs, nalloc * sizeof(LRRemoteSub));
+				if (subs == NULL)
+					subs = palloc(nalloc * sizeof(LRRemoteSub));
+				else
+					subs = repalloc(subs, nalloc * sizeof(LRRemoteSub));
 			}
 			strlcpy(subs[n].subname, subname, NAMEDATALEN);
 			strlcpy(subs[n].slotname, slotname, NAMEDATALEN);

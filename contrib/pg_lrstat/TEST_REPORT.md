@@ -127,7 +127,30 @@ SELECT count(*) FROM pg_lrstat_pub_history();
 
 > 注：崩溃栈来自 macOS DiagnosticReports：`_PG_init → WaitEventCustomNew → LWLockAcquire → SEGV`。该调用是外部合入的未测代码，本轮修复并补齐验证。
 
-## 5. 复现命令
+## 5. 集群负载验证与订阅端 core 修复（2026-09-23 第三轮）
+
+新增 `scripts/logical_rep_test.sh`：搭建发布端+订阅端双节点（双方 preload pg_lrstat、2s 采样/10s 窗口），建立 publication/subscription，`pgbench -T` 持续负载，期间周期观测两侧视图，结束时断言健康位与积压不变式。该脚本复现了外部环境报告的订阅端 core，并定位为**两处叠加缺陷**：
+
+| 缺陷 | 根因 | 修复 |
+| --- | --- | --- |
+| 订阅端 bgworker 崩溃（`repalloc → GetMemoryChunkMethodID SEGV`） | `repalloc(NULL, size)` 不是合法调用（repalloc 无条件读指针的 chunk 头，不像 libc `realloc` 接受 NULL）；一旦存在订阅行即触发 `subs=repalloc(NULL,...)` | 首次分配改用 `palloc()`，仅对已分配块 `repalloc` |
+| conninfo 悬垂指针 | `TextDatumGetCString` 对短 varlena 零拷贝，返回指针指向 SPI tupletable 内存，`SPI_finish()` 后失效，而 `subs[].conninfo` 生命周期更长 | `pstrdup()` 复制并转移所有权 |
+
+修复后 45~60s pgbench 负载验证（`PASS`）：
+
+```text
+17:03:27 pub[gen/send MB/s=6.98/6.98|...] sub[ok|6.96/6.96/6.96/0.00|...]
+17:03:52 (drain) pub[gen/send MB/s=6.49/6.49|...] sub[ok|6.33/6.33/6.34/0.00|...]
+17:04:03 (drain) pub[gen/send MB/s=0.23/0.23|...] sub[ok|0.23/0.23/0.23/0.00|...]
+pg_lrstat_info  publisher[loaded/last_round_ok/dropped = true/true/0]  subscriber[true/true/0]
+PASS: pg_lrstat statistics behaved correctly under load
+```
+
+验证点：全程 `remote_state=ok`（远端轮询首次被真实执行并稳定）；两端 gen/send/recv 速率数值一致且随负载同频涨落；drain 阶段速率回落；`apply_rate=0` 为初始同步期正常形态（apply worker 在 COPY，origin 未推进，BEST_PRACTICES §3.3 有该特征说明）。回归测试同步复跑全绿。
+
+> 教训记录：崩溃路径（有订阅的订阅端）此前从未被任何测试覆盖——TAP 002 因本机缺 IPC::Run 未跑、手工验证只覆盖无订阅的发布端。集群脚本现作为该路径的常规防线。
+
+## 6. 复现命令
 
 ```sh
 # autotrees
