@@ -608,6 +608,7 @@ emit_overall(const char *name, char worker_char, Oid relid,
 	bool		has_rpub;
 	XLogRecPtr	recv = s->received_lsn ? s->received_lsn :
 		s->latest_end_lsn;
+	XLogRecPtr	applied = 0;
 	double		gen = 0, send = 0, spill = 0, stream = 0, recv_rate = 0,
 				apply = 0;
 	TimestampTz t0 = 0, t1 = 0;
@@ -637,7 +638,6 @@ emit_overall(const char *name, char worker_char, Oid relid,
 
 	apply_ok = lr_rate(ring, n, f_sub_applied, &apply, &t0, &t1);
 	recv_ok = lr_rate(ring, n, f_sub_received, &recv_rate, &t0, &t1);
-	unapplied = lsn_diff(recv, s->applied_lsn);
 
 	if (has_rpub)
 	{
@@ -648,16 +648,30 @@ emit_overall(const char *name, char worker_char, Oid relid,
 		spill_ok = lr_rate(re->ring, re->n, f_pub_spill, &spill, &t0, &t1);
 		stream_ok = lr_rate(re->ring, re->n, f_pub_stream, &stream, &t0, &t1);
 
+		/*
+		 * Applied position: v18+ does not advance the subscription
+		 * origin's remote_lsn for regular streaming, so prefer the
+		 * feedback flush position (what the publisher's walsender
+		 * believes we applied); origin wins only when it is ahead.
+		 */
+		applied = Max(s->applied_lsn, rs->peer_flush_lsn);
+
 		unsent = lsn_diff(rs->current_lsn, rs->sent_lsn);
 		inflight = lsn_diff(rs->sent_lsn, recv);
-		total = lsn_diff(rs->current_lsn, s->applied_lsn);
+		total = lsn_diff(rs->current_lsn, applied);
 		retained = lsn_diff(rs->current_lsn, rs->restart_lsn);
 		feedback_lag = lsn_diff(recv, rs->peer_recv_lsn);
+		unapplied = lsn_diff(recv, applied);
 
 		eta_total_ok = send_ok && apply_ok;
 		if (eta_total_ok)
 			eta_total = (double) unsent / (send > 0 ? send : 1.0) +
 				(double) (inflight + unapplied) / (apply > 0 ? apply : 1.0);
+	}
+	else
+	{
+		applied = s->applied_lsn;
+		unapplied = lsn_diff(recv, applied);
 	}
 
 	lr_row_reset(&r);

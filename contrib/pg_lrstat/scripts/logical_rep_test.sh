@@ -65,8 +65,8 @@ echo "== init publisher (port $P_PORT) and subscriber (port $S_PORT) under $T"
 cat >>"$P_DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_lrstat'
 wal_level = logical
-max_wal_senders = 10
-max_replication_slots = 10
+max_wal_senders = 32
+max_replication_slots = 32
 pg_lrstat.sample_interval = '2s'
 pg_lrstat.rate_window = '10s'
 pg_lrstat.remote_poll_budget = '2s'

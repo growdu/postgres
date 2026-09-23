@@ -67,7 +67,12 @@ typedef struct LRPubSample
 	uint64		total_bytes;		/* D1: decode total counter		*/
 } LRPubSample;
 
-/* One subscriber-side sample (per apply / tablesync worker). */
+/*
+ * worker_type passthrough: "apply" / "table synchronization" (v18) or
+ * "tablesync" (older) -- 16 bytes do not fit the v18 spelling
+ */
+#define LR_WTYPE_LEN	24
+
 typedef struct LRSubSample
 {
 	TimestampTz ts;
@@ -117,7 +122,7 @@ typedef struct LRTargetMeta
 
 	/* subscriber */
 	char		subslotname[NAMEDATALEN];
-	char		worker_type[LR_STATE_LEN];
+	char		worker_type[LR_WTYPE_LEN];
 	pid_t		worker_pid;
 	pid_t		leader_pid;
 	TimestampTz last_msg_send_time;

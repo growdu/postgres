@@ -150,7 +150,28 @@ PASS: pg_lrstat statistics behaved correctly under load
 
 > 教训记录：崩溃路径（有订阅的订阅端）此前从未被任何测试覆盖——TAP 002 因本机缺 IPC::Run 未跑、手工验证只覆盖无订阅的发布端。集群脚本现作为该路径的常规防线。
 
-## 6. 复现命令
+## 6. 表同步（tablesync）场景验证与修复（2026-09-23 第四轮）
+
+外部环境反馈"订阅端在 table sync 场景仍会 core"。以 60 表订阅 + 1s 高频采样复现，共定位并修复**四个叠加缺陷**：
+
+| 缺陷 | 根因 | 修复 |
+| --- | --- | --- |
+| 同步 worker 启停瞬间 worker 段错误（`pfree → GetMemoryChunkMethodID SEGV`） | `lrstat_round` 末尾手工 `pfree(subs/conninfo)`，而这些内存属于 `round_ctx` 且轮末统一 `MemoryContextReset`——手工释放既多余又与 SPI 生命周期竞争 | 删除手工 pfree，完全依赖上下文 reset |
+| `pstrdup(TextDatumGetCString(...))` 崩溃（`AllocSetAlloc` 内） | `TextDatumGetCString` 对 SPI datum 零拷贝/不 detoast，可能交出 tupletable 内部指针或 toast 指针 | 字符串提取一律改用 `SPI_getvalue()`（detoast + palloc 副本 + NULL 安全），`col_text` 与 conninfo 同步收敛 |
+| `applied_lsn` 恒空、追平后 backlog 永不清零（96MB 幽灵积压） | PG18 中订阅 origin 命名为 `pg_<subid>`（不再是订阅名）→ join 落空；且常规流式应用**不推进** origin 的 `remote_lsn`（实测恒 0/0，仅 `local_lsn` 推进） | origin join 同时匹配两种命名；overall 的应用位点改取反馈位 `max(origin.remote_lsn, rpub.peer_flush_lsn)`，语义回退为发布端口径（滞后一个反馈周期，注释说明） |
+| `worker_type` 显示 "table synchroni" 截断、tablesync worker 被误判为 apply | PG18 的 worker_type 值为 `table synchronization`（19 字节）> 原 16 字节缓冲；`strncmp("tablesync")` 判定失效 | 缓冲扩至 `LR_WTYPE_LEN=24`，判定改为前缀 `"table"` |
+
+修复后验证（60 表订阅重建 + 同步洪峰 + 3 次 postmaster 重启 + 负载后排空）：
+
+```text
+19:34:19 pub[gen/send=7.63/7.63] sub[ok|7.63/7.63/7.63/7.63|...]   ← apply_rate 首次正确非零
+19:34:39 (drain) sub[ok|7.43/7.43/7.44/7.44|0|0|0]                  ← backlog 排空
+final backlog_total=0 bytes;  pg_lrstat_info both [true/true/0];  PASS
+```
+
+同步排障备注：验证中出现的"60 表卡在 data-copy"经查为测试环境 `max_replication_slots=10` 被临时同步槽耗尽所致（与扩展无关），集群脚本已将槽上限提至 32。
+
+## 7. 复现命令
 
 ```sh
 # autotrees

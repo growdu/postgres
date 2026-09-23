@@ -63,7 +63,11 @@ static LRRemoteSub *sample_subscriber(TimestampTz now, int *nsubs);
 	"LEFT JOIN pg_stat_replication_slots rs ON rs.slot_name = s.slot_name " \
 	"WHERE s.slot_type = 'logical'"
 
-/* Subscriber-side snapshot, one row per subscription worker. */
+/*
+ * Subscriber-side snapshot, one row per subscription worker.  Note the
+ * origin join: since v18 the subscription origin is named "pg_<subid>",
+ * older releases used the subscription name, so match both.
+ */
 #define SUB_SQL \
 	"SELECT su.subname::text, su.subslotname::text, su.subconninfo, " \
 	"       st.worker_type, st.pid AS worker_pid, st.leader_pid, st.relid, " \
@@ -75,7 +79,7 @@ static LRRemoteSub *sample_subscriber(TimestampTz now, int *nsubs);
 	"FROM pg_subscription su " \
 	"LEFT JOIN pg_stat_subscription st ON st.subid = su.oid " \
 	"LEFT JOIN pg_replication_origin_status o " \
-	"       ON o.external_id = su.subname::text " \
+	"       ON o.external_id IN ('pg_' || su.oid, su.subname) " \
 	"LEFT JOIN pg_stat_subscription_stats ss ON ss.subid = su.oid"
 
 /* ---- SPI column helpers (keep the row loops short) ---- */
@@ -94,12 +98,22 @@ col_val(HeapTuple tup, TupleDesc td, int fn, bool *isnull)
 static void
 col_text(HeapTuple tup, TupleDesc td, int fn, char *out, Size outlen)
 {
-	bool	isnull;
+	if (fn >= 1)
+	{
+		/*
+		 * SPI_getvalue() detoasts and returns a fresh palloc'd copy
+		 * (NULL for NULL) -- unlike TextDatumGetCString on a raw
+		 * SPI_getbinval() datum, which may hand back a pointer into
+		 * the tupletable (or a toast pointer).
+		 */
+		char	   *val = SPI_getvalue(tup, td, fn);
 
-	(void) col_val(tup, td, fn, &isnull);
-	if (!isnull)
-		strlcpy(out, TextDatumGetCString(col_val(tup, td, fn, &isnull)),
-				outlen);
+		if (val != NULL)
+		{
+			strlcpy(out, val, outlen);
+			pfree(val);
+		}
+	}
 }
 
 static bool
@@ -193,7 +207,6 @@ lrstat_round(void)
 	TimestampTz	now = GetCurrentTimestamp();
 	LRRemoteSub *subs = NULL;
 	int			nsubs = 0;
-	int			i;
 	bool		failed = false;
 	char		round_error[LR_ERROR_LEN];
 
@@ -276,13 +289,12 @@ lrstat_round(void)
 		lrstat_remote_round(subs, nsubs,
 							now + (int64) lrstat_remote_poll_budget_ms * 1000);
 
-	if (subs != NULL)
-	{
-		for (i = 0; i < nsubs; i++)
-			if (subs[i].conninfo != NULL)
-				pfree(subs[i].conninfo);
-		pfree(subs);
-	}
+	/*
+	 * Note: subs[] and every conninfo live in round_ctx, which the
+	 * caller resets right after this function returns -- freeing them
+	 * here by hand bought nothing and raced with memory that SPI
+	 *Finish already released (segfault under tablesync churn).
+	 */
 }
 
 static void
@@ -406,6 +418,7 @@ sample_subscriber(TimestampTz now, int *nsubs)
 			LRTargetMeta m;
 			LRTargetCtl *t;
 			Oid			relid;
+			int			fn_ci = FN(td, "subconninfo");
 
 			memset(&s, 0, sizeof(s));
 			memset(&m, 0, sizeof(m));
@@ -415,18 +428,17 @@ sample_subscriber(TimestampTz now, int *nsubs)
 			col_text(tup, td, FN(td, "subslotname"), m.subslotname,
 					 NAMEDATALEN);
 			col_text(tup, td, FN(td, "worker_type"), m.worker_type,
-					 LR_STATE_LEN);
+					 LR_WTYPE_LEN);
 			/*
-			 * Full copy: conninfo may exceed any sane stack buffer, and
-			 * TextDatumGetCString() may return a pointer straight into
-			 * the SPI tupletable (zero-copy for short varlenas), which
-			 * dies at SPI_finish() -- subs[] outlives it.
+			 * Full copy via SPI_getvalue(): subconninfo can exceed any
+			 * sane stack buffer, and it must outlive SPI_finish().
 			 */
-			(void) col_val(tup, td, FN(td, "subconninfo"), &isnull);
-			if (!isnull)
-				conninfo = pstrdup(TextDatumGetCString(col_val(tup, td,
-											   FN(td, "subconninfo"),
-											   &isnull)));
+			{
+				char	   *val;
+
+				if (fn_ci >= 1 && (val = SPI_getvalue(tup, td, fn_ci)) != NULL)
+					conninfo = val;
+			}
 
 			relid = DatumGetObjectId(col_val(tup, td, FN(td, "relid"), &isnull));
 			if (isnull)
@@ -447,7 +459,8 @@ sample_subscriber(TimestampTz now, int *nsubs)
 			m.sync_error_count = col_int8(tup, td, FN(td, "sync_error_count"), -1);
 
 			t = lrstat_find_or_create(LR_SUB, subname, relid,
-									  strncmp(m.worker_type, "tablesync", 9) == 0 ? 't' : 'a');
+									  (strncmp(m.worker_type, "table", 5) == 0)
+									  ? 't' : 'a');
 			if (t != NULL)
 			{
 				lrstat_push_sample(t, &s);
