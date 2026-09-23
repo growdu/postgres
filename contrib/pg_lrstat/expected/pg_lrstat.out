@@ -1,0 +1,176 @@
+-- Copyright (c) 2026, PostgreSQL Global Development Group
+-- Deterministic tests of the sampling/rate machinery via the inject
+-- functions.  The server runs with shared_preload_libraries=pg_lrstat
+-- and pg_lrstat.allow_inject=on (see pg_lrstat.conf); the database has
+-- no real slots or subscriptions, so the only targets are the injected
+-- ones and every output below is exact.  Rates are rounded to absorb
+-- the few-millisecond gap between the two now() calls.
+CREATE EXTENSION pg_lrstat;
+-- Diagnostics view: in this configuration the extension is preloaded
+SELECT loaded, layout_version, ntargets > 0, remote_poll
+FROM pg_lrstat_info;
+ loaded | layout_version | ?column? | remote_poll 
+--------+----------------+----------+-------------
+ t      |              1 | t        | t
+(1 row)
+
+-- Two samples 110s apart, inside the default 2min rate window:
+--   gen  = 16 MB / 110s, send = 8 MB / 110s
+SELECT pg_lrstat_inject_pub('t1', now() - interval '110 seconds',
+                            '0/0', '0/0', '0/0', '0/0', '0/0');
+ pg_lrstat_inject_pub 
+----------------------
+ 
+(1 row)
+
+SELECT pg_lrstat_inject_pub('t1', now(),
+                            '0/1000000', '0/800000',
+                            '0/400000', '0/400000', '0/200000');
+ pg_lrstat_inject_pub 
+----------------------
+ 
+(1 row)
+
+-- publisher rate view (MB/s)
+SELECT round(send_rate::numeric, 2) AS send_mbps,
+       round(gen_rate::numeric, 2) AS gen_mbps
+FROM pg_lrstat_pub_rate WHERE slot_name = 't1';
+ send_mbps | gen_mbps 
+-----------+----------
+      0.07 |     0.15
+(1 row)
+
+-- publisher sample view: point-in-time backlogs (bytes)
+SELECT backlog_unsent, backlog_inflight, backlog_peer_unapplied,
+       backlog_total, retained_wal
+FROM pg_lrstat_pub_sample WHERE slot_name = 't1';
+ backlog_unsent | backlog_inflight | backlog_peer_unapplied | backlog_total | retained_wal 
+----------------+------------------+------------------------+---------------+--------------
+        8388608 |          4194304 |                      0 |      12582912 |     14680064
+(1 row)
+
+-- stage decomposition
+SELECT stage, backlog_bytes FROM pg_lrstat_pipeline
+WHERE slot_name = 't1' ORDER BY stage;
+     stage      | backlog_bytes 
+----------------+---------------
+ inflight       |       4194304
+ peer_unapplied |             0
+ retained       |      14680064
+ unsent         |       8388608
+(4 rows)
+
+-- raw history, one row per injected sample
+SELECT count(*) FROM pg_lrstat_pub_history('t1');
+ count 
+-------
+     2
+(1 row)
+
+-- subscriber + remotely-polled publisher rings compose the overall view
+SELECT pg_lrstat_inject_rpub('s1', now() - interval '110 seconds',
+                             '0/0', '0/0', '0/0', '0/0', '0/0');
+ pg_lrstat_inject_rpub 
+-----------------------
+ 
+(1 row)
+
+SELECT pg_lrstat_inject_rpub('s1', now(),
+                             '0/1000000', '0/800000',
+                             '0/400000', '0/400000', '0/200000');
+ pg_lrstat_inject_rpub 
+-----------------------
+ 
+(1 row)
+
+SELECT pg_lrstat_inject_sub('s1', now() - interval '110 seconds', '0/0', '0/0');
+ pg_lrstat_inject_sub 
+----------------------
+ 
+(1 row)
+
+SELECT pg_lrstat_inject_sub('s1', now(), '0/780000', '0/600000');
+ pg_lrstat_inject_sub 
+----------------------
+ 
+(1 row)
+
+SELECT remote_state, backlog_unsent, backlog_inflight, backlog_unapplied,
+       backlog_total, feedback_lag_bytes
+FROM pg_lrstat_overall WHERE sub_name = 's1';
+ remote_state | backlog_unsent | backlog_inflight | backlog_unapplied | backlog_total | feedback_lag_bytes 
+--------------+----------------+------------------+-------------------+---------------+--------------------
+ ok           |        8388608 |           524288 |           1572864 |      10485760 |            3670016
+(1 row)
+
+-- subscriber rates (MB/s)
+SELECT round(recv_rate::numeric, 2) AS recv_mbps,
+       round(apply_rate::numeric, 2) AS apply_mbps
+FROM pg_lrstat_sub_rate WHERE sub_name = 's1';
+ recv_mbps | apply_mbps 
+-----------+------------
+      0.07 |       0.05
+(1 row)
+
+SELECT received_lsn, latest_end_lsn, applied_lsn, backlog_apply
+FROM pg_lrstat_sub_sample WHERE sub_name = 's1';
+ received_lsn | latest_end_lsn | applied_lsn | backlog_apply 
+--------------+----------------+-------------+---------------
+ 0/780000     | 0/780000       | 0/600000    |       1572864
+(1 row)
+
+SELECT count(*) FROM pg_lrstat_sub_history('s1');
+ count 
+-------
+     2
+(1 row)
+
+-- a single sample cannot cover half of the window: rates must be NULL
+SELECT pg_lrstat_inject_pub('t2', now(), '0/1000', '0/1000',
+                            '0/1000', '0/1000', '0/1000');
+ pg_lrstat_inject_pub 
+----------------------
+ 
+(1 row)
+
+SELECT send_rate IS NULL AS single_sample_rate_is_null
+FROM pg_lrstat_pub_rate WHERE slot_name = 't2';
+ single_sample_rate_is_null 
+----------------------------
+ t
+(1 row)
+
+-- reset clears every target
+SELECT pg_lrstat_reset();
+ pg_lrstat_reset 
+-----------------
+ 
+(1 row)
+
+SELECT count(*) FROM pg_lrstat_pub_sample;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM pg_lrstat_sub_sample;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM pg_lrstat_overall;
+ count 
+-------
+     0
+(1 row)
+
+SELECT dropped_samples FROM pg_lrstat_info;
+ dropped_samples 
+-----------------
+               0
+(1 row)
+
+-- NULL arguments are rejected instead of being silently swallowed
+SELECT pg_lrstat_inject_pub(NULL, now(), '0/0', '0/0', '0/0', '0/0', '0/0');
+ERROR:  pg_lrstat inject arguments must not be NULL

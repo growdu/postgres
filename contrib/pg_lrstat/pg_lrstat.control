@@ -1,0 +1,6 @@
+# pg_lrstat extension
+comment = 'logical replication LSN and rate statistics'
+default_version = '1.0'
+module_pathname = '$libdir/pg_lrstat'
+superuser = true
+relocatable = false
