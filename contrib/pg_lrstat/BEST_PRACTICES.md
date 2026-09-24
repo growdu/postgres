@@ -1,192 +1,196 @@
-# 逻辑复制性能分析最佳实践（pg_lrstat）
+# 逻辑复制性能排障手册（运维版）
 
-配套文档：[USER_MANUAL.md](USER_MANUAL.md)（视图与配置）、[DESIGN.md](DESIGN.md) §6（方法论来源）。
-本文是操作手册：所有 SQL 可直接粘贴，按"巡检 → 定位 → 下钻 → 定论"组织。
+> 面向不熟悉内核的运维同学。所有 SQL 可直接粘贴；每个输出都给了"正常长什么样、异常怎么办"。
+> 视图列的完整定义见 [USER_MANUAL.md](USER_MANUAL.md) §5，字段来源见 §6。
 
 ---
 
-## 0. 黄金法则
+## 0. 先建一张图：逻辑复制就是一条快递流水线
 
-1. **先定位段，再谈原因**：`backlog_total` 在 unsent / inflight / unapplied 哪一段，答案完全不同。
-2. **速率判据要持续成立**：所有结论基于"2min 窗口持续"的读数，单点毛刺不下结论。
-3. **时间只用反馈 lag 列**：`write_lag/flush_lag/replay_lag` 由内核按反馈时间戳计算，可跨机；绝不拿两端 `now()` 相减。
-4. **字节换算走 LSN 位点**：速率列是 WAL 位点等效速率；要对比网络带宽时用解码膨胀率换算（见 §3.1）。
-
-## 1. 三步定位法
+把发布端想成**总仓**、订阅端想成**分仓**，数据变更是**包裹**：
 
 ```
-① backlog_total 超阈值且持续增长？
-├─ 否 → 稳态：转 §5 容量评估（余量 = gen − min(send, apply)）
-└─ 是 → ② 积压集中在哪段（overall 视图三列占比）？
-    ├─ unsent 占大头     → 发布端问题     → §3.1
-    ├─ inflight 占大头   → 网络或反馈     → §3.2
-    └─ unapplied 占大头  → 订阅端应用     → §3.3
+总仓生产包裹 ──► 打包发出 ──► 干线运输 ──► 分仓签收 ──► 上架(写进表) ──► 回执给总仓
+ (WAL生成)      (发送)        (网络)       (接收)        (应用)          (反馈)
+   gen_rate     send_rate                   recv_rate    apply_rate
+        |←─ 没发货 ─┐|←── 在路上 ──┐|←── 到了没上架 ─┐
+        └── backlog_unsent ── backlog_inflight ── backlog_unapplied ──┘
+                              （三段加起来 = backlog_total 总积压）
 ```
 
-速率关系判定表（判据须持续成立）：
+**排障只需要回答三个问题**：货压在哪一段？哪个人（环节）干得慢？还要多久清完？本手册全部内容就是这三问。
 
-| 速率关系（持续） | 结论 |
-| --- | --- |
-| `send_rate < gen_rate` 且 unsent 增长 | 发布端发送/解码吞吐不足 |
-| `send_rate ≈ gen_rate` 且 total 稳定非零 | 发送已尽力，短板在网络或对端 |
-| `recv_rate ≈ send_rate` 且 inflight 小 | 网络不是瓶颈 |
-| `apply_rate < recv_rate` 且 unapplied 增长 | 订阅端应用是短板 |
-| 三者接近且 total → 0 | 全链路健康 |
+## 1. 五分钟名词速查（人话版）
 
-## 2. 每日巡检（5 条 SQL）
-
-```sql
--- ① 健康自检：一次看完扩展状态
-SELECT loaded, last_round_ok, dropped_samples, nrounds FROM pg_lrstat_info;
-
--- ② 订阅端全景（两端合成；发布端零安装也可用）
-SELECT sub_name, remote_state,
-       round(gen_rate::numeric,1)   AS gen_mb,
-       round(send_rate::numeric,1)  AS send_mb,
-       round(apply_rate::numeric,1) AS apply_mb,
-       pg_size_pretty(backlog_total) AS total,
-       round(eta_total::numeric)     AS eta_s,
-       send_stalled, apply_stalled
-FROM pg_lrstat_overall
-ORDER BY backlog_total DESC;
-
--- ③ 停滞告警源（接监控直接用）
-SELECT sub_name FROM pg_lrstat_overall
-WHERE send_stalled OR apply_stalled;
-
--- ④ 发布端 WAL 风险（槽拖爆磁盘倒计时）
-SELECT slot_name, wal_status,
-       pg_size_pretty(retained_wal)      AS retained,
-       pg_size_pretty(safe_wal_size)     AS safe_margin,
-       replay_lag
-FROM pg_lrstat_pub_sample
-ORDER BY retained_wal DESC;
-
--- ⑤ 解码压力（大事务特征）
-SELECT slot_name, spill_bytes, stream_bytes, total_bytes
-FROM pg_lrstat_pub_sample
-WHERE spill_bytes > 0 OR stream_bytes > 0;
-```
-
-## 3. 分段下钻
-
-### 3.1 发布端（unsent 段）
-
-```sql
-SELECT slot_name, state, sync_state,
-       round(gen_rate::numeric,1)  AS gen_mb,
-       round(send_rate::numeric,1) AS send_mb,
-       round(spill_rate::numeric,2) AS spill_mb,
-       round(stream_rate::numeric,2) AS stream_mb,
-       pg_size_pretty(backlog_unsent) AS unsent
-FROM pg_lrstat_pub_sample s JOIN pg_lrstat_pub_rate r USING (slot_name);
-```
-
-- **解码压力**：`spill_rate/stream_rate > 0` = ReorderBuffer 溢写/流式落盘，大事务解码被磁盘拖累。长期高 spill → 控制发布端事务大小（批量提交）或增大逻辑解码内存（`logical_decoding_work_mem`）。
-- **解码膨胀率**（输出协议字节 ÷ 输入 WAL 字节）。history 视图暂未含 `total_bytes`，用两次快照计算（监控端可周期抓取同一查询）：
-
-```sql
--- 抓两次（间隔 ≥ 一个采样周期），膨胀率 = Δtotal_bytes / Δcurrent_lsn：
-SELECT now(), slot_name, current_lsn, total_bytes
-FROM pg_lrstat_pub_sample;
-
--- 得到的是"每字节 WAL 产生的协议字节数"。它同时用于把速率换算成
--- 线上字节速率：线上速率 ≈ gen_rate × 膨胀率，才能与 NIC 带宽对照
--- （send_rate 本身是 LSN 等效速率，不能直接比带宽）。
-```
-
-- **同步复制干扰**：`sync_state` 非 async 且 state 显示等待 → walsender 被同步复制拖住，是等待不是吞吐问题。
-- **多订阅共担**：多个槽的 unsent 同步增长而 `gen_rate` 正常 → 发布端 CPU/IO 是共享瓶颈（WAL 读取与解码按槽重复发生）。
-
-### 3.2 网络与反馈（inflight 段）
-
-```sql
-SELECT sub_name,
-       pg_size_pretty(backlog_inflight)   AS inflight,
-       pg_size_pretty(feedback_lag_bytes) AS fb_lag,
-       write_lag, replay_lag
-FROM pg_lrstat_overall;
-```
-
-- **先排除假在途**：`inflight ≈ feedback_lag_bytes` → 是反馈周期（内核默认 10s）的观测滞后，不是网络问题。
-- **真在途持续增长**：用解码膨胀率把 `send_rate` 换算成线上字节速率与带宽对照；高 RTT 链路特征是 inflight 稳定在 **带宽×RTT（BDP）** 量级后不再增长——此时扩带宽无效，需提高并发流或压缩。
-
-### 3.3 订阅端（unapplied 段）
-
-```sql
-SELECT sub_name, worker_type, worker_pid, leader_pid,
-       round(recv_rate::numeric,1)  AS recv_mb,
-       round(apply_rate::numeric,1) AS apply_mb,
-       round(local_wal_rate::numeric,1) AS local_wal_mb,
-       pg_size_pretty(backlog_apply) AS unapplied,
-       apply_stalled
-FROM pg_lrstat_sub_rate;
-```
-
-- **apply_stalled = t**：查 `pg_stat_activity` 中该 worker_pid 的 `wait_event`（锁等待最常见：订阅端长事务/DDL 与回放冲突）；查 `pg_stat_subscription_stats.apply_error_count` 增速（冲突重试）。
-- **吞吐不足但无停滞**：单 apply worker 串行回放是常态瓶颈——大事务、行级触发器、索引维护、外键检查。核对 `streaming` 设置与并行 worker 是否真启动（`leader_pid` 非空）。
-- **存储瓶颈**：`local_wal_rate` 与 `apply_rate` 严重不成比例，或订阅端磁盘写饱和（`pg_stat_io`）。
-- **初始同步期**：存在 `worker_type='tablesync'` 行时 unapplied 增长属正常，按 relid 行单独评估。
-
-## 4. 故障模式 → 指标签名速查
-
-| 模式 | 签名（组合特征） | 第一动作 |
+| 术语 | 人话 | 对应视图列 |
 | --- | --- | --- |
-| 大事务回放 | spill/stream 飙升；unsent 先增后骤降；apply_rate 短暂归零 | 等待 + 溯源大事务，评估拆批 |
-| 网络抖动 | inflight 尖峰 + feedback_lag_bytes 波动；send_rate 突降恢复 | 抓包/看链路，勿动数据库 |
-| 订阅端锁冲突 | apply_stalled 且 wait_event 为锁；unapplied 阶梯增长 | `pg_blocking_pids()` 找阻塞源 |
-| 订阅暂停/断开 | 槽 active=f 或 send_stalled；retained_wal 线性增长；wal_status 沿 reserved→unreserved→lost 恶化 | 恢复订阅或drop槽，重点盯 wal_status=unreserved |
-| 发布端写入洪峰 | gen_rate 突增，积压沿 unsent→inflight→unapplied 依次传导 | 各段到达时间差即各段延迟，评估是否限流 |
-| 反馈滞后误报 | inflight ≈ feedback_lag_bytes 且 applied_lsn 持续推进 | 无需处理，读 overall 而非发布端视图 |
-| 目标槽满 | pg_lrstat_info.dropped_samples 增长 + 新槽/订阅不出现在视图 | 调大 max_targets 重启 |
+| WAL | 数据库的记账流水：所有增删改先记流水再落盘，复制就是把这些流水发给对方重演一遍 | `gen_rate` = 记流水的速度 |
+| LSN | 流水账的页码，只增不减。"进行到哪了"都用页码表示 | 各 `*_lsn` 列 |
+| 发送 / 接收 / 应用 | 打包发出去 / 分仓收到了 / 真正写进表里 | `send_rate` / `recv_rate` / `apply_rate` |
+| 积压（backlog） | 还没走完的量，**单位是字节**，用 `pg_size_pretty()` 看着舒服 | `backlog_*` |
+| 回执（反馈） | 分仓每 10 秒回一句"我用到第几页了"。**总仓眼里的分仓进度最多滞后 10 秒**，这是设计如此不是故障 | `feedback_lag_bytes` |
+| 槽（slot） | 总仓的客户档案：只要分仓没确认，流水就不许删 | `retained_wal`（为这个客户扣住的流水总量） |
+| 解码（decoding） | 把流水翻译成分仓能执行的语句 | `spill_rate`（翻译不过来堆到磁盘的速度） |
+| ETA | 按当前速度清完积压需要的秒数 | `eta_total` |
 
-## 5. 容量规划
+## 2. 日常巡检：三条 SQL
+
+### ① 插件本身健康吗（每天一次 / 告警缺失时）
 
 ```sql
--- 净追平速率：为负则永远追不平，先扩容短板侧
-SELECT sub_name,
-       round(least(send_rate, apply_rate)::numeric,1) AS drain_mb,
-       round(gen_rate::numeric,1)                      AS gen_mb,
-       round((least(send_rate, apply_rate) - gen_rate)::numeric,1) AS net_mb,
-       round((backlog_total / nullif(least(send_rate,apply_rate)*1048576,0))::numeric) AS eta_if_gen_stops_s
-FROM pg_lrstat_overall;
-
--- 槽无推进期间，retained WAL 增速 ≈ WAL 生成速率。取 history 最近 10 分钟
--- 相邻样本的增量，磁盘可用空间 ÷ 平均增速 = 拖爆倒计时：
-WITH d AS (
-  SELECT current_lsn - lag(current_lsn) OVER (ORDER BY ts) AS wal_bytes,
-         extract(epoch FROM (ts - lag(ts) OVER (ORDER BY ts))) AS secs
-  FROM pg_lrstat_pub_history('mysub', now() - interval '10 minutes')
-)
-SELECT round(avg(wal_bytes / nullif(secs,0))::numeric) AS retained_bps
-FROM d;
+SELECT loaded, last_round_ok, dropped_samples FROM pg_lrstat_info;
 ```
 
-实用做法：取 `pg_lrstat_pub_history` 中 retained_wal 两个时刻的差 ÷ 时间得增速，`磁盘可用 / 增速` = 剩余小时数；同时用 `wal_status`/`safe_wal_size` 与 `max_slot_wal_keep_size` 设告警。
+```
+ loaded | last_round_ok | dropped_samples
+--------+---------------+-----------------
+ t      | t             |               0     ← 正常：已加载/采样正常/没丢数据
+```
 
-**稳态余量**：backlog→0 时的 `gen_rate − min(send_rate, apply_rate)` 即当前余量；用 history 长序列回归"余量 vs 负载"，按峰值外推。
+| 异常 | 含义 | 动作 |
+| --- | --- | --- |
+| `loaded = f` | 没预加载，所有视图都是空的 | 检查 `shared_preload_libraries` 并重启 |
+| `last_round_ok = f` | 采样进程上一轮失败了 | 看 `last_round_error` 列的错误信息 |
+| `dropped_samples > 0` | 监控目标太多装不下了 | 调大 `pg_lrstat.max_targets`（需重启） |
 
-## 6. 场景剧本
+### ② 复制整体健康吗（核心巡检）
 
-**A. 迁移追平监控**：割接前持续看 `overall.eta_total`；用净追平速率重估（持续写入下 eta_total 会骗人，见 §5）；backlog_total 归零且三速率同频后，再叠加一个静默窗口验证零漂移，方可割接。
+```sql
+SELECT sub_name, remote_state,
+       round(gen_rate::numeric,1)   AS 生成,
+       round(send_rate::numeric,1)  AS 发送,
+       round(recv_rate::numeric,1)  AS 接收,
+       round(apply_rate::numeric,1) AS 应用,
+       pg_size_pretty(backlog_total) AS 总积压,
+       round(eta_total::numeric)     AS 追平秒,
+       send_stalled, apply_stalled
+FROM pg_lrstat_overall;
+```
 
-**B. 订阅暂停/恢复**：暂停期间盯发布端 `retained_wal` 增速与 `wal_status`（unreserved 即亮红灯）；恢复后看 `send_stalled→f`、eta_total 递减至 0。
+```
+ sub_name | remote_state | 生成 | 发送 | 接收 | 应用 | 总积压 | 追平秒 | send_stalled | apply_stalled
+----------+--------------+------+------+------+------+--------+--------+--------------+--------------
+ sub_a    | ok           |  7.6 |  7.6 |  7.6 |  7.6 | 8 kB   |      1 | f            | f
+```
 
-**C. 大事务窗口**：事前预估 `spill_rate` 将转正；事中允许 apply_rate 短暂为 0（区分 stalled：`apply_stalled` 为 f）；事后确认 unsent 骤降且 history 无持久台阶。
+**读法（就三条）**：
+1. **四个速率相等** = 一切正常，货流顺畅（都等于"生成"是因为上游产多少下游就跟多少）；
+2. **从左到右第一个掉队的数字就是瓶颈**：发送 < 生成 → 总仓发货慢（§4-A）；应用 < 接收 → 分仓上架慢（§4-C）；
+3. **两个 stalled 任一为 t** = 对应环节停摆了，优先处理（§5 卡片 1）。
 
-**D. 发布端瓶颈确认**：多槽 unsent 同步增长 + gen_rate 正常 + OS 侧 walsender CPU 饱和 → 解码 CPU 是共享瓶颈；单槽场景对比 send_rate 与解码膨胀率换算的线上速率定位 CPU/网络谁是短板。
+`remote_state`：`ok` 正常；`unreachable` 连不上总仓（网络/总仓宕机，插件在自动重连）；`n/a` 还没轮询到（刚启动 30 秒内正常）。
 
-## 7. 窗口与粒度选择
+### ③ 发布端磁盘会被拖爆吗
 
-- 默认（30s 采样 / 2min 窗口）：容量评估、趋势、常规巡检——**不要**用它看秒级毛刺。
-- 实时排障：临时调小 `sample_interval=1s, rate_window=4s`（窗口 ≥ 2×间隔；SIGHUP 生效），用完调回，避免放大采样开销。
-- 历史回溯：`*_history` 按 `since` 过滤；30s 粒度 1800 点 ≈ 15 小时，更长的趋势落监控端存储。
+```sql
+SELECT slot_name, wal_status,
+       pg_size_pretty(retained_wal)  AS 扣住的流水,
+       pg_size_pretty(safe_wal_size) AS 距离上限余量
+FROM pg_lrstat_pub_sample;
+```
 
-## 8. 陷阱清单
+- `retained_wal` **持续增长** = 有分仓没收货，总仓在替它囤流水；
+- `wal_status` 从 `reserved` 变成 **`unreserved`** = 囤到警戒线了，立即处理（§5 卡片 3）；变 `lost` = 流水已被删，这个订阅**缺数据了，必须重建**。
 
-1. `backlog_inflight` 在发布端视图里天然含反馈"假在途"，判断网络问题先看 `feedback_lag_bytes`。
-2. 单 apply worker 回放大事务期间速率归零 ≠ 故障；以 `apply_stalled` 与 wait_event 为准。
-3. `local_wal_rate` 含订阅库其他写入（analyze/vacuum/用户写），专用订阅库才可当"应用产生的 WAL"读。
-4. progress 类百分比是 LSN 比值近似，FSFP 重放等场景偏差大，只作参考。
-5. `eta_total` 假设速率持续；持续写入场景必须用净追平速率重估。
-6. 跨机时间比较只用反馈 lag 列；`*_time` 列只用于各自端内的时序。
+## 3. 第一问：货压在哪一段？
+
+```sql
+SELECT sub_name,
+       pg_size_pretty(backlog_unsent)    AS 没发货,
+       pg_size_pretty(backlog_inflight)  AS 在路上,
+       pg_size_pretty(backlog_unapplied) AS 到了没上架,
+       pg_size_pretty(backlog_total)     AS 总积压
+FROM pg_lrstat_overall;
+```
+
+哪个列大就去对应章节：**没发货 → §4-A（总仓问题）**；**在路上 → §4-B（网络）**；**到了没上架 → §4-C（分仓问题）**。
+
+## 4. 分段处理手册
+
+### A. 没发货（unsent 大，总仓的问题）
+
+1. `send_stalled = t`？→ 总仓发送停了，最常见是**订阅端断开**（分仓重启/网络断）。确认订阅端进程在不在，恢复连接后这里自己会动起来。
+2. `spill_rate > 0`？→ **大事务**：业务一次改了几十上百万行，翻译打包要时间。属正常现象，等它发完；频繁出现就找业务方把大事务拆小（分批提交）。
+3. 发布端有**好几个订阅**、大家同时变慢、但 `gen_rate` 正常？→ 总仓 CPU 被多个翻译任务挤占，考虑拆分发布端或限制订阅数。
+4. `sync_state` 不是 `async` 且发布端在等同步复制？→ 这不是慢，是**在等另一个同步备库确认**，找 DBA 确认同步复制配置。
+
+### B. 在路上（inflight 大，先别急着报修网络）
+
+**关键一步：先排除"假在路上"**——回执每 10 秒才发一次，所以总仓眼里总有一点"在路上"的假象：
+
+```sql
+SELECT pg_size_pretty(backlog_inflight)   AS 在路上,
+       pg_size_pretty(feedback_lag_bytes) AS 回执滞后
+FROM pg_lrstat_overall;
+```
+
+两个数**差不多大** → 是回执延迟的假象，**不是网络问题**，收工。只有"在路上"**持续增长**且远大于回执滞后，才是真网络瓶颈——找网络组，给他们"发送速率"（MB/s）和链路带宽对比即可。
+
+### C. 到了没上架（unapplied 大，分仓的问题）
+
+1. `apply_stalled = t`？→ **多半是锁**：分仓往表里写数据时被人堵住了。一条 SQL 找到堵人的：
+
+```sql
+-- 在订阅端执行，把 <PID> 换成 sub_sample 里查到的 worker_pid
+SELECT pid, wait_event_type, wait_event,
+       pg_blocking_pids(pid) AS 被谁堵
+FROM pg_stat_activity WHERE pid = <PID>;
+```
+
+常见堵因：有人在订阅库跑长事务/改表。处理：等它结束或与业务协调 kill。
+
+2. 不停但一直慢（应用 < 接收）？→ 分仓**单线程上架**是设计如此，下面任何一条都会拖慢：目标表索引太多、有触发器、外键检查、单条事务太大。治理方向在订阅端表结构，不在复制配置。
+3. 看到 `worker_type = 'table synchronization'` 的行？→ **初始同步进行中**，"到了没上架"增长是正常过程，等同步完成（行消失）即可。
+
+## 5. 故障处理卡片
+
+**卡片 1：复制彻底不动了**
+一眼确认：`send_stalled=t` 或 `apply_stalled=t`。
+常见原因：订阅端被锁堵住（§4-C 的 SQL 查）；发布端订阅断开；订阅报错反复重试（`pg_stat_subscription_stats` 里错误计数在涨 → 看订阅端日志的具体报错，多是约束冲突）。
+处理：按原因三选一解锁/重连/修数据。
+
+**卡片 2：越追越远（发送 < 生成，持续）**
+含义：总仓产货快过发货，差距只会越来越大。
+处理：先按 §4-A 排查；确认是纯吞吐不够的话，用"净追平速度"判断是否要扩容：`min(发送,应用) − 生成` 是**正数**才追得平，负数必须扩容/拆负载，调参数没用。
+
+**卡片 3：磁盘要被流水撑爆（retained_wal 增长 / wal_status=unreserved）**
+处理顺序：找到收不下货的订阅（`pg_lrstat_pub_sample` 里 retained 最大的槽）→ 恢复它的消费；短期救急可以调大 `max_slot_wal_keep_size`；**`wal_status` 一旦 `lost`，这个订阅数据已缺，只能重建**（先留好业务数据再操作）。
+
+**卡片 4：一阵慢一阵快**
+签名：`spill_rate` 间歇 > 0，总积压锯齿形。
+原因：大事务。见 §4-A-2，属可解释的正常现象；要平滑就拆事务。
+
+**卡片 5：割接前问"还要多久"**
+```sql
+SELECT sub_name, pg_size_pretty(backlog_total) AS 总积压,
+       round(eta_total::numeric) AS 追平秒,
+       round((least(send_rate,apply_rate) - gen_rate)::numeric,1) AS 净追平MB
+FROM pg_lrstat_overall;
+```
+`eta_total` 假设业务停写；**业务继续在写时看"净追平"**：必须为正。例：积压 100GB、净追平 2MB/s ≈ 14 小时。割接窗口按这个留余量，积压归零后再静默观察一个窗口无增长才动手。
+
+**卡片 6：看起来落后其实没事**
+签名：`backlog_inflight ≈ feedback_lag_bytes`，且"应用"速率正常。
+原因：回执 10 秒一发造成的观测假象。无需处理，别误派网络工单。
+
+## 6. 常见误读十条
+
+1. 四个速率相等**不是抄数 bug**，是健康的表现（都被"生成"定节奏）。
+2. "应用"在单个大事务回放期间读到 0 属正常（事务提交才记账），看 `apply_stalled` 区分真假停。
+3. 速率列是 **NULL 不是 0**：刚启动、采样中断恢复、或窗口数据不足——等一个采样周期再看。
+4. `local_wal_rate` 包含订阅库自己的其他写入，只有专用订阅库才能当"应用产生的量"读。
+5. `backlog_inflight` 天然含 10 秒回执假象（见卡片 6）。
+6. 实例**重启后历史清零**（数据在内存），速率要等约 1 分钟才恢复显示；长期趋势靠监控采集 history 视图。
+7. `eta_total` 在持续写入下偏乐观，用净追平速度重估（卡片 5）。
+8. 发布端视图里的对端进度**最多滞后 10 秒**（回执周期），订阅端视图是实时的——判断分仓状态优先看订阅端。
+9. 查 history 视图**一定带过滤条件**（订阅名/时间），否则全量数据量很大。
+10. `sync_state` 非 async 时的"慢"是等同步备库确认，不是复制故障（§4-A-4）。
+
+## 7. 什么时候升级处理
+
+| 现象 | 找谁 |
+| --- | --- |
+| `pg_lrstat_info` 异常 / 视图全空 / 采样进程反复失败 | 扩展维护者（带 `last_round_error` 内容） |
+| `wal_status = lost` | DBA：订阅已缺数据，需按预案重建订阅 |
+| 订阅端冲突报错（错误计数在涨） | 业务方对齐数据 + DBA 处理冲突 |
+| 各环节速率都正常、业务仍反馈延迟 | 应用侧排查（复制链路已证清白） |
