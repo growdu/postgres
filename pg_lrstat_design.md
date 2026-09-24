@@ -407,102 +407,156 @@ pg_lrstat_reset() → void
 - `history` 视图**stop 后可查**（会话期内逐间隔数据）；持久会话跨重启可查；
 - `cluster_stat` 是唯一的"两端"视图——`send_stat`/`recv_stat` 只看各自端，运维日常巡检/排障只需盯 `cluster_stat` 一个。
 
-### 5.3 视图字段详解
+### 5.3 视图字段详解（每列注明"为什么需要它"）
 
-#### `pg_lrstat_info`（一行，~22 列）
+#### `pg_lrstat_info`（一行，15 列）
 
-| 列 | 类型 | 说明 |
+| 列 | 类型 | 为什么需要 |
 | --- | --- | --- |
-| `loaded` | bool | 是否经 shared_preload_libraries 加载；false 时其余视图全空 |
-| `layout_version` | int4 | 共享内存布局版本 |
-| `session_name` | text | 当前/最近会话名 |
-| `session_running` | bool | 是否有会话进行中 |
-| `session_id` | int8 | 会话编号 |
-| `session_state` | text | idle / running / stopped / interrupted |
-| `session_persisted` | bool | 当前会话是否持久化 |
-| `session_start_ts` / `session_stop_ts` | timestamptz | 会话起止 |
-| `session_truncated` / `session_degraded` | bool | 日志超限 / 文件写失败 |
-| `archived_sessions` | int4 | 会话目录归档数 |
-| `sample_interval_ms` | int8 | 采样周期（= 瞬时速率粒度） |
-| `session_max_samples` | int8 | 会话日志容量 |
-| `max_targets` | int4 | 目标容量 |
-| `remote_poll` | bool | 远端轮询开关 |
-| `last_round_ts` | timestamptz | 最近采样轮时刻 |
-| `last_round_ok` | bool | 最近一轮是否成功 |
-| `last_round_error` | text | 最近失败轮错误摘要 |
-| `nrounds` | int8 | 启动以来完成轮数 |
-| `dropped_samples` | int8 | 目标满载丢弃计数 |
+| `loaded` | bool | 第一步自检：false = 没预加载，其余视图全空，先修配置 |
+| `session_name` | text | 当前/最近会话名——确认你在看的确实是刚跑的那轮 |
+| `session_state` | text | idle/running/stopped/interrupted——是还在跑、已结束、还是崩溃了 |
+| `session_persisted` | bool | false = 重启后数据丢失——决定要不要在重启前导出报告 |
+| `session_start_ts` / `session_stop_ts` | timestamptz | 会话起止时间——和其他系统日志对时间线 |
+| `session_truncated` | bool | true = 日志超上限有丢失——报告数据不完整，需扩容 |
+| `session_degraded` | bool | true = 文件写失败——持久化不完整，导出可能缺数据 |
+| `archived_sessions` | int4 | 归档数量——提醒清理旧文件 |
+| `sample_interval_ms` | int8 | 瞬时速率的粒度——读数前先知道"30 秒内的平均"是什么概念 |
+| `last_round_ts` | timestamptz | 采样 worker 最近一次成功——长期不更新 = worker 挂了 |
+| `last_round_ok` | bool | 上一轮采样成功与否 |
+| `last_round_error` | text | 失败时的错误信息——定位采样问题 |
+| `nrounds` | int8 | 启动以来完成轮数——worker 存活证据（应随时间增长） |
+| `dropped_samples` | int8 | 目标槽满导致丢弃——>0 需调大 max_targets |
 
-#### `pg_lrstat_send_stat`（发送端，一复制连接一行，逻辑+物理通用）
+**删除的列**（及原因）：`layout_version`（内部机制，运维无需感知）；`session_running`（`session_state='running'` 已覆盖）；`session_id`（运维用名字不用编号）；`elapsed_secs`（`session_start_ts` 可推算）；`max_targets`/`session_max_samples`/`remote_poll`（GUC 回显，不应在视图重复）。
 
-| 列 | 类型 | 说明 |
+#### `pg_lrstat_send_stat`（发送端，一复制连接一行，37 列）
+
+| 列 | 类型 | 为什么需要 |
 | --- | --- | --- |
-| `slot_name` | text | 槽名（逻辑）或连接标识（物理） |
-| `kind` | text | logical / physical |
-| `sample_time` | timestamptz | 最新样本时刻 |
-| `session_name` / `elapsed_secs` | text / float8 | 所属会话与已历时 |
-| `database`/`plugin`/`temporary`/`active`/`sender_pid`/`application_name`/`client_addr`/`state`/`sync_state`/`wal_status`/`safe_wal_size` | — | 槽与 walsender 透传属性 |
-| `current_lsn`/`sent_lsn`/`peer_recv_lsn`/`peer_flush_lsn`/`peer_applied_lsn`/`confirmed_flush_lsn`/`restart_lsn` | pg_lsn | C0~C7 位点 |
-| `spill_bytes`/`stream_bytes`/`total_bytes` | int8 | 解码计数器累计 |
-| `backlog_unsent`/`backlog_inflight`/`backlog_peer_unapplied`/`backlog_total`/`retained_wal` | int8 | 积压（字节） |
-| `gen_instant`/`gen_avg` | float8 | WAL 生成速率（MB/s） |
-| `send_instant`/`send_avg` | float8 | 发送速率 |
-| `apply_instant`/`apply_avg` | float8 | 对端应用速率（经反馈） |
-| `confirm_instant`/`confirm_avg` | float8 | 确认水位推进速率 |
-| `spill_instant`/`spill_avg`、`stream_instant`/`stream_avg` | float8 | 解码溢写/流式速率 |
-| `write_lag`/`flush_lag`/`replay_lag` | interval | 反馈延迟 |
-| `send_blocked` | bool | 发送堵住：有积压但最近间隔速率≈0 |
+| **标识（11 列）** | | |
+| `slot_name` | text | 目标标识——与 cluster_stat/日志对位 |
+| `kind` | text | logical/physical——一种 SQL 适配两种复制 |
+| `sample_time` | timestamptz | 数据新鲜度——距今多久 |
+| `session_name` | text | 属于哪个测量会话 |
+| `database` | text | 槽属于哪个库——多库集群区分 |
+| `plugin` | text | 输出插件（pgoutput/wal2json）——解码排障要知道 |
+| `temporary` | bool | true=tablesync 临时槽——别和主槽混淆 |
+| `active` | bool | walsender 是否在线——false=订阅端断开 |
+| `sender_pid` | int4 | 关联 pg_stat_activity 排查 walsender 进程 |
+| `application_name` | text | 订阅端标识——定位是哪个订阅连的 |
+| `client_addr` | text | 订阅端 IP——网络排障 |
+| **状态（4 列）** | | |
+| `state` | text | walsender 状态（streaming/catchup）——catchup=正在追 |
+| `sync_state` | text | async/sync——sync 时的"慢"是在等备库不是真慢 |
+| `wal_status` | text | reserved/unreserved/lost——**lost=数据已丢必须重建** |
+| `safe_wal_size` | int8 | 距 max_slot_wal_keep_size 余量——磁盘风险预警 |
+| **位点（3 列）** | | |
+| `current_lsn` | pg_lsn | WAL 生成顶端——与外部工具（pg_waldump）交叉对照 |
+| `sent_lsn` | pg_lsn | 已发送位——同上 |
+| `confirmed_flush_lsn` | pg_lsn | 槽确认水位——WAL 回收决策位 |
+| **积压（5 列）** | | |
+| `backlog_unsent` | int8 | 已生成未发送——发布端发货段积压 |
+| `backlog_inflight` | int8 | 已发送对端未确认接收——含 10s 反馈假象 |
+| `backlog_peer_unapplied` | int8 | 对端已收未应用（反馈口径，最多滞后 10s） |
+| `backlog_total` | int8 | 端到端总积压（反馈口径） |
+| `retained_wal` | int8 | 槽扣住的 WAL——磁盘风险指标 |
+| **速率（14 列，MB/s）** | | |
+| `gen_instant` / `gen_avg` | float8 | WAL 生成——是否上游产出突增 |
+| `send_instant` / `send_avg` | float8 | 发送——发送是否跟得上生成 |
+| `apply_instant` / `apply_avg` | float8 | 对端应用（经反馈）——发布端视角看订阅端 |
+| `spill_instant` / `spill_avg` | float8 | 解码溢写——>0 = 大事务解码压力 |
+| `stream_instant` / `stream_avg` | float8 | 解码流式——>0 = 流式大事务 |
+| **延迟与判定（5 列）** | | |
+| `write_lag` / `flush_lag` / `replay_lag` | interval | 内核反馈延迟（唯一跨机时间源）——定位延迟在网络还是对端 |
+| `send_blocked` | bool | **发送堵住**：unsent>0 且最近间隔 send≈0 |
 
-#### `pg_lrstat_recv_stat`（接收端，一 worker/恢复进程一行）
+**删除的列**（及原因）：`peer_recv_lsn`/`peer_flush_lsn`/`peer_applied_lsn`（三个中间位点——积压列已总结，运维不需要原值）；`restart_lsn`（retained_wal 已总结）；`spill_bytes`/`stream_bytes`/`total_bytes` 累计原值（速率列已总结，原值在 history 可查）；`confirm_instant`/`confirm_avg`（运维看 retained_wal 趋势，不看确认速率）；`reply_time`（active+state 已覆盖）；`elapsed_secs`（可推算）。
 
-| 列 | 类型 | 说明 |
+#### `pg_lrstat_recv_stat`（接收端，一 worker/恢复进程一行，23 列）
+
+| 列 | 类型 | 为什么需要 |
 | --- | --- | --- |
-| `recv_name` | text | 逻辑=订阅名，物理=standby 标识 |
-| `kind` | text | logical / physical |
-| `sample_time` / `session_name` / `elapsed_secs` | — | 同 send_stat |
-| `worker_type` / `worker_pid` / `leader_pid` / `relid` / `slot_name` | — | worker 拓扑 |
-| `received_lsn` / `latest_end_lsn` / `applied_lsn` / `origin_local_lsn` / `local_wal_lsn` | pg_lsn | C3′/C5′ 等位点 |
-| `last_msg_send_time` / `last_msg_receipt_time` / `latest_end_time` | timestamptz | 消息时间戳 |
-| `backlog_apply` | int8 | C3′−C5′ |
-| `recv_instant` / `recv_avg` | float8 | 接收速率（MB/s） |
-| `apply_instant` / `apply_avg` | float8 | 应用/回放速率 |
-| `local_wal_instant` / `local_wal_avg` | float8 | 接收端本地 WAL 速率 |
-| `apply_error_count` / `sync_error_count` | int8 | 错误计数 |
-| `apply_blocked` | bool | **应用堵住了**：有积压（backlog>0）但最近一个采样间隔应用速率≈0——数据到了没写进表 |
+| **标识（8 列）** | | |
+| `recv_name` | text | 逻辑=订阅名 物理=standby 标识 |
+| `kind` | text | logical/physical |
+| `sample_time` / `session_name` | — | 同 send_stat |
+| `worker_type` | text | apply/tablesync/recovery——区分 worker 角色 |
+| `worker_pid` | int4 | 关联 pg_stat_activity **查锁堵**——排障第一步 |
+| `slot_name` | text | 与 send_stat 对位的键 |
+| `leader_pid` / `relid` | int4/oid | 并行 apply 拓扑 / tablesync 目标表 |
+| **位点（2 列）** | | |
+| `received_lsn` | pg_lsn | 本地实收位——无反馈延迟，判断分仓状态首选 |
+| `applied_lsn` | pg_lsn | 已应用位——origin∪反馈融合后 |
+| **消息时间（2 列）** | | |
+| `last_msg_send_time` / `last_msg_receipt_time` | timestamptz | 一对时间戳给出**单条消息的网络延迟**——网络排障原始素材 |
+| **积压（1 列）** | | |
+| `backlog_apply` | int8 | 已收未应用——分仓"到了没上架"积压 |
+| **速率（6 列，MB/s）** | | |
+| `recv_instant` / `recv_avg` | float8 | 接收速率——分仓收货能力 |
+| `apply_instant` / `apply_avg` | float8 | 应用/回放速率——分仓上架能力（瓶颈最常见的列） |
+| `local_wal_instant` / `local_wal_avg` | float8 | 分仓本地 WAL 速率——应用产生的写入量 |
+| **错误与判定（3 列）** | | |
+| `apply_error_count` / `sync_error_count` | int8 | 冲突/错误计数——在涨 = 反复重试 |
+| `apply_blocked` | bool | **应用堵住**：backlog>0 且最近间隔 apply≈0——查 worker_pid 的 wait_event |
 
-#### `pg_lrstat_cluster_stat`（一复制对一行，**唯一两端合成视图**）
+**删除的列**：`origin_local_lsn`（重启续传位点，日常运维不用，排障时从系统视图查）；`local_wal_lsn`（速率列已总结）；`latest_end_lsn`（received_lsn 的回退源，不直接展示）；`latest_end_time`（last_msg_receipt_time 已覆盖）。
 
-| 列组 | 列 | 说明 |
+#### `pg_lrstat_cluster_stat`（一复制对一行，**唯一两端合成视图**，37 列）
+
+| 列组 | 列 | 为什么需要 |
 | --- | --- | --- |
-| 标识 | `recv_name` / `slot_name` / `kind` / `session_name` / `elapsed_secs` | 复制对标识（逻辑=订阅，物理=standby 对） |
-| 轮询 | `remote_state` / `last_remote_poll_time` | 接收端轮询发送端的健康度 |
-| 发送端位点 | `send_current_lsn` / `sent_lsn` / `confirmed_flush_lsn` / `restart_lsn` | 来自 RSEND 目标 |
-| 接收端位点 | `received_lsn` / `applied_lsn` | 来自 RECV 目标 |
-| 发送端速率 | `gen_instant`/`gen_avg`、`send_instant`/`send_avg` | MB/s |
-| 接收端速率 | `recv_instant`/`recv_avg`、`apply_instant`/`apply_avg` | MB/s |
-| 积压 | `backlog_unsent`/`inflight`/`unapplied`/`total`/`retained_wal`/`feedback_lag_bytes` | 字节 |
-| 延迟 | `write_lag`/`flush_lag`/`replay_lag` | interval |
-| 追平 | `catchup_send_secs`/`catchup_total_secs` | 秒（基于 avg） |
-| 堵住 | `send_blocked`/`apply_blocked` | bool |
-| 解码 | `spill_instant`/`spill_avg`/`stream_instant`/`stream_avg` | MB/s |
+| **标识（5 列）** | | |
+| | `recv_name` / `slot_name` / `kind` / `session_name` | 复制对标识 |
+| | `sample_time` | 数据新鲜度 |
+| **轮询健康（2 列）** | | |
+| | `remote_state` / `last_remote_poll_time` | 接收端能否轮到发送端——unreachable=网络问题 |
+| **位点（5 列）** | | |
+| | `send_current_lsn` / `sent_lsn` | 发送端两个主检查点——与外部工具交叉对照 |
+| | `received_lsn` / `applied_lsn` | 接收端两个主检查点 |
+| | `confirmed_flush_lsn` | WAL 回收水位 |
+| **速率（16 列，MB/s）** | | |
+| | `gen_instant`/`gen_avg` | 生成——上游是否突增 |
+| | `send_instant`/`send_avg` | 发送——是否跟得上 |
+| | `recv_instant`/`recv_avg` | 接收——分仓收货 |
+| | `apply_instant`/`apply_avg` | 应用——分仓上架（最常见瓶颈列） |
+| | `spill_instant`/`spill_avg` | 解码溢写——大事务压力 |
+| | `stream_instant`/`stream_avg` | 解码流式——流式大事务 |
+| **积压（6 列）** | | |
+| | `backlog_unsent` | 没发货 |
+| | `backlog_inflight` | 在路上 |
+| | `backlog_unapplied` | 到了没上架 |
+| | `backlog_total` | 总积压（三段之和） |
+| | `retained_wal` | 磁盘风险 |
+| | `feedback_lag_bytes` | 反馈滞后——区分"真在途"和"10s 回执假象" |
+| **延迟（3 列）** | | |
+| | `write_lag`/`flush_lag`/`replay_lag` | 时间维度延迟——定位网络 vs 应用 |
+| **追平与堵住（4 列）** | | |
+| | `catchup_send_secs` / `catchup_total_secs` | 还要多久追平（秒） |
+| | `send_blocked` / `apply_blocked` | 告警源——哪个环节停了 |
+
+**删除的列**：`restart_lsn`（retained_wal 已总结）；`elapsed_secs`（可推算）。
 
 #### `pg_lrstat_send_history`（发送端一目标一间隔一行，stop 后可查）
 
-| 列 | 说明 |
+| 列 | 为什么需要 |
 | --- | --- |
-| `session_name` / `name` / `ts` | 会话/目标/间隔结束时刻 |
-| `d_current` / `d_sent` / `d_spill` / `d_stream` | 本间隔增量（字节） |
-| `level_current` / `level_sent` / `level_confirmed` / `level_restart` | 前缀和重建的水位 |
-| `backlog_unsent` / `backlog_total` / `retained_wal` | 由水位派生 |
+| `session_name` / `name` / `ts` | 画曲线的坐标轴 |
+| `d_current` / `d_sent` | 本间隔增量——**速率时序图的数据源** |
+| `d_spill` / `d_stream` | 本间隔解码增量——解码压力时序图 |
+| `level_current` / `level_sent` / `level_confirmed` | 前缀和重建的水位——**水位阶梯图的数据源** |
+| `backlog_unsent` / `backlog_total` | 由水位派生的逐间隔积压——**积压面积图的数据源** |
 
 #### `pg_lrstat_recv_history`（接收端一目标一间隔一行，stop 后可查）
 
-| 列 | 说明 |
+| 列 | 为什么需要 |
 | --- | --- |
 | `session_name` / `name` / `ts` | 同上 |
 | `d_received` / `d_applied` | 本间隔增量 |
-| `level_received` / `level_applied` | 前缀和重建的水位 |
-| `backlog_apply` | 由水位派生 |
+| `level_received` / `level_applied` | 水位重建 |
+| `backlog_apply` | 逐间隔积压 |
+
+**删除的列**（history 视图）：`level_restart`（retained_wal 可由 level_current - level_restart 算，但 export 不画保水曲线，不预存）；`kind`（视图名已区分侧）。
 
 ### 5.4 GUC
 
