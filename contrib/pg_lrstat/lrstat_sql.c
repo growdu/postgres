@@ -13,6 +13,7 @@
 
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
@@ -177,7 +178,30 @@ pg_lrstat_info(PG_FUNCTION_ARGS)
     lr_put_i8(&r, 0);
     lr_put_i8(&r, 0);
     lr_put_bool(&r, lrstat_remote_poll);
-    lr_put_text(&r, NULL);
+
+    /* archived session names */
+    {
+        char **names = NULL;
+        int count = 0;
+        if (ready)
+            count = lrstat_store_list(&names);
+        if (count > 0 && names != NULL)
+        {
+            ArrayType *arr;
+            Datum *elems = palloc(count * sizeof(Datum));
+            int i;
+            for (i = 0; i < count; i++)
+                elems[i] = CStringGetTextDatum(names[i]);
+            arr = construct_array(elems, count, TEXTOID, -1,
+                                  InvalidOid, TYPALIGN_INT);
+            lr_put(&r, PointerGetDatum(arr), false);
+        }
+        else
+        {
+            lr_put(&r, 0, true);
+        }
+    }
+
     lr_emit(rsinfo, &r);
     PG_RETURN_NULL();
 }
@@ -543,7 +567,6 @@ lrstat_start(PG_FUNCTION_ARGS)
     text *name_arg = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
     char name[NAMEDATALEN];
     char auto_name[64];
-    TimestampTz now;
 
     if (!superuser())
         ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -573,8 +596,6 @@ lrstat_start(PG_FUNCTION_ARGS)
     }
 
     lrstat_session_start(name);
-    now = GetCurrentTimestamp();
-
     PG_RETURN_DATUM(CStringGetTextDatum(name));
 }
 
@@ -615,8 +636,6 @@ lrstat_stop(PG_FUNCTION_ARGS)
     }
 
     lrstat_session_stop();
-    stop_ts = GetCurrentTimestamp();
-
     PG_RETURN_DATUM(CStringGetTextDatum(name));
 }
 
@@ -628,5 +647,40 @@ pg_lrstat_reset(PG_FUNCTION_ARGS)
         ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                         errmsg("must be superuser")));
     lrstat_session_reset();
+    PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(lrstat_delete);
+Datum
+lrstat_delete(PG_FUNCTION_ARGS)
+{
+    text *name_arg = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
+    char name[NAMEDATALEN];
+
+    if (!superuser())
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                        errmsg("must be superuser")));
+    if (name_arg == NULL)
+        ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                        errmsg("session name is required")));
+    if (!lrstat_ready())
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("pg_lrstat not loaded")));
+
+    strlcpy(name, text_to_cstring(name_arg), NAMEDATALEN);
+
+    /* refuse to delete a running session */
+    SpinLockAcquire(&lrstat->session.mutex);
+    if (lrstat->session.running && strcmp(lrstat->session.name, name) == 0)
+    {
+        SpinLockRelease(&lrstat->session.mutex);
+        ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE),
+                        errmsg("session %s is still running, stop it first", name)));
+    }
+    SpinLockRelease(&lrstat->session.mutex);
+
+    if (lrstat_store_delete(name) != 0)
+        ereport(NOTICE, (errmsg("no archived session named %s", name)));
+
     PG_RETURN_VOID();
 }

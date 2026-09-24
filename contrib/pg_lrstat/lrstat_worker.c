@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+
 #include "access/xact.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
@@ -31,6 +33,7 @@ pg_noreturn void pg_lrstat_worker_main(Datum arg);
 
 static void lrstat_round(void);
 static void lrstat_compute_entries(void);
+static void lrstat_persist_entries(void);
 static void sample_send_side(TimestampTz now);
 static LRPollTarget *sample_recv_side(TimestampTz now, int *n_targets);
 
@@ -206,7 +209,12 @@ lrstat_round(void)
 	 * interval deltas and append to the session entry array.
 	 */
 	if (running)
+	{
+		int before = lrstat_get_entry_count();
 		lrstat_compute_entries();
+		lrstat_persist_entries();
+		(void) before;
+	}
 
 	/* remote polling outside the transaction */
 	if (running && lrstat_remote_poll && targets != NULL && n_targets > 0)
@@ -279,6 +287,53 @@ lrstat_compute_entries(void)
 		lrstat_append_entry(i, last.send.ts,
 							d_curr, d_sent, d_recv, d_applied,
 							d_spill, d_stream);
+	}
+}
+
+/* Persist newly written entries to session file if persist=true */
+static void
+lrstat_persist_entries(void)
+{
+	/* Check if session is persisted via degraded flag (simplified: we
+	 * store persist state separately — for now, check if the file exists */
+	char	   *path;
+	struct stat st;
+
+	path = psprintf("%s/pg_lrstat/sessions/%s.sess", DataDir,
+					lrstat->session.name);
+	if (stat(path, &st) != 0)
+	{
+		pfree(path);
+		return;     /* non-persist session, no file */
+	}
+	pfree(path);
+
+	/* Append all new entries to file */
+	{
+		int total = lrstat_get_entry_count();
+		/* Just append everything written this round — the compute_entries
+		 * already wrote to the in-memory array; for file we need to know
+		 * how many are new.  For simplicity in P2, we append all entries
+		 * up to a local counter tracked across rounds. */
+		static int last_persisted = 0;
+		int new_entries = total - last_persisted;
+
+		if (new_entries > 0)
+		{
+			/* Build a contiguous array of new entries */
+			LRSessionEntry *buf = palloc(new_entries * sizeof(LRSessionEntry));
+			int i;
+			for (i = 0; i < new_entries; i++)
+				memcpy(&buf[i], lrstat_entry_at(last_persisted + i),
+					   sizeof(LRSessionEntry));
+			lrstat_store_append(new_entries, buf);
+			pfree(buf);
+			last_persisted = total;
+		}
+
+		/* Reset on new session */
+		if (total == 0)
+			last_persisted = 0;
 	}
 }
 

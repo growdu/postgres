@@ -234,6 +234,17 @@ extern void lrstat_note_dropped(const char *name);
 /* lrstat_worker.c */
 extern PGDLLEXPORT pg_noreturn void pg_lrstat_worker_main(Datum arg);
 
+/* lrstat_store.c */
+extern int  lrstat_store_create(const char *name, uint64 session_id,
+								TimestampTz start_ts);
+extern void lrstat_store_append(int n_entries, LRSessionEntry *entries);
+extern void lrstat_store_finalize(const char *name, const char *state,
+								  int n_targets, int n_entries,
+								  bool truncated, bool degraded);
+extern void lrstat_store_recover(void);
+extern int  lrstat_store_list(char ***names_out);
+extern int  lrstat_store_delete(const char *name);
+
 /* lrstat_remote.c */
 extern void lrstat_run_remote_poll(const LRPollTarget *targets, int ntargets,
 							   TimestampTz deadline);

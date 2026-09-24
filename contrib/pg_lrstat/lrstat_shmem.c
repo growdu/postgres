@@ -100,6 +100,7 @@ lrstat_shmem_startup(void)
 
 	lrstat->ntargets = lrstat_max_targets;
 	lrstat->ring_len = lrstat_ring_len;
+	lrstat->n_entries = 0;
 
 	for (i = 0; i < lrstat->ntargets; i++)
 	{
@@ -107,6 +108,9 @@ lrstat_shmem_startup(void)
 		MemSet(t, 0, sizeof(LRTargetCtl));
 		SpinLockInit(&t->mutex);
 	}
+
+	/* Recover interrupted sessions from files */
+	lrstat_store_recover();
 }
 
 bool
@@ -341,6 +345,11 @@ lrstat_session_start(const char *name)
 		SpinLockRelease(&t->mutex);
 	}
 	lrstat->n_entries = 0;
+
+	/* Create session file for persist sessions */
+	if (lrstat_store_create(name, lrstat->session.session_id,
+							 lrstat->session.start_ts) != 0)
+		lrstat->session.degraded = true;
 }
 
 void
@@ -353,6 +362,12 @@ lrstat_session_stop(void)
 	lrstat->session.running = false;
 	lrstat->session.stop_ts = GetCurrentTimestamp();
 	SpinLockRelease(&lrstat->session.mutex);
+
+	/* Finalize session file */
+	lrstat_store_finalize(lrstat->session.name, "stopped",
+						  lrstat->ntargets, lrstat->n_entries,
+						  lrstat->session.truncated,
+						  lrstat->session.degraded);
 }
 
 void

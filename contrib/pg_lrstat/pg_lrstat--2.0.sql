@@ -18,6 +18,11 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'pg_lrstat_reset'
 LANGUAGE C VOLATILE;
 
+CREATE FUNCTION lrstat_delete(name text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'lrstat_delete'
+LANGUAGE C VOLATILE;
+
 -- View: info (1 row, health + session state)
 CREATE FUNCTION pg_lrstat_info(
     OUT loaded bool, OUT session_name text, OUT session_state text,

@@ -6,6 +6,7 @@ OBJS = \
   lrstat_remote.o \
   lrstat_shmem.o \
   lrstat_sql.o \
+  lrstat_store.o \
   lrstat_worker.o \
   pg_lrstat.o
 PGFILEDESC = "pg_lrstat - replication measurement sessions"
