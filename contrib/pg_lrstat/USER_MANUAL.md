@@ -116,37 +116,207 @@ SELECT ts, current_lsn, sent_lsn, peer_applied_lsn
 FROM pg_lrstat_pub_history('mysub', now() - interval '1 hour');
 ```
 
-## 5. 视图详解
+## 5. 视图详解（完整字段参考）
 
-单位约定：**速率 MB/s（1MB=1048576B）**，**积压/字节类列 bytes**（可直接 `pg_size_pretty`），**eta_* 秒**。每个视图的每一列都有 `COMMENT ON COLUMN`，psql 里 `\d+ pg_lrstat_overall` 可看全部释义。
+单位约定：**速率 MB/s（1MB=1048576B）**、**积压/字节类列 bytes**（可直接 `pg_size_pretty`）、**eta_* 秒**。本节覆盖全部 8 个视图的每一个字段；数据库内对关键列另有 `COMMENT ON COLUMN`（`\d+ 视图名` 可查），完整语义以本节为准。
 
-### 5.1 `pg_lrstat_info` — 诊断（先看这个）
+通用约定（各视图反复出现，先记住这三条）：
 
-一行：`loaded / layout_version / ntargets / ring_len / sample_interval_ms / rate_window_ms / max_targets / remote_poll / last_round_ts / last_round_ok / last_round_error / nrounds / dropped_samples`。
+- **时间三件套**：`rate_time`（本行速率的计算时刻）、`window_start_time`/`window_end_time`（差分实际使用的样本区间边界）、`window_secs`（实际窗口秒数）——速率读数可追溯；窗口数据不足半程时速率列为 NULL 而非 0。
+- **NULL 哨兵**：`pg_lsn` 列值为 0 时显示 NULL（无数据）；pid 为 0 显示 NULL。
+- **链路图**（overall/pub 视图通用编号）：
 
-### 5.2 `pg_lrstat_pub_sample` — 发布端采样表（一逻辑槽一行）
+```
+发布端                                订阅端
+pub_current ──► sent ──► [网络] ──► received ──► applied ──► (反馈) ──► confirmed_flush
+     └──restart(保水)
+  |←unsent→|←──inflight──→|←─unapplied─→|
+  |←──────────────── backlog_total ────────→|
+```
 
-最新样本的瞬时事实：32 列 = 标识（slot/database/plugin/temporary/active/sender_pid/application_name/client_addr/state/sync_state）+ 7 个 LSN 检查点（current/sent/peer_recv/peer_flush/peer_applied/confirmed_flush/restart）+ wal_status/safe_wal_size + 解码计数器（spill/stream/total_bytes）+ 5 个积压 + 3 个反馈 lag + reply_time。
+### 5.1 `pg_lrstat_info` — 诊断（先看这个，13 列）
 
-### 5.3 `pg_lrstat_pub_rate` — 发布端速率表
+| 列 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `loaded` | bool | 扩展是否经 `shared_preload_libraries` 加载。`f` 时其余视图全空——排障第一步 |
+| `layout_version` | int4 | 共享内存布局版本；升级后不匹配会拒绝附加（防御旧段被误读） |
+| `ntargets` | int4 | 目标槽数（容量，等于 `max_targets`） |
+| `ring_len` | int8 | 每目标环长（`raw_history_samples` 生效值） |
+| `sample_interval_ms` | int8 | 采样周期生效值 |
+| `rate_window_ms` | int8 | 速率窗口生效值 |
+| `max_targets` | int8 | 同 ntargets（配置原值） |
+| `remote_poll` | bool | 订阅端是否启用发布端轮询 |
+| `last_round_ts` | timestamptz | 采样器最近一次完成轮的时刻；长期不更新=worker 异常 |
+| `last_round_ok` | bool | 最近一轮是否成功 |
+| `last_round_error` | text | 最近失败轮的错误摘要（成功时 NULL） |
+| `nrounds` | int8 | 启动以来完成的轮数（worker 存活的证据） |
+| `dropped_samples` | int8 | 因目标槽满而被丢弃的样本数；非 0 需调大 `max_targets` 并重启 |
 
-`rate_time` + 实际差分窗口三件套（`window_start_time/window_end_time/window_secs`）+ gen/send/peer_apply/confirm/spill/stream 六速率 + `eta_unsent/eta_total` + `send_stalled`。
+### 5.2 `pg_lrstat_pub_sample` — 发布端采样表（一逻辑槽一行，32 列）
 
-### 5.4 `pg_lrstat_sub_sample` / `pg_lrstat_sub_rate` — 订阅端
+最新样本的瞬时事实。前 11 列标识与状态，中间 11 列位点与计数，后 10 列派生积压与延迟。
 
-按 worker 一行（apply/tablesync，`leader_pid` 区分并行）：接收/应用/本地 WAL 检查点、`backlog_apply`；速率表给 recv/apply/local_wal 三速率与 `eta_apply`、`apply_stalled`。
+| 列 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `slot_name` | text | 逻辑槽名（与订阅端 `subslotname` 对位 join 的键） |
+| `sample_time` | timestamptz | 本行样本的采样时刻 |
+| `database` | text | 槽所属发布库 |
+| `plugin` | text | 输出插件（pgoutput/wal2json…） |
+| `temporary` | bool | true = 初始同步的临时槽（tablesync 期间出现） |
+| `active` | bool | 槽是否被 walsender 持有；订阅断开时变 f |
+| `sender_pid` | int4 | 服务该槽的 walsender pid（无则为 NULL） |
+| `application_name` | text | 订阅侧连接标识（默认=订阅名） |
+| `client_addr` | text | 订阅端地址（权限不足时 NULL） |
+| `state` | text | walsender 状态（streaming/catchup…，无 walsender 为 NULL） |
+| `sync_state` | text | 同步复制角色（async/sync…）；非 async 且 state 显示等待=被同步复制拖住而非吞吐问题 |
+| `current_lsn` | pg_lsn | C0：`pg_current_wal_lsn()`——WAL 生成顶端 |
+| `sent_lsn` | pg_lsn | C2：walsender 已发送位（无 walsender 为 NULL） |
+| `peer_recv_lsn` | pg_lsn | C3：反馈报文报告的订阅端接收位（滞后一个反馈周期） |
+| `peer_flush_lsn` | pg_lsn | C4：反馈报告的已提交落盘位 |
+| `peer_applied_lsn` | pg_lsn | C5：反馈报告的已应用位 |
+| `confirmed_flush_lsn` | pg_lsn | C6：槽确认水位（WAL 回收决策依据） |
+| `restart_lsn` | pg_lsn | C7：槽保水位 |
+| `wal_status` | text | 保留状态（reserved/unreserved/lost…），lost=已丢数据需重建订阅 |
+| `safe_wal_size` | int8 | 距离 `max_slot_wal_keep_size` 的余量（bytes） |
+| `spill_bytes` | int8 | 解码溢写累计字节（ReorderBuffer 落盘） |
+| `stream_bytes` | int8 | 解码流式累计字节（未提交大事务） |
+| `total_bytes` | int8 | 解码输出累计字节；与 WAL 增量之比≈解码膨胀率 |
+| `backlog_unsent` | int8 | bytes：current−sent，未发送积压（含未解码） |
+| `backlog_inflight` | int8 | bytes：sent−peer_recv，在途（含反馈滞后造成的假在途，见 overall 的 `feedback_lag_bytes`） |
+| `backlog_peer_unapplied` | int8 | bytes：peer_recv−peer_applied，对端已收未应用（反馈口径） |
+| `backlog_total` | int8 | bytes：current−peer_applied，端到端总积压（反馈口径） |
+| `retained_wal` | int8 | bytes：current−restart，该槽扣住的 WAL 总量（磁盘风险） |
+| `write_lag` / `flush_lag` / `replay_lag` | interval | 内核按反馈时间戳计算的延迟：对端确认接收/落盘/应用的时间滞后；唯一可跨机使用的时间延迟 |
+| `reply_time` | timestamptz | 最近一次收到反馈的时刻 |
 
-### 5.5 `pg_lrstat_pipeline` — 发布端阶段分解（一槽四行）
+### 5.3 `pg_lrstat_pub_rate` — 发布端速率表（14 列）
 
-`stage ∈ {unsent, inflight, peer_unapplied, retained}`，每行带该段积压、排空速率与反馈时间 lag——画堆叠柱状图直接用。
+| 列 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `slot_name` | text | 槽名 |
+| `rate_time` + 窗口三件套 | — | 见通用约定 |
+| `gen_rate` | float8 | WAL 生成速率（发布库全体写入） |
+| `send_rate` | float8 | walsender 发送速率（LSN 等效；与带宽对比需乘解码膨胀率） |
+| `apply_rate` | float8 | 对端应用速率（**经反馈**，含反馈周期延迟；订阅端本地的准确值看 `pg_lrstat_sub_rate`） |
+| `confirm_rate` | float8 | 槽确认水位推进速率 |
+| `spill_rate` / `stream_rate` | float8 | 解码溢写/流式速率，>0 = 大事务解码压力 |
+| `eta_unsent` | float8 | 秒：unsent/send_rate；速率不足 `eta_min_rate` 或积压为 0 时 NULL |
+| `eta_total` | float8 | 秒：排空总积压的预估（分段求和） |
+| `send_stalled` | bool | 发布端停滞：unsent>0 且 send_rate≈0（告警源） |
+
+### 5.4 `pg_lrstat_sub_sample` / `pg_lrstat_sub_rate` — 订阅端（18 + 12 列）
+
+采样表一行/worker（apply 或 `table synchronization`；`leader_pid` 区分并行 apply），速率表同粒度。
+
+**`pg_lrstat_sub_sample`：**
+
+| 列 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `sub_name` | text | 订阅名 |
+| `sample_time` | timestamptz | 采样时刻 |
+| `subslotname` | text | 对应发布端槽名 |
+| `worker_type` | text | `apply` / `table synchronization`（v18 拼写） |
+| `worker_pid` / `leader_pid` | int4 | worker 进程 / 其 leader（并行 apply 时非空） |
+| `relid` | oid | tablesync 的目标表（apply 行为 NULL） |
+| `received_lsn` | pg_lsn | C3′：实收位（`received_lsn`，本地实时、无反馈延迟） |
+| `latest_end_lsn` | pg_lsn | 最后一个 keepalive/数据消息的结束位（received 为空时的回退源） |
+| `applied_lsn` | pg_lsn | C5′：已应用位（origin `remote_lsn`；v18 注意见 overall 的说明） |
+| `origin_local_lsn` | pg_lsn | origin 的本地 WAL 位点（最后一次带 origin 提交的本地位置） |
+| `local_wal_lsn` | pg_lsn | 订阅库 `pg_current_wal_lsn()`（含非复制写入，`local_wal_rate` 的数据源） |
+| `last_msg_send_time` / `last_msg_receipt_time` | timestamptz | 最近消息的发布端发送时刻/本地接收时刻（诊断网络延迟的原始素材） |
+| `latest_end_time` | timestamptz | 最近 keepalive 结束时刻 |
+| `backlog_apply` | int8 | bytes：received−applied，已收未应用（本地口径，overall 同名列无反馈失真） |
+| `apply_error_count` / `sync_error_count` | int8 | 应用/同步错误累计（-1 显示 NULL=未知） |
+
+**`pg_lrstat_sub_rate`：**
+
+| 列 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `sub_name` / `worker_type` / `relid` | — | 目标标识（同上） |
+| `rate_time` + 窗口三件套 | — | 见通用约定 |
+| `recv_rate` | float8 | 接收速率（本地实收位差分） |
+| `apply_rate` | float8 | 应用速率（origin 位点差分，**本地口径、无反馈延迟**） |
+| `local_wal_rate` | float8 | 订阅端本地 WAL 生成速率（应用回放产生 + 本库其他写入噪声；专用订阅库才可当"应用产生的 WAL"读） |
+| `eta_apply` | float8 | 秒：backlog_apply/apply_rate |
+| `apply_stalled` | bool | 订阅端停滞：unapplied>0 且 apply_rate≈0——先查 `pg_stat_activity` 中 worker 的 `wait_event`（多为锁冲突） |
+
+### 5.5 `pg_lrstat_pipeline` — 发布端阶段分解（一槽四行，8 列）
+
+| 列 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `slot_name` | text | 槽名 |
+| `stage` | text | `unsent`（current→sent）/ `inflight`（sent→对端已收）/ `peer_unapplied`（对端已收→已应用）/ `retained`（槽保水） |
+| `rate_time` + 窗口三件套 | — | 见通用约定（窗口取自 send_rate 的差分区间） |
+| `backlog_bytes` | int8 | 本段积压（bytes）；四段堆叠图直接用 |
+| `rate` | float8 | 本段排空速率（MB/s；retained 段恒 NULL） |
+| `lag` | interval | 本段反馈时间滞后：inflight=write_lag、peer_unapplied=replay−write（负则 NULL）、unsent/retained=NULL |
 
 ### 5.6 `pg_lrstat_overall` — 订阅端整体视图（一订阅一行，34 列）
 
-发布端列来自远端轮询、订阅端列来自本地采样；`remote_state ∈ {ok, unreachable, stale, n/a}`；含 `feedback_lag_bytes`（本地实收 − 反馈接收位，量化反馈滞后）。
+两端合成：发布端列来自 **RPUB 环**（采样器凭 conninfo 轮询发布端，时间戳为本地时钟，**两端时钟偏差不进入任何计算**），订阅端列来自 **SUB 环**（本地实时）。这是日常监控的主视图。
 
-### 5.7 `pg_lrstat_pub_history / sub_history` — 原始时间序列
+**标识与轮询健康：**
 
-`(name, since)` 两个可选过滤参数；按时间升序返回环内原始样本。
+| 列 | 类型 | 含义与用途 |
+| --- | --- | --- |
+| `sub_name` | text | 订阅名 |
+| `subslotname` | text | 发布端槽名（与发布端视图 join 的钥匙） |
+| `remote_state` | text | `ok` 正常；`unreachable` 连不上发布端（指数退避重连）；`stale` 可达但槽不存在（新建订阅未建槽）或单轮预算耗尽；`n/a` 无远端数据（`remote_poll=off` 或首轮未完成） |
+| `last_remote_poll_time` | timestamptz | 最近一次成功轮询时刻（本地时钟）；与 `rate_time` 差值判断远端数据新鲜度 |
+
+**时间轴：** `sample_time`（SUB 数据采样时刻）、`rate_time` + 窗口三件套——见通用约定。
+
+**六个位点（0 显示 NULL）：**
+
+| 列 | 检查点 | 来源 | 含义 |
+| --- | --- | --- | --- |
+| `pub_current_lsn` | C0 | RPUB | 发布端 WAL 顶端 |
+| `sent_lsn` | C2 | RPUB | 已发送位 |
+| `received_lsn` | C3′ | SUB | 本地实收位（无反馈延迟） |
+| `applied_lsn` | C5′ | SUB | 已应用位（origin）；注意：积压计算内部用 `max(origin 位, 反馈 flush 位)` 取更靠前者（v18 反馈位更可靠），本列展示 origin 原值 |
+| `confirmed_flush_lsn` | C6 | RPUB | 槽确认水位 |
+| `restart_lsn` | C7 | RPUB | 槽保水位 |
+
+**六个速率（MB/s）：** `gen_rate`/`send_rate`/`spill_rate`/`stream_rate` 来自 RPUB 环差分；`recv_rate`/`apply_rate` 来自 SUB 环差分。判读：`send<gen 持续`=发布端发不动；`apply<recv 持续`=订阅端短板；四速率同频且 backlog→0=健康。
+
+**六个积压（bytes）：**
+
+| 列 | 公式 | 含义与用途 |
+| --- | --- | --- |
+| `backlog_unsent` | current−sent | 发布端未发送 |
+| `backlog_inflight` | sent−received（本地实收） | **真网络在途**——不含发布端视图那种反馈假在途 |
+| `backlog_unapplied` | received−applied | 已收未应用 |
+| `backlog_total` | current−applied | 端到端总积压（三段之和） |
+| `retained_wal` | current−restart | 槽扣住的 WAL（磁盘风险，配合发布端 wal_status） |
+| `feedback_lag_bytes` | received−反馈接收位 | 反馈滞后量的直接观测：若 `inflight≈feedback_lag_bytes`，"在途"是反馈延迟假象而非网络问题 |
+
+**反馈时间延迟：** `write_lag`/`flush_lag`/`replay_lag`（interval）——同 §5.2，唯一可跨机的时间延迟来源，NULL=尚无反馈。
+
+**ETA 与停滞：**
+
+| 列 | 含义与用途 |
+| --- | --- |
+| `eta_unsent`（秒） | unsent/send_rate；速率不足或积压为 0 时 NULL |
+| `eta_total`（秒） | unsent/send + (inflight+unapplied)/apply；**持续写入场景用净追平速率重估**（`min(send,apply)−gen` 为负则追不平） |
+| `send_stalled` | 发布端停滞标志（告警源） |
+| `apply_stalled` | 订阅端停滞标志——先查 apply worker 的 wait_event |
+
+**NULL 规则速记**：`remote_state='n/a'` 时发布端侧 5 位点、4 速率、5 积压、3 lag、`eta_unsent`、`send_stalled` 全 NULL，仅本地列有效；采样中断/窗口不足时对应速率 NULL 而非 0。日常巡检盯 8 列：`remote_state`、四速率、`backlog_total`、`eta_total`、两个 stalled。
+
+### 5.7 `pg_lrstat_pub_history / sub_history` — 原始时间序列（8 + 7 列）
+
+`(name, since)` 两个可选过滤参数；按时间升序返回环内原始样本（监控画图用）。
+
+| pub_history 列 | 含义 | | sub_history 列 | 含义 |
+| --- | --- | --- | --- | --- |
+| `name` | 槽名 | | `name` | 订阅名 |
+| `ts` | 样本时刻 | | `ts` | 样本时刻 |
+| `current_lsn` | C0 | | `received_lsn` | C3′ |
+| `sent_lsn` | C2 | | `latest_end_lsn` | 消息结束位 |
+| `peer_recv_lsn` | C3 | | `applied_lsn` | C5′ |
+| `peer_applied_lsn` | C5 | | `origin_local_lsn` | origin 本地位 |
+| `confirmed_flush_lsn` | C6 | | `local_wal_lsn` | 本地 WAL 顶端 |
+| `restart_lsn` | C7 | | | |
 
 ## 6. 运维操作
 
