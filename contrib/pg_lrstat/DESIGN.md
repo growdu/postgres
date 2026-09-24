@@ -40,7 +40,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | **瞬时速率（instant）** | 最近两个样本的差分 ÷ 采样间隔——"刚刚 30 秒怎么样" |
 | **平均速率（avg）** | 最新样本 − 锚点 ÷ 经过时间——"这轮从头到现在平均多少" |
 | **会话日志** | 会话期内逐间隔的增量记录（内存一份；persist 会话另落盘一份） |
-| **会话报告** | stop 后由会话日志聚合出的完整统计（总量、平均、峰值、停滞等） |
+| **会话报告** | stop 后由会话日志聚合出的完整统计（总量、平均、峰值、堵住等） |
 
 ### 1.3 目标与非目标
 
@@ -136,19 +136,19 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | `avg_f` | total ÷ duration | 会话平均（= stop 时刻 live 的 avg） |
 | `f_instant_min/max/avg` | 会话日志逐间隔统计 | 瞬时速率分布（峰值/谷值/均值） |
 | `peak_backlog_*` | 锚点起增量前缀和重建各水位，取逐间隔最大 | 峰值积压 |
-| `stalled_intervals` | 瞬时 apply/send ≈0 且对应积压 >0 的间隔数 | 停滞时长占比 |
+| `blocked_intervals` | 瞬时 apply/send ≈0 且对应积压 >0 的间隔数 | 堵住时长占比 |
 | `polls_ok / polls_fail` | 远端轮询成功/失败次数 | 整体视图专有 |
 | `partial` | 目标首个样本晚于 start_ts | 会话中途加入的目标 |
 | `truncated` / `degraded` | 会话日志超上限 / 文件写失败 | 数据完整性标记 |
 
-### 3.4 追平预估（catchup）与停滞（live 视图）
+### 3.4 追平预估（catchup）与堵住（live 视图）
 
 ```
 catchup_send_secs  = backlog_unsent / avg(send)
 catchup_total_secs = backlog_unsent / avg(send) + (inflight + unapplied) / avg(apply)
 ```
 
-平均速率低于 `catchup_min_rate`（默认 1kB/s）或积压为 0 时为 NULL；持续写入场景需用**净追平速率** `min(avg send, avg apply) − avg gen` 重估（为负则追不平）。`*_stalled` = 对应积压>0 且**瞬时**速率有效但 < 1 B/s（"最近一个采样间隔没动"）。
+平均速率低于 `catchup_min_rate`（默认 1kB/s）或积压为 0 时为 NULL；持续写入场景需用**净追平速率** `min(avg send, avg apply) − avg gen` 重估（为负则追不平）。`*_blocked` = 对应积压>0 且**瞬时**速率有效但 < 1 B/s（"最近一个采样间隔没动"）。
 
 ---
 
@@ -451,7 +451,7 @@ pg_lrstat_reset() → void
 | `confirm_instant`/`confirm_avg` | float8 | 确认水位推进速率 |
 | `spill_instant`/`spill_avg`、`stream_instant`/`stream_avg` | float8 | 解码溢写/流式速率 |
 | `write_lag`/`flush_lag`/`replay_lag` | interval | 反馈延迟 |
-| `send_stalled` | bool | unsent>0 且瞬时 send≈0 |
+| `send_blocked` | bool | 发送堵住：有积压但最近间隔速率≈0 |
 
 #### `pg_lrstat_recv_stat`（接收端，一 worker/恢复进程一行）
 
@@ -468,7 +468,7 @@ pg_lrstat_reset() → void
 | `apply_instant` / `apply_avg` | float8 | 应用/回放速率 |
 | `local_wal_instant` / `local_wal_avg` | float8 | 接收端本地 WAL 速率 |
 | `apply_error_count` / `sync_error_count` | int8 | 错误计数 |
-| `apply_stalled` | bool | backlog>0 且瞬时 apply≈0 |
+| `apply_blocked` | bool | **应用堵住了**：有积压（backlog>0）但最近一个采样间隔应用速率≈0——数据到了没写进表 |
 
 #### `pg_lrstat_cluster_stat`（一复制对一行，**唯一两端合成视图**）
 
@@ -483,7 +483,7 @@ pg_lrstat_reset() → void
 | 积压 | `backlog_unsent`/`inflight`/`unapplied`/`total`/`retained_wal`/`feedback_lag_bytes` | 字节 |
 | 延迟 | `write_lag`/`flush_lag`/`replay_lag` | interval |
 | 追平 | `catchup_send_secs`/`catchup_total_secs` | 秒（基于 avg） |
-| 停滞 | `send_stalled`/`apply_stalled` | bool |
+| 堵住 | `send_blocked`/`apply_blocked` | bool |
 | 解码 | `spill_instant`/`spill_avg`/`stream_instant`/`stream_avg` | MB/s |
 
 #### `pg_lrstat_send_history`（发送端一目标一间隔一行，stop 后可查）
@@ -655,8 +655,8 @@ FROM pg_stat_wal_receiver wr;
 | persist 会话文件写失败 | 采样不中断，`degraded=true`，stop 时 WARNING |
 | 实例在 persist 会话中崩溃 | 重启后自动收尾为 `interrupted` 归档，丢失 ≤1 间隔 |
 | 非 persist 会话遇重启 | 会话与报告消失（设计行为） |
-| 接收端锁堵塞应用（逻辑） | `apply_stalled=t`；逐间隔序列呈台阶形（起点/拐点=被堵/放开时刻） |
-| 单个大事务回放 | apply 瞬时速率归 0（位点仅提交边界推进），`stalled` 区分，报告 min 值体现 |
+| 接收端锁堵塞应用（逻辑） | `apply_blocked=t`；逐间隔序列呈台阶形（起点/拐点=被堵/放开时刻） |
+| 单个大事务回放 | apply 瞬时速率归 0（位点仅提交边界推进），`blocked` 区分，报告 min 值体现 |
 | 远端发送端宕机 | `remote_state='unreachable'`，指数退避重连，本地采样不受影响 |
 | 目标数超容量 | 丢弃计数 + 限频 WARNING（`pg_lrstat_info.dropped_samples`） |
 | 重复 start / 重名 / 名字不符的 stop | 一律报错，不产生副作用 |
