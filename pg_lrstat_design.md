@@ -575,24 +575,123 @@ pg_lrstat_reset() → void
 
 ### 5.5 报告导出 `lrstat_export(name, format, dest)`
 
-导出指定会话的全部 6 个视图数据。非持久会话从内存渲染（窗口期至下次 start），持久会话从归档渲染。
+导出指定会话的全部 6 个视图数据 **+ 自动分析结论**。非持久会话从内存渲染（窗口期至下次 start），持久会话从归档渲染。
+
+#### 5.5.1 自动分析结论（导出的核心价值）
+
+导出时从会话数据自动计算以下结论，以**人话**呈现在报告最顶部（运维第一眼看到的就是"哪里慢、要多久"）：
+
+**① 瓶颈判定**——根据积压分布 + 速率对比，自动定位到具体环节：
+
+```
+判定逻辑（按优先级）：
+  if send_avg < gen_avg AND backlog_unsent 占总积压 > 50%:
+      → 瓶颈 = 发送端（发送跟不上生成）
+      → 若 spill_avg > 0: 深层原因 = 解码（大事务溢写磁盘）
+      → 若 sync_state != 'async': 深层原因 = 等同步复制确认（不是真慢）
+  elif backlog_unapplied 占总积压 > 50% AND apply_avg < recv_avg:
+      → 瓶颈 = 接收端应用（数据到了没写进表）
+      → 若 apply_blocked: 深层原因 = 锁堵塞（查 worker_pid 的 wait_event）
+  elif backlog_inflight 占总积压 > 50% AND inflight >> feedback_lag:
+      → 瓶颈 = 网络（数据在路上推不动）
+  else:
+      → 无明显瓶颈（四速率同频，积压趋零）
+```
+
+输出格式（HTML/JSON 均含）：
+
+```json
+{
+  "analysis": {
+    "bottleneck": "接收端应用",           // 发送端 / 接收端应用 / 网络 / 无
+    "deep_cause": "锁堵塞",              // 解码溢写 / 等同步复制 / 锁堵塞 / —
+    "evidence": {
+      "gen_avg": 7.5, "send_avg": 7.5, "recv_avg": 7.4, "apply_avg": 3.2,
+      "backlog_unsent_pct": 1, "backlog_unapplied_pct": 85, "backlog_inflight_pct": 14,
+      "spill_avg": 0, "apply_blocked": true
+    }
+  }
+}
+```
+
+**② 追平预估**——当前没 apply 的数据还要多久：
+
+```
+当前积压追平时间 = backlog_unapplied / avg_apply          （秒）
+  若 avg_apply ≈ 0 且 backlog > 0: 显示"应用已停，追平时间不可估"
+```
+
+**③ 容量外推**——按本次会话的平均 apply 速率，同步不同量级 WAL 需要多久：
+
+```
+同步 50G  ≈ 50 × 1024³ / (avg_apply × 1048576)  秒 ≈ 50×1024 / avg_apply 秒
+同步 100G ≈ 100 × 1024 / avg_apply 秒
+同步 200G ≈ 200 × 1024 / avg_apply 秒
+```
+
+输出示例（HTML 中的表格）：
+
+```
+┌──────────────────────────────────────────────────┐
+│  按本次会话平均应用速率 3.2 MB/s 计算：             │
+├──────────┬───────────┬───────────────────────────┤
+│ 同步量    │ 预计耗时    │ 备注                      │
+├──────────┼───────────┼───────────────────────────┤
+│ 当前积压  │   85MB    │ 27 秒                     │
+│ 50 GB    │  4.4 小时  │ 假设发送端能跟上           │
+│ 100 GB   │  8.9 小时  │                           │
+│ 200 GB   │ 17.8 小时  │ ≈ 17 小时 47 分            │
+└──────────┴───────────┴───────────────────────────┘
+│ ⚠ 注意：假设平均速率持续；若 gen > send 则永远追不平 │
+└──────────────────────────────────────────────────┘
+```
+
+**④ 净追平速率**（最重要的判断）：
+
+```
+净速率 = min(avg_send, avg_apply) − avg_gen
+  > 0: 能追平（值越大追得越快）
+  = 0: 保持现状（积压不再增长也不缩小）
+  < 0: 追不平（差距只会越来越大，必须扩容/拆负载）
+```
+
+#### 5.5.2 导出格式
 
 **`format='html'`（默认）——自包含单文件**：无 CDN、全部 CSS/JS 内嵌，浏览器双击即开：
 
 | 区块 | 内容 |
 | --- | --- |
+| **分析结论卡片**（最顶部） | 瓶颈判定 + 深层原因 + 追平预估 + 容量外推表 + 净追平速率——运维第一眼就看这里 |
 | 头部卡片 | 会话名/时间窗/时长/目标数/状态/三大总量 |
-| 速率时序图 | gen/send/recv/apply 逐间隔曲线 + 平均线，内嵌 SVG + 原生 JS（悬停数值/缩放） |
-| 积压堆叠面积图 | unsent/inflight/unapplied 堆叠 + total 总线，峰值点标注 |
-| 四水位阶梯图 | current/sent/received/applied——一眼看出哪条腿拖后 |
+| 速率时序图 | gen/send/recv/apply 逐间隔曲线 + 平均线，内嵌 SVG + 原生 JS |
+| 积压堆叠面积图 | unsent/inflight/unapplied 堆叠 + total 总线，峰值标注 |
+| 四水位阶梯图 | current/sent/received/applied |
 | 统计表 | send_stat / recv_stat / cluster_stat 全列，每目标一行可排序 |
 | 解码压力 | spill/stream 逐间隔柱状图（有数据才渲染） |
 
-**`format='png'`**：三张核心图表的静态位图（`<name>_rates/_backlog/_levels.png`），worker 进程内纯 C + libpng 离屏渲染固定版式（服务器零浏览器依赖），贴工单/群聊用。
+**`format='json'`**：机器可读完整数据包：
 
-**`format='json'`**：机器可读完整数据包（会话元信息 + 每目标报告行 + 逐间隔序列，字段名与视图列一一对应），供 Grafana/Python 消费。
+```json
+{
+  "session": { "name": "...", "start": "...", "stop": "...", "state": "stopped" },
+  "analysis": { ... },           // §5.5.1 的四项结论
+  "capacity": {                   // §5.5.1-③ 的容量外推
+    "avg_apply_mbps": 3.2,
+    "catchup_current": { "backlog_bytes": 89128960, "est_secs": 27 },
+    "sync_50g_secs": 16000, "sync_100g_secs": 32000, "sync_200g_secs": 64000,
+    "net_catchup_mbps": -0.1      // §5.5.1-④
+  },
+  "send_stat": [ ... ],
+  "recv_stat": [ ... ],
+  "cluster_stat": [ ... ],
+  "send_history": [ ... ],
+  "recv_history": [ ... ]
+}
+```
 
-**`dest`**：默认 `$PGDATA/pg_lrstat/exports/`（自动创建）；自定义路径必须以该目录为根（防任意写），文件名固定 `<name>[_<chart>].<ext>`。`dest := '-'` 不写文件直接返回内容（HTML/JSON 为 text、PNG 为 bytea），配合 `\o report.html`。返回 `(path, content, bytes)`。
+**`format='png'`**：三张核心图表的静态位图（`<name>_rates/_backlog/_levels.png`），纯 C + libpng 固定版式。
+
+**`dest`**：默认 `$PGDATA/pg_lrstat/exports/`；`dest := '-'` 直接返回内容。返回 `(path, content, bytes)`。
 
 ### 5.6 权限
 
