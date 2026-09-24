@@ -318,7 +318,130 @@ pub_current ──► sent ──► [网络] ──► received ──► appli
 | `confirmed_flush_lsn` | C6 | | `local_wal_lsn` | 本地 WAL 顶端 |
 | `restart_lsn` | C7 | | | |
 
-## 6. 运维操作
+## 6. 速率是怎么算出来的
+
+### 6.1 采样模型：先存样本，查询时才算
+
+后台 worker 每 `sample_interval`（默认 30s）把一组位点快照（`pg_current_wal_lsn()`、`sent_lsn`、`received_lsn`、`applied_lsn`…）写入共享内存的**环形历史**（默认 1800 点 ≈ 15 小时）。视图里的速率不是存的，而是**查询时对历史做窗口差分**现算的——所以改 `rate_window` 后立刻重查同一段历史就能得到不同平滑度的读数，历史本身不受影响。
+
+### 6.2 差分算法与数值示例
+
+对任一速率列（如 `send_rate`）：
+
+```
+取环内最新样本 s1；
+从 s1 向前找仍落在 rate_window 内的最旧样本 s0；
+rate = (sent_lsn(s1) − sent_lsn(s0)) / (ts(s1) − ts(s0))   → 字节/秒
+显示值 = rate ÷ 1048576                                     → MB/s
+```
+
+**手算示例**（与回归测试同款数字）：两次采样间隔 110s，`sent_lsn` 从 `0/0` 推进到 `0/800000`（8 MiB）：
+
+```
+send_rate = 8 × 1048576 B ÷ 110 s ≈ 76.1 kB/s ≈ 0.0727 MB/s
+```
+
+积压列则**不做差分**，是最新样本上两点位相减（负值截为 0）：`backlog_unsent = current_lsn − sent_lsn`，即查询那一刻的字节量。
+
+**有效性规则**（防止误导性读数，违反时速率列为 NULL 而非 0）：
+
+- 新鲜度：最新样本距 now 超过 3×`sample_interval`（采样中断/worker 刚重启）→ NULL；
+- 跨度：实际样本跨度不足 `rate_window` 的一半（刚启动、历史不足）→ NULL。
+
+每行的 `window_start_time / window_end_time / window_secs` 就是本次差分实际用的区间，读数可复核。
+
+### 6.3 ETA 与停滞判定
+
+```
+eta_unsent = backlog_unsent / send_rate                     （秒）
+eta_total  = backlog_unsent / send_rate
+           + (backlog_inflight + backlog_unapplied) / apply_rate
+```
+
+速率低于 `eta_min_rate`（默认 1kB/s）或积压为 0 时 ETA 为 NULL（避免"速率≈0 → ETA=∞"噪声）。`*_stalled` = 积压>0 且对应速率有效但 < 1 B/s。**持续写入场景下 `eta_total` 会偏乐观**，应改用净追平速率：`min(send,apply) − gen` 为正才追得平（见 §7.3）。
+
+### 6.4 单位语义：LSN 等效字节 vs 网络字节
+
+速率的分母是 **WAL 位点差**（LSN 等效字节/秒），不是 socket 字节数。要与网卡带宽对比，先算**解码膨胀率**：
+
+```
+膨胀率 = Δtotal_bytes / Δcurrent_lsn        （协议输出字节 ÷ 输入 WAL 字节）
+线上字节速率 ≈ gen_rate × 膨胀率            ← 拿这个跟带宽比
+```
+
+（`total_bytes` 在 `pg_lrstat_pub_sample`；历史视图暂不含它，用两次快照相除即可。）
+
+### 6.5 时钟纪律
+
+SUB 环与 RPUB 环（轮询发布端）的时间戳**全部取订阅端本地时钟**——发布端速率实为"本地时钟轴上的轮询差分"，两机 NTP 偏差不进入任何计算。跨机的时间滞后只用反馈 lag 列（`write/flush/replay_lag`，内核按反馈时间戳计算），绝不拿两端 `now()` 相减。
+
+### 6.6 调参影响
+
+- 窗口调大（如 10min）：读数平滑、适合容量结论，反应迟钝；
+- 窗口调小：灵敏但毛刺多；约束 `rate_window ≥ 2 × sample_interval`（否则凑不够样本，速率为 NULL）；
+- 排障临时组合：`sample_interval=1s, rate_window=4s`（`pg_reload_conf()` 生效），用完调回默认。
+
+## 7. 性能分析实战（五分钟流程）
+
+完整方法论文档是 [BEST_PRACTICES.md](BEST_PRACTICES.md)（巡检 SQL 清单、四类场景剧本、容量规划），本节是可直接上手的核心流程。
+
+### 7.1 三步定位：总量 → 分段 → 速率关系
+
+```
+① backlog_total 超阈值且持续增长？
+├─ 否 → 稳态，做容量评估即可（余量 = gen − min(send, apply)）
+└─ 是 → ② 积压集中在哪一段？（overall 三列占比）
+    ├─ unsent 占大头     → 发布端问题     → 7.2-A
+    ├─ inflight 占大头   → 网络或反馈     → 7.2-B
+    └─ unapplied 占大头  → 订阅端应用     → 7.2-C
+```
+
+| 速率关系（须在窗口内持续成立） | 结论 |
+| --- | --- |
+| `send_rate < gen_rate` 且 unsent 增长 | 发布端发送/解码吞吐不足 |
+| `send_rate ≈ gen_rate` 且 total 稳定非零 | 发送已尽力，短板在网络或对端 |
+| `recv_rate ≈ send_rate` 且 inflight 小 | 网络不是瓶颈 |
+| `apply_rate < recv_rate` 且 unapplied 增长 | 订阅端应用是短板 |
+| 四速率接近且 total → 0 | 全链路健康 |
+
+### 7.2 分段下钻
+
+**A. 发布端（unsent）**：看 `spill_rate/stream_rate > 0`？是则大事务解码被磁盘拖累（拆事务或调 `logical_decoding_work_mem`）；`sync_state` 非 async 且 state 显示等待 = 被同步复制拖住，不是吞吐问题；多槽 unsent 同步增长而 gen 正常 = 发布端 CPU/IO 共享瓶颈。
+
+**B. 网络（inflight）**：**先排除假在途**——若 `backlog_inflight ≈ feedback_lag_bytes`，说明"在途"主要是反馈周期（默认 10s）的观测滞后，不是网络问题；真在途持续增长才按 §6.4 换算线上速率与带宽对照。
+
+**C. 订阅端（unapplied）**：`apply_stalled=t` → 查 `pg_stat_activity` 中该 worker 的 `wait_event`（锁等待最常见）；无停滞但 `apply < recv` → 单 apply worker 串行回放是常态瓶颈（大事务/触发器/索引/外键），核对 `streaming` 与并行 worker（`leader_pid` 非空）是否生效；存在 `worker_type='table synchronization'` 行时 unapplied 增长属初始同步正常现象。
+
+### 7.3 两个必会换算
+
+```sql
+-- 净追平速率：为负 = 永远追不平，先扩容短板侧再谈 ETA
+SELECT sub_name,
+       round(least(send_rate, apply_rate)::numeric,1) AS drain_mb,
+       round(gen_rate::numeric,1)                      AS gen_mb,
+       round((least(send_rate, apply_rate) - gen_rate)::numeric,1) AS net_mb
+FROM pg_lrstat_overall;
+
+-- 槽拖爆磁盘倒计时：retained 增速 ≈ 无推进时的 WAL 生成速率
+WITH d AS (
+  SELECT current_lsn - lag(current_lsn) OVER (ORDER BY ts) AS bytes,
+         extract(epoch FROM (ts - lag(ts) OVER (ORDER BY ts))) AS secs
+  FROM pg_lrstat_pub_history('mysub', now() - interval '10 minutes')
+)
+SELECT round(avg(bytes / nullif(secs,0))::numeric) AS retained_bps FROM d;
+```
+
+### 7.4 故障模式速查
+
+| 模式 | 签名 | 第一动作 |
+| --- | --- | --- |
+| 大事务回放 | spill/stream 飙升；unsent 先增后骤降；apply_rate 短暂归零 | 等待+溯源大事务 |
+| 订阅端锁冲突 | apply_stalled 且 wait_event 为锁；unapplied 阶梯增长 | `pg_blocking_pids()` 找阻塞源 |
+| 订阅暂停/断开 | 槽 active=f 或 send_stalled；retained 线性增长；wal_status 沿 reserved→unreserved→lost 恶化 | 恢复订阅；wal_status=unreserved 即亮红灯 |
+| 反馈滞后误报 | inflight ≈ feedback_lag_bytes 且 applied_lsn 持续推进 | 无需处理 |
+| 写入洪峰 | gen_rate 突增，积压沿 unsent→inflight→unapplied 依次传导 | 各段到达时间差=各段延迟 |
+
+## 8. 运维操作
 
 ```sql
 -- 清空所有目标与历史（superuser）
@@ -333,7 +456,7 @@ SELECT pg_lrstat_inject_pub('pg_lrstat_test_t', now(), '0/1000000', '0/800000',
                             '0/400000', '0/400000', '0/200000');
 ```
 
-## 7. 故障排查
+## 9. 故障排查
 
 | 现象 | 看 | 结论/处理 |
 | --- | --- | --- |
@@ -345,7 +468,7 @@ SELECT pg_lrstat_inject_pub('pg_lrstat_test_t', now(), '0/1000000', '0/800000',
 | `remote_state='n/a'` | 同上 | 无远端数据（`remote_poll=off` 或首轮未完成） |
 | 速率列全 NULL | `window_secs` | 采样中断/刚启动：最新样本距 now > 3×interval，或窗口跨度不足半程 |
 
-## 8. 已知限制（读前必知）
+## 10. 已知限制（读前必知）
 
 1. **单库采样**：worker 只连一个库；因槽/订阅/walsender 统计均为集群级，通常无感。跨库特殊场景见设计文档附录 D。
 2. **反馈延迟**：发布端视图的对端位置（C3~C5）滞后一个 `wal_receiver_status_interval`（默认 10s）；订阅端视图无此延迟——这是两端都装的价值。
