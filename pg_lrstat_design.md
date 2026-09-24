@@ -141,14 +141,14 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | `partial` | 目标首个样本晚于 start_ts | 会话中途加入的目标 |
 | `truncated` / `degraded` | 会话日志超上限 / 文件写失败 | 数据完整性标记 |
 
-### 3.4 ETA 与停滞（live 视图）
+### 3.4 追平预估（catchup）与停滞（live 视图）
 
 ```
-eta_unsent = backlog_unsent / avg(send)
-eta_total  = backlog_unsent / avg(send) + (inflight + unapplied) / avg(apply)
+catchup_send_secs  = backlog_unsent / avg(send)
+catchup_total_secs = backlog_unsent / avg(send) + (inflight + unapplied) / avg(apply)
 ```
 
-速率低于 `eta_min_rate`（默认 1kB/s）或积压为 0 时为 NULL；持续写入场景需用**净追平速率** `min(avg send, avg apply) − avg gen` 重估（为负则追不平）。`*_stalled` = 对应积压>0 且**瞬时**速率有效但 < 1 B/s（"最近一个采样间隔没动"）。
+平均速率低于 `catchup_min_rate`（默认 1kB/s）或积压为 0 时为 NULL；持续写入场景需用**净追平速率** `min(avg send, avg apply) − avg gen` 重估（为负则追不平）。`*_stalled` = 对应积压>0 且**瞬时**速率有效但 < 1 B/s（"最近一个采样间隔没动"）。
 
 ---
 
@@ -472,7 +472,7 @@ pg_lrstat_reset() → void
 | 双端双速率 | `gen`/`send`/`recv`/`apply`/`spill`/`stream` 各 instant+avg |
 | 积压 | `backlog_unsent`/`inflight`/`unapplied`/`total`/`retained_wal`/`feedback_lag_bytes` |
 | 延迟 | `write_lag`/`flush_lag`/`replay_lag` |
-| 判定 | `eta_unsent`/`eta_total`（基于 avg）/`send_stalled`/`apply_stalled` |
+| 判定 | `catchup_send_secs`/`catchup_total_secs`（秒，基于 avg）/`send_stalled`/`apply_stalled` |
 
 #### `pg_lrstat_pipeline_live`（发送端一连接四行）
 
@@ -509,7 +509,7 @@ pg_lrstat_reset() → void
 | `pg_lrstat.session_max_samples` | `2880` | 重启 | 会话日志容量（30s≈24h；0=关闭逐间隔，仅留汇总） |
 | `pg_lrstat.max_targets` | `32` | 重启 | 目标槽容量 |
 | `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标老化回收阈值 |
-| `pg_lrstat.eta_min_rate` | `1kB/s` | SIGHUP | ETA 有效性下限（作用于 avg） |
+| `pg_lrstat.catchup_min_rate` | `1kB/s` | SIGHUP | 追平预估有效性下限（avg 低于此值返回 NULL） |
 | `pg_lrstat.remote_poll` | on | SIGHUP | 接收端是否轮询发送端 |
 | `pg_lrstat.remote_connect_timeout` | `5s` | SIGHUP | 远端连接超时 |
 | `pg_lrstat.remote_poll_budget` | `500ms` | SIGHUP | 单轮远端轮询总预算 |
