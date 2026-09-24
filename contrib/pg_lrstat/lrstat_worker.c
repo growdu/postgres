@@ -30,6 +30,7 @@
 pg_noreturn void pg_lrstat_worker_main(Datum arg);
 
 static void lrstat_round(void);
+static void lrstat_compute_entries(void);
 static void sample_send_side(TimestampTz now);
 static LRPollTarget *sample_recv_side(TimestampTz now, int *n_targets);
 
@@ -200,10 +201,17 @@ lrstat_round(void)
 		PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	/*
+	 * Session log: if a session is running, compute per-target
+	 * interval deltas and append to the session entry array.
+	 */
+	if (running)
+		lrstat_compute_entries();
+
 	/* remote polling outside the transaction */
 	if (running && lrstat_remote_poll && targets != NULL && n_targets > 0)
 		lrstat_run_remote_poll(targets, n_targets,
-						   now + (int64) lrstat_remote_poll_budget_ms * 1000);
+							   now + (int64) lrstat_remote_poll_budget_ms * 1000);
 
 	if (targets != NULL)
 	{
@@ -212,6 +220,65 @@ lrstat_round(void)
 			if (targets[i].conninfo != NULL)
 				pfree(targets[i].conninfo);
 		pfree(targets);
+	}
+}
+
+static void
+lrstat_compute_entries(void)
+{
+	int i;
+
+	for (i = 0; i < lrstat->ntargets; i++)
+	{
+		LRTargetCtl *t = lrstat_target_at(i);
+		bool use;
+		LRSample anchor, prev, last;
+		LRTargetMeta m;
+		int64 d_curr = 0, d_sent = 0, d_recv = 0, d_applied = 0;
+		int64 d_spill = 0, d_stream = 0;
+
+		SpinLockAcquire(&t->mutex);
+		use = t->in_use;
+		if (use)
+		{
+			memcpy(&anchor, &t->anchor, sizeof(LRSample));
+			memcpy(&prev, &t->prev, sizeof(LRSample));
+			memcpy(&last, &t->last, sizeof(LRSample));
+			memcpy(&m, &t->meta, sizeof(LRTargetMeta));
+		}
+		SpinLockRelease(&t->mutex);
+		if (!use || prev.send.ts == 0)
+			continue;   /* no previous sample yet (first round) */
+
+		if (t->kind == LR_SEND || t->kind == LR_RSEND)
+		{
+			d_curr = (int64)(last.send.current_lsn - prev.send.current_lsn);
+			d_sent = (int64)(last.send.sent_lsn - prev.send.sent_lsn);
+			d_recv = 0;
+			d_applied = (int64)(last.send.peer_applied_lsn - prev.send.peer_applied_lsn);
+			d_spill = (int64)(last.send.spill_bytes - prev.send.spill_bytes);
+			d_stream = (int64)(last.send.stream_bytes - prev.send.stream_bytes);
+		}
+		else if (t->kind == LR_RECV)
+		{
+			d_curr = 0;
+			d_sent = 0;
+			d_recv = (int64)(last.recv.received_lsn - prev.recv.received_lsn);
+			d_applied = (int64)(last.recv.applied_lsn - prev.recv.applied_lsn);
+			d_spill = 0;
+			d_stream = 0;
+		}
+
+		if (d_curr < 0) d_curr = 0;
+		if (d_sent < 0) d_sent = 0;
+		if (d_recv < 0) d_recv = 0;
+		if (d_applied < 0) d_applied = 0;
+		if (d_spill < 0) d_spill = 0;
+		if (d_stream < 0) d_stream = 0;
+
+		lrstat_append_entry(i, last.send.ts,
+							d_curr, d_sent, d_recv, d_applied,
+							d_spill, d_stream);
 	}
 }
 

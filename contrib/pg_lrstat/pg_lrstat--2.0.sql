@@ -93,21 +93,43 @@ RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_cluster_stat'
 LANGUAGE C STABLE;
 
+-- View: send_history (send-side per-interval series, stop后可查)
+CREATE FUNCTION pg_lrstat_send_history(
+    OUT name text, OUT ts timestamptz,
+    OUT d_current float8, OUT d_sent float8,
+    OUT d_spill float8, OUT d_stream float8)
+RETURNS setof record
+AS 'MODULE_PATHNAME', 'pg_lrstat_send_history'
+LANGUAGE C STABLE;
+
+-- View: recv_history (recv-side per-interval series, stop后可查)
+CREATE FUNCTION pg_lrstat_recv_history(
+    OUT name text, OUT ts timestamptz,
+    OUT d_received float8, OUT d_applied float8)
+RETURNS setof record
+AS 'MODULE_PATHNAME', 'pg_lrstat_recv_history'
+LANGUAGE C STABLE;
+
 CREATE VIEW pg_lrstat_info AS SELECT * FROM pg_lrstat_info();
 CREATE VIEW pg_lrstat_send_stat AS SELECT * FROM pg_lrstat_send_stat();
 CREATE VIEW pg_lrstat_recv_stat AS SELECT * FROM pg_lrstat_recv_stat();
 CREATE VIEW pg_lrstat_cluster_stat AS SELECT * FROM pg_lrstat_cluster_stat();
+CREATE VIEW pg_lrstat_send_history AS SELECT * FROM pg_lrstat_send_history();
+CREATE VIEW pg_lrstat_recv_history AS SELECT * FROM pg_lrstat_recv_history();
 
 REVOKE ALL ON FUNCTION
     pg_lrstat_info(), pg_lrstat_send_stat(),
-    pg_lrstat_recv_stat(), pg_lrstat_cluster_stat()
+    pg_lrstat_recv_stat(), pg_lrstat_cluster_stat(),
+    pg_lrstat_send_history(), pg_lrstat_recv_history()
 FROM PUBLIC;
 
 REVOKE ALL ON
     pg_lrstat_info, pg_lrstat_send_stat,
-    pg_lrstat_recv_stat, pg_lrstat_cluster_stat
+    pg_lrstat_recv_stat, pg_lrstat_cluster_stat,
+    pg_lrstat_send_history, pg_lrstat_recv_history
 FROM PUBLIC;
 GRANT SELECT ON
     pg_lrstat_info, pg_lrstat_send_stat,
-    pg_lrstat_recv_stat, pg_lrstat_cluster_stat
+    pg_lrstat_recv_stat, pg_lrstat_cluster_stat,
+    pg_lrstat_send_history, pg_lrstat_recv_history
 TO pg_monitor;

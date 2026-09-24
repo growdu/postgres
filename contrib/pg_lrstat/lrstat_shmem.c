@@ -340,8 +340,7 @@ lrstat_session_start(const char *name)
 		t->last_sample_ts = 0;
 		SpinLockRelease(&t->mutex);
 	}
-	/* session log is implicitly cleared: worker resets write position */
-	lrstat->session.truncated = false;
+	lrstat->n_entries = 0;
 }
 
 void
@@ -383,27 +382,27 @@ lrstat_session_reset(void)
 
 /*
  * Append one interval entry.  Returns entry index or -1 if full.
- * Note: entry write position is tracked by the worker (single writer).
+ * n_entries tracks the write position (single writer: the worker).
  */
 int
 lrstat_append_entry(int target_idx, TimestampTz ts,
 					int64 d_curr, int64 d_sent, int64 d_recv,
 					int64 d_applied, int64 d_spill, int64 d_stream)
 {
-	/* the worker calls this with the next slot; bounds checked by caller */
 	LRSessionEntry *e;
-	static int next_entry = 0;
+	int max_entries;
 
 	if (!lrstat_ready())
 		return -1;
 
-	if (next_entry >= lrstat->ntargets * lrstat->ring_len)
+	max_entries = lrstat->ntargets * lrstat->ring_len;
+	if (lrstat->n_entries >= max_entries)
 	{
 		lrstat->session.truncated = true;
 		return -1;
 	}
 
-	e = lrstat_entry_at(next_entry);
+	e = lrstat_entry_at(lrstat->n_entries);
 	e->ts = ts;
 	e->target_idx = target_idx;
 	e->d_current = d_curr;
@@ -412,20 +411,25 @@ lrstat_append_entry(int target_idx, TimestampTz ts,
 	e->d_applied = d_applied;
 	e->d_spill = d_spill;
 	e->d_stream = d_stream;
-	next_entry++;
-	return next_entry - 1;
+	lrstat->n_entries++;
+	return lrstat->n_entries - 1;
 }
 
-/* Reset the session log write position (called by worker on start). */
 void
-lrstat_reset_entry_position(void);
-void
-lrstat_reset_entry_position(void)
+lrstat_reset_entries(void)
 {
-	/* We need to reset next_entry in lrstat_append_entry. For now,
-	 * the worker manages its own position.  This will be refactored
-	 * into the shared struct in the next iteration. */
-	/* TODO: move next_entry into LRStatShared for proper reset */
+	if (!lrstat_ready())
+		return;
+	lrstat->n_entries = 0;
+	lrstat->session.truncated = false;
+}
+
+int
+lrstat_get_entry_count(void)
+{
+	if (!lrstat_ready())
+		return 0;
+	return lrstat->n_entries;
 }
 
 void

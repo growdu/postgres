@@ -451,6 +451,87 @@ pg_lrstat_cluster_stat(PG_FUNCTION_ARGS)
 }
 
 /* =================================================================
+ * pg_lrstat_send_history / pg_lrstat_recv_history
+ * =================================================================
+ */
+
+PG_FUNCTION_INFO_V1(pg_lrstat_send_history);
+Datum
+pg_lrstat_send_history(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    int n, i;
+
+    InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+    if (!lrstat_ready())
+        PG_RETURN_NULL();
+
+    n = lrstat_get_entry_count();
+    for (i = 0; i < n; i++)
+    {
+        LRSessionEntry *e = lrstat_entry_at(i);
+        LRTargetCtl *t = lrstat_target_at(e->target_idx);
+        char name[NAMEDATALEN];
+        LRTargetKind kind;
+        LRRow r;
+
+        SpinLockAcquire(&t->mutex);
+        kind = t->kind;
+        strlcpy(name, t->name, NAMEDATALEN);
+        SpinLockRelease(&t->mutex);
+        if (kind != LR_SEND && kind != LR_RSEND)
+            continue;
+
+        lr_row_reset(&r);
+        lr_put_text(&r, name);
+        lr_put_ts(&r, e->ts);
+        lr_put_f8(&r, e->d_current > 0, (double)e->d_current / MB_DIV);
+        lr_put_f8(&r, e->d_sent > 0, (double)e->d_sent / MB_DIV);
+        lr_put_f8(&r, e->d_spill > 0, (double)e->d_spill / MB_DIV);
+        lr_put_f8(&r, e->d_stream > 0, (double)e->d_stream / MB_DIV);
+        lr_emit(rsinfo, &r);
+    }
+    PG_RETURN_NULL();
+}
+
+PG_FUNCTION_INFO_V1(pg_lrstat_recv_history);
+Datum
+pg_lrstat_recv_history(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    int n, i;
+
+    InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+    if (!lrstat_ready())
+        PG_RETURN_NULL();
+
+    n = lrstat_get_entry_count();
+    for (i = 0; i < n; i++)
+    {
+        LRSessionEntry *e = lrstat_entry_at(i);
+        LRTargetCtl *t = lrstat_target_at(e->target_idx);
+        char name[NAMEDATALEN];
+        LRTargetKind kind;
+        LRRow r;
+
+        SpinLockAcquire(&t->mutex);
+        kind = t->kind;
+        strlcpy(name, t->name, NAMEDATALEN);
+        SpinLockRelease(&t->mutex);
+        if (kind != LR_RECV)
+            continue;
+
+        lr_row_reset(&r);
+        lr_put_text(&r, name);
+        lr_put_ts(&r, e->ts);
+        lr_put_f8(&r, e->d_received > 0, (double)e->d_received / MB_DIV);
+        lr_put_f8(&r, e->d_applied > 0, (double)e->d_applied / MB_DIV);
+        lr_emit(rsinfo, &r);
+    }
+    PG_RETURN_NULL();
+}
+
+/* =================================================================
  * lrstat_start / lrstat_stop / lrstat_reset
  * =================================================================
  */

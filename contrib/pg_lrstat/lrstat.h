@@ -174,6 +174,7 @@ typedef struct LRStatShared
 	LRSessionState session;
 	int         ntargets;
 	int         ring_len;           /* session_max_samples */
+	int         n_entries;         /* session log write position (worker only) */
 	/* targets and session entries follow, see lrstat_target_at/_entry_at */
 } LRStatShared;
 
@@ -225,6 +226,8 @@ extern int  lrstat_append_entry(int target_idx, TimestampTz ts,
 								int64 d_curr, int64 d_sent,
 								int64 d_recv, int64 d_applied,
 								int64 d_spill, int64 d_stream);
+extern void lrstat_reset_entries(void);
+extern int  lrstat_get_entry_count(void);
 extern void lrstat_note_round(bool ok, const char *error);
 extern void lrstat_note_dropped(const char *name);
 
