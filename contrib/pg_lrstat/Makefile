@@ -3,6 +3,7 @@
 MODULE_big = pg_lrstat
 OBJS = \
   $(WIN32RES) \
+  lrstat_export.o \
   lrstat_remote.o \
   lrstat_shmem.o \
   lrstat_sql.o \

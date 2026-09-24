@@ -23,6 +23,13 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'lrstat_delete'
 LANGUAGE C VOLATILE;
 
+CREATE FUNCTION lrstat_export(
+    name text DEFAULT NULL,
+    format text DEFAULT 'html')
+RETURNS text
+AS 'MODULE_PATHNAME', 'lrstat_export'
+LANGUAGE C VOLATILE;
+
 -- View: info (1 row, health + session state)
 CREATE FUNCTION pg_lrstat_info(
     OUT loaded bool, OUT session_name text, OUT session_state text,
