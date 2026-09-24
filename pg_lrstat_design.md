@@ -1,6 +1,6 @@
 # pg_lrstat 设计文档（v2.0）
 
-逻辑复制测量会话扩展：命名会话、双速率实时观测、可视化报告导出
+复制（逻辑/物理）测量会话扩展：命名会话、双速率实时观测、可视化报告导出
 
 | 项 | 内容 |
 | --- | --- |
@@ -14,7 +14,7 @@
 
 ### 1.1 要解决的问题
 
-逻辑复制链路出问题时，运维要回答的永远是四个问题：**货压在哪一段？谁干得慢？从什么时候开始、越来越差还是正在好转？还要多久清完？** PostgreSQL 自带的系统视图只提供瞬时快照（LSN 位点、状态），没有速率、没有趋势、没有"这一轮压测跑完到底什么水平"。本扩展用显式的**测量会话**补齐这一层：
+复制链路（逻辑或物理）出问题时，运维要回答的永远是四个问题：**货压在哪一段？谁干得慢？从什么时候开始、越来越差还是正在好转？还要多久清完？** PostgreSQL 自带的系统视图只提供瞬时快照（LSN 位点、状态），没有速率、没有趋势、没有"这一轮压测跑完到底什么水平"。本扩展用显式的**测量会话**补齐这一层：
 
 ```
 lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
@@ -35,7 +35,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | 概念 | 定义 |
 | --- | --- |
 | **会话（session）** | 一次 `lrstat_start` 到 `lrstat_stop` 的测量窗口，有唯一名字、编号、起止时间 |
-| **目标（target）** | 被监测的对象：发布端一个逻辑槽（PUB）、订阅端一个 worker（SUB）、订阅端轮询到的发布端槽镜像（RPUB） |
+| **目标（target）** | 被监测的对象：发送端一条复制连接/一个复制槽（SEND）、接收端一个 worker 或恢复进程（RECV）、接收端远端轮询到的发送端镜像（RSEND） |
 | **锚点样本（anchor）** | 会话首轮采到的样本，平均速率的起算基准 |
 | **瞬时速率（instant）** | 最近两个样本的差分 ÷ 采样间隔——"刚刚 30 秒怎么样" |
 | **平均速率（avg）** | 最新样本 − 锚点 ÷ 经过时间——"这轮从头到现在平均多少" |
@@ -44,18 +44,18 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 
 ### 1.3 目标与非目标
 
-**目标**：一次会话一份完整报告；瞬时/平均双速率语义清晰；会话可命名、可按需持久化（默认零文件写入）、崩溃自动恢复；发布端/订阅端双侧视角，订阅端可凭订阅连接串合成两端整体视图（发布端免安装）；纯只读观测，不修改复制行为、不占用复制槽、默认不写数据库数据（无 WAL、无表）。
+**目标**：一次会话一份完整报告；瞬时/平均双速率语义清晰；会话可命名、可按需持久化（默认零文件写入）、崩溃自动恢复；发送端/接收端双侧视角，接收端可凭复制连接串（逻辑订阅 conninfo 或物理 walreceiver conninfo）合成两端整体视图（发送端免安装）；纯只读观测，不修改复制行为、不占用复制槽、默认不写数据库数据（无 WAL、无表）。
 
 **非目标**：7×24 连续趋势（监控端周期采 live 视图落库实现）；跨集群拉取数据；表级粒度；自动故障处理。
 
 ---
 
-## 2. 逻辑复制链路与观测点
+## 2. 复制链路与观测点
 
-### 2.1 链路图
+### 2.1 逻辑复制链路图
 
 ```
-发布端                                     订阅端
+发送端                                     接收端
 ┌──────────────────────────────┐          ┌───────────────────────────────┐
 │ WAL 生成(current_lsn)  C0     │          │                               │
 │   ▼                          │  TCP     │  接收(received_lsn)  C3'       │
@@ -71,24 +71,26 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 
 ### 2.2 检查点与数据来源
 
-| # | 检查点 | 发布端来源 | 订阅端来源 | 语义 |
+| # | 检查点 | 发送端来源 | 接收端来源 | 语义 |
 | --- | --- | --- | --- | --- |
-| C0 | WAL 生成位点 | `pg_current_wal_lsn()` | —（订阅端本地另有 `pg_current_wal_lsn()`，含义为订阅库自身写入，两码事） | 已写入 WAL 的最大位置 |
+| C0 | WAL 生成位点 | `pg_current_wal_lsn()` | —（接收端本地另有 `pg_current_wal_lsn()`，含义为接收库自身写入，两码事） | 已写入 WAL 的最大位置 |
 | C2 | 已发送位点 | `pg_stat_replication.sent_lsn` | — | walsender 已写出发送缓冲并 flush 的位置 |
-| C3 | 对端已接收 | `pg_stat_replication.write_lsn`（反馈 write 槽位） | `pg_stat_subscription.received_lsn`（空则 `latest_end_lsn`） | 订阅端收到的流位置 |
+| C3 | 对端已接收 | `pg_stat_replication.write_lsn`（反馈 write 槽位） | 逻辑：`pg_stat_subscription.received_lsn`；物理：`pg_stat_wal_receiver.flushed_lsn` | 接收端收到的流位置 |
 | C4 | 对端已提交落盘 | `pg_stat_replication.flush_lsn`（反馈 flush 槽位） | — | 已应用且本地落盘的提交位点 |
-| C5 | 对端已应用 | `pg_stat_replication.replay_lsn`（反馈 apply 槽位） | origin `remote_lsn` 与反馈 flush 位取大（见 §4.6） | 已应用的事务提交位点 |
+| C5 | 对端已应用/回放 | `pg_stat_replication.replay_lsn`（反馈 apply/replay 槽位） | 逻辑：origin `remote_lsn` 与反馈 flush 位取大（§4.6）；物理：`pg_last_wal_replay_lsn()` | 逻辑=已应用的事务位；物理=已回放的 WAL 位 |
 | C6 | 安全水位 | `pg_replication_slots.confirmed_flush_lsn` | — | WAL 回收决策位 |
 | C7 | 槽保水位 | `pg_replication_slots.restart_lsn` | — | 为该槽保留的最早 WAL；C0−C7 即扣住的 WAL 量 |
 | D1 | 解码压力 | `pg_stat_replication_slots` 的 `spill_bytes/stream_bytes/total_bytes` | — | ReorderBuffer 溢写/流式/总输出字节计数 |
 
 ### 2.3 设计依赖的内核事实（PG18，均已在仓库核实）
 
-1. **反馈报文三槽位**：订阅端 `send_feedback()` 把**接收位 recvpos** 填在报文 write 槽、**已提交落盘位** 填在 flush 槽、**已应用位** 填在 apply 槽——这是订阅端状态进入发布端视图的唯一通道，也决定了发布端观测最多滞后一个反馈周期（`wal_receiver_status_interval`，默认 10s）。
-2. **origin 命名与推进**：订阅的复制源名为 `pg_<订阅oid>`；其 `remote_lsn` **只在事务提交边界跳变**（`replorigin_session_advance` 由提交路径调用），单事务回放期间不推进。因此订阅端应用位点需用反馈 flush 位融合（§4.6）。
+1. **逻辑反馈三槽位**：逻辑接收端 `send_feedback()` 把**接收位 recvpos** 填在报文 write 槽、**已提交落盘位** 填在 flush 槽、**已应用位** 填在 apply 槽——这是接收端状态进入发送端视图的唯一通道，也决定了发送端观测最多滞后一个反馈周期（`wal_receiver_status_interval`，默认 10s）。
+2. **origin 命名与推进**：逻辑订阅的复制源名为 `pg_<订阅oid>`；其 `remote_lsn` **只在事务提交边界跳变**（`replorigin_session_advance` 由提交路径调用），单事务回放期间不推进。因此逻辑接收端应用位点需用反馈 flush 位融合（§4.6）。
 3. **worker_type 取值**：`apply` / `parallel apply` / `table synchronization`（注意拼写与长度）。
-4. **逻辑流不落订阅端 WAL**：订阅端 WAL 只含应用回放产生的记录；`pg_stat_wal_receiver` 不覆盖逻辑订阅。
-5. **时钟纪律**：任何跨机时间延迟只能用内核按反馈时间戳计算的 lag 列（`write_lag/flush_lag/replay_lag`）；本扩展所有样本（含远端轮询）统一打**采样方本地时钟**，两端 NTP 偏差不进入任何计算。
+4. **逻辑流不落接收端 WAL**：逻辑订阅的流只存在于 apply worker 内存，接收端 WAL 仅含回放产生的记录；`pg_stat_wal_receiver` 只覆盖物理流复制。
+5. **物理复制的接收端视图**：standby 上 `pg_stat_wal_receiver` 暴露 `written_lsn/flushed_lsn/latest_end_lsn/last_msg_send_time/last_msg_receipt_time/sender_host/sender_port/conninfo`；`pg_last_wal_receive_lsn()` / `pg_last_wal_replay_lsn()` 给接收/回放位点；物理反馈的 write/flush/replay 位是 walreceiver 直接上报的**真实值**（无逻辑复制那种 origin 语义问题）。
+6. **`pg_stat_replication.kind`**：PG18 区分 `physical`/`logical` walsender，发送端同一视图可按 kind 过滤，一条采样 SQL 同时覆盖两种复制。
+7. **时钟纪律**：任何跨机时间延迟只能用内核按反馈时间戳计算的 lag 列（`write_lag/flush_lag/replay_lag`）；本扩展所有样本（含远端轮询）统一打**采样方本地时钟**，两端 NTP 偏差不进入任何计算。
 
 ---
 
@@ -101,18 +103,18 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | 积压 | 公式 | 含义 |
 | --- | --- | --- |
 | `backlog_unsent` | C0 − C2 | 已生成未发送（含未解码） |
-| `backlog_inflight` | C2 − C3′ | 发出后订阅端尚未收到——真网络在途（订阅端本地实收口径，无反馈假象） |
+| `backlog_inflight` | C2 − C3′ | 发出后接收端尚未收到——真网络在途（接收端本地实收口径，无反馈假象） |
 | `backlog_unapplied` | C3′ − C5′ | 已收到未应用 |
 | `backlog_total` | C0 − C5′ | 端到端总积压（三段之和） |
-| `backlog_apply` | C3′ − C5′（订阅端视图） | 同 unapplied，订阅端独立视图口径 |
+| `backlog_apply` | C3′ − C5′（接收端视图） | 同 unapplied，接收端独立视图口径 |
 | `retained_wal` | C0 − C7 | 槽扣住的 WAL 总量（磁盘风险） |
 | `feedback_lag_bytes` | C3′ − 反馈 write 槽位 | 回执滞后量：区分"真在途"与"10 秒回执假象"的交叉观测量 |
 
-发布端视图另提供 `backlog_peer_unapplied`（C3−C5，反馈口径，最多滞后 10s）。
+发送端视图另提供 `backlog_peer_unapplied`（C3−C5，反馈口径，最多滞后 10s）。
 
 ### 3.2 双速率
 
-对任一速率字段 f ∈ {gen(C0), send(C2), recv(C3′), apply(C5′), spill(D1), stream(D1), confirm(C6)}：
+对任一速率字段 f ∈ {gen(C0), send(C2), recv(C3′), apply(C5′), spill(D1), stream(D1), confirm(C6)}——apply 在逻辑复制=应用速率、在物理复制=回放速率，列名统一为 apply：
 
 ```
 瞬时 instant(f) = (f(S_last) − f(S_prev)) / (ts(S_last) − ts(S_prev))
@@ -155,21 +157,21 @@ eta_total  = backlog_unsent / avg(send) + (inflight + unapplied) / avg(apply)
 ### 4.1 部署形态
 
 ```
-发布端实例                                订阅端实例
+发送端实例                                接收端实例
 shared_preload_libraries=pg_lrstat        shared_preload_libraries=pg_lrstat
 ┌──────────────────────┐                 ┌─────────────────────────────┐
 │ pg_lrstat 采样 worker │                 │ pg_lrstat 采样 worker        │
-│  SPI 采样发布端视图    │   普通 libpq     │  SPI 采样订阅端视图           │
-│  → PUB 目标           │ ◄────────────── │  凭 subconninfo 轮询发布端    │
-│                        │  (远端轮询)      │  → RPUB 目标 + 两端合成       │
+│  SPI 采样发送端视图    │   普通 libpq     │  SPI 采样接收端视图           │
+│  → SEND 目标          │ ◄────────────── │  凭连接串轮询发送端            │
+│  (逻辑+物理)           │  (远端轮询)      │  → RSEND 目标 + 两端合成       │
 └─────────┬────────────┘                 └──────────┬──────────────────┘
           ▼ 共享内存（会话状态+目标+会话日志）            ▼
           └──────────────► SQL 视图 / 会话文件 / 报告导出 ◄┘
 ```
 
-- 同一扩展两端通用：发布库产出 PUB 目标（槽），订阅库产出 SUB 目标（worker）与 RPUB 目标（轮询镜像）；
-- **订阅端可独立部署**：凭订阅连接串轮询发布端系统视图，`overall` 系列视图合成两端，发布端零安装；
-- 采样 worker 只连一个库（`pg_lrstat.database`，默认 postgres）——槽、订阅、复制源、walsender 统计均为集群级，单连接看全集群。
+- 同一扩展两端通用：发送端产出 SEND 目标（逻辑槽+物理连接），接收端产出 RECV 目标（逻辑 worker 或物理恢复进程）与 RSEND 目标（远端轮询镜像）；
+- **接收端可独立部署**：凭连接串轮询发送端系统视图（逻辑复制的连接串来自 `pg_subscription.subconninfo`，物理复制的来自 `pg_stat_wal_receiver.conninfo`），`overall` 系列视图合成两端，发送端零安装；
+- 采样 worker 只连一个库（`pg_lrstat.database`，默认 postgres）——槽、订阅、复制源、walsender/walreceiver 统计均为集群级，单连接看全集群。物理复制发送端的逻辑槽与物理连接都出现在 `pg_replication_slots`/`pg_stat_replication`，按 `kind` 列区分；接收端 standby 的 `pg_stat_wal_receiver` 同样集群级可见。
 
 ### 4.2 组件
 
@@ -177,7 +179,7 @@ shared_preload_libraries=pg_lrstat        shared_preload_libraries=pg_lrstat
 | --- | --- | --- |
 | 入口 | `pg_lrstat.c` | GUC 定义、共享内存请求/启动 hook、worker 注册、wait event 惰性注册点 |
 | 采样器 | `lrstat_worker.c` | bgworker 主循环：会话感知的采样、增量入会话日志、双写会话文件 |
-| 远端轮询 | `lrstat_remote.c` | 订阅端→发布端只读轮询（libpqsrv、预算/退避、反馈位回填） |
+| 远端轮询 | `lrstat_remote.c` | 接收端→发送端只读轮询（libpqsrv、预算/退避、反馈位回填） |
 | 共享内存 | `lrstat_shmem.c` | 会话状态、目标表（anchor/prev/last）、内存会话日志、报告聚合 |
 | 会话文件 | `lrstat_store.c` | persist 会话的文件读写（双写/fsync/原子头尾/启动恢复） |
 | SQL 层 | `lrstat_sql.c` | start/stop/export/delete 命令、全部视图 SRF、报告聚合 |
@@ -201,7 +203,7 @@ typedef struct LRSessionState
     slock_t     mutex;              /* 会话状态转换锁                            */
 } LRSessionState;
 
-/* 发布端样本（PUB 与 RPUB 共用，按 kind 解释） */
+/* 发送端样本（SEND 与 RSEND 共用，按 kind 解释；逻辑/物理通用） */
 typedef struct LRPubSample
 {
     TimestampTz ts;                 /* 采样方本地时钟                            */
@@ -217,18 +219,18 @@ typedef struct LRPubSample
     uint64      total_bytes;        /* D1                                        */
 } LRPubSample;
 
-/* 订阅端样本 */
-typedef struct LRSubSample
+/* 接收端样本（逻辑=apply worker，物理=恢复进程） */
+typedef struct LRRecvSample
 {
     TimestampTz ts;
-    XLogRecPtr  received_lsn;       /* C3'                                       */
-    XLogRecPtr  latest_end_lsn;     /* keepalive 结束位（received 回退源）        */
-    XLogRecPtr  applied_lsn;        /* C5' origin ∪ 反馈 flush（§4.6）           */
-    XLogRecPtr  origin_local_lsn;   /* origin 本地位点                           */
-    XLogRecPtr  local_wal_lsn;      /* 订阅库 pg_current_wal_lsn()               */
-} LRSubSample;
+    XLogRecPtr  received_lsn;       /* C3' 逻辑:received_lsn 物理:receive_lsn   */
+    XLogRecPtr  latest_end_lsn;     /* keepalive / latest_end_lsn 回退源         */
+    XLogRecPtr  applied_lsn;        /* C5' 逻辑:origin∪反馈 物理:replay_lsn     */
+    XLogRecPtr  origin_local_lsn;   /* 逻辑:origin local_lsn 物理:Invalid       */
+    XLogRecPtr  local_wal_lsn;      /* 接收库 pg_current_wal_lsn()              */
+} LRRecvSample;
 
-typedef union LRSample { LRPubSample pub; LRSubSample sub; } LRSample;
+typedef union LRSample { LRPubSample pub; LRRecvSample sub; } LRSample;
 
 /* 透传属性（不参与速率），每轮整块重写 */
 typedef struct LRTargetMeta
@@ -239,10 +241,10 @@ typedef struct LRTargetMeta
     char  database[64], plugin[64], application_name[64], client_addr[64];
     int64 safe_wal_size, write_lag_us, flush_lag_us, replay_lag_us;   /* lag: -1 未知 */
     TimestampTz reply_time;
-    char  remote_state[16];          /* RPUB: ok/unreachable/stale/n/a           */
+    char  remote_state[16];          /* RSEND: ok/unreachable/stale/n/a          */
     TimestampTz last_remote_poll;
     char  subslotname[64];
-    char  worker_type[24];           /* apply / parallel apply / table synchronization */
+    char  worker_type[24];           /* apply / parallel apply / table sync / recovery */
     pid_t worker_pid, leader_pid;
     TimestampTz last_msg_send_time, last_msg_receipt_time, latest_end_time;
     int64 apply_error_count, sync_error_count;
@@ -251,7 +253,7 @@ typedef struct LRTargetMeta
 /* 每目标：三槽位（锚点/前一/最新），无历史环 */
 typedef struct LRTargetCtl
 {
-    LRTargetKind kind;               /* PUB / SUB / RPUB                          */
+    LRTargetKind kind;               /* SEND / RECV / RSEND                       */
     char     name[NAMEDATALEN];
     char     worker_char;            /* SUB: 'a' apply / 't' tablesync            */
     Oid      relid;                  /* SUB tablesync 目标表，否则 0              */
@@ -306,27 +308,32 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 
 **竞态规则**：状态转换与采样轮经 `LRSessionState.mutex` + worker latch 协调——先置状态再唤醒；增量以该轮醒来时读到的状态为准，首/末间隔并入或剔除一个采样周期属可接受误差，`duration` 以实际样本区间为准。
 
-### 4.5 远端轮询机制（订阅端 → 发布端）
+### 4.5 远端轮询机制（接收端 → 发送端）
 
-- **连接**：每个启用中的订阅一条**普通 libpq 连接**（libpqsrv 助手函数：FD 记账、wait event、信号中断安全），复用 `subconninfo`，仅注入 `application_name='pg_lrstat'`、`connect_timeout`、`options=-c statement_timeout=…`；凭证只在内存；
-- **查询**：按 `subslotname` 过滤发布端槽（与发布端本地采样同一 SQL 形态，见 §6）；结果写 RPUB 目标三槽位，**时间戳取轮询完成时的订阅端本地时钟**；
+- **连接**：每个被监测的复制对一条**普通 libpq 连接**（libpqsrv 助手函数：FD 记账、wait event、信号中断安全）。连接串来源：
+  - 逻辑复制：`pg_subscription.subconninfo`；
+  - 物理复制：`pg_stat_wal_receiver.conninfo`（standby 侧解析后反向连主库）；
+  仅注入 `application_name='pg_lrstat'`、`connect_timeout`、`options=-c statement_timeout=…`；凭证只在内存；
+- **查询**：按槽名/连接名过滤发送端（与发送端本地采样同一 SQL 形态，见 §6）；结果写 RSEND 目标三槽位，**时间戳取轮询完成时的接收端本地时钟**；
 - **预算与退避**：单轮总预算 `remote_poll_budget`（默认 500ms），超时标 `remote_state='stale'` 不阻塞本地采样；连接/查询失败指数退避（1s→2s→…→60s）并标 `unreachable`；
-- **发布端可达但槽不存在**（订阅初始建槽间隙）标 `stale`；
+- **发送端可达但目标不存在**（初始建槽间隙/standby 断连）标 `stale`；
 - wait event 在首次轮询时惰性注册（`WaitEventExtensionNew` 在 postmaster pre-load 阶段调用会段错误，必须惰性）。
 
-### 4.6 订阅端应用位点的融合（origin ∪ 反馈）
+### 4.6 接收端应用位点的融合（逻辑专用，物理天然准确）
 
-origin 的 `remote_lsn` 只在事务提交边界推进（§2.3-2），单大事务/初始同步期间恒为 0 会让应用速率与积压失真。规则：
+**逻辑复制**：origin 的 `remote_lsn` 只在事务提交边界推进（§2.3-2），单大事务/初始同步期间恒为 0 会让应用速率与积压失真。融合规则：
 
 ```
-采样时：applied = origin.remote_lsn（§6 订阅端 SQL）
+采样时：applied = origin.remote_lsn（§6 接收端 SQL）
 每轮远端轮询成功后：
-    lrstat_bump_applied(subname, 反馈 flush 位)   ← 只增更新 last 槽位的 applied，
+    lrstat_bump_applied(recv_name, 反馈 flush 位)   ← 只增更新 last 槽位的 applied，
                                                     时间戳不动（差分序列保持单调）
 视图/报告使用：max(origin, 反馈 flush)
 ```
 
-效果：速率与积压共用同一条既本地又连续的序列，行内自洽。`origin_local_lsn` 列保留 origin 原值（重启续传位点，排障对照用）。
+**物理复制**：`pg_last_wal_replay_lsn()` 由恢复进程实时推进，物理反馈的 replay 位也是 walreceiver 直接上报的真实值——**无需融合**，直接采样即准确。
+
+效果：速率与积压共用同一条既本地又连续的序列，行内自洽。逻辑的 `origin_local_lsn` 列保留 origin 原值（重启续传位点，排障对照用；物理复制此列恒 NULL）。
 
 ### 4.7 会话文件与持久化机制（仅 `persist=true`）
 
@@ -355,7 +362,7 @@ origin 的 `remote_lsn` 只在事务提交边界推进（§2.3-2），单大事�
 - **字符串提取**：一律 `SPI_getvalue()`（detoast + 独立副本 + NULL 安全），杜绝 toast 指针/零拷贝悬垂；
 - **分配**：数组首配 `palloc`，仅对已分配块 `repalloc`（`repalloc(NULL)` 非法）；worker 每轮在独立内存上下文运行，轮末重置整体回收；
 - **EXEC_BACKEND**：后端惰性 `ShmemInitStruct` 附加（以"曾 preload"标记门控，绝不误创建段）；worker 入口 `PGDLLEXPORT` 导出；
-- **目标管理**：键 (kind, name, relid, worker_char)；`parallel apply` 行跳过（leader 行是规范源）；目标老化 `stale_target_ttl` 后可被复用；满载丢弃计数入 `dropped_samples` 并限频 WARNING。
+- **目标管理**：键 (kind, name, relid, worker_char)；逻辑的 `parallel apply` 行跳过（leader 行是规范源）；物理的 worker_char='p'（recovery 进程，每 standby 一个）；目标老化 `stale_target_ttl` 后可被复用；满载丢弃计数入 `dropped_samples` 并限频 WARNING。
 
 ---
 
@@ -391,10 +398,10 @@ pg_lrstat_reset() → void
 | --- | --- | --- | --- |
 | `pg_lrstat_info` | 一行 | 任何时候 | 扩展与当前会话健康自检 |
 | `pg_lrstat_sessions` | 一会话一行 | 任何时候 | 会话目录（含运行中与归档） |
-| `pg_lrstat_pub_live` | 发布端一槽一行 | 任何时候（running 时速率有效） | 发布端实时：位点+积压+双速率 |
-| `pg_lrstat_sub_live` | 订阅端一 worker 一行 | 同上 | 订阅端实时 |
-| `pg_lrstat_overall_live` | 一订阅一行 | 同上 | 两端合成实时（发布端免安装） |
-| `pg_lrstat_pipeline_live` | 发布端一槽四行 | 同上 | 四阶段分解 |
+| `pg_lrstat_send_live` | 发送端一连接一行（逻辑槽+物理连接） | 任何时候（running 时速率有效） | 发送端实时：位点+积压+双速率 |
+| `pg_lrstat_recv_live` | 接收端一 worker/恢复进程一行 | 同上 | 接收端实时（逻辑=apply worker，物理=recovery） |
+| `pg_lrstat_overall_live` | 一复制对一行（逻辑订阅/物理standby） | 同上 | 两端合成实时（发送端免安装） |
+| `pg_lrstat_pipeline_live` | 发送端一连接四行 | 同上 | 四阶段分解 |
 | `pg_lrstat_report(name)` | 会话内一目标一行 | stop 后 | 会话总结报告 |
 | `pg_lrstat_overall_report(name)` | 会话内一订阅一行 | stop 后 | 两端合成的会话总结 |
 | `pg_lrstat_report_intervals(name)` | 会话内一目标一间隔一行 | stop 后 | 逐间隔序列（画曲线） |
@@ -426,7 +433,7 @@ pg_lrstat_reset() → void
 | `nrounds` | int8 | 启动以来完成轮数 |
 | `dropped_samples` | int8 | 目标满载丢弃计数（>0 需扩 max_targets） |
 
-#### `pg_lrstat_pub_live`（发布端，一逻辑槽一行）
+#### `pg_lrstat_send_live`（发送端，一复制连接一行，逻辑槽+物理连接通用）
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
@@ -441,12 +448,12 @@ pg_lrstat_reset() → void
 | `write_lag`/`flush_lag`/`replay_lag` | interval | 内核反馈延迟（唯一跨机时间源） |
 | `send_stalled` | bool | unsent>0 且瞬时 send≈0 |
 
-#### `pg_lrstat_sub_live`（订阅端，一 worker 一行）
+#### `pg_lrstat_recv_live`（接收端，一 worker/恢复进程一行）
 
 | 列 | 说明 |
 | --- | --- |
-| `sub_name`/`sample_time`/`session_name`/`elapsed_secs` | 标识与时间 |
-| `worker_type`/`worker_pid`/`leader_pid`/`relid`/`subslotname` | worker 拓扑 |
+| `recv_name`/`sample_time`/`session_name`/`elapsed_secs` | 标识与时间（逻辑=订阅名，物理=standby 恢复进程标识） |
+| `worker_type`/`worker_pid`/`leader_pid`/`relid`/`slot_name` | worker 拓扑（逻辑=apply/tablesync，物理=recovery） |
 | `received_lsn`/`latest_end_lsn`/`applied_lsn`/`origin_local_lsn`/`local_wal_lsn` | C3′/C5′ 等位点 |
 | `last_msg_send_time`/`last_msg_receipt_time`/`latest_end_time` | 消息时间戳 |
 | `backlog_apply` | C3′−C5′ |
@@ -458,16 +465,16 @@ pg_lrstat_reset() → void
 
 | 列组 | 内容 |
 | --- | --- |
-| 标识 | `sub_name`/`subslotname`/`session_name`/`elapsed_secs` |
+| 标识 | `recv_name`/`slot_name`/`session_name`/`elapsed_secs` |
 | 轮询健康 | `remote_state`（ok/unreachable/stale/n/a）/`last_remote_poll_time` |
 | 时间 | `sample_time`/`rate_time` |
-| 双端位点 | `pub_current_lsn`/`sent_lsn`（RPUB）；`received_lsn`/`applied_lsn`/`confirmed_flush_lsn`/`restart_lsn` |
+| 双端位点 | `send_current_lsn`/`sent_lsn`（RSEND）；`received_lsn`/`applied_lsn`/`confirmed_flush_lsn`/`restart_lsn` |
 | 双端双速率 | `gen`/`send`/`recv`/`apply`/`spill`/`stream` 各 instant+avg |
 | 积压 | `backlog_unsent`/`inflight`/`unapplied`/`total`/`retained_wal`/`feedback_lag_bytes` |
 | 延迟 | `write_lag`/`flush_lag`/`replay_lag` |
 | 判定 | `eta_unsent`/`eta_total`（基于 avg）/`send_stalled`/`apply_stalled` |
 
-#### `pg_lrstat_pipeline_live`（发布端一槽四行）
+#### `pg_lrstat_pipeline_live`（发送端一连接四行）
 
 `slot_name`/`session_name`/`stage`（unsent/inflight/peer_unapplied/retained）/`sample_time`/`backlog_bytes`/`rate_instant`/`rate_avg`/`lag`。
 
@@ -503,7 +510,7 @@ pg_lrstat_reset() → void
 | `pg_lrstat.max_targets` | `32` | 重启 | 目标槽容量 |
 | `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标老化回收阈值 |
 | `pg_lrstat.eta_min_rate` | `1kB/s` | SIGHUP | ETA 有效性下限（作用于 avg） |
-| `pg_lrstat.remote_poll` | on | SIGHUP | 订阅端是否轮询发布端 |
+| `pg_lrstat.remote_poll` | on | SIGHUP | 接收端是否轮询发送端 |
 | `pg_lrstat.remote_connect_timeout` | `5s` | SIGHUP | 远端连接超时 |
 | `pg_lrstat.remote_poll_budget` | `500ms` | SIGHUP | 单轮远端轮询总预算 |
 | `pg_lrstat.database` | `postgres` | 重启 | 采样 worker 连接库 |
@@ -571,7 +578,7 @@ FROM pg_lrstat_sessions ORDER BY start_ts DESC;
 
 三条只读 SQL（worker 每轮执行）：
 
-**发布端（发布实例本地）**：
+**发送端（发送实例本地，逻辑+物理通用，按 kind 区分）**：
 
 ```sql
 SELECT s.slot_name::text, d.datname::text, s.plugin::text, s.temporary, s.active,
@@ -589,10 +596,11 @@ FROM pg_replication_slots s
 LEFT JOIN pg_database d ON d.oid = s.datoid
 LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid     -- walsender 持有槽，精确关联
 LEFT JOIN pg_stat_replication_slots rs ON rs.slot_name = s.slot_name
-WHERE s.slot_type = 'logical';
+WHERE s.slot_type IN ('logical', 'physical');
+-- 逻辑与物理 walsender 都出现在 pg_stat_replication，kind 列区分（PG18）
 ```
 
-**订阅端（订阅实例本地）**：
+**接收端——逻辑复制（订阅实例本地）**：
 
 ```sql
 SELECT su.subname::text, su.subslotname::text, su.subconninfo,
@@ -611,7 +619,23 @@ LEFT JOIN pg_stat_subscription_stats ss ON ss.subid = su.oid;
 
 （worker 侧跳过 `worker_type='parallel apply'` 行——leader 行是规范数据源。）
 
-**远端轮询（订阅端凭 subconninfo 在发布端执行，$1=subslotname）**：与发布端查询同构，`WHERE s.slot_name = $1`，仅取位点子集；结果时间戳打**订阅端本地时钟**。
+**接收端——物理复制（standby 实例本地）**：
+
+```sql
+-- standby 的接收/回放位点与 walreceiver 状态（无 origin，无订阅）
+SELECT 'standby' AS recv_name,
+       wr.slot_name, wr.status, wr.sender_host, wr.sender_port,
+       wr.written_lsn, wr.flushed_lsn, wr.latest_end_lsn,
+       pg_last_wal_receive_lsn() AS received_lsn,
+       pg_last_wal_replay_lsn()  AS applied_lsn,
+       NULL::pg_lsn AS origin_local_lsn,
+       pg_current_wal_lsn() AS local_wal_lsn,
+       wr.last_msg_send_time, wr.last_msg_receipt_time, wr.latest_end_time,
+       wr.conninfo
+FROM pg_stat_wal_receiver wr;
+```
+
+**远端轮询（接收端凭连接串在发送端执行，$1=槽名/连接标识）**：与发送端查询同构，`WHERE s.slot_name = $1`，仅取位点子集；结果时间戳打**接收端本地时钟**。
 
 ---
 
@@ -632,11 +656,14 @@ LEFT JOIN pg_stat_subscription_stats ss ON ss.subid = su.oid;
 | persist 会话文件写失败 | 采样不中断，`degraded=true`，stop 时 WARNING |
 | 实例在 persist 会话中崩溃 | 重启后自动收尾为 `interrupted` 归档，丢失 ≤1 间隔 |
 | 非 persist 会话遇重启 | 会话与报告消失（设计行为） |
-| 订阅端锁堵塞应用 | `apply_stalled=t`；逐间隔序列呈台阶形（起点/拐点=被堵/放开时刻） |
+| 接收端锁堵塞应用（逻辑） | `apply_stalled=t`；逐间隔序列呈台阶形（起点/拐点=被堵/放开时刻） |
 | 单个大事务回放 | apply 瞬时速率归 0（位点仅提交边界推进），`stalled` 区分，报告 min 值体现 |
-| 远端发布端宕机 | `remote_state='unreachable'`，指数退避重连，本地采样不受影响 |
+| 远端发送端宕机 | `remote_state='unreachable'`，指数退避重连，本地采样不受影响 |
 | 目标数超容量 | 丢弃计数 + 限频 WARNING（`pg_lrstat_info.dropped_samples`） |
 | 重复 start / 重名 / 名字不符的 stop | 一律报错，不产生副作用 |
+| 物理复制 standby 升主 / 断连 | RECV 目标 `worker_type='recovery'` 行的位点停止推进；RSEND 目 `remote_state` 转 unreachable |
+| 物理复制级联（A→B→C） | B 同时是发送端（对 C）和接收端（对 A），两侧视图独立展现 |
+| 逻辑+物理混合部署 | SEND 视图列出所有 walsender（kind 区分），RECV 视图同时有 apply worker 与 recovery 行 |
 
 ## 9. 测试方案
 
@@ -649,16 +676,18 @@ LEFT JOIN pg_stat_subscription_stats ss ON ss.subid = su.oid;
 | 默认零文件路径 | persist=false 全流程不创建任何文件/目录；重启后无痕 |
 | 报告导出 | html 可解析且含三类图数据点；png 三图非空；json 与视图逐字段对拍；dest 越界拒绝；dest='-' 与落盘内容一致；非持久会话导出窗口期 |
 | 会话边界 | 目标中途加入 partial；stop 恰逢采样轮；混用 persist 模式 |
+| 物理复制 | primary+standby 集群：send_live 列出物理连接（kind=physical）、recv_live 列出 recovery 行、overall 合成两端；pgbench 负载下四速率一致；standby 断连→remote_state 转 unreachable；级联场景两侧独立 |
 
 ## 10. 实施计划
 
 | 阶段 | 交付 |
 | --- | --- |
-| P0 | 会话状态机 + start/stop + 三槽位采样 + live 视图族（双速率） |
+| P0 | 会话状态机 + start/stop + 三槽位采样 + live 视图族（双速率，逻辑复制） |
 | P1 | 内存会话日志 + report/intervals/overall_report + 回归/TAP 重写 |
 | P2 | 可选持久化（persist 路径：双写/fsync/原子头尾）、启动恢复、sessions/delete、专项测试 |
 | P3 | 报告导出（json → html+SVG → png/libpng）+ 导出专项测试 |
-| P4 | 用户文档（USER_MANUAL/BEST_PRACTICES 按会话模型改写） |
+| P4 | 物理复制支持（send SQL kind 过滤、standby 采样 SQL、pg_stat_wal_receiver 视角）+ 物理专项测试 |
+| P5 | 用户文档（USER_MANUAL/BEST_PRACTICES 按会话模型改写，含物理复制） |
 
 ## 附录：示例输出（目标形态）
 
