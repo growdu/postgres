@@ -429,6 +429,16 @@ sample_subscriber(TimestampTz now, int *nsubs)
 					 NAMEDATALEN);
 			col_text(tup, td, FN(td, "worker_type"), m.worker_type,
 					 LR_WTYPE_LEN);
+
+			/*
+			 * "parallel apply" workers are sub-units of the leader;
+			 * the leader row (worker_type 'apply', leader_pid NULL)
+			 * carries the canonical stream state for the 'a' target,
+			 * so skip the parallel rows instead of letting them
+			 * collide with the leader key.
+			 */
+			if (strncmp(m.worker_type, "parallel", 8) == 0)
+				continue;
 			/*
 			 * Full copy via SPI_getvalue(): subconninfo can exceed any
 			 * sane stack buffer, and it must outlive SPI_finish().

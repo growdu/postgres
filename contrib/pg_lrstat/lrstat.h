@@ -219,6 +219,7 @@ extern void lrstat_copy_meta(LRTargetCtl *target, LRTargetMeta *out);
 extern void lrstat_reset_all(void);
 extern void lrstat_note_round(bool ok, const char *error);
 extern void lrstat_note_dropped(const char *name);
+extern void lrstat_bump_applied(const char *subname, XLogRecPtr applied);
 
 /* lrstat_worker.c */
 extern PGDLLEXPORT pg_noreturn void pg_lrstat_worker_main(Datum arg);

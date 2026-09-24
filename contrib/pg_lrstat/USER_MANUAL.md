@@ -220,7 +220,7 @@ pub_current ──► sent ──► [网络] ──► received ──► appli
 | `relid` | oid | tablesync 的目标表（apply 行为 NULL） |
 | `received_lsn` | pg_lsn | C3′：实收位（`received_lsn`，本地实时、无反馈延迟） |
 | `latest_end_lsn` | pg_lsn | 最后一个 keepalive/数据消息的结束位（received 为空时的回退源） |
-| `applied_lsn` | pg_lsn | C5′：已应用位（origin `remote_lsn`；v18 注意见 overall 的说明） |
+| `applied_lsn` | pg_lsn | C5′：已应用位。取 `max(origin remote_lsn, 反馈flush位)`——origin 仅在事务提交边界跳变，每轮远端轮询后用反馈位回填，保证速率与积压用同一条一致序列 |
 | `origin_local_lsn` | pg_lsn | origin 的本地 WAL 位点（最后一次带 origin 提交的本地位置） |
 | `local_wal_lsn` | pg_lsn | 订阅库 `pg_current_wal_lsn()`（含非复制写入，`local_wal_rate` 的数据源） |
 | `last_msg_send_time` / `last_msg_receipt_time` | timestamptz | 最近消息的发布端发送时刻/本地接收时刻（诊断网络延迟的原始素材） |
@@ -273,7 +273,7 @@ pub_current ──► sent ──► [网络] ──► received ──► appli
 | `pub_current_lsn` | C0 | RPUB | 发布端 WAL 顶端 |
 | `sent_lsn` | C2 | RPUB | 已发送位 |
 | `received_lsn` | C3′ | SUB | 本地实收位（无反馈延迟） |
-| `applied_lsn` | C5′ | SUB | 已应用位（origin）；注意：积压计算内部用 `max(origin 位, 反馈 flush 位)` 取更靠前者（v18 反馈位更可靠），本列展示 origin 原值 |
+| `applied_lsn` | C5′ | SUB | 已应用位 = `max(origin remote_lsn, 反馈flush位)`（每轮轮询后回填），速率与积压共用此序列，行内自洽 |
 | `confirmed_flush_lsn` | C6 | RPUB | 槽确认水位 |
 | `restart_lsn` | C7 | RPUB | 槽保水位 |
 
@@ -481,5 +481,5 @@ SELECT pg_lrstat_inject_pub('pg_lrstat_test_t', now(), '0/1000000', '0/800000',
 2. **反馈延迟**：发布端视图的对端位置（C3~C5）滞后一个 `wal_receiver_status_interval`（默认 10s）；订阅端视图无此延迟——这是两端都装的价值。
 3. `backlog_inflight`（发布端口径）含反馈滞后造成的"假在途"；`pg_lrstat_overall` 用本地接收位计算，无此失真。
 4. `local_wal_rate` 含订阅库自身其他写入的噪声。
-5. 大事务回放期间 `apply_rate` 可能短暂为 0（单事务内无 commit 位点推进），`apply_stalled` 辅助区分。
+5. 大事务回放期间 `apply_rate` 可能短暂为 0（反馈位与 origin 都在提交边界才推进，单事务内无位点更新），`apply_stalled` 辅助区分；并行 apply 的 worker 行不单列（与 leader 合并，以 leader 行为准）。
 6. `pg_lrstat_pipeline` 的 progress 为 LSN 比值近似，不是精确百分比。

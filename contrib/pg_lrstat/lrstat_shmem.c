@@ -338,6 +338,46 @@ lrstat_reset_all(void)
 }
 
 /*
+ * Fold the feedback flush position into the newest sample of the
+ * named subscription's leader target.  The origin remote_lsn only
+ * moves at transaction-commit boundaries, so the applied series (and
+ * every rate derived from it) can sit still while the subscription is
+ * visibly making progress -- folding the feedback position in keeps
+ * apply_rate and backlog_unapplied on one consistent series.  The
+ * value only ever grows and the sample timestamp is untouched, so
+ * differentiators still see a monotonic sequence.
+ */
+void
+lrstat_bump_applied(const char *subname, XLogRecPtr applied)
+{
+	int			i;
+
+	if (!lrstat_ready() || applied == 0)
+		return;
+
+	for (i = 0; i < lrstat->ntargets; i++)
+	{
+		LRTargetCtl *t = lrstat_target_at(i);
+		bool		match;
+
+		SpinLockAcquire(&t->mutex);
+		match = (t->in_use && t->kind == LR_SUB &&
+				 t->worker_char == 'a' && t->relid == 0 &&
+				 strcmp(t->name, subname) == 0);
+		if (match && t->n_samples > 0)
+		{
+			uint32		idx = (t->head + t->ring_len - 1) % t->ring_len;
+
+			if (LR_TARGET_RING(t)[idx].sub.applied_lsn < applied)
+				LR_TARGET_RING(t)[idx].sub.applied_lsn = applied;
+		}
+		SpinLockRelease(&t->mutex);
+		if (match)
+			return;
+	}
+}
+
+/*
  * Record the outcome of one sampler round.  The error text is copied
  * under the header spinlock; truncation is acceptable for diagnostics.
  */

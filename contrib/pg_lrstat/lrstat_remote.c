@@ -384,6 +384,13 @@ lrstat_remote_round(const LRRemoteSub *subs, int nsubs, TimestampTz deadline)
 				lrstat_set_meta(t, &m);
 			}
 
+			/*
+			 * Keep the subscriber-side applied series consistent with
+			 * what the publisher's feedback says we applied (the
+			 * origin remote_lsn only advances at commit boundaries).
+			 */
+			lrstat_bump_applied(subs[j].subname, s.pub.peer_flush_lsn);
+
 			c->failures = 0;
 			c->next_retry = 0;
 		}
