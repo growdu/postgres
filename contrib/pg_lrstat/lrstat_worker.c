@@ -477,6 +477,9 @@ sample_recv_side(TimestampTz now, int *n_targets)
 			if (!isnull)
 				conninfo = SPI_getvalue(tup, td, FN(td, "subconninfo"));
 
+			/* read the slot name for remote polling */
+			col_text(tup, td, FN(td, "subslotname"), slot_name, sizeof(slot_name));
+
 			relid = DatumGetObjectId(col_val(tup, td, FN(td, "relid"), &isnull));
 			if (isnull) relid = 0;
 
@@ -513,8 +516,12 @@ sample_recv_side(TimestampTz now, int *n_targets)
 					if (n >= nalloc)
 					{
 						nalloc = nalloc == 0 ? 8 : nalloc * 2;
-						targets = repalloc(targets,
-										   nalloc * sizeof(LRPollTarget));
+						/* repalloc requires non-NULL; first allocation via palloc */
+						if (targets == NULL)
+							targets = palloc(nalloc * sizeof(LRPollTarget));
+						else
+							targets = repalloc(targets,
+											   nalloc * sizeof(LRPollTarget));
 					}
 					strlcpy(targets[n].recv_name, recv_name, NAMEDATALEN);
 					strlcpy(targets[n].slot_name, slot_name, NAMEDATALEN);

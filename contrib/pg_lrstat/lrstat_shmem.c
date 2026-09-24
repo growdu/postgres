@@ -12,6 +12,8 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/shmem.h"
@@ -21,6 +23,9 @@
 #include "lrstat.h"
 
 LRStatShared *lrstat = NULL;
+
+/* set by lrstat_start() before lrstat_session_start() */
+bool lrstat_persist_requested = false;
 
 static bool lrstat_was_preloaded = false;
 
@@ -259,6 +264,15 @@ lrstat_push_sample(LRTargetCtl *target, const LRSample *sample)
 	SpinLockAcquire(&target->mutex);
 	if (sample->send.ts > target->last_sample_ts)
 	{
+		/* rotate: prev = last; last = new; first round sets anchor */
+		if (target->last.send.ts > 0)
+		{
+			target->prev = target->last;
+		}
+		if (target->anchor.send.ts == 0)
+		{
+			target->anchor = *sample;
+		}
 		target->last = *sample;
 		target->last_sample_ts = sample->send.ts;
 	}
@@ -346,10 +360,12 @@ lrstat_session_start(const char *name)
 	}
 	lrstat->n_entries = 0;
 
-	/* Create session file for persist sessions */
-	if (lrstat_store_create(name, lrstat->session.session_id,
+	/* Create session file only when persist was explicitly requested */
+	if (lrstat_persist_requested &&
+		lrstat_store_create(name, lrstat->session.session_id,
 							 lrstat->session.start_ts) != 0)
 		lrstat->session.degraded = true;
+	lrstat_persist_requested = false;  /* reset for next session */
 }
 
 void
@@ -363,11 +379,18 @@ lrstat_session_stop(void)
 	lrstat->session.stop_ts = GetCurrentTimestamp();
 	SpinLockRelease(&lrstat->session.mutex);
 
-	/* Finalize session file */
-	lrstat_store_finalize(lrstat->session.name, "stopped",
-						  lrstat->ntargets, lrstat->n_entries,
-						  lrstat->session.truncated,
-						  lrstat->session.degraded);
+	/* Finalize session file only if it exists (persist session) */
+	{
+		char *path = psprintf("%s/pg_lrstat/sessions/%s.sess", DataDir,
+							  lrstat->session.name);
+		struct stat st;
+		if (stat(path, &st) == 0)
+			lrstat_store_finalize(lrstat->session.name, "stopped",
+								  lrstat->ntargets, lrstat->n_entries,
+								  lrstat->session.truncated,
+								  lrstat->session.degraded);
+		pfree(path);
+	}
 }
 
 void

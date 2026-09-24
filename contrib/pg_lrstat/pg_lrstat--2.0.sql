@@ -3,7 +3,7 @@
 \echo Use "CREATE EXTENSION pg_lrstat" to load this file. \quit
 
 -- Session commands
-CREATE FUNCTION lrstat_start(name text DEFAULT NULL)
+CREATE FUNCTION lrstat_start(name text DEFAULT NULL, persist boolean DEFAULT false)
 RETURNS text
 AS 'MODULE_PATHNAME', 'lrstat_start'
 LANGUAGE C VOLATILE;

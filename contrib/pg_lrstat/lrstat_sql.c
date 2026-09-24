@@ -21,6 +21,8 @@
 
 #include "lrstat.h"
 
+extern bool lrstat_persist_requested;
+
 #define MB_DIV (1024.0 * 1024.0)
 #define MAX_COLS 40
 
@@ -595,6 +597,7 @@ lrstat_start(PG_FUNCTION_ARGS)
         strlcpy(name, auto_name, NAMEDATALEN);
     }
 
+    lrstat_persist_requested = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
     lrstat_session_start(name);
     PG_RETURN_DATUM(CStringGetTextDatum(name));
 }
