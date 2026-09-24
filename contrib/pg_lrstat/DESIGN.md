@@ -98,7 +98,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 
 ### 3.1 位点与积压（瞬时量）
 
-位点即 §2.2 的 C0~C7 原值。积压为最新样本上两点位相减（负值截 0），单位字节：
+位点即 §2.2 的 C0~C7 原值。积压为最新样本上两点位相减（负值截 0），**单位 MB**（字节 ÷ 1048576，float8）：
 
 | 积压 | 公式 | 含义 |
 | --- | --- | --- |
@@ -108,7 +108,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | `backlog_total` | C0 − C5′ | 端到端总积压（三段之和） |
 | `backlog_apply` | C3′ − C5′（接收端视图） | 同 unapplied，接收端独立视图口径 |
 | `retained_wal` | C0 − C7 | 槽扣住的 WAL 总量（磁盘风险） |
-| `feedback_lag_bytes` | C3′ − 反馈 write 槽位 | 回执滞后量：区分"真在途"与"10 秒回执假象"的交叉观测量 |
+| `feedback_lag_mb` | C3′ − 反馈 write 槽位 | 回执滞后量：区分"真在途"与"10 秒回执假象"的交叉观测量 |
 
 发送端视图另提供 `backlog_peer_unapplied`（C3−C5，反馈口径，最多滞后 10s）。
 
@@ -121,9 +121,9 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 平均 avg(f)     = (f(S_last) − f(S_anchor)) / (ts(S_last) − ts(S_anchor))
 ```
 
-- 单位：字节/秒内部计算，视图输出 MB/s（÷1048576）；
+- 单位：**MB/s**（内部按 LSN 差分得到字节/秒，输出前 ÷ 1048576 转为 MB/s）；
 - 瞬时速率的粒度 = `sample_interval`（默认 30s，可调至 1s）；
-- 数值示例：两样本相隔 110s，`sent_lsn` 从 `0/0` 到 `0/800000`（8 MiB）→ `send` 瞬时 = 平均 = 8×1048576÷110 ≈ 0.0727 MB/s；
+- 数值示例：两样本相隔 110s，`sent_lsn` 从 `0/0` 到 `0/800000`（8 MB）→ `send` 瞬时 = 平均 = 8 ÷ 110 ≈ 0.0727 MB/s；
 - 有效性规则：最新样本距查询超过 3×采样间隔（采样中断）→ 速率列 NULL；`S_prev` 缺失（会话首轮）→ 瞬时列 NULL，平均列=首段值；
 - **速率是页码（LSN）差不是网线字节**：与带宽对比需乘解码膨胀率（`total_bytes` 增量 ÷ C0 增量）。
 
@@ -132,7 +132,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | 指标 | 计算 | 说明 |
 | --- | --- | --- |
 | `duration_secs` | 实际首末样本区间 | 以样本为准，非命令时刻 |
-| `total_f_bytes` | f(S_last) − f(S_anchor) | 各字段会话总量 |
+| `total_f_mb` | f(S_last) − f(S_anchor)（÷ 1048576） | 各字段会话总量（MB） |
 | `avg_f` | total ÷ duration | 会话平均（= stop 时刻 live 的 avg） |
 | `f_instant_min/max/avg` | 会话日志逐间隔统计 | 瞬时速率分布（峰值/谷值/均值） |
 | `peak_backlog_*` | 锚点起增量前缀和重建各水位，取逐间隔最大 | 峰值积压 |
@@ -144,11 +144,11 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 ### 3.4 追平预估（catchup）与堵住（live 视图）
 
 ```
-catchup_send_secs  = backlog_unsent / avg(send)
-catchup_total_secs = backlog_unsent / avg(send) + (inflight + unapplied) / avg(apply)
+catchup_send_secs  = backlog_unsent_mb / avg_send_mbps
+catchup_total_secs = backlog_unsent_mb / avg_send_mbps + (backlog_inflight_mb + backlog_unapplied_mb) / avg_apply_mbps
 ```
 
-平均速率低于 `catchup_min_rate`（默认 1kB/s）或积压为 0 时为 NULL；持续写入场景需用**净追平速率** `min(avg send, avg apply) − avg gen` 重估（为负则追不平）。`*_blocked` = 对应积压>0 且**瞬时**速率有效但 < 1 B/s（"最近一个采样间隔没动"）。
+平均速率低于 `catchup_min_rate`（默认 0.001 MB/s）或积压为 0 时为 NULL；持续写入场景需用**净追平速率** `min(avg send, avg apply) − avg gen` 重估（为负则追不平）。`*_blocked` = 对应积压>0 且**瞬时**速率有效但 < 0.001 MB/s（"最近一个采样间隔没动"）。
 
 ---
 
@@ -271,7 +271,7 @@ typedef struct LRSessionEntry
     TimestampTz ts;                  /* 间隔结束时刻                              */
     int32     target_idx;           /* 目标表下标                                */
     int64     d_current, d_sent, d_received, d_applied,
-              d_spill, d_stream;    /* 本间隔增量（字节）                        */
+              d_spill, d_stream;    /* 本间隔增量（字节，视图输出转 MB）          */
 } LRSessionEntry;
 ```
 
@@ -450,17 +450,17 @@ pg_lrstat_reset() → void
 | `state` | text | walsender 状态（streaming/catchup）——catchup=正在追 |
 | `sync_state` | text | async/sync——sync 时的"慢"是在等备库不是真慢 |
 | `wal_status` | text | reserved/unreserved/lost——**lost=数据已丢必须重建** |
-| `safe_wal_size` | int8 | 距 max_slot_wal_keep_size 余量——磁盘风险预警 |
+| `safe_wal_size` | float8 | 距 WAL 上限余量（MB）——磁盘风险预警 |
 | **位点（3 列）** | | |
 | `current_lsn` | pg_lsn | WAL 生成顶端——与外部工具（pg_waldump）交叉对照 |
 | `sent_lsn` | pg_lsn | 已发送位——同上 |
 | `confirmed_flush_lsn` | pg_lsn | 槽确认水位——WAL 回收决策位 |
 | **积压（5 列）** | | |
-| `backlog_unsent` | int8 | 已生成未发送——发布端发货段积压 |
-| `backlog_inflight` | int8 | 已发送对端未确认接收——含 10s 反馈假象 |
-| `backlog_peer_unapplied` | int8 | 对端已收未应用（反馈口径，最多滞后 10s） |
-| `backlog_total` | int8 | 端到端总积压（反馈口径） |
-| `retained_wal` | int8 | 槽扣住的 WAL——磁盘风险指标 |
+| `backlog_unsent` | float8 | 已生成未发送（MB） |
+| `backlog_inflight` | float8 | 已发送对端未确认接收（MB） |
+| `backlog_peer_unapplied` | float8 | 对端已收未应用（MB，反馈口径） |
+| `backlog_total` | float8 | 端到端总积压（MB） |
+| `retained_wal` | float8 | 槽扣住的 WAL（MB）——磁盘风险指标 |
 | **速率（14 列，MB/s）** | | |
 | `gen_instant` / `gen_avg` | float8 | WAL 生成——是否上游产出突增 |
 | `send_instant` / `send_avg` | float8 | 发送——发送是否跟得上生成 |
@@ -491,7 +491,7 @@ pg_lrstat_reset() → void
 | **消息时间（2 列）** | | |
 | `last_msg_send_time` / `last_msg_receipt_time` | timestamptz | 一对时间戳给出**单条消息的网络延迟**——网络排障原始素材 |
 | **积压（1 列）** | | |
-| `backlog_apply` | int8 | 已收未应用——分仓"到了没上架"积压 |
+| `backlog_apply` | float8 | 已收未应用（MB） |
 | **速率（6 列，MB/s）** | | |
 | `recv_instant` / `recv_avg` | float8 | 接收速率——分仓收货能力 |
 | `apply_instant` / `apply_avg` | float8 | 应用/回放速率——分仓上架能力（瓶颈最常见的列） |
@@ -528,7 +528,7 @@ pg_lrstat_reset() → void
 | | `backlog_unapplied` | 到了没上架 |
 | | `backlog_total` | 总积压（三段之和） |
 | | `retained_wal` | 磁盘风险 |
-| | `feedback_lag_bytes` | 反馈滞后——区分"真在途"和"10s 回执假象" |
+| | `feedback_lag_mb` | 反馈滞后（MB）——区分"真在途"和"10s 回执假象" |
 | **延迟（3 列）** | | |
 | | `write_lag`/`flush_lag`/`replay_lag` | 时间维度延迟——定位网络 vs 应用 |
 | **追平与堵住（4 列）** | | |
@@ -542,17 +542,17 @@ pg_lrstat_reset() → void
 | 列 | 为什么需要 |
 | --- | --- |
 | `session_name` / `name` / `ts` | 画曲线的坐标轴 |
-| `d_current` / `d_sent` | 本间隔增量——**速率时序图的数据源** |
-| `d_spill` / `d_stream` | 本间隔解码增量——解码压力时序图 |
+| `d_current` / `d_sent` | 本间隔增量（MB）——**速率时序图的数据源** |
+| `d_spill` / `d_stream` | 本间隔解码增量（MB）——解码压力时序图 |
 | `level_current` / `level_sent` / `level_confirmed` | 前缀和重建的水位——**水位阶梯图的数据源** |
-| `backlog_unsent` / `backlog_total` | 由水位派生的逐间隔积压——**积压面积图的数据源** |
+| `backlog_unsent` / `backlog_total` | 由水位派生的逐间隔积压（MB）——**积压面积图的数据源** |
 
 #### `pg_lrstat_recv_history`（接收端一目标一间隔一行，stop 后可查）
 
 | 列 | 为什么需要 |
 | --- | --- |
 | `session_name` / `name` / `ts` | 同上 |
-| `d_received` / `d_applied` | 本间隔增量 |
+| `d_received` / `d_applied` | 本间隔增量（MB） |
 | `level_received` / `level_applied` | 水位重建 |
 | `backlog_apply` | 逐间隔积压 |
 
@@ -566,7 +566,7 @@ pg_lrstat_reset() → void
 | `pg_lrstat.session_max_samples` | `2880` | 重启 | 会话日志容量（30s≈24h；0=关闭逐间隔，仅留汇总） |
 | `pg_lrstat.max_targets` | `32` | 重启 | 目标槽容量 |
 | `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标老化回收阈值 |
-| `pg_lrstat.catchup_min_rate` | `1kB/s` | SIGHUP | 追平预估有效性下限（avg 低于此值返回 NULL） |
+| `pg_lrstat.catchup_min_rate` | `0.001` | SIGHUP | 追平预估有效性下限（MB/s，avg 低于此值返回 NULL） |
 | `pg_lrstat.remote_poll` | on | SIGHUP | 接收端是否轮询发送端 |
 | `pg_lrstat.remote_connect_timeout` | `5s` | SIGHUP | 远端连接超时 |
 | `pg_lrstat.remote_poll_budget` | `500ms` | SIGHUP | 单轮远端轮询总预算 |
@@ -617,16 +617,16 @@ pg_lrstat_reset() → void
 **② 追平预估**——当前没 apply 的数据还要多久：
 
 ```
-当前积压追平时间 = backlog_unapplied / avg_apply          （秒）
-  若 avg_apply ≈ 0 且 backlog > 0: 显示"应用已停，追平时间不可估"
+当前积压追平时间 = backlog_unapplied_mb / avg_apply_mbps   （秒）
+  若 avg_apply ≈ 0 且积压 > 0: 显示"应用已停，追平时间不可估"
 ```
 
 **③ 容量外推**——按本次会话的平均 apply 速率，同步不同量级 WAL 需要多久：
 
 ```
-同步 50G  ≈ 50 × 1024³ / (avg_apply × 1048576)  秒 ≈ 50×1024 / avg_apply 秒
-同步 100G ≈ 100 × 1024 / avg_apply 秒
-同步 200G ≈ 200 × 1024 / avg_apply 秒
+同步 50G  ≈ 50 × 1024 / avg_apply_mbps  秒
+同步 100G ≈ 100 × 1024 / avg_apply_mbps  秒
+同步 200G ≈ 200 × 1024 / avg_apply_mbps  秒
 ```
 
 输出示例（HTML 中的表格）：
@@ -677,7 +677,7 @@ pg_lrstat_reset() → void
   "analysis": { ... },           // §5.5.1 的四项结论
   "capacity": {                   // §5.5.1-③ 的容量外推
     "avg_apply_mbps": 3.2,
-    "catchup_current": { "backlog_bytes": 89128960, "est_secs": 27 },
+    "catchup_current": { "backlog_mb": 85, "est_secs": 27 },
     "sync_50g_secs": 16000, "sync_100g_secs": 32000, "sync_200g_secs": 64000,
     "net_catchup_mbps": -0.1      // §5.5.1-④
   },
@@ -709,14 +709,14 @@ SELECT recv_name,
        round(send_instant::numeric,1) AS 发送_瞬时,
        round(send_avg::numeric,1)     AS 发送_平均,
        round(apply_avg::numeric,1)    AS 应用_平均,
-       pg_size_pretty(backlog_total)  AS 总积压,
+       round(backlog_total,1)         AS 总积压MB,
        round(catchup_total_secs)      AS 追平秒
 FROM pg_lrstat_cluster_stat;
 
 SELECT lrstat_stop('mig_20260924');
 
 -- 会话结束后看逐间隔曲线：
-SELECT ts, pg_size_pretty(d_current) AS 每段生成
+SELECT ts, round(d_current,1) AS 每段生成MB
 FROM pg_lrstat_send_history WHERE name = 'sub_a_slot' ORDER BY ts;
 
 -- 可视化导出（全部视图数据）：
@@ -849,7 +849,7 @@ SELECT lrstat_start('bench_am', true);
 SELECT recv_name, round(send_instant::numeric,1) AS send_ins,
        round(send_avg::numeric,1) AS send_avg,
        round(apply_avg::numeric,1) AS apply_avg,
-       pg_size_pretty(backlog_total) AS total
+       round(backlog_total,1) AS total_mb
 FROM pg_lrstat_cluster_stat;
 
  recv_name | send_ins | send_avg | apply_avg | total
@@ -858,7 +858,7 @@ FROM pg_lrstat_cluster_stat;
 
 SELECT lrstat_stop('bench_am');
 SELECT session_name, state, round(duration_secs) AS secs,
-       pg_size_pretty(total_current) AS 生成总量, round(avg_send::numeric,1) AS 平均发送
+       round(total_current,0)        AS 生成MB, round(avg_send::numeric,1) AS 平均发送
 FROM pg_lrstat_cluster_stat;
 
  session_name | state   | secs | 生成总量 | 平均发送
