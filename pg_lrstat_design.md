@@ -27,7 +27,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
    └──────────────────────────────────────────────────┘
         │
         ▼
-   会话报告（总量/平均/峰值/逐间隔序列）→ 可视化导出（HTML/PNG/JSON）
+   会话报告（总量/平均/峰值/逐间隔序列）→ 可视化导出（HTML/JSON）
 ```
 
 ### 1.2 核心概念
@@ -183,7 +183,7 @@ shared_preload_libraries=pg_lrstat        shared_preload_libraries=pg_lrstat
 | 共享内存 | `lrstat_shmem.c` | 会话状态、目标表（anchor/prev/last）、内存会话日志、报告聚合 |
 | 会话文件 | `lrstat_store.c` | persist 会话的文件读写（双写/fsync/原子头尾/启动恢复） |
 | SQL 层 | `lrstat_sql.c` | start/stop/export/delete 命令、全部视图 SRF、报告聚合 |
-| 导出渲染 | `lrstat_export.c` | HTML（内嵌 SVG+JS）/ PNG（libpng）/ JSON 三格式渲染 |
+| 导出渲染 | `lrstat_export.c` | HTML（内嵌 SVG+JS）+ JSON 两格式 + 分析结论计算 |
 
 ### 4.3 共享内存布局
 
@@ -224,9 +224,7 @@ typedef struct LRRecvSample
 {
     TimestampTz ts;
     XLogRecPtr  received_lsn;       /* C3' 逻辑:received_lsn 物理:receive_lsn   */
-    XLogRecPtr  latest_end_lsn;     /* keepalive / latest_end_lsn 回退源         */
     XLogRecPtr  applied_lsn;        /* C5' 逻辑:origin∪反馈 物理:replay_lsn     */
-    XLogRecPtr  origin_local_lsn;   /* 逻辑:origin local_lsn 物理:Invalid       */
     XLogRecPtr  local_wal_lsn;      /* 接收库 pg_current_wal_lsn()              */
 } LRRecvSample;
 
@@ -243,11 +241,14 @@ typedef struct LRTargetMeta
     TimestampTz reply_time;
     char  remote_state[16];          /* RSEND: ok/unreachable/stale/n/a          */
     TimestampTz last_remote_poll;
-    char  subslotname[64];
+    /* slot_name 即目标键 name，meta 不重复存储 */
     char  worker_type[24];           /* apply / parallel apply / table sync / recovery */
     pid_t worker_pid, leader_pid;
     TimestampTz last_msg_send_time, last_msg_receipt_time, latest_end_time;
     int64 apply_error_count, sync_error_count;
+    /* 以下为内部字段：不参与速率差分，不暴露到视图 */
+    XLogRecPtr origin_lsn;          /* 逻辑:origin remote_lsn（bump_applied 比较用） */
+    XLogRecPtr latest_end_lsn;      /* received_lsn 为空时的回退源                  */
 } LRTargetMeta;
 
 /* 每目标：三槽位（锚点/前一/最新），无历史环 */
@@ -354,6 +355,7 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 - **启动恢复**：shmem 启动 hook 扫描会话目录（目录不存在即跳过——默认常态）；`state=running` 的文件自动补写会话尾、标 `interrupted` 归档；内存会话索引（名/id/状态/时间戳）随之重建。**不做跨重启续跑**（锚点失效，速率语义不可靠）；
 - **降级**：文件写失败（磁盘满/权限）不阻断采样——内存侧继续、`degraded=true`、stop 时 WARNING；
 - **清理**：`lrstat_delete(name)` 删除归档（superuser，不可恢复；非持久会话提示无归档）；无自动过期，目录大小靠巡检。
+- **版本迁移**：`layout_version` 变更后，启动恢复**跳过**不匹配的旧文件并限频 WARNING（列出文件名），不做自动迁移——保留原文件不损坏，用户可手动删除。
 
 ### 4.8 并发、锁与内存安全规则
 
@@ -377,13 +379,13 @@ lrstat_start(name text DEFAULT NULL, persist boolean DEFAULT false)
     -- 名字省略自动生成 sess_<id>_<yyyymmdd_hhmmss>；persist 默认 false
 
 lrstat_stop(name text)
-    → (session_id, session_name, started_at, stopped_at, report_digest jsonb)
+    → (session_name, started_at, stopped_at)
     -- superuser。结束指定名字的会话（须与 start 一致，防误停）；
-    -- digest 为报告摘要（时长/总量/平均），可直接看
+    -- stop 后查 cluster_stat / send_stat / recv_stat 看完整报告
 
 lrstat_export(name text, format text DEFAULT 'html', dest text DEFAULT NULL)
-    → (path text, content text|bytea, bytes bigint)
-    -- 导出会话报告，详见 §5.5
+    → (path text, content text, bytes bigint)
+    -- format: 'html'（自包含可视化）/ 'json'（机器可读）；详见 §5.5
 
 lrstat_delete(name text) → void
     -- superuser。删除一个已归档会话文件；运行中/非持久会话相应报错或提示
@@ -420,7 +422,7 @@ pg_lrstat_reset() → void
 | `session_start_ts` / `session_stop_ts` | timestamptz | 会话起止时间——和其他系统日志对时间线 |
 | `session_truncated` | bool | true = 日志超上限有丢失——报告数据不完整，需扩容 |
 | `session_degraded` | bool | true = 文件写失败——持久化不完整，导出可能缺数据 |
-| `archived_sessions` | int4 | 归档数量——提醒清理旧文件 |
+| `archived_session_names` | text[] | 归档会话名列表——`lrstat_export(name)` 和 `lrstat_delete(name)` 需要知道名字，从这里查 |
 | `sample_interval_ms` | int8 | 瞬时速率的粒度——读数前先知道"30 秒内的平均"是什么概念 |
 | `last_round_ts` | timestamptz | 采样 worker 最近一次成功——长期不更新 = worker 挂了 |
 | `last_round_ok` | bool | 上一轮采样成功与否 |
@@ -483,7 +485,7 @@ pg_lrstat_reset() → void
 | `sample_time` / `session_name` | — | 同 send_stat |
 | `worker_type` | text | apply/tablesync/recovery——区分 worker 角色 |
 | `worker_pid` | int4 | 关联 pg_stat_activity **查锁堵**——排障第一步 |
-| `slot_name` | text | 与 send_stat 对位的键 |
+| `slot_name` | text | 与 send_stat 对位的键（= 目标键 name） |
 | `leader_pid` / `relid` | int4/oid | 并行 apply 拓扑 / tablesync 目标表 |
 | **位点（2 列）** | | |
 | `received_lsn` | pg_lsn | 本地实收位——无反馈延迟，判断分仓状态首选 |
@@ -502,7 +504,7 @@ pg_lrstat_reset() → void
 
 **删除的列**：`origin_local_lsn`（重启续传位点，日常运维不用，排障时从系统视图查）；`local_wal_lsn`（速率列已总结）；`latest_end_lsn`（received_lsn 的回退源，不直接展示）；`latest_end_time`（last_msg_receipt_time 已覆盖）。
 
-#### `pg_lrstat_cluster_stat`（一复制对一行，**唯一两端合成视图**，37 列）
+#### `pg_lrstat_cluster_stat`（一复制对一行，**唯一两端合成视图**，38 列）
 
 | 列组 | 列 | 为什么需要 |
 | --- | --- | --- |
@@ -534,6 +536,7 @@ pg_lrstat_reset() → void
 | **追平与堵住（4 列）** | | |
 | | `catchup_send_secs` / `catchup_total_secs` | 还要多久追平（秒） |
 | | `send_blocked` / `apply_blocked` | 告警源——哪个环节停了 |
+| | `bottleneck` | text：`send`/`recv_apply`/`network`/`none`——SQL CASE WHEN 实时判定（§5.5.1），**会话期间随时可查** |
 
 **删除的列**：`restart_lsn`（retained_wal 已总结）；`elapsed_secs`（可推算）。
 
@@ -579,7 +582,10 @@ pg_lrstat_reset() → void
 
 #### 5.5.1 自动分析结论（导出的核心价值）
 
-导出时从会话数据自动计算以下结论，以**人话**呈现在报告最顶部（运维第一眼看到的就是"哪里慢、要多久"）：
+以下结论在**两个层面**可用：
+
+- **SQL 层（会话期间随时可查）**：`cluster_stat.bottleneck` 列实时判定瓶颈环节（CASE WHEN），`catchup_*_secs` 列实时给出追平预估；
+- **导出层（stop 后完整报告）**：四项结论在导出时从视图/会话日志计算，以**人话**呈现在报告最顶部。
 
 **① 瓶颈判定**——根据积压分布 + 速率对比，自动定位到具体环节：
 
@@ -689,14 +695,12 @@ pg_lrstat_reset() → void
 }
 ```
 
-**`format='png'`**：三张核心图表的静态位图（`<name>_rates/_backlog/_levels.png`），纯 C + libpng 固定版式。
-
 **`dest`**：默认 `$PGDATA/pg_lrstat/exports/`；`dest := '-'` 直接返回内容。返回 `(path, content, bytes)`。
 
 ### 5.6 权限
 
 - 视图（含 report/sessions/info）：`REVOKE ALL FROM PUBLIC; GRANT SELECT TO pg_monitor`
-- `lrstat_start/stop/reset/delete`、inject、export(html/png)：superuser
+- `lrstat_start/stop/reset/delete`、inject、export(html)：superuser
 - `lrstat_export(..., 'json')`：pg_monitor
 
 ### 5.7 使用示例（完整流程）
@@ -719,7 +723,11 @@ SELECT lrstat_stop('mig_20260924');
 SELECT ts, round(d_current,1) AS 每段生成MB
 FROM pg_lrstat_send_history WHERE name = 'sub_a_slot' ORDER BY ts;
 
--- 可视化导出（全部视图数据）：
+-- 会话期间实时查瓶颈（不需要导出）：
+SELECT recv_name, bottleneck, round(catchup_total_secs) AS 追平秒
+FROM pg_lrstat_cluster_stat;
+
+-- 可视化导出（全部视图数据 + 分析结论）：
 SELECT lrstat_export('mig_20260924');            -- HTML 报告
 SELECT lrstat_export('mig_20260924','json');     -- 机器可读
 ```
@@ -826,7 +834,8 @@ FROM pg_stat_wal_receiver wr;
 | TAP 002 / scripts/logical_rep_test.sh | 真实发布订阅：start → pgbench -T N → stat 双速率非零、instant 波动、avg 单调收敛 → stop → stat 总量与 pgbench WAL 量级一致、history 行数 ≈ N/30 |
 | 持久化专项（persist=true） | stop 后 restart 报告完整；kill -9 mid-session → interrupted、丢失 ≤1 间隔；只读目录注入 → degraded；delete 生效 |
 | 默认零文件路径 | persist=false 全流程不创建任何文件/目录；重启后无痕 |
-| 报告导出 | html 可解析且含三类图数据点；png 三图非空；json 与视图逐字段对拍；dest 越界拒绝；dest='-' 与落盘内容一致；非持久会话导出窗口期 |
+| 报告导出 | html 可解析且含三类图数据点与瓶颈判定；json 与视图逐字段对拍（含 analysis/capacity）；dest 越界拒绝；dest='-' 与落盘一致 |
+| 分析结论 | 注入已知速率/积压 → 验证 `cluster_stat.bottleneck` 判定：send<gen+unsent>50%→'send'；apply<recv+unapplied>50%→'recv_apply'；四速率同频→'none'；spill>0 时 deep_cause 正确；export JSON 的 analysis/capacity 与手算对拍 |
 | 会话边界 | 目标中途加入 partial；stop 恰逢采样轮；混用 persist 模式 |
 | 物理复制 | primary+standby 集群：send_stat 列出物理连接（kind=physical）、recv_stat 列出 recovery 行、cluster_stat 合成两端；pgbench 负载下四速率一致；standby 断连→remote_state 转 unreachable；级联场景两侧独立 |
 
@@ -837,7 +846,7 @@ FROM pg_stat_wal_receiver wr;
 | P0 | 会话状态机 + start/stop + 三槽位采样 + live 视图族（双速率，逻辑复制） |
 | P1 | 内存会话日志 + send/recv/cluster_stat + send/recv_history + 回归/TAP 重写 |
 | P2 | 可选持久化（persist 路径：双写/fsync/原子头尾）、启动恢复、sessions/delete、专项测试 |
-| P3 | 报告导出（json → html+SVG → png/libpng）+ 导出专项测试 |
+| P3 | 报告导出（json → html+SVG）+ bottleneck 列 + 分析结论测试 |
 | P4 | 物理复制支持（send SQL kind 过滤、standby 采样 SQL、pg_stat_wal_receiver 视角）+ 物理专项测试 |
 | P5 | 用户文档（USER_MANUAL/BEST_PRACTICES 按会话模型改写，含物理复制） |
 
