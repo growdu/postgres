@@ -305,7 +305,14 @@ pub_current ──► sent ──► [网络] ──► received ──► appli
 
 ### 5.7 `pg_lrstat_pub_history / sub_history` — 原始时间序列（8 + 7 列）
 
-`(name, since)` 两个可选过滤参数；按时间升序返回环内原始样本（监控画图用）。
+既有**视图**（`\dv` 可见，返回全部目标、整环数据），也有同名**函数**可带参数过滤——画图时建议用函数形式缩小范围：
+
+```sql
+SELECT * FROM pg_lrstat_pub_history;                                -- 全量（视图）
+SELECT * FROM pg_lrstat_pub_history('mysub', now() - interval '1 hour');  -- 过滤（函数）
+```
+
+按时间升序返回环内原始样本。
 
 | pub_history 列 | 含义 | | sub_history 列 | 含义 |
 | --- | --- | --- | --- | --- |

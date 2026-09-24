@@ -151,6 +151,10 @@ CREATE VIEW pg_lrstat_sub_rate AS SELECT * FROM pg_lrstat_sub_rate();
 CREATE VIEW pg_lrstat_pipeline AS SELECT * FROM pg_lrstat_pipeline();
 CREATE VIEW pg_lrstat_overall AS SELECT * FROM pg_lrstat_overall();
 CREATE VIEW pg_lrstat_info AS SELECT * FROM pg_lrstat_info();
+-- History views show every target, full ring; use the underlying
+-- functions with (name, since) arguments for filtered queries.
+CREATE VIEW pg_lrstat_pub_history AS SELECT * FROM pg_lrstat_pub_history();
+CREATE VIEW pg_lrstat_sub_history AS SELECT * FROM pg_lrstat_sub_history();
 
 REVOKE ALL ON FUNCTION
     pg_lrstat_pub_sample(), pg_lrstat_pub_rate(),
@@ -163,12 +167,14 @@ FROM PUBLIC;
 REVOKE ALL ON
     pg_lrstat_pub_sample, pg_lrstat_pub_rate,
     pg_lrstat_sub_sample, pg_lrstat_sub_rate,
-    pg_lrstat_pipeline, pg_lrstat_overall, pg_lrstat_info
+    pg_lrstat_pipeline, pg_lrstat_overall, pg_lrstat_info,
+    pg_lrstat_pub_history, pg_lrstat_sub_history
 FROM PUBLIC;
 GRANT SELECT ON
     pg_lrstat_pub_sample, pg_lrstat_pub_rate,
     pg_lrstat_sub_sample, pg_lrstat_sub_rate,
-    pg_lrstat_pipeline, pg_lrstat_overall, pg_lrstat_info
+    pg_lrstat_pipeline, pg_lrstat_overall, pg_lrstat_info,
+    pg_lrstat_pub_history, pg_lrstat_sub_history
 TO pg_monitor;
 
 --
@@ -256,3 +262,8 @@ COMMENT ON COLUMN pg_lrstat_info.last_round_ok IS 'outcome of the last sampler r
 COMMENT ON COLUMN pg_lrstat_info.last_round_error IS 'error message when the last round failed';
 COMMENT ON COLUMN pg_lrstat_info.nrounds IS 'completed sampler rounds since startup';
 COMMENT ON COLUMN pg_lrstat_info.dropped_samples IS 'samples dropped because every target slot held fresh data; raise pg_lrstat.max_targets if nonzero';
+
+COMMENT ON VIEW pg_lrstat_pub_history IS
+    'Raw publisher-side samples, chronological (all targets, full ring)';
+COMMENT ON VIEW pg_lrstat_sub_history IS
+    'Raw subscriber-side samples, chronological (all targets, full ring)';
