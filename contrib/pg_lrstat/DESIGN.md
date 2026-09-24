@@ -21,7 +21,7 @@ v1.x 是**连续监控**模型：后台采样写入每目标 1800 点的环形�
 ### 1.2 v2.0 模型：显式测量会话（可命名，持久化可选）
 
 ```
-lrstat_start('mig_20260924', persist := false)   采样中(30s/轮)   随时查询        lrstat_stop()
+lrstat_start('mig_20260924', persist := false)   采样中(30s/轮)   随时查询    lrstat_stop('mig_20260924')
      │ ────────── 会话开始 ──────────────► │──────────────► │──── 会话结束 ────► │
      │                                    │                │                   │
   记录会话名/锚点样本                     逐轮采样         live 视图输出        冻结全部数据
@@ -32,7 +32,7 @@ lrstat_start('mig_20260924', persist := false)   采样中(30s/轮)   随时查�
 
 - **`lrstat_start([name [, persist]])`**：开启一个**命名会话**（名字省略自动生成 `sess_<id>_<时间戳>`）。清空会话存储，触发一轮即时采样作为**锚点**（anchor），开始计时；会话名在历史会话中必须唯一。**`persist` 默认 `false`**——纯内存会话，不写任何文件；显式传 `true` 才启用会话文件持久化。
 - **采样期间随时查询**：每个目标输出**瞬时速率**（最近两个样本的差分，即一个采样间隔——默认 30 秒——内的速率）与**平均速率**（锚点到最新样本的全程差分）。没有窗口概念。
-- **`lrstat_stop()`**：结束会话，冻结 start→stop 期间的全部逐间隔数据与统计，形成**会话报告**。非持久会话的报告保留在内存中直至下次 `lrstat_start()`；持久会话（`persist=true`）的报告连同逐间隔日志落盘归档，跨重启保留，按会话名随时回看、对比、清理。
+- **`lrstat_stop(name)`**：结束**指定名字**的会话（名字必须与 start 一致，防止误停其他会话；同名不匹配报错）。冻结 start→stop 期间的全部逐间隔数据与统计，形成**会话报告**。非持久会话的报告保留在内存中直至下次 `lrstat_start()`；持久会话（`persist=true`）的报告连同逐间隔日志落盘归档，跨重启保留，按会话名随时回看、对比、清理、导出。
 - **重启恢复（仅持久会话）**：持久会话的采样增量随轮次双写（共享内存 + 会话文件），实例崩溃/重启至多丢失最后一个采样间隔；启动时发现未闭合的会话文件即自动以 `interrupted` 状态收尾归档。非持久会话随重启自然消失——这是默认行为。
 
 ### 1.3 目标 / 非目标
@@ -190,7 +190,7 @@ typedef struct LRInterval
 ### 4.4 会话生命周期与状态机
 
 ```
-idle ──lrstat_start(name)──► running ──lrstat_stop()──► stopped ──lrstat_start(name')──► running(...)
+idle ──lrstat_start(name,persist)──► running ──lrstat_stop(name)──► stopped ──lrstat_start(name')──► running(...)
   │                            │  ▲
   │                            │  └──── 每采样轮：prev=last; last=新样本；
   │                            │         running 时增量双写(内存日志+会话文件)
@@ -201,7 +201,7 @@ idle ──lrstat_start(name)──► running ──lrstat_stop()──► stop
 
 - **start(name, persist)**：superuser；`running=true` 则报错（一次一会话）；名字与历史会话重复则报错（提示换名或先 `lrstat_delete`）。`session_id++`，`persist=true` 时创建会话文件（头 `state=running`）否则纯内存，清空内存会话存储，记录 `start_ts` 与名字，**唤醒 worker 立即执行一轮采样**——该轮样本即锚点（保证 start 后一个 `sample_interval` 内即可查到双速率）。
 - **采样轮**（worker 主循环，每 `sample_interval`）：若 `running`，每目标 `prev=last, last=新样本`，增量 append 内存日志，持久会话再**同步追加会话文件**（满则 `truncated=true` 丢弃，限频 WARNING）；若非 running 只更新 `last`（live 视图仍可看末状态，速率列为 NULL）。
-- **stop()**：superuser；`running=false`，记录 `stop_ts`，唤醒 worker 立即采一轮**收尾样本**（捕捉 stop 前最后一段增量），冻结内存日志，计算报告聚合；持久会话**写入会话尾、头置 `state=stopped`**，此后 `report` 视图按名从文件读取；非持久会话报告留在内存，保留至下次 start。
+- **stop(name)**：superuser；名字与运行中会话不符则报错；置 `running=false`，记录 `stop_ts`，唤醒 worker 立即采一轮**收尾样本**（捕捉 stop 前最后一段增量），冻结内存日志，计算报告聚合；持久会话**写入会话尾、头置 `state=stopped`**，此后 `report` 视图按名从文件读取；非持久会话报告留在内存，保留至下次 start。
 - **竞态**：start/stop 与采样轮通过 `LRSessionState.mutex` 与 worker latch 协调——先置状态再唤醒，增量以"该轮看到的 running 状态"为准，最多造成首/末间隔并入或剔除一个采样周期，报告 `duration` 以实际样本区间为准。文件写失败（磁盘满/权限）不阻断采样：内存侧继续，会话标记 `degraded`，stop 时 WARNING 提示持久化不完整。
 
 ## 5. 对外 SQL 接口
@@ -214,9 +214,14 @@ lrstat_start(name text DEFAULT NULL, persist boolean DEFAULT false)
     -- superuser；重复 start / 名字与历史会话冲突均报错；名字省略自动生成；
     -- persist 默认 false：纯内存会话，不写文件；true 才启用会话文件归档
 
-lrstat_stop()
+lrstat_stop(name text)
     → (session_id, session_name, started_at, stopped_at, report_digest)
-    -- 冻结（持久会话同时落盘归档）并返回摘要；无运行中会话报错
+    -- 结束指定名字的会话（须与 start 的名字一致，防误停）；
+    -- 冻结（持久会话同时落盘归档）并返回摘要；无该会话/未在运行则报错
+
+lrstat_export(name text, format text DEFAULT 'html', dest text DEFAULT NULL)
+    → (path_or_content)
+    -- 导出指定会话的成套报告，见 §5.4
 
 lrstat_delete(name text) → void
     -- 删除一个已归档会话文件（superuser；不可恢复；运行中会话不允许删；
@@ -248,7 +253,12 @@ SELECT sub_name,
        round(apply_avg::numeric,1)    AS 应用_平均,
        pg_size_pretty(backlog_total)  AS 总积压
 FROM pg_lrstat_overall_live;
-SELECT lrstat_stop();
+SELECT lrstat_stop('mig_20260924');
+
+-- 导出可视化报告（详见 §5.4）：
+SELECT lrstat_export('mig_20260924');                 -- HTML 到默认目录
+SELECT lrstat_export('mig_20260924', 'png');          -- PNG 图表集
+SELECT lrstat_export('mig_20260924', 'json');         -- 机器可读
 
 -- 完整报告（本会话，跨重启仍可查）：
 SELECT * FROM pg_lrstat_report('mig_20260924');
@@ -262,6 +272,29 @@ SELECT session_name, state, round(duration_secs) AS 秒,
        pg_size_pretty(total_current) AS 会话总量 FROM pg_lrstat_sessions
 ORDER BY start_ts DESC;
 ```
+
+### 5.4 报告导出 `lrstat_export(name, format, dest)`
+
+对**已 stop（或 interrupted）**的会话导出成套报告。三种格式，前两种面向"发给人看"，第三种面向"喂给工具"：
+
+**`format='html'`（默认，自包含单文件）**——一个不依赖任何外部资源（无 CDN、内嵌全部 CSS/JS）的 `.html`，浏览器双击即开，含：
+
+| 区块 | 内容 |
+| --- | --- |
+| 头部卡片 | 会话名/时间窗/时长/目标数/状态（stopped/interrupted/degraded），关键总数（生成/发送/应用总量） |
+| 速率时序图 | 每速率字段一条曲线（gen/send/recv/apply，MB/s，逐间隔），瞬时值 + 平均线；交互式（悬停看数值、缩放），内嵌轻量绘图（SVG + 原生 JS，无外部依赖） |
+| 积压堆叠面积图 | unsent/inflight/unapplied 三段堆叠 + total 总线（前缀和重建的逐间隔水位），峰值点自动标注 |
+| 分段水位图 | current/sent/received/applied 四条阶梯线——一眼看出"哪条腿拖后" |
+| 会话统计表 | §3.2 报告列全量（avg/min/max 瞬时、峰值积压、停滞间隔数），每目标一行可排序 |
+| 解码压力小节 | spill/stream 逐间隔柱状图（有数据才渲染） |
+
+**`format='png'`**——HTML 版核心图表的静态位图集（`<name>_rates.png / _backlog.png / _levels.png`），供贴工单/群聊；worker 进程离屏渲染（纯 C + libpng 画固定版式坐标轴与折线，服务器端无浏览器依赖）。
+
+**`format='json'`**——机器可读完整数据包：会话元信息 + 每目标报告行 + 逐间隔序列，字段名与视图列一一对应；供 Grafana/Python/内部平台二次消费。
+
+**`dest`**：默认写 `$PGDATA/pg_lrstat/exports/`（自动创建）；指定路径必须以该目录为根（防任意写），文件名固定 `<name>[_<chart>].<ext>`。返回 `(path, bytes)`；`dest := '-'` 则不写文件、直接返回内容（HTML/JSON 为 text、PNG 为 bytea），便于 `\o report.html` 或管道消费。
+
+**非持久会话同样可导出**（从内存报告渲染）；内存被下次 `lrstat_start()` 覆盖后则只能导出持久会话。导出要求 superuser（读 PGDATA、生成文件）；JSON 格式可放宽到 `pg_monitor`。
 
 ## 6. 详细设计要点
 
@@ -304,7 +337,7 @@ ORDER BY start_ts DESC;
 
 ### 6.4 权限
 
-视图授予 `pg_monitor`；`lrstat_start/stop/reset` 与 inject 仅 superuser。
+视图授予 `pg_monitor`；`lrstat_start/stop/reset/delete`、inject 及 export（html/png）仅 superuser；`lrstat_export(...,'json')` 放宽到 `pg_monitor`。
 
 ## 7. 测试方案
 
@@ -314,6 +347,7 @@ ORDER BY start_ts DESC;
 | TAP 001 | 同上注入算术（会话版） |
 | TAP 002 / scripts/logical_rep_test.sh | 真实发布订阅：start('bench') → pgbench -T N → 期间断言 live 双速率非零且 instant 波动、avg 单调收敛 → stop → 断言 report 的 duration/total/avg 与 pgbench 产出的 WAL 量级一致、intervals 行数 ≈ N/30 |
 | 持久化专项（persist=true 路径） | ① stop 后 `pg_ctl restart` → `pg_lrstat_sessions` 仍列出该会话（`persisted=t`）、report/intervals 数据完整；② **会话中 kill -9 postmaster** → 重启后该会话显示 `interrupted`、数据截至最后落盘间隔（与内存对照丢失 ≤1 个间隔）；③ 文件写失败注入（只读目录）→ 采样不中断、`degraded` 标记、stop 时 WARNING；④ delete 后 sessions/report 不再可见，目录文件消失 |
+| 报告导出 | ① html：单文件含内嵌资源、可被 xmllint 解析、含速率/积压/水位三类图的数据点（grep 校验）；② png：三张图生成且非空、尺寸合法；③ json：结构与视图对拍（逐字段相等）；④ dest 越界路径拒绝、dest='-' 返回内容与写文件内容一致；⑤ 非持久会话导出成功、下次 start 后导出报"无归档" |
 | 默认路径（persist=false） | 全流程**不产生任何文件**（目录不创建）；报告内存可查至下次 start；重启后 sessions/report 中无此会话；delete 提示无归档 |
 | 会话边界 | 目标中途加入（会话中建订阅）partial 标记；stop 恰逢采样轮；同一实例先后混用 persist=true/false 会话 |
 
@@ -324,7 +358,8 @@ ORDER BY start_ts DESC;
 | P0 | 会话状态机（含命名/冲突校验）+ start/stop + 三槽位采样 + live 视图（双速率） |
 | P1 | 会话日志 + report/intervals 视图 + overall_live/report |
 | P2 | 可选持久化（`persist=true` 路径：双写/fsync/原子头尾）、启动恢复（interrupted 自动收尾）、sessions 视图/delete、持久化与默认零文件路径的专项测试 |
-| P3 | 迁移工具：v1 部署的视图对照说明；文档（USER_MANUAL/BEST_PRACTICES 会话化改写） |
+| P3 | 报告导出（json → html+SVG → png/libpng）、export 专项测试 |
+| P4 | 迁移工具：v1 部署的视图对照说明；文档（USER_MANUAL/BEST_PRACTICES 会话化改写） |
 
 ## 9. 与连续监控的关系（趋势怎么办）
 
