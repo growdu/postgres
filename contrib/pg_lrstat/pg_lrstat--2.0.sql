@@ -105,19 +105,23 @@ RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_cluster_stat'
 LANGUAGE C STABLE;
 
--- View: send_history (send-side per-interval series, stop后可查)
+-- View: send_history (full raw samples with all LSNs, always recording)
 CREATE FUNCTION pg_lrstat_send_history(
     OUT name text, OUT ts timestamptz,
-    OUT d_current float8, OUT d_sent float8,
-    OUT d_spill float8, OUT d_stream float8)
+    OUT current_lsn pg_lsn, OUT sent_lsn pg_lsn,
+    OUT peer_recv_lsn pg_lsn, OUT peer_flush_lsn pg_lsn,
+    OUT peer_applied_lsn pg_lsn,
+    OUT confirmed_flush_lsn pg_lsn, OUT restart_lsn pg_lsn,
+    OUT spill_bytes int8, OUT stream_bytes int8)
 RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_send_history'
 LANGUAGE C STABLE;
 
--- View: recv_history (recv-side per-interval series, stop后可查)
+-- View: recv_history (full raw samples with all LSNs, always recording)
 CREATE FUNCTION pg_lrstat_recv_history(
     OUT name text, OUT ts timestamptz,
-    OUT d_received float8, OUT d_applied float8)
+    OUT received_lsn pg_lsn, OUT applied_lsn pg_lsn,
+    OUT local_wal_lsn pg_lsn)
 RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_recv_history'
 LANGUAGE C STABLE;

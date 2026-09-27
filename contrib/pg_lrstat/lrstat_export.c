@@ -26,6 +26,7 @@
 
 #define MB_DIV (1024.0 * 1024.0)
 #define EXPORT_DIR "pg_lrstat/exports"
+#define EXPORT_MAX_HISTORY 500    /* most recent samples in a report */
 
 /* ----------------------------------------------------------------
  * Data gathering: snapshot of everything needed for the report
@@ -34,6 +35,7 @@
 
 typedef struct LRExportTarget
 {
+	int         ctl_idx;           /* index in the shared target array */
 	char        name[NAMEDATALEN];
 	LRTargetKind kind;
 	char        worker_char;
@@ -51,9 +53,29 @@ typedef struct LRExportData
 	bool        truncated, degraded;
 	int         n_targets;
 	LRExportTarget targets[64];    /* max_targets */
-	int         n_entries;
-	LRSessionEntry *entries;       /* palloc'd copy */
+	int         n_entries;         /* entries copied into the report */
+	int         total_entries;     /* valid entries in shared memory */
+	LRHistoryEntry *entries;       /* chronological, newest last */
 } LRExportData;
+
+/* "0/1A2B3C" text form of an LSN ("" when unset) */
+static const char *
+lsn_str(XLogRecPtr lsn)
+{
+	if (lsn == 0)
+		return "";
+	return psprintf("%X/%X", (uint32) (lsn >> 32), (uint32) lsn);
+}
+
+static const LRExportTarget *
+find_target_by_ctl(const LRExportData *d, int ctl_idx)
+{
+	int i;
+	for (i = 0; i < d->n_targets; i++)
+		if (d->targets[i].ctl_idx == ctl_idx)
+			return &d->targets[i];
+	return NULL;
+}
 
 static void
 gather_data(LRExportData *d)
@@ -85,6 +107,7 @@ gather_data(LRExportData *d)
 		use = t->in_use;
 		if (use)
 		{
+			et->ctl_idx = i;
 			et->kind = t->kind;
 			strlcpy(et->name, t->name, NAMEDATALEN);
 			et->worker_char = t->worker_char;
@@ -100,12 +123,18 @@ gather_data(LRExportData *d)
 			d->n_targets++;
 	}
 
-	d->n_entries = lrstat_get_entry_count();
+	/* history: chronological copy, capped to the most recent samples */
+	d->total_entries = lrstat_history_count();
+	d->n_entries = Min(d->total_entries, EXPORT_MAX_HISTORY);
 	if (d->n_entries > 0)
 	{
-		d->entries = palloc(d->n_entries * sizeof(LRSessionEntry));
+		int skip = d->total_entries - d->n_entries;
+
+		d->entries = palloc(d->n_entries * sizeof(LRHistoryEntry));
 		for (i = 0; i < d->n_entries; i++)
-			memcpy(&d->entries[i], lrstat_entry_at(i), sizeof(LRSessionEntry));
+			memcpy(&d->entries[i],
+				   lrstat_history_at(lrstat_history_slot(skip + i)),
+				   sizeof(LRHistoryEntry));
 	}
 }
 
@@ -125,6 +154,9 @@ typedef struct LRAnalysis
 	double      net_catchup_mbps;
 	double      sync_50g_secs, sync_100g_secs, sync_200g_secs;
 	bool        has_data;
+	/* shared-array indexes the rate chart is built from (-1: none) */
+	int         chart_send_ctl;
+	int         chart_recv_ctl;
 } LRAnalysis;
 
 static void
@@ -137,6 +169,8 @@ compute_analysis(LRExportData *d, LRAnalysis *a)
 	MemSet(a, 0, sizeof(LRAnalysis));
 	a->bottleneck = "none";
 	a->deep_cause = "";
+	a->chart_send_ctl = -1;
+	a->chart_recv_ctl = -1;
 
 	if (d->n_targets == 0)
 	{
@@ -144,6 +178,18 @@ compute_analysis(LRExportData *d, LRAnalysis *a)
 		return;
 	}
 	a->has_data = true;
+
+	/* chart fallbacks: first send target, first leader recv target */
+	for (i = 0; i < d->n_targets; i++)
+	{
+		if (a->chart_send_ctl < 0 &&
+			(d->targets[i].kind == LR_SEND || d->targets[i].kind == LR_RSEND))
+			a->chart_send_ctl = d->targets[i].ctl_idx;
+		if (a->chart_recv_ctl < 0 &&
+			d->targets[i].kind == LR_RECV && d->targets[i].worker_char == 'a' &&
+			d->targets[i].relid == 0)
+			a->chart_recv_ctl = d->targets[i].ctl_idx;
+	}
 
 	/* find the first recv target (leader) and its rsend mirror */
 	for (i = 0; i < d->n_targets; i++)
@@ -174,6 +220,10 @@ compute_analysis(LRExportData *d, LRAnalysis *a)
 		a->has_data = false;
 		return;
 	}
+
+	/* prefer the matched pair for the chart */
+	a->chart_send_ctl = rsend_t->ctl_idx;
+	a->chart_recv_ctl = recv_t->ctl_idx;
 
 	{
 		const LRSendSample *rs = &rsend_t->last.send;
@@ -343,27 +393,47 @@ build_json(LRExportData *d, LRAnalysis *a)
 		appendStringInfo(s, "\n  ],\n");
 	}
 
-	/* history (per-interval) */
-	appendStringInfo(s, "  \"history\": [\n");
+	/* history: raw samples (most recent EXPORT_MAX_HISTORY) */
+	appendStringInfo(s, "  \"history\": {\n");
+	appendStringInfo(s, "    \"total_samples\": %d,\n", d->total_entries);
+	appendStringInfo(s, "    \"exported_samples\": %d,\n", d->n_entries);
+	appendStringInfo(s, "    \"samples\": [\n");
 	for (i = 0; i < d->n_entries; i++)
 	{
-		LRSessionEntry *e = &d->entries[i];
-		if (e->target_idx >= 0 && e->target_idx < d->n_targets)
-		{
+		LRHistoryEntry *e = &d->entries[i];
+		const LRExportTarget *t = find_target_by_ctl(d, e->target_idx);
+		bool is_recv = (t != NULL && t->kind == LR_RECV);
+
+		appendStringInfo(s, "    {\"name\": \"%s\", \"ts\": \"%s\","
+						 " \"kind\": \"%s\",",
+						 t ? t->name : "?",
+						 timestamptz_to_str(e->ts),
+						 is_recv ? "recv" : "send");
+		if (is_recv)
 			appendStringInfo(s,
-							 "    {\"name\": \"%s\", \"ts\": \"%s\","
-							 " \"d_current_mb\": %.2f, \"d_sent_mb\": %.2f,"
-							 " \"d_received_mb\": %.2f, \"d_applied_mb\": %.2f}%s\n",
-							 d->targets[e->target_idx].name,
-							 timestamptz_to_str(e->ts),
-							 (double)e->d_current / MB_DIV,
-							 (double)e->d_sent / MB_DIV,
-							 (double)e->d_received / MB_DIV,
-							 (double)e->d_applied / MB_DIV,
-							 i < d->n_entries - 1 ? "," : "");
-		}
+							 " \"received_lsn\": \"%s\","
+							 " \"applied_lsn\": \"%s\","
+							 " \"local_wal_lsn\": \"%s\"}",
+							 lsn_str(e->received_lsn),
+							 lsn_str(e->applied_lsn),
+							 lsn_str(e->local_wal_lsn));
+		else
+			appendStringInfo(s,
+							 " \"current_lsn\": \"%s\","
+							 " \"sent_lsn\": \"%s\","
+							 " \"confirmed_flush_lsn\": \"%s\","
+							 " \"restart_lsn\": \"%s\","
+							 " \"spill_bytes\": " UINT64_FORMAT ","
+							 " \"stream_bytes\": " UINT64_FORMAT "}",
+							 lsn_str(e->current_lsn),
+							 lsn_str(e->sent_lsn),
+							 lsn_str(e->confirmed_lsn),
+							 lsn_str(e->restart_lsn),
+							 e->spill_bytes,
+							 e->stream_bytes);
+		appendStringInfo(s, "%s\n", i < d->n_entries - 1 ? "," : "");
 	}
-	appendStringInfo(s, "  ]\n");
+	appendStringInfo(s, "    ]\n  }\n");
 
 	appendStringInfoString(s, "}\n");
 	return s;
@@ -374,23 +444,103 @@ build_json(LRExportData *d, LRAnalysis *a)
  * ----------------------------------------------------------------
  */
 
-static void
-svg_rates(StringInfo s, LRExportData *d)
+/*
+ * One chart point: an interval rate derived from two consecutive
+ * raw samples of the same target.
+ */
+typedef struct LRSeriesPoint
 {
-	int i;
-	int width = 800, height = 300, margin = 40;
-	double max_mb = 0.001;
+	TimestampTz ts;
+	double      mbps;
+} LRSeriesPoint;
 
-	/* find max for scaling */
+/* field: 0 = send current_lsn (gen), 1 = send sent_lsn, 2 = recv applied_lsn */
+static void
+series_for_target(const LRExportData *d, int ctl_idx, int field,
+				  LRSeriesPoint **pts_out, int *n_out)
+{
+	LRSeriesPoint *pts = palloc(Max(d->n_entries, 1) * sizeof(LRSeriesPoint));
+	LRHistoryEntry prev;
+	bool has_prev = false;
+	int n = 0;
+	int i;
+
 	for (i = 0; i < d->n_entries; i++)
 	{
-		double v = (double)d->entries[i].d_current / MB_DIV;
-		if (v > max_mb) max_mb = v;
-		v = (double)d->entries[i].d_sent / MB_DIV;
-		if (v > max_mb) max_mb = v;
-		v = (double)d->entries[i].d_applied / MB_DIV;
-		if (v > max_mb) max_mb = v;
+		LRHistoryEntry *e = &d->entries[i];
+
+		if (e->target_idx != ctl_idx)
+			continue;
+		if (has_prev)
+		{
+			double dt = (double)(e->ts - prev.ts) / 1e6;
+
+			if (dt > 0)
+			{
+				int64		dv;
+				double		mbps = 0;
+
+				switch (field)
+				{
+					case 0:
+						dv = (int64)(e->current_lsn - prev.current_lsn); break;
+					case 1:
+						dv = (int64)(e->sent_lsn - prev.sent_lsn); break;
+					default:
+						dv = (int64)(e->applied_lsn - prev.applied_lsn); break;
+				}
+				if (dv > 0)
+					mbps = (double)dv / dt / MB_DIV;
+				pts[n].ts = e->ts;
+				pts[n].mbps = mbps;
+				n++;
+			}
+		}
+		prev = *e;
+		has_prev = true;
 	}
+
+	*pts_out = pts;
+	*n_out = n;
+}
+
+static void
+polyline_series(StringInfo s, LRSeriesPoint *pts, int n, const char *color,
+				int width, int height, int margin, int max_n, double yscale)
+{
+	int i;
+	double xstep = max_n > 1 ? (double)(width - 2 * margin) / (max_n - 1) : 1;
+
+	appendStringInfo(s,
+					 "  <polyline fill='none' stroke='%s' stroke-width='2' points='",
+					 color);
+	for (i = 0; i < n; i++)
+		appendStringInfo(s, "%s%.1f,%.1f", i > 0 ? " " : "",
+						 margin + i * xstep,
+						 height - margin - pts[i].mbps * yscale);
+	appendStringInfoString(s, "'/>\n");
+}
+
+static void
+svg_rates(StringInfo s, LRExportData *d, LRAnalysis *a)
+{
+	int width = 800, height = 300, margin = 40;
+	LRSeriesPoint *gen = NULL, *snd = NULL, *app = NULL;
+	int n_gen = 0, n_snd = 0, n_app = 0, max_n;
+	double max_mb = 0.001;
+	int i;
+
+	if (a->chart_send_ctl >= 0)
+	{
+		series_for_target(d, a->chart_send_ctl, 0, &gen, &n_gen);
+		series_for_target(d, a->chart_send_ctl, 1, &snd, &n_snd);
+	}
+	if (a->chart_recv_ctl >= 0)
+		series_for_target(d, a->chart_recv_ctl, 2, &app, &n_app);
+
+	for (i = 0; i < n_gen; i++) if (gen[i].mbps > max_mb) max_mb = gen[i].mbps;
+	for (i = 0; i < n_snd; i++) if (snd[i].mbps > max_mb) max_mb = snd[i].mbps;
+	for (i = 0; i < n_app; i++) if (app[i].mbps > max_mb) max_mb = app[i].mbps;
 
 	appendStringInfo(s, "<svg width='%d' height='%d' xmlns='http://www.w3.org/2000/svg'>\n",
 					 width, height);
@@ -402,40 +552,14 @@ svg_rates(StringInfo s, LRExportData *d)
 	appendStringInfo(s, "  <line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#333'/>",
 					 margin, margin, margin, height - margin);
 
-	if (d->n_entries > 1)
+	max_n = Max(n_gen, Max(n_snd, n_app));
+	if (max_n > 1)
 	{
-		double xstep = (double)(width - 2 * margin) / (d->n_entries - 1);
 		double yscale = (double)(height - 2 * margin) / max_mb;
 
-		/* gen line */
-		appendStringInfoString(s, "  <polyline fill='none' stroke='#2563eb' stroke-width='2' points='");
-		for (i = 0; i < d->n_entries; i++)
-		{
-			double v = (double)d->entries[i].d_current / MB_DIV;
-			appendStringInfo(s, "%s%.1f,%.1f", i > 0 ? " " : "",
-							 margin + i * xstep, height - margin - v * yscale);
-		}
-		appendStringInfoString(s, "'/>\n");
-
-		/* sent line */
-		appendStringInfoString(s, "  <polyline fill='none' stroke='#dc2626' stroke-width='2' points='");
-		for (i = 0; i < d->n_entries; i++)
-		{
-			double v = (double)d->entries[i].d_sent / MB_DIV;
-			appendStringInfo(s, "%s%.1f,%.1f", i > 0 ? " " : "",
-							 margin + i * xstep, height - margin - v * yscale);
-		}
-		appendStringInfoString(s, "'/>\n");
-
-		/* applied line */
-		appendStringInfoString(s, "  <polyline fill='none' stroke='#16a34a' stroke-width='2' points='");
-		for (i = 0; i < d->n_entries; i++)
-		{
-			double v = (double)d->entries[i].d_applied / MB_DIV;
-			appendStringInfo(s, "%s%.1f,%.1f", i > 0 ? " " : "",
-							 margin + i * xstep, height - margin - v * yscale);
-		}
-		appendStringInfoString(s, "'/>\n");
+		polyline_series(s, gen, n_gen, "#2563eb", width, height, margin, max_n, yscale);
+		polyline_series(s, snd, n_snd, "#dc2626", width, height, margin, max_n, yscale);
+		polyline_series(s, app, n_app, "#16a34a", width, height, margin, max_n, yscale);
 	}
 
 	/* legend */
@@ -450,6 +574,10 @@ svg_rates(StringInfo s, LRExportData *d)
 	appendStringInfo(s, "  <text x='%d' y='34' font-size='11'>apply</text>", width - 30);
 
 	appendStringInfoString(s, "</svg>\n");
+
+	if (gen) pfree(gen);
+	if (snd) pfree(snd);
+	if (app) pfree(app);
 }
 
 static StringInfo
@@ -530,38 +658,44 @@ build_html(LRExportData *d, LRAnalysis *a)
 		appendStringInfo(s, " from %s", timestamptz_to_str(d->start_ts));
 	if (d->stop_ts > 0)
 		appendStringInfo(s, " to %s", timestamptz_to_str(d->stop_ts));
-	appendStringInfo(s, " &mdash; %d targets, %d intervals",
-					 d->n_targets, d->n_entries);
+	appendStringInfo(s, " &mdash; %d targets, %d samples",
+					 d->n_targets, d->total_entries);
 	if (d->truncated) appendStringInfoString(s, " <b>[truncated]</b>");
 	if (d->degraded) appendStringInfoString(s, " <b>[degraded]</b>");
 	appendStringInfoString(s, "</p>\n</div>\n");
 
 	/* charts */
 	appendStringInfoString(s, "<div class='card'>\n");
-	svg_rates(s, d);
+	svg_rates(s, d, a);
 	appendStringInfoString(s, "</div>\n");
 
 	/* raw history table */
 	if (d->n_entries > 0)
 	{
 		int i;
-		appendStringInfoString(s,
-			"<div class='card'>\n<h2>Per-interval data</h2>\n"
-			"<table><tr><th>ts</th><th>name</th>"
-			"<th>d_current MB</th><th>d_sent MB</th>"
-			"<th>d_received MB</th><th>d_applied MB</th></tr>\n");
+		appendStringInfo(s,
+			"<div class='card'>\n<h2>Raw history samples</h2>\n"
+			"<p class='label'>showing the most recent %d of %d samples</p>\n"
+			"<table><tr><th>ts</th><th>name</th><th>kind</th>"
+			"<th>current_lsn</th><th>sent_lsn</th>"
+			"<th>received_lsn</th><th>applied_lsn</th></tr>\n",
+			d->n_entries, d->total_entries);
 		for (i = 0; i < d->n_entries; i++)
 		{
-			LRSessionEntry *e = &d->entries[i];
-			const char *nm = (e->target_idx >= 0 && e->target_idx < d->n_targets)
-				? d->targets[e->target_idx].name : "?";
-			appendStringInfo(s, "<tr><td>%s</td><td>%s</td>"
-							 "<td>%.2f</td><td>%.2f</td><td>%.2f</td><td>%.2f</td></tr>\n",
-							 timestamptz_to_str(e->ts), nm,
-							 (double)e->d_current / MB_DIV,
-							 (double)e->d_sent / MB_DIV,
-							 (double)e->d_received / MB_DIV,
-							 (double)e->d_applied / MB_DIV);
+			LRHistoryEntry *e = &d->entries[i];
+			const LRExportTarget *t = find_target_by_ctl(d, e->target_idx);
+			bool is_recv = (t != NULL && t->kind == LR_RECV);
+			const char *cur = !is_recv && e->current_lsn ? lsn_str(e->current_lsn) : "-";
+			const char *snt = !is_recv && e->sent_lsn ? lsn_str(e->sent_lsn) : "-";
+			const char *rcv = is_recv && e->received_lsn ? lsn_str(e->received_lsn) : "-";
+			const char *apl = is_recv && e->applied_lsn ? lsn_str(e->applied_lsn) : "-";
+
+			appendStringInfo(s, "<tr><td>%s</td><td>%s</td><td>%s</td>"
+							 "<td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",
+							 timestamptz_to_str(e->ts),
+							 t ? t->name : "?",
+							 is_recv ? "recv" : "send",
+							 cur, snt, rcv, apl);
 		}
 		appendStringInfoString(s, "</table>\n</div>\n");
 	}

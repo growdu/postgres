@@ -117,20 +117,30 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 | 追平 | `catchup_send_secs` `catchup_total_secs` | 还要多久追平（秒） |
 | 判定 | `send_blocked` `apply_blocked` `bottleneck` | 哪堵了 + 自动瓶颈判定（send/recv_apply/network/none） |
 
-### 4.5 `pg_lrstat_send_history` — 发送端逐间隔序列（stop 后可查）
+### 4.5 `pg_lrstat_send_history` — 发送端原始样本序列（始终记录）
+
+每个采样轮、每个发送端目标一行**完整 LSN 快照**。这是其他视图最原始的数据来源：速率、积压都由相邻两行作差算出。
 
 | 列 | 含义 |
 | --- | --- |
-| `name` `ts` | 哪个目标、什么时间 |
-| `d_current` `d_sent` | 本间隔生成了多少 MB、发送了多少 MB |
-| `d_spill` `d_stream` | 解码溢写/流式多少 MB |
+| `name` `ts` | 哪个目标、哪个采样轮 |
+| `current_lsn` | 发送端当前 WAL 生成位点 |
+| `sent_lsn` | 已发给接收端的位点——与上一行作差即该轮发送量 |
+| `peer_recv_lsn` `peer_flush_lsn` `peer_applied_lsn` | 接收端反馈回来的收到/落盘/应用三个水位 |
+| `confirmed_flush_lsn` | 槽已确认位点（发送端可清理的边界） |
+| `restart_lsn` | 槽保水起点——`current_lsn − restart_lsn` 即 retained_wal |
+| `spill_bytes` `stream_bytes` | 解码溢写/流式累计字节数——增长快说明解码压力大 |
 
-### 4.6 `pg_lrstat_recv_history` — 接收端逐间隔序列（stop 后可查）
+### 4.6 `pg_lrstat_recv_history` — 接收端原始样本序列（始终记录）
 
 | 列 | 含义 |
 | --- | --- |
 | `name` `ts` | 同上 |
-| `d_received` `d_applied` | 本间隔收了多少 MB、应用了多少 MB |
+| `received_lsn` | 已从网络收到的位点 |
+| `applied_lsn` | 已应用的位点（提交边界）——与上一行作差即该轮应用量 |
+| `local_wal_lsn` | 接收端本地 WAL 写入位点 |
+
+> 历史环形写满后覆盖最旧样本（`pg_lrstat_info.session_truncated = true`），始终保留最近的记录。`lrstat_start` 会清空历史重新开始。
 
 ## 5. 速率是怎么算的
 
@@ -149,7 +159,7 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 | GUC | 默认 | 说明 |
 | --- | --- | --- |
 | `sample_interval` | `30s` | 采样周期 = 瞬时速率粒度（可调 1s） |
-| `session_max_samples` | `2880` | 会话日志容量（30s≈24h；0=关） |
+| `session_max_samples` | `2880` | 历史环形容量：每目标保留的采样数（2s 间隔 ≈ 96 分钟；写满覆盖最旧） |
 | `max_targets` | `32` | 目标槽数量 |
 | `remote_poll` | `on` | 接收端是否轮询发送端 |
 | `remote_poll_budget` | `500ms` | 远端轮询时间预算 |
@@ -176,8 +186,11 @@ FROM pg_lrstat_cluster_stat;
 -- 3. 结束测量
 SELECT lrstat_stop('mig_20260924');
 
--- 4. 看逐间隔趋势
-SELECT ts, round(d_sent,1) AS 每段发送MB
+-- 4. 看逐轮发送速率（相邻样本 sent_lsn 作差）
+SELECT ts,
+       round(pg_wal_lsn_diff(sent_lsn, lag(sent_lsn) OVER (ORDER BY ts))
+             / 1024 / 1024
+             / extract(epoch FROM ts - lag(ts) OVER (ORDER BY ts)), 1) AS 发送MBps
 FROM pg_lrstat_send_history ORDER BY ts;
 
 -- 5. 导出报告（HTML 包含图表+分析结论）
@@ -193,7 +206,7 @@ SELECT lrstat_export('mig_20260924');
 | 速率全是 NULL | 刚 start 还没两个样本，等一个采样周期 |
 | cluster_stat 没数据 | 没有活跃的订阅/复制连接，或 remote_state = unreachable |
 | apply_rate = 0 但积压在涨 | 应用堵住了（锁冲突），查 worker_pid 的 wait_event |
-| history 视图空 | 会话还没 stop，或 session_max_samples = 0 |
+| history 视图空 | 还没到第一个采样轮，或该侧没有复制目标（发送端视图在订阅端要 start 后才有远端镜像数据） |
 | 四个速率相等 | 正常！下游跟得上，都被"生成"定节奏 |
 | 会重启后数据丢了 | persist=false 的会话随重启消失，这是设计；要保留就用 persist=true |
 | 磁盘上有 pg_lrstat 目录 | persist 会话的文件，用 lrstat_delete(name) 清理 |

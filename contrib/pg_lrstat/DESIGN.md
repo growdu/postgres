@@ -39,8 +39,8 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | **锚点样本（anchor）** | 会话首轮采到的样本，平均速率的起算基准 |
 | **瞬时速率（instant）** | 最近两个样本的差分 ÷ 采样间隔——"刚刚 30 秒怎么样" |
 | **平均速率（avg）** | 最新样本 − 锚点 ÷ 经过时间——"这轮从头到现在平均多少" |
-| **会话日志** | 会话期内逐间隔的增量记录（内存一份；persist 会话另落盘一份） |
-| **会话报告** | stop 后由会话日志聚合出的完整统计（总量、平均、峰值、堵住等） |
+| **历史数组** | 每轮每目标一条**全量原始 LSN 样本**的环形记录（始终在记；persist 会话另落盘一份不覆盖的完整副本） |
+| **会话报告** | stop 后由历史数组聚合出的完整统计（总量、平均、峰值、堵住等） |
 
 ### 1.3 目标与非目标
 
@@ -134,12 +134,12 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | `duration_secs` | 实际首末样本区间 | 以样本为准，非命令时刻 |
 | `total_f_mb` | f(S_last) − f(S_anchor)（÷ 1048576） | 各字段会话总量（MB） |
 | `avg_f` | total ÷ duration | 会话平均（= stop 时刻 live 的 avg） |
-| `f_instant_min/max/avg` | 会话日志逐间隔统计 | 瞬时速率分布（峰值/谷值/均值） |
+| `f_instant_min/max/avg` | 历史相邻样本差值的统计 | 瞬时速率分布（峰值/谷值/均值） |
 | `peak_backlog_*` | 锚点起增量前缀和重建各水位，取逐间隔最大 | 峰值积压 |
 | `blocked_intervals` | 瞬时 apply/send ≈0 且对应积压 >0 的间隔数 | 堵住时长占比 |
 | `polls_ok / polls_fail` | 远端轮询成功/失败次数 | 整体视图专有 |
 | `partial` | 目标首个样本晚于 start_ts | 会话中途加入的目标 |
-| `truncated` / `degraded` | 会话日志超上限 / 文件写失败 | 数据完整性标记 |
+| `truncated` / `degraded` | 历史环形覆盖最旧 / 文件写失败 | 数据完整性标记 |
 
 ### 3.4 追平预估（catchup）与堵住（live 视图）
 
@@ -165,7 +165,7 @@ shared_preload_libraries=pg_lrstat        shared_preload_libraries=pg_lrstat
 │  → SEND 目标          │ ◄────────────── │  凭连接串轮询发送端            │
 │  (逻辑+物理)           │  (远端轮询)      │  → RSEND 目标 + 两端合成       │
 └─────────┬────────────┘                 └──────────┬──────────────────┘
-          ▼ 共享内存（会话状态+目标+会话日志）            ▼
+          ▼ 共享内存（会话状态+目标+历史环形数组）       ▼
           └──────────────► SQL 视图 / 会话文件 / 报告导出 ◄┘
 ```
 
@@ -178,9 +178,9 @@ shared_preload_libraries=pg_lrstat        shared_preload_libraries=pg_lrstat
 | 组件 | 文件 | 职责 |
 | --- | --- | --- |
 | 入口 | `pg_lrstat.c` | GUC 定义、共享内存请求/启动 hook、worker 注册、wait event 惰性注册点 |
-| 采样器 | `lrstat_worker.c` | bgworker 主循环：会话感知的采样、增量入会话日志、双写会话文件 |
+| 采样器 | `lrstat_worker.c` | bgworker 主循环：采样三槽位轮转、全量样本入历史、persist 会话双写文件 |
 | 远端轮询 | `lrstat_remote.c` | 接收端→发送端只读轮询（libpqsrv、预算/退避、反馈位回填） |
-| 共享内存 | `lrstat_shmem.c` | 会话状态、目标表（anchor/prev/last）、内存会话日志、报告聚合 |
+| 共享内存 | `lrstat_shmem.c` | 会话状态、目标表（anchor/prev/last）、历史环形数组（覆盖最旧） |
 | 会话文件 | `lrstat_store.c` | persist 会话的文件读写（双写/fsync/原子头尾/启动恢复） |
 | SQL 层 | `lrstat_sql.c` | start/stop/export/delete 命令、全部视图 SRF、报告聚合 |
 | 导出渲染 | `lrstat_export.c` | HTML（内嵌 SVG+JS）+ JSON 两格式 + 分析结论计算 |
@@ -198,7 +198,7 @@ typedef struct LRSessionState
     char        name[NAMEDATALEN];  /* 会话名（start 传入或自动生成）             */
     TimestampTz start_ts;
     TimestampTz stop_ts;
-    bool        truncated;          /* 会话日志超上限                            */
+    bool        truncated;          /* 历史环形已覆盖最旧                        */
     bool        degraded;           /* 会话文件写失败，持久化不完整               */
     slock_t     mutex;              /* 会话状态转换锁                            */
 } LRSessionState;
@@ -266,17 +266,22 @@ typedef struct LRTargetCtl
     LRTargetMeta meta;
 } LRTargetCtl;
 
-/* 会话日志条目：每轮每目标一条（内存数组与文件记录共用此形） */
-typedef struct LRSessionEntry
+/* 历史条目：每轮每目标一条全量原始样本（内存环形数组与文件记录共用此形） */
+typedef struct LRHistoryEntry
 {
-    TimestampTz ts;                  /* 间隔结束时刻                              */
+    TimestampTz ts;                  /* 本轮采样时刻                              */
     int32     target_idx;           /* 目标表下标                                */
-    int64     d_current, d_sent, d_received, d_applied,
-              d_spill, d_stream;    /* 本间隔增量（字节，视图输出转 MB）          */
-} LRSessionEntry;
+    /* 发送端 LSN（SEND/RSEND 目标）                                         */
+    XLogRecPtr current_lsn, sent_lsn;
+    XLogRecPtr peer_recv_lsn, peer_flush_lsn, peer_applied_lsn;
+    XLogRecPtr confirmed_lsn, restart_lsn;
+    uint64    spill_bytes, stream_bytes;
+    /* 接收端 LSN（RECV 目标）                                               */
+    XLogRecPtr received_lsn, applied_lsn, local_wal_lsn;
+} LRHistoryEntry;                   /* 不存差值：差值由视图/导出按相邻样本现算    */
 ```
 
-**空间公式**：`MAXALIGN(头) + max_targets × MAXALIGN(sizeof(LRTargetCtl)+3×sizeof(LRSample)) + session_max_samples × max_targets × sizeof(LRSessionEntry)`。默认（32 目标 / 2880 间隔）≈ 0.3MB + 4.4MB ≈ **5MB**，postmaster 启动期一次预留。
+**空间公式**：`MAXALIGN(头) + max_targets × MAXALIGN(sizeof(LRTargetCtl)+3×sizeof(LRSample)) + session_max_samples × max_targets × sizeof(LRHistoryEntry)`。默认（32 目标 / 2880 间隔）≈ 0.3MB + 10.3MB ≈ **11MB**，postmaster 启动期一次预留。
 
 ### 4.4 会话机制
 
@@ -286,26 +291,25 @@ typedef struct LRSessionEntry
 idle ──start(name,persist)──► running ──stop(name)──► stopped ──start(name')──► running(...)
   │                             │  ▲
   │                             │  └─ 采样轮：prev=last; last=新样本;
-  │                             │     running 时算增量 → 内存日志（+persist 会话文件）
+  │                             │     每轮把全量样本 append 历史（+persist 会话文件）
   │                             └ 实例重启：恢复线程把 persist 会话收尾为 interrupted
-  └ 非 persist 会话随重启消失；目录中的历史会话（stopped/interrupted）任意可查
+  └ 历史（环形）始终在记，非 persist 会话数据随重启消失；目录中的历史会话任意可查
 ```
 
-**start(name, persist)**：superuser。校验：当前无 running 会话、名字不与历史会话冲突（重名报错，提示换名或 `lrstat_delete`）。动作：`session_id++`、记录名字与 `start_ts`、清空内存会话日志与全部目标的 anchor/prev/last、`persist=true` 时创建会话文件（头 `state=running`）；**唤醒 worker 立即执行一轮采样**——该轮样本即锚点，保证 start 后一个采样间隔内即可查到双速率。
+**start(name, persist)**：superuser。校验：当前无 running 会话、名字不与历史会话冲突（重名报错，提示换名或 `lrstat_delete`）。动作：`session_id++`、记录名字与 `start_ts`、清空历史数组与全部目标的 anchor/prev/last、`persist=true` 时创建会话文件（头 `state=running`）；**唤醒 worker 立即执行一轮采样**——该轮样本即锚点，保证 start 后一个采样间隔内即可查到双速率。
 
 **采样轮**（每 `sample_interval`）：
 
 ```
-1. 若 running 且无锚点：本轮样本 → anchor = prev = last（该目标 partial=false）
-   目标首见晚于 start_ts：锚点取首见样本，标 partial
-2. 若 running 且已有锚点：增量 d = last − prev → append 内存会话日志
-   （persist 会话同步追加会话文件并 fsync；日志满 → truncated=true 丢弃+限频 WARNING）
-   然后 prev = last; last = 新样本
-3. 若非 running：只更新 last（live 视图可看末状态，速率列 NULL）
-4. 远端轮询（§4.5）+ 应用位点回填（§4.6）
+1. 三槽位轮转：首见样本入 anchor；prev=last; last=新样本（非 running 同样轮转）
+2. 历史 append：每目标本轮 last 的全量 LSN 快照 → 内存环形数组；
+   环满覆盖最旧并置 truncated=true（视图按时间升序读）；
+   persist 会话同步追加会话文件并 fsync（文件不覆盖，落全量）
+   同一目标样本时间戳未前进（如 stop 后远端镜像冻结）则跳过，防止重复刷屏
+3. 远端轮询（§4.5）+ 应用位点回填（§4.6）只在 running 时执行
 ```
 
-**stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`、唤醒 worker 采一轮**收尾样本**（补上最后一段增量）、冻结内存日志并聚合报告；persist 会话写会话尾、头置 `state=stopped`。
+**stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`；persist 会话文件头置 `state=stopped`（条目数按文件大小回填）。停止后内存历史与视图继续可查，直到下一次 start 清零。
 
 **竞态规则**：状态转换与采样轮经 `LRSessionState.mutex` + worker latch 协调——先置状态再唤醒；增量以该轮醒来时读到的状态为准，首/末间隔并入或剔除一个采样周期属可接受误差，`duration` 以实际样本区间为准。
 
@@ -402,8 +406,8 @@ pg_lrstat_reset() → void
 | `pg_lrstat_send_stat` | 发送端一连接一行 | 发送端全量：位点 + 积压 + 双速率（gen/send/spill/stream） |
 | `pg_lrstat_recv_stat` | 接收端一 worker/恢复进程一行 | 接收端全量：位点 + 积压 + 双速率（recv/apply/local_wal） |
 | `pg_lrstat_cluster_stat` | 一复制对一行 | **唯一能看到两端合成数据的视图**：双端位点/速率/积压/追平预估 |
-| `pg_lrstat_send_history` | 发送端一目标一间隔一行 | 发送端逐间隔原始序列（画曲线） |
-| `pg_lrstat_recv_history` | 接收端一目标一间隔一行 | 接收端逐间隔原始序列（画曲线） |
+| `pg_lrstat_send_history` | 发送端一目标一轮一行 | 发送端全量原始 LSN 序列（始终记录，画曲线） |
+| `pg_lrstat_recv_history` | 接收端一目标一轮一行 | 接收端全量原始 LSN 序列（始终记录，画曲线） |
 
 - `stat` 视图**会话期间实时更新**（显示最新样本+当前速率），**stop 后冻结**（显示会话最终值）——不需要区分 live/report 两套；
 - `history` 视图**stop 后可查**（会话期内逐间隔数据）；持久会话跨重启可查；
@@ -540,24 +544,25 @@ pg_lrstat_reset() → void
 
 **删除的列**：`restart_lsn`（retained_wal 已总结）；`elapsed_secs`（可推算）。
 
-#### `pg_lrstat_send_history`（发送端一目标一间隔一行，stop 后可查）
+#### `pg_lrstat_send_history`（发送端一目标一轮一行，全量原始样本，始终记录）
 
 | 列 | 为什么需要 |
 | --- | --- |
-| `session_name` / `name` / `ts` | 画曲线的坐标轴 |
-| `d_current` / `d_sent` | 本间隔增量（MB）——**速率时序图的数据源** |
-| `d_spill` / `d_stream` | 本间隔解码增量（MB）——解码压力时序图 |
-| `level_current` / `level_sent` / `level_confirmed` | 前缀和重建的水位——**水位阶梯图的数据源** |
-| `backlog_unsent` / `backlog_total` | 由水位派生的逐间隔积压（MB）——**积压面积图的数据源** |
+| `name` / `ts` | 画曲线的坐标轴 |
+| `current_lsn` / `sent_lsn` | 生成与发送水位——相邻行作差即逐间隔速率（MB/s） |
+| `peer_recv_lsn` / `peer_flush_lsn` / `peer_applied_lsn` | 接收端反馈三水位——网络/落盘/应用逐段延迟定位 |
+| `confirmed_flush_lsn` / `restart_lsn` | 槽位点与保水起点（retained_wal = current − restart） |
+| `spill_bytes` / `stream_bytes` | 解码溢出/流式计数——解码压力时序 |
 
-#### `pg_lrstat_recv_history`（接收端一目标一间隔一行，stop 后可查）
+#### `pg_lrstat_recv_history`（接收端一目标一轮一行，全量原始样本，始终记录）
 
 | 列 | 为什么需要 |
 | --- | --- |
-| `session_name` / `name` / `ts` | 同上 |
-| `d_received` / `d_applied` | 本间隔增量（MB） |
-| `level_received` / `level_applied` | 水位重建 |
-| `backlog_apply` | 逐间隔积压 |
+| `name` / `ts` | 同上 |
+| `received_lsn` / `applied_lsn` | 收到与应用水位——相邻行作差即 recv/apply 速率 |
+| `local_wal_lsn` | 接收端本地 WAL 位点——与 received 对比看重放写入速率 |
+
+**设计原则**：history 只存**原始 LSN 快照**，不预存差值/水位/积压——一切派生量（速率、积压、峰值）由查询或导出时对相邻样本现算，history 是其他状态表与报告的**最原始数据来源**。
 
 **删除的列**（history 视图）：`level_restart`（retained_wal 可由 level_current - level_restart 算，但 export 不画保水曲线，不预存）；`kind`（视图名已区分侧）。
 
@@ -566,7 +571,7 @@ pg_lrstat_reset() → void
 | GUC | 默认 | 作用域 | 说明 |
 | --- | --- | --- | --- |
 | `pg_lrstat.sample_interval` | `30s` | SIGHUP | 采样周期 = 瞬时速率粒度（下限 1s） |
-| `pg_lrstat.session_max_samples` | `2880` | 重启 | 会话日志容量（30s≈24h；0=关闭逐间隔，仅留汇总） |
+| `pg_lrstat.session_max_samples` | `2880` | 重启 | 历史环形容量（每目标采样数；2s≈96min/目标） |
 | `pg_lrstat.max_targets` | `32` | 重启 | 目标槽容量 |
 | `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标老化回收阈值 |
 | `pg_lrstat.catchup_min_rate` | `0.001` | SIGHUP | 追平预估有效性下限（MB/s，avg 低于此值返回 NULL） |
@@ -585,7 +590,7 @@ pg_lrstat_reset() → void
 以下结论在**两个层面**可用：
 
 - **SQL 层（会话期间随时可查）**：`cluster_stat.bottleneck` 列实时判定瓶颈环节（CASE WHEN），`catchup_*_secs` 列实时给出追平预估；
-- **导出层（stop 后完整报告）**：四项结论在导出时从视图/会话日志计算，以**人话**呈现在报告最顶部。
+- **导出层（stop 后完整报告）**：四项结论在导出时从视图/历史数组计算，以**人话**呈现在报告最顶部。
 
 **① 瓶颈判定**——根据积压分布 + 速率对比，自动定位到具体环节：
 
@@ -689,9 +694,10 @@ pg_lrstat_reset() → void
   },
   "send_stat": [ ... ],
   "recv_stat": [ ... ],
-  "cluster_stat": [ ... ],
-  "send_history": [ ... ],
-  "recv_history": [ ... ]
+  "history": {
+    "total_samples": 101, "exported_samples": 101,
+    "samples": [ ... ]              /* 全量原始 LSN 样本（最近 500 条） */
+  }
 }
 ```
 
@@ -719,9 +725,10 @@ FROM pg_lrstat_cluster_stat;
 
 SELECT lrstat_stop('mig_20260924');
 
--- 会话结束后看逐间隔曲线：
-SELECT ts, round(d_current,1) AS 每段生成MB
-FROM pg_lrstat_send_history WHERE name = 'sub_a_slot' ORDER BY ts;
+-- 会话结束后看逐间隔发送速率（相邻样本 sent_lsn 作差）：
+SELECT ts, round(pg_wal_lsn_diff(sent_lsn, lag(sent_lsn) OVER (ORDER BY ts)) / 1024 / 1024
+                 / extract(epoch FROM ts - lag(ts) OVER (ORDER BY ts)), 1) AS 发送MBps
+FROM pg_lrstat_send_history WHERE name = 'asub' ORDER BY ts;
 
 -- 会话期间实时查瓶颈（不需要导出）：
 SELECT recv_name, bottleneck, round(catchup_total_secs) AS 追平秒
@@ -812,7 +819,7 @@ FROM pg_stat_wal_receiver wr;
 | 场景 | 行为 |
 | --- | --- |
 | 会话中目标中途加入（建新订阅/槽） | 锚点取首见样本，报告 `partial=true` |
-| 会话日志超上限 | `truncated=true`，后续间隔丢弃，报告标注 |
+| 历史环形写满 | `truncated=true`，覆盖最旧样本（persist 文件不覆盖），报告标注 |
 | persist 会话文件写失败 | 采样不中断，`degraded=true`，stop 时 WARNING |
 | 实例在 persist 会话中崩溃 | 重启后自动收尾为 `interrupted` 归档，丢失 ≤1 间隔 |
 | 非 persist 会话遇重启 | 会话与报告消失（设计行为） |

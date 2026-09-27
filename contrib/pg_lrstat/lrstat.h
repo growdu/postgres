@@ -136,15 +136,30 @@ typedef struct LRTargetCtl
 } LRTargetCtl;
 
 /*
- * Session interval entry: one per target per sampling round.
+ * History entry: one full raw sample per target per sampling round.
+ * This IS the primary data store — every round, every target's
+ * complete LSN snapshot is recorded here.  Stat views and rates
+ * derive from this; nothing is pre-computed at write time.
  */
-typedef struct LRSessionEntry
+typedef struct LRHistoryEntry
 {
 	TimestampTz ts;
 	int32       target_idx;
-	int64       d_current, d_sent, d_received, d_applied,
-	            d_spill, d_stream;  /* per-interval deltas (bytes) */
-} LRSessionEntry;
+	/* send-side LSNs (SEND / RSEND targets) */
+	XLogRecPtr  current_lsn;        /* C0 */
+	XLogRecPtr  sent_lsn;           /* C2 */
+	XLogRecPtr  peer_recv_lsn;      /* C3  feedback write */
+	XLogRecPtr  peer_flush_lsn;     /* C4  feedback flush */
+	XLogRecPtr  peer_applied_lsn;   /* C5  feedback apply */
+	XLogRecPtr  confirmed_lsn;      /* C6  slot confirmed_flush */
+	XLogRecPtr  restart_lsn;        /* C7  slot restart */
+	uint64      spill_bytes;        /* D1 */
+	uint64      stream_bytes;       /* D1 */
+	/* recv-side LSNs (RECV targets) */
+	XLogRecPtr  received_lsn;       /* C3' */
+	XLogRecPtr  applied_lsn;        /* C5' */
+	XLogRecPtr  local_wal_lsn;      /* recv pg_current_wal_lsn() */
+} LRHistoryEntry;
 
 /*
  * Global session state.
@@ -167,7 +182,7 @@ typedef struct LRSessionState
  * Shared memory layout:
  *   [LRSessionState header]
  *   [LRTargetCtl array (max_targets)]
- *   [LRSessionEntry array (session_max_samples × max_targets)]
+ *   [LRHistoryEntry array (session_max_samples × max_targets)]
  */
 typedef struct LRStatShared
 {
@@ -207,7 +222,7 @@ extern void lrstat_shmem_startup(void);
 extern void lrstat_note_preload(void);
 extern bool lrstat_ready(void);
 extern LRTargetCtl *lrstat_target_at(int i);
-extern LRSessionEntry *lrstat_entry_at(int idx);
+extern LRHistoryEntry *lrstat_history_at(int idx);
 extern LRTargetCtl *lrstat_find_or_create(LRTargetKind kind, const char *name,
 										  Oid relid, char worker_char);
 extern bool lrstat_lookup(LRTargetKind kind, const char *name,
@@ -222,12 +237,13 @@ extern void lrstat_bump_applied(const char *recv_name, XLogRecPtr applied);
 extern void lrstat_session_start(const char *name);
 extern void lrstat_session_stop(void);
 extern void lrstat_session_reset(void);
-extern int  lrstat_append_entry(int target_idx, TimestampTz ts,
-								int64 d_curr, int64 d_sent,
-								int64 d_recv, int64 d_applied,
-								int64 d_spill, int64 d_stream);
+extern void lrstat_history_from_sample(LRHistoryEntry *e, int target_idx,
+									   const LRSample *sample);
+extern void lrstat_append_history_entry(const LRHistoryEntry *e);
 extern void lrstat_reset_entries(void);
 extern int  lrstat_get_entry_count(void);
+extern int  lrstat_history_count(void);   /* valid entries (== cap once wrapped) */
+extern int  lrstat_history_slot(int i);   /* i-th oldest entry -> array index */
 extern void lrstat_note_round(bool ok, const char *error);
 extern void lrstat_note_dropped(const char *name);
 
@@ -237,9 +253,8 @@ extern PGDLLEXPORT pg_noreturn void pg_lrstat_worker_main(Datum arg);
 /* lrstat_store.c */
 extern int  lrstat_store_create(const char *name, uint64 session_id,
 								TimestampTz start_ts);
-extern void lrstat_store_append(int n_entries, LRSessionEntry *entries);
+extern void lrstat_store_append(int n_entries, LRHistoryEntry *entries);
 extern void lrstat_store_finalize(const char *name, const char *state,
-								  int n_targets, int n_entries,
 								  bool truncated, bool degraded);
 extern void lrstat_store_recover(void);
 extern int  lrstat_store_list(char ***names_out);

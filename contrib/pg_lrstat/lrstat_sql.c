@@ -492,10 +492,10 @@ pg_lrstat_send_history(PG_FUNCTION_ARGS)
     if (!lrstat_ready())
         PG_RETURN_NULL();
 
-    n = lrstat_get_entry_count();
+    n = lrstat_history_count();
     for (i = 0; i < n; i++)
     {
-        LRSessionEntry *e = lrstat_entry_at(i);
+        LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
         LRTargetCtl *t = lrstat_target_at(e->target_idx);
         char name[NAMEDATALEN];
         LRTargetKind kind;
@@ -511,10 +511,15 @@ pg_lrstat_send_history(PG_FUNCTION_ARGS)
         lr_row_reset(&r);
         lr_put_text(&r, name);
         lr_put_ts(&r, e->ts);
-        lr_put_f8(&r, e->d_current > 0, (double)e->d_current / MB_DIV);
-        lr_put_f8(&r, e->d_sent > 0, (double)e->d_sent / MB_DIV);
-        lr_put_f8(&r, e->d_spill > 0, (double)e->d_spill / MB_DIV);
-        lr_put_f8(&r, e->d_stream > 0, (double)e->d_stream / MB_DIV);
+        lr_put_lsn(&r, e->current_lsn);
+        lr_put_lsn(&r, e->sent_lsn);
+        lr_put_lsn(&r, e->peer_recv_lsn);
+        lr_put_lsn(&r, e->peer_flush_lsn);
+        lr_put_lsn(&r, e->peer_applied_lsn);
+        lr_put_lsn(&r, e->confirmed_lsn);
+        lr_put_lsn(&r, e->restart_lsn);
+        lr_put_i8(&r, (int64) e->spill_bytes);
+        lr_put_i8(&r, (int64) e->stream_bytes);
         lr_emit(rsinfo, &r);
     }
     PG_RETURN_NULL();
@@ -531,10 +536,10 @@ pg_lrstat_recv_history(PG_FUNCTION_ARGS)
     if (!lrstat_ready())
         PG_RETURN_NULL();
 
-    n = lrstat_get_entry_count();
+    n = lrstat_history_count();
     for (i = 0; i < n; i++)
     {
-        LRSessionEntry *e = lrstat_entry_at(i);
+        LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
         LRTargetCtl *t = lrstat_target_at(e->target_idx);
         char name[NAMEDATALEN];
         LRTargetKind kind;
@@ -550,8 +555,9 @@ pg_lrstat_recv_history(PG_FUNCTION_ARGS)
         lr_row_reset(&r);
         lr_put_text(&r, name);
         lr_put_ts(&r, e->ts);
-        lr_put_f8(&r, e->d_received > 0, (double)e->d_received / MB_DIV);
-        lr_put_f8(&r, e->d_applied > 0, (double)e->d_applied / MB_DIV);
+        lr_put_lsn(&r, e->received_lsn);
+        lr_put_lsn(&r, e->applied_lsn);
+        lr_put_lsn(&r, e->local_wal_lsn);
         lr_emit(rsinfo, &r);
     }
     PG_RETURN_NULL();

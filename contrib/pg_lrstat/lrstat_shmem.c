@@ -55,7 +55,7 @@ lrstat_shmem_size(void)
 	Size header = MAXALIGN(sizeof(LRStatShared));
 	Size targets = (Size) lrstat_max_targets * MAXALIGN(sizeof(LRTargetCtl));
 	Size entries = (Size) lrstat_max_targets * (Size) lrstat_ring_len *
-		sizeof(LRSessionEntry);
+		sizeof(LRHistoryEntry);
 	return header + targets + entries;
 }
 
@@ -133,11 +133,11 @@ lrstat_target_at(int i)
 	return (LRTargetCtl *) (target_base() + (Size) i * target_stride());
 }
 
-LRSessionEntry *
-lrstat_entry_at(int idx)
+LRHistoryEntry *
+lrstat_history_at(int idx)
 {
-	return (LRSessionEntry *) (entry_base() +
-							   (Size) idx * sizeof(LRSessionEntry));
+	return (LRHistoryEntry *) (entry_base() +
+							   (Size) idx * sizeof(LRHistoryEntry));
 }
 
 static bool
@@ -386,7 +386,6 @@ lrstat_session_stop(void)
 		struct stat st;
 		if (stat(path, &st) == 0)
 			lrstat_store_finalize(lrstat->session.name, "stopped",
-								  lrstat->ntargets, lrstat->n_entries,
 								  lrstat->session.truncated,
 								  lrstat->session.degraded);
 		pfree(path);
@@ -419,38 +418,56 @@ lrstat_session_reset(void)
 }
 
 /*
- * Append one interval entry.  Returns entry index or -1 if full.
- * n_entries tracks the write position (single writer: the worker).
+ * Fill one history entry from a raw sample (send fields for SEND/RSEND
+ * targets, recv fields for RECV targets — the unused side stays zero).
  */
-int
-lrstat_append_entry(int target_idx, TimestampTz ts,
-					int64 d_curr, int64 d_sent, int64 d_recv,
-					int64 d_applied, int64 d_spill, int64 d_stream)
+void
+lrstat_history_from_sample(LRHistoryEntry *e, int target_idx,
+						   const LRSample *sample)
 {
-	LRSessionEntry *e;
+	memset(e, 0, sizeof(LRHistoryEntry));
+	e->ts = sample->send.ts;    /* ts is first member of both structs */
+	e->target_idx = target_idx;
+	e->current_lsn = sample->send.current_lsn;
+	e->sent_lsn = sample->send.sent_lsn;
+	e->peer_recv_lsn = sample->send.peer_recv_lsn;
+	e->peer_flush_lsn = sample->send.peer_flush_lsn;
+	e->peer_applied_lsn = sample->send.peer_applied_lsn;
+	e->confirmed_lsn = sample->send.confirmed_lsn;
+	e->restart_lsn = sample->send.restart_lsn;
+	e->spill_bytes = sample->send.spill_bytes;
+	e->stream_bytes = sample->send.stream_bytes;
+	e->received_lsn = sample->recv.received_lsn;
+	e->applied_lsn = sample->recv.applied_lsn;
+	e->local_wal_lsn = sample->recv.local_wal_lsn;
+}
+
+/*
+ * Append one full history entry (raw sample).  The array wraps when
+ * full: history always covers the most recent rounds, and `truncated`
+ * marks that the oldest samples were overwritten.  n_entries is the
+ * write cursor (single writer: the worker).
+ */
+void
+lrstat_append_history_entry(const LRHistoryEntry *e)
+{
 	int max_entries;
 
 	if (!lrstat_ready())
-		return -1;
+		return;
 
 	max_entries = lrstat->ntargets * lrstat->ring_len;
+	if (max_entries <= 0)
+		return;
+
 	if (lrstat->n_entries >= max_entries)
 	{
+		lrstat->n_entries = 0;
 		lrstat->session.truncated = true;
-		return -1;
 	}
 
-	e = lrstat_entry_at(lrstat->n_entries);
-	e->ts = ts;
-	e->target_idx = target_idx;
-	e->d_current = d_curr;
-	e->d_sent = d_sent;
-	e->d_received = d_recv;
-	e->d_applied = d_applied;
-	e->d_spill = d_spill;
-	e->d_stream = d_stream;
+	*lrstat_history_at(lrstat->n_entries) = *e;
 	lrstat->n_entries++;
-	return lrstat->n_entries - 1;
 }
 
 void
@@ -468,6 +485,26 @@ lrstat_get_entry_count(void)
 	if (!lrstat_ready())
 		return 0;
 	return lrstat->n_entries;
+}
+
+/* Number of valid entries: cursor while filling, capacity once wrapped. */
+int
+lrstat_history_count(void)
+{
+	if (!lrstat_ready())
+		return 0;
+	if (lrstat->session.truncated)
+		return lrstat->ntargets * lrstat->ring_len;
+	return lrstat->n_entries;
+}
+
+/* Index of the i-th oldest entry (i = 0 .. lrstat_history_count()-1). */
+int
+lrstat_history_slot(int i)
+{
+	int max_entries = lrstat->ntargets * lrstat->ring_len;
+	int oldest = lrstat->session.truncated ? lrstat->n_entries : 0;
+	return (oldest + i) % max_entries;
 }
 
 void

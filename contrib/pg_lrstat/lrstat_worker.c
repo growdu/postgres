@@ -32,8 +32,7 @@
 pg_noreturn void pg_lrstat_worker_main(Datum arg);
 
 static void lrstat_round(void);
-static void lrstat_compute_entries(void);
-static void lrstat_persist_entries(void);
+static void lrstat_record_history(void);
 static void sample_send_side(TimestampTz now);
 static LRPollTarget *sample_recv_side(TimestampTz now, int *n_targets);
 
@@ -205,16 +204,11 @@ lrstat_round(void)
 	CommitTransactionCommand();
 
 	/*
-	 * Session log: if a session is running, compute per-target
-	 * interval deltas and append to the session entry array.
+	 * History: record full raw samples for every active target,
+	 * every round, regardless of session state.  This IS the
+	 * primary data store — rates and stat views derive from it.
 	 */
-	if (running)
-	{
-		int before = lrstat_get_entry_count();
-		lrstat_compute_entries();
-		lrstat_persist_entries();
-		(void) before;
-	}
+	lrstat_record_history();
 
 	/* remote polling outside the transaction */
 	if (running && lrstat_remote_poll && targets != NULL && n_targets > 0)
@@ -231,109 +225,75 @@ lrstat_round(void)
 	}
 }
 
+/*
+ * Record one full raw sample per active target into the history array
+ * every round (always, not only during sessions) — history IS the
+ * primary data store.  For persist sessions, append the same entries
+ * to the session file.  Targets whose sample did not advance since
+ * the previous round (e.g. a remote-polled sender after session stop)
+ * are skipped so history is not flooded with duplicate samples.
+ */
+static TimestampTz *recorded_ts = NULL;    /* per target, worker-lifetime */
+
 static void
-lrstat_compute_entries(void)
+lrstat_record_history(void)
 {
+	LRHistoryEntry *newents = NULL;
+	int n_new = 0;
 	int i;
+
+	if (!lrstat_ready())
+		return;
+
+	if (recorded_ts == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		recorded_ts = palloc0(lrstat->ntargets * sizeof(TimestampTz));
+		MemoryContextSwitchTo(old);
+	}
+
+	/* persist sessions write their full history to a file */
+	if (lrstat->session.running)
+	{
+		char	   *path = psprintf("%s/pg_lrstat/sessions/%s.sess",
+									DataDir, lrstat->session.name);
+		struct stat st;
+		bool		persist = (stat(path, &st) == 0);
+
+		pfree(path);
+		if (persist)
+			newents = palloc(lrstat->ntargets * sizeof(LRHistoryEntry));
+	}
 
 	for (i = 0; i < lrstat->ntargets; i++)
 	{
 		LRTargetCtl *t = lrstat_target_at(i);
-		bool use;
-		LRSample anchor, prev, last;
-		LRTargetMeta m;
-		int64 d_curr = 0, d_sent = 0, d_recv = 0, d_applied = 0;
-		int64 d_spill = 0, d_stream = 0;
+		bool		use;
+		LRSample	last;
+		LRHistoryEntry e;
 
 		SpinLockAcquire(&t->mutex);
 		use = t->in_use;
 		if (use)
-		{
-			memcpy(&anchor, &t->anchor, sizeof(LRSample));
-			memcpy(&prev, &t->prev, sizeof(LRSample));
 			memcpy(&last, &t->last, sizeof(LRSample));
-			memcpy(&m, &t->meta, sizeof(LRTargetMeta));
-		}
 		SpinLockRelease(&t->mutex);
-		if (!use || prev.send.ts == 0)
-			continue;   /* no previous sample yet (first round) */
 
-		if (t->kind == LR_SEND || t->kind == LR_RSEND)
-		{
-			d_curr = (int64)(last.send.current_lsn - prev.send.current_lsn);
-			d_sent = (int64)(last.send.sent_lsn - prev.send.sent_lsn);
-			d_recv = 0;
-			d_applied = (int64)(last.send.peer_applied_lsn - prev.send.peer_applied_lsn);
-			d_spill = (int64)(last.send.spill_bytes - prev.send.spill_bytes);
-			d_stream = (int64)(last.send.stream_bytes - prev.send.stream_bytes);
-		}
-		else if (t->kind == LR_RECV)
-		{
-			d_curr = 0;
-			d_sent = 0;
-			d_recv = (int64)(last.recv.received_lsn - prev.recv.received_lsn);
-			d_applied = (int64)(last.recv.applied_lsn - prev.recv.applied_lsn);
-			d_spill = 0;
-			d_stream = 0;
-		}
+		if (!use || last.send.ts <= 0 || last.send.ts == recorded_ts[i])
+			continue;
 
-		if (d_curr < 0) d_curr = 0;
-		if (d_sent < 0) d_sent = 0;
-		if (d_recv < 0) d_recv = 0;
-		if (d_applied < 0) d_applied = 0;
-		if (d_spill < 0) d_spill = 0;
-		if (d_stream < 0) d_stream = 0;
-
-		lrstat_append_entry(i, last.send.ts,
-							d_curr, d_sent, d_recv, d_applied,
-							d_spill, d_stream);
+		lrstat_history_from_sample(&e, i, &last);
+		lrstat_append_history_entry(&e);
+		recorded_ts[i] = last.send.ts;
+		if (newents != NULL)
+			newents[n_new++] = e;
 	}
-}
 
-/* Persist newly written entries to session file if persist=true */
-static void
-lrstat_persist_entries(void)
-{
-	/* Check if session is persisted via degraded flag (simplified: we
-	 * store persist state separately — for now, check if the file exists */
-	char	   *path;
-	struct stat st;
-
-	path = psprintf("%s/pg_lrstat/sessions/%s.sess", DataDir,
-					lrstat->session.name);
-	if (stat(path, &st) != 0)
+	if (newents != NULL)
 	{
-		pfree(path);
-		return;     /* non-persist session, no file */
-	}
-	pfree(path);
-
-	/* Append all new entries to file */
-	{
-		int total = lrstat_get_entry_count();
-		/* Just append everything written this round — the compute_entries
-		 * already wrote to the in-memory array; for file we need to know
-		 * how many are new.  For simplicity in P2, we append all entries
-		 * up to a local counter tracked across rounds. */
-		static int last_persisted = 0;
-		int new_entries = total - last_persisted;
-
-		if (new_entries > 0)
-		{
-			/* Build a contiguous array of new entries */
-			LRSessionEntry *buf = palloc(new_entries * sizeof(LRSessionEntry));
-			int i;
-			for (i = 0; i < new_entries; i++)
-				memcpy(&buf[i], lrstat_entry_at(last_persisted + i),
-					   sizeof(LRSessionEntry));
-			lrstat_store_append(new_entries, buf);
-			pfree(buf);
-			last_persisted = total;
-		}
-
-		/* Reset on new session */
-		if (total == 0)
-			last_persisted = 0;
+		if (n_new > 0)
+			lrstat_store_append(n_new, newents);
+		pfree(newents);
 	}
 }
 

@@ -61,13 +61,22 @@ lrstat_file_path(const char *name)
 static void
 lrstat_ensure_dir(void)
 {
+	char	   *parent = psprintf("%s/%s", DataDir, LRSTAT_DIR);
 	char	   *dir = lrstat_dir_path();
+
+	/* two levels: pg_lrstat/ then pg_lrstat/sessions/ */
+	if (MakePGDirectory(parent) < 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("pg_lrstat: could not create directory %s", parent)));
 
 	/* Use MakePGDirectory which respects PGDIRPERM */
 	if (MakePGDirectory(dir) < 0 && errno != EEXIST)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("pg_lrstat: could not create directory %s", dir)));
+
+	pfree(parent);
 }
 
 /*
@@ -116,7 +125,7 @@ lrstat_store_create(const char *name, uint64 session_id, TimestampTz start_ts)
  * Called by the worker after each sampling round.
  */
 void
-lrstat_store_append(int n_entries, LRSessionEntry *entries)
+lrstat_store_append(int n_entries, LRHistoryEntry *entries)
 {
 	char	   *path = lrstat_file_path(lrstat->session.name);
 	int			fd;
@@ -131,8 +140,8 @@ lrstat_store_append(int n_entries, LRSessionEntry *entries)
 		return;
 	}
 
-	if (write(fd, entries, n_entries * sizeof(LRSessionEntry)) !=
-		(size_t)(n_entries * sizeof(LRSessionEntry)))
+	if (write(fd, entries, n_entries * sizeof(LRHistoryEntry)) !=
+		(size_t)(n_entries * sizeof(LRHistoryEntry)))
 	{
 		lrstat->session.degraded = true;
 		CloseTransientFile(fd);
@@ -147,22 +156,24 @@ lrstat_store_append(int n_entries, LRSessionEntry *entries)
 
 /*
  * Finalize a session file (stop or interrupted).
- * Rewrites the header with final state and entry count.
+ * Rewrites the header with final state; the entry count is derived
+ * from the file size so wrapped in-memory rings don't undercount.
  */
 void
 lrstat_store_finalize(const char *name, const char *state,
-					  int n_targets, int n_entries,
 					  bool truncated, bool degraded)
 {
 	char	   *path = lrstat_file_path(name);
 	LRFileHeader hdr;
+	struct stat st;
 	int			fd;
 
 	fd = OpenTransientFile(path, O_RDWR);
 	if (fd < 0)
 		return;
 
-	if (read(fd, &hdr, sizeof(hdr)) != sizeof(hdr))
+	if (fstat(fd, &st) != 0 ||
+		read(fd, &hdr, sizeof(hdr)) != sizeof(hdr))
 	{
 		CloseTransientFile(fd);
 		return;
@@ -170,8 +181,10 @@ lrstat_store_finalize(const char *name, const char *state,
 
 	strlcpy(hdr.state, state, sizeof(hdr.state));
 	hdr.stop_ts = GetCurrentTimestamp();
-	hdr.n_targets = n_targets;
-	hdr.n_entries = n_entries;
+	hdr.n_targets = lrstat->ntargets;
+	hdr.n_entries = st.st_size > (off_t) sizeof(hdr)
+		? (int32)((st.st_size - sizeof(hdr)) / sizeof(LRHistoryEntry))
+		: 0;
 	hdr.truncated = truncated;
 	hdr.degraded = degraded;
 
@@ -228,7 +241,6 @@ lrstat_store_recover(void)
 		{
 			elog(LOG, "pg_lrstat: recovering interrupted session %s", hdr.name);
 			lrstat_store_finalize(hdr.name, "interrupted",
-								  hdr.n_targets, hdr.n_entries,
 								  hdr.truncated, hdr.degraded);
 		}
 
@@ -271,7 +283,11 @@ lrstat_store_list(char ***names_out)
 		if (n >= nalloc)
 		{
 			nalloc = nalloc == 0 ? 8 : nalloc * 2;
-			names = repalloc(names, nalloc * sizeof(char *));
+			/* repalloc requires non-NULL; first allocation via palloc */
+			if (names == NULL)
+				names = palloc(nalloc * sizeof(char *));
+			else
+				names = repalloc(names, nalloc * sizeof(char *));
 		}
 		/* strip .sess suffix */
 		names[n] = pstrdup(fname);
