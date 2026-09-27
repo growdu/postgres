@@ -29,3 +29,14 @@ install_data(
   'pg_lrstat--2.0.sql',
   kwargs: contrib_data_args,
 )
+
+tests += {
+  'name': 'pg_lrstat',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'tap': {
+    'tests': [
+      't/001_tablesync.pl',
+    ],
+  },
+}

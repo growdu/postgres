@@ -34,7 +34,8 @@ pg_noreturn void pg_lrstat_worker_main(Datum arg);
 static void lrstat_round(void);
 static void lrstat_record_history(void);
 static void sample_send_side(TimestampTz now);
-static LRPollTarget *sample_recv_side(TimestampTz now, int *n_targets);
+static LRPollTarget *sample_recv_side(TimestampTz now, int *n_targets,
+									  MemoryContext poll_ctx);
 
 #define SEND_SQL \
 	"SELECT s.slot_name::text, d.datname::text, s.plugin::text, " \
@@ -150,9 +151,16 @@ pg_lrstat_worker_main(Datum main_arg)
 		PG_CATCH();
 		{
 			ErrorData *edata = CopyErrorData();
+
+			/* leave no aborted transaction behind across rounds */
+			AbortOutOfAnyTransaction();
 			FlushErrorState();
-			elog(LOG, "pg_lrstat: round failed: %s",
-				 edata->message ? edata->message : "unknown");
+			elog(LOG, "pg_lrstat: round failed: %s (%s:%d in %s)%s%s",
+				 edata->message ? edata->message : "unknown",
+				 edata->filename ? edata->filename : "?",
+				 edata->lineno, edata->funcname ? edata->funcname : "?",
+				 edata->backtrace ? "\nbacktrace: " : "",
+				 edata->backtrace ? edata->backtrace : "");
 			FreeErrorData(edata);
 		}
 		PG_END_TRY();
@@ -175,7 +183,9 @@ lrstat_round(void)
 	TimestampTz now = GetCurrentTimestamp();
 	LRPollTarget *targets = NULL;
 	int n_targets = 0;
+	MemoryContext poll_ctx;
 	bool running;
+	bool round_failed;
 
 	if (!lrstat_ready())
 		return;
@@ -184,24 +194,48 @@ lrstat_round(void)
 	running = lrstat->session.running;
 	SpinLockRelease(&lrstat->session.mutex);
 
+	/*
+	 * The poll target list and its conninfo copies must outlive the
+	 * round's SPI session, so remember this (pre-SPI) context for them.
+	 */
+	poll_ctx = CurrentMemoryContext;
+
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
+	SPI_connect();
 
+	round_failed = false;
 	PG_TRY();
 	{
-		targets = sample_recv_side(now, &n_targets);
+		targets = sample_recv_side(now, &n_targets, poll_ctx);
 		sample_send_side(now);
-	}
-	PG_FINALLY();
-	{
 		SPI_finish();
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		/* leave no SPI session or aborted transaction behind */
+		SPI_finish();
+		AbortOutOfAnyTransaction();
+		round_failed = true;
+		edata = CopyErrorData();
+		FlushErrorState();
+		elog(LOG, "pg_lrstat: round failed: %s (%s:%d in %s)",
+			 edata->message ? edata->message : "unknown",
+			 edata->filename ? edata->filename : "?",
+			 edata->lineno, edata->funcname ? edata->funcname : "?");
+		FreeErrorData(edata);
 	}
 	PG_END_TRY();
 
-	if (ActiveSnapshotSet())
-		PopActiveSnapshot();
-	CommitTransactionCommand();
+	if (!round_failed)
+	{
+		if (ActiveSnapshotSet())
+			PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
 
 	/*
 	 * History: record full raw samples for every active target,
@@ -297,19 +331,19 @@ lrstat_record_history(void)
 	}
 }
 
+/*
+ * Send-side sampling; runs inside the round's SPI session.
+ */
 static void
 sample_send_side(TimestampTz now)
 {
-	SPI_connect();
-	PG_TRY();
-	{
-		int ret = SPI_execute(SEND_SQL, true, 0);
-		SPITupleTable *tuptab = SPI_tuptable;
-		TupleDesc td = tuptab->tupdesc;
-		uint64 i;
+	int ret = SPI_execute(SEND_SQL, true, 0);
+	SPITupleTable *tuptab = SPI_tuptable;
+	TupleDesc td = tuptab->tupdesc;
+	uint64 i;
 
-		if (ret != SPI_OK_SELECT)
-			elog(ERROR, "pg_lrstat: send-side sampling failed");
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "pg_lrstat: send-side sampling failed");
 
 		for (i = 0; i < SPI_processed; i++)
 		{
@@ -378,24 +412,22 @@ sample_send_side(TimestampTz now)
 				lrstat_push_sample(t, &s);
 				lrstat_set_meta(t, &m);
 			}
-		}
 	}
-	PG_FINALLY();
-	{
-		SPI_finish();
-	}
-	PG_END_TRY();
 }
 
+/*
+ * Recv-side sampling; runs inside the round's SPI session.  Returns the
+ * list of subscriptions to remote-poll, allocated (like the conninfo
+ * copies) in poll_ctx — the caller's pre-SPI context — so it survives
+ * the round's SPI_finish.
+ */
 static LRPollTarget *
-sample_recv_side(TimestampTz now, int *n_targets)
+sample_recv_side(TimestampTz now, int *n_targets, MemoryContext poll_ctx)
 {
 	LRPollTarget *targets = NULL;
 	int n = 0, nalloc = 0;
 
 	*n_targets = 0;
-	SPI_connect();
-	PG_TRY();
 	{
 		int ret = SPI_execute(RECV_SQL, true, 0);
 		SPITupleTable *tuptab = SPI_tuptable;
@@ -432,10 +464,18 @@ sample_recv_side(TimestampTz now, int *n_targets)
 
 			wc = (strncmp(m.worker_type, "table", 5) == 0) ? 't' : 'a';
 
-			/* full copy of conninfo (may exceed stack buffer) */
+			/* full copy of conninfo into caller-lifetime memory */
 			(void) col_val(tup, td, FN(td, "subconninfo"), &isnull);
 			if (!isnull)
-				conninfo = SPI_getvalue(tup, td, FN(td, "subconninfo"));
+			{
+				char *val = SPI_getvalue(tup, td, FN(td, "subconninfo"));
+
+				if (val)
+				{
+					conninfo = MemoryContextStrdup(poll_ctx, val);
+					pfree(val);
+				}
+			}
 
 			/* read the slot name for remote polling */
 			col_text(tup, td, FN(td, "subslotname"), slot_name, sizeof(slot_name));
@@ -475,13 +515,19 @@ sample_recv_side(TimestampTz now, int *n_targets)
 				{
 					if (n >= nalloc)
 					{
+						LRPollTarget *grow;
+
 						nalloc = nalloc == 0 ? 8 : nalloc * 2;
-						/* repalloc requires non-NULL; first allocation via palloc */
-						if (targets == NULL)
-							targets = palloc(nalloc * sizeof(LRPollTarget));
-						else
-							targets = repalloc(targets,
-											   nalloc * sizeof(LRPollTarget));
+						/* repalloc requires non-NULL; grow in the
+						 * caller's context, not the SPI context */
+						grow = MemoryContextAlloc(poll_ctx,
+												  nalloc * sizeof(LRPollTarget));
+						if (targets != NULL)
+						{
+							memcpy(grow, targets, n * sizeof(LRPollTarget));
+							pfree(targets);
+						}
+						targets = grow;
 					}
 					strlcpy(targets[n].recv_name, recv_name, NAMEDATALEN);
 					strlcpy(targets[n].slot_name, slot_name, NAMEDATALEN);
@@ -493,11 +539,6 @@ sample_recv_side(TimestampTz now, int *n_targets)
 			}
 		}
 	}
-	PG_FINALLY();
-	{
-		SPI_finish();
-	}
-	PG_END_TRY();
 
 	*n_targets = n;
 	return targets;

@@ -108,6 +108,8 @@ static void
 walk(LRTargetKind kind, EmitFn emit, ReturnSetInfo *rsi)
 {
     int i;
+    TimestampTz now = GetCurrentTimestamp();
+
     if (!lrstat_ready()) return;
 
     for (i = 0; i < lrstat->ntargets; i++)
@@ -121,12 +123,21 @@ walk(LRTargetKind kind, EmitFn emit, ReturnSetInfo *rsi)
         use = (t->in_use && t->kind == kind);
         if (use)
         {
-            strlcpy(name, t->name, NAMEDATALEN);
-            wc = t->worker_char; relid = t->relid;
-            memcpy(&a, &t->anchor, sizeof(LRSample));
-            memcpy(&p, &t->prev, sizeof(LRSample));
-            memcpy(&l, &t->last, sizeof(LRSample));
-            memcpy(&m, &t->meta, sizeof(LRTargetMeta));
+            /* expired: target vanished from sampling (e.g. finished
+             * table sync worker) longer than stale_target_ttl ago */
+            if (t->last_sample_ts > 0 &&
+                TimestampDifferenceMilliseconds(t->last_sample_ts, now) >=
+                (double) lrstat_stale_target_ttl_s * 1000.0)
+                use = false;
+            else
+            {
+                strlcpy(name, t->name, NAMEDATALEN);
+                wc = t->worker_char; relid = t->relid;
+                memcpy(&a, &t->anchor, sizeof(LRSample));
+                memcpy(&p, &t->prev, sizeof(LRSample));
+                memcpy(&l, &t->last, sizeof(LRSample));
+                memcpy(&m, &t->meta, sizeof(LRTargetMeta));
+            }
         }
         SpinLockRelease(&t->mutex);
 

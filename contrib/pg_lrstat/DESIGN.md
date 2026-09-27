@@ -368,7 +368,7 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 - **字符串提取**：一律 `SPI_getvalue()`（detoast + 独立副本 + NULL 安全），杜绝 toast 指针/零拷贝悬垂；
 - **分配**：数组首配 `palloc`，仅对已分配块 `repalloc`（`repalloc(NULL)` 非法）；worker 每轮在独立内存上下文运行，轮末重置整体回收；
 - **EXEC_BACKEND**：后端惰性 `ShmemInitStruct` 附加（以"曾 preload"标记门控，绝不误创建段）；worker 入口 `PGDLLEXPORT` 导出；
-- **目标管理**：键 (kind, name, relid, worker_char)；逻辑的 `parallel apply` 行跳过（leader 行是规范源）；物理的 worker_char='p'（recovery 进程，每 standby 一个）；目标老化 `stale_target_ttl` 后可被复用；满载丢弃计数入 `dropped_samples` 并限频 WARNING。
+- **目标管理**：键 (kind, name, relid, worker_char)；逻辑的 `parallel apply` 行跳过（leader 行是规范源）；物理的 worker_char='p'（recovery 进程，每 standby 一个）；目标超过 `stale_target_ttl` 未再被采样（如 table sync worker 结束）即从视图过期剔除、槽位可被复用；满载丢弃计数入 `dropped_samples` 并限频 WARNING。
 
 ---
 
@@ -573,7 +573,7 @@ pg_lrstat_reset() → void
 | `pg_lrstat.sample_interval` | `30s` | SIGHUP | 采样周期 = 瞬时速率粒度（下限 1s） |
 | `pg_lrstat.session_max_samples` | `2880` | 重启 | 历史环形容量（每目标采样数；2s≈96min/目标） |
 | `pg_lrstat.max_targets` | `32` | 重启 | 目标槽容量 |
-| `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标老化回收阈值 |
+| `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标消失后多少秒从视图过期剔除、槽位回收 |
 | `pg_lrstat.catchup_min_rate` | `0.001` | SIGHUP | 追平预估有效性下限（MB/s，avg 低于此值返回 NULL） |
 | `pg_lrstat.remote_poll` | on | SIGHUP | 接收端是否轮询发送端 |
 | `pg_lrstat.remote_connect_timeout` | `5s` | SIGHUP | 远端连接超时 |
