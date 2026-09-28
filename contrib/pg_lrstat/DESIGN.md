@@ -409,6 +409,7 @@ pg_lrstat_reset() → void
 | `pg_lrstat_send_history` | 发送端一目标一轮一行 | 发送端全量原始 LSN 序列（始终记录，画曲线），首列 session_name 标归属 |
 | `pg_lrstat_recv_history` | 接收端一目标一轮一行 | 接收端全量原始 LSN 序列（始终记录，画曲线），首列 session_name 标归属 |
 | `pg_lrstat_session_stat` | 一会话×目标×侧一行 | 纯 SQL 视图：对 history 按会话聚合（总量 MB、平均 MB/s、样本区间）——按会话名查历史统计的入口 |
+| `pg_lrstat_send/recv_rate_history` | 一目标一间隔一行 | 纯 SQL 视图：窗口函数对相邻样本现算逐间隔速率（MB/s）——不预存派生值，history 仍是唯一数据源 |
 
 - `stat` 视图**会话期间实时更新**（显示最新样本+当前速率），**stop 后冻结**（显示会话最终值）——不需要区分 live/report 两套；
 - `history` 视图**stop 后可查**（会话期内逐间隔数据）；持久会话跨重启可查；

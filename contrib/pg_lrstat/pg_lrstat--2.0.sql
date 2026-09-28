@@ -190,6 +190,36 @@ SELECT session_name, name, n_samples, first_ts, last_ts,
        END AS apply_mbps
   FROM s;
 
+-- Views: send/recv_rate_history — per-interval rates between two
+-- consecutive samples, derived from the raw history views with window
+-- functions.  No extra storage: the raw samples stay the single source
+-- of truth, these views fix the derivation once for everyone.
+CREATE VIEW pg_lrstat_send_rate_history AS
+SELECT session_name, name, ts,
+       extract(epoch FROM ts - lag(ts) OVER w)::numeric AS interval_secs,
+       round((pg_wal_lsn_diff(current_lsn, lag(current_lsn) OVER w) / 1048576
+              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS gen_mbps,
+       round((pg_wal_lsn_diff(sent_lsn, lag(sent_lsn) OVER w) / 1048576
+              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS send_mbps,
+       round((pg_wal_lsn_diff(peer_applied_lsn, lag(peer_applied_lsn) OVER w) / 1048576
+              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS peer_apply_mbps,
+       round((spill_bytes  - lag(spill_bytes)  OVER w)::numeric / 1048576, 3) AS spill_mb,
+       round((stream_bytes - lag(stream_bytes) OVER w)::numeric / 1048576, 3) AS stream_mb
+  FROM pg_lrstat_send_history
+WINDOW w AS (PARTITION BY session_name, name ORDER BY ts);
+
+CREATE VIEW pg_lrstat_recv_rate_history AS
+SELECT session_name, name, ts,
+       extract(epoch FROM ts - lag(ts) OVER w)::numeric AS interval_secs,
+       round((pg_wal_lsn_diff(received_lsn, lag(received_lsn) OVER w) / 1048576
+              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS recv_mbps,
+       round((pg_wal_lsn_diff(applied_lsn, lag(applied_lsn) OVER w) / 1048576
+              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS apply_mbps,
+       round((pg_wal_lsn_diff(local_wal_lsn, lag(local_wal_lsn) OVER w) / 1048576
+              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS local_wal_mbps
+  FROM pg_lrstat_recv_history
+WINDOW w AS (PARTITION BY session_name, name ORDER BY ts);
+
 REVOKE ALL ON FUNCTION
     pg_lrstat_info(), pg_lrstat_send_stat(),
     pg_lrstat_recv_stat(), pg_lrstat_cluster_stat(),
@@ -200,11 +230,13 @@ REVOKE ALL ON
     pg_lrstat_info, pg_lrstat_send_stat,
     pg_lrstat_recv_stat, pg_lrstat_cluster_stat,
     pg_lrstat_send_history, pg_lrstat_recv_history,
-    pg_lrstat_session_stat
+    pg_lrstat_session_stat,
+    pg_lrstat_send_rate_history, pg_lrstat_recv_rate_history
 FROM PUBLIC;
 GRANT SELECT ON
     pg_lrstat_info, pg_lrstat_send_stat,
     pg_lrstat_recv_stat, pg_lrstat_cluster_stat,
     pg_lrstat_send_history, pg_lrstat_recv_history,
-    pg_lrstat_session_stat
+    pg_lrstat_session_stat,
+    pg_lrstat_send_rate_history, pg_lrstat_recv_rate_history
 TO pg_monitor;

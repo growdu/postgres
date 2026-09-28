@@ -65,9 +65,9 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 
 全部要求 superuser。
 
-## 4. 视图（只有 7 个）
+## 4. 视图（只有 9 个）
 
-日常巡检**只需要盯 `cluster_stat` 一个**；按会话名查历史用 `session_stat`。
+日常巡检**只需要盯 `cluster_stat` 一个**；按会话名查历史用 `session_stat`；画逐间隔速率曲线用 `*_rate_history`。
 
 ### 4.1 `pg_lrstat_info` — 健康自检（1 行）
 
@@ -159,6 +159,25 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 SELECT session_name, name, round(applied_mb,1) 应用MB, apply_mbps 平均MBps
 FROM pg_lrstat_session_stat WHERE apply_mbps IS NOT NULL
 ORDER BY apply_mbps DESC;
+```
+
+### 4.8 `pg_lrstat_send_rate_history` / `pg_lrstat_recv_rate_history` — 每两次采样之间的速率
+
+对 history 视图用窗口函数现算的**逐间隔速率**（不额外存储，原始 LSN 仍是唯一数据源；画速率曲线直接查这两个）。
+
+| 列 | 含义 |
+| --- | --- |
+| `session_name` `name` `ts` | 本间隔结束时的样本 |
+| `interval_secs` | 与上一样本的间隔秒数 |
+| `gen_mbps` `send_mbps` `peer_apply_mbps`（发送端）/ `recv_mbps` `apply_mbps` `local_wal_mbps`（接收端） | 本间隔的平均速率（MB/s）；会话首行为 NULL |
+| `spill_mb` `stream_mb`（仅发送端） | 本间隔解码溢写/流式增量（MB）——瞬时值突增说明该轮解码压力大 |
+
+```sql
+-- 例：看最近 10 个间隔的应用速率
+SELECT to_char(ts,'HH24:MI:SS') 时刻, apply_mbps
+FROM pg_lrstat_recv_rate_history
+WHERE session_name = '压测A'
+ORDER BY ts DESC LIMIT 10;
 ```
 
 ## 5. 速率是怎么算的

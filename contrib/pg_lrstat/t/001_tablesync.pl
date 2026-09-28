@@ -167,15 +167,16 @@ $result = $node_subscriber->poll_query_until(
 ));
 is($result, 1, 'history rows carry the session name');
 
-# a persist session with some load to aggregate
+# a persist session with some load to aggregate; keep it alive for at
+# least three sampling rounds so the rate views have intervals
+$node_subscriber->safe_psql('postgres',
+	"SELECT lrstat_start('archived', true)");
 $node_publisher->safe_psql('postgres',
 	q(INSERT INTO lrstat_test SELECT g, repeat(md5(g::text), 50)
 	  FROM generate_series(100001, 110000) g));
-$node_subscriber->safe_psql('postgres',
-	"SELECT lrstat_start('archived', true)");
 $result = $node_subscriber->poll_query_until(
 	'postgres', qq(
-	SELECT count(*) > 0 FROM pg_lrstat_recv_history
+	SELECT count(*) >= 3 FROM pg_lrstat_recv_history
 	WHERE session_name = 'archived'
 ));
 is($result, 1, 'second session stamped in history');
@@ -188,6 +189,18 @@ $result = $node_subscriber->safe_psql('postgres', qq(
 	WHERE session_name = 'archived' AND n_samples > 0
 ));
 is($result, 't', 'session_stat aggregates the archived session');
+
+# per-interval rate views derive rates between consecutive samples
+$result = $node_subscriber->poll_query_until('postgres', qq(
+	SELECT count(*) > 0 FROM pg_lrstat_recv_rate_history
+	WHERE session_name = 'archived' AND recv_mbps IS NOT NULL
+));
+is($result, 1, 'recv_rate_history derives per-interval rates');
+$result = $node_subscriber->safe_psql('postgres', qq(
+	SELECT count(*) FROM pg_lrstat_send_rate_history
+	WHERE session_name = 'archived' AND interval_secs IS NULL
+));
+cmp_ok($result, '>=', 1, 'first sample of a session has NULL rate');
 
 # a third session resets the in-memory history; the archived session
 # remains queryable by name through its file
