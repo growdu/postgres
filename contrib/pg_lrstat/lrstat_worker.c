@@ -496,6 +496,14 @@ sample_recv_side(TimestampTz now, int *n_targets, MemoryContext poll_ctx)
 
 			m.worker_pid = (pid_t) col_i8(tup, td, FN(td, "worker_pid"), 0);
 			m.leader_pid = (pid_t) col_i8(tup, td, FN(td, "leader_pid"), 0);
+
+			/*
+			 * A subscription row with no worker running (startup or
+			 * restart window) carries no positions; skip it instead of
+			 * pushing an all-zero sample that would poison the anchor.
+			 */
+			if (m.worker_pid == 0)
+				continue;
 			m.last_msg_send_time = col_ts(tup, td, FN(td, "last_msg_send_time"));
 			m.last_msg_receipt_time = col_ts(tup, td, FN(td, "last_msg_receipt_time"));
 			m.apply_error_count = col_i8(tup, td, FN(td, "apply_error_count"), -1);

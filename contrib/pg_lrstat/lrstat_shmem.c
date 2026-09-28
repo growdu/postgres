@@ -354,18 +354,32 @@ lrstat_lookup(LRTargetKind kind, const char *name,
 	return false;
 }
 
+/*
+ * A sample with all-zero LSNs (e.g. a subscription whose worker is not
+ * running) is not a valid measurement baseline; never let it become
+ * the anchor — avg rates would count the whole WAL history as delta.
+ */
+static bool
+sample_valid(const LRTargetCtl *t, const LRSample *s)
+{
+	if (t->kind == LR_RECV)
+		return s->recv.received_lsn != 0 || s->recv.applied_lsn != 0;
+	return s->send.current_lsn != 0 || s->send.sent_lsn != 0 ||
+		s->send.restart_lsn != 0;
+}
+
 void
 lrstat_push_sample(LRTargetCtl *target, const LRSample *sample)
 {
 	SpinLockAcquire(&target->mutex);
 	if (sample->send.ts > target->last_sample_ts)
 	{
-		/* rotate: prev = last; last = new; first round sets anchor */
+		/* rotate: prev = last; last = new; first valid sample sets anchor */
 		if (target->last.send.ts > 0)
 		{
 			target->prev = target->last;
 		}
-		if (target->anchor.send.ts == 0)
+		if (target->anchor.send.ts == 0 && sample_valid(target, sample))
 		{
 			target->anchor = *sample;
 		}

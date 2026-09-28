@@ -147,8 +147,8 @@ WITH s AS (
            count(*)::int8                     AS n_samples,
            min(ts)                            AS first_ts,
            max(ts)                            AS last_ts,
-           pg_wal_lsn_diff(max(current_lsn), min(current_lsn)) AS gen_bytes,
-           pg_wal_lsn_diff(max(sent_lsn), min(sent_lsn))       AS sent_bytes,
+           pg_wal_lsn_diff(max(current_lsn), min(nullif(current_lsn, '0/0'))) AS gen_bytes,
+           pg_wal_lsn_diff(max(sent_lsn), min(nullif(sent_lsn, '0/0')))       AS sent_bytes,
            NULL::numeric                      AS received_bytes,
            NULL::numeric                      AS applied_bytes
       FROM pg_lrstat_send_history
@@ -161,8 +161,8 @@ WITH s AS (
            max(ts),
            NULL::numeric,
            NULL::numeric,
-           pg_wal_lsn_diff(max(received_lsn), min(received_lsn)),
-           pg_wal_lsn_diff(max(applied_lsn), min(applied_lsn))
+           pg_wal_lsn_diff(max(received_lsn), min(nullif(received_lsn, '0/0'))),
+           pg_wal_lsn_diff(max(applied_lsn), min(nullif(applied_lsn, '0/0')))
       FROM pg_lrstat_recv_history
      WHERE session_name IS NOT NULL
      GROUP BY session_name, name
@@ -197,11 +197,11 @@ SELECT session_name, name, n_samples, first_ts, last_ts,
 CREATE VIEW pg_lrstat_send_rate_history AS
 SELECT session_name, name, ts,
        extract(epoch FROM ts - lag(ts) OVER w)::numeric AS interval_secs,
-       round((pg_wal_lsn_diff(current_lsn, lag(current_lsn) OVER w) / 1048576
+       round((pg_wal_lsn_diff(nullif(current_lsn, '0/0'), nullif(lag(current_lsn) OVER w, '0/0')) / 1048576
               / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS gen_mbps,
-       round((pg_wal_lsn_diff(sent_lsn, lag(sent_lsn) OVER w) / 1048576
+       round((pg_wal_lsn_diff(nullif(sent_lsn, '0/0'), nullif(lag(sent_lsn) OVER w, '0/0')) / 1048576
               / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS send_mbps,
-       round((pg_wal_lsn_diff(peer_applied_lsn, lag(peer_applied_lsn) OVER w) / 1048576
+       round((pg_wal_lsn_diff(nullif(peer_applied_lsn, '0/0'), nullif(lag(peer_applied_lsn) OVER w, '0/0')) / 1048576
               / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS peer_apply_mbps,
        round((spill_bytes  - lag(spill_bytes)  OVER w)::numeric / 1048576, 3) AS spill_mb,
        round((stream_bytes - lag(stream_bytes) OVER w)::numeric / 1048576, 3) AS stream_mb
@@ -211,11 +211,11 @@ WINDOW w AS (PARTITION BY session_name, name ORDER BY ts);
 CREATE VIEW pg_lrstat_recv_rate_history AS
 SELECT session_name, name, ts,
        extract(epoch FROM ts - lag(ts) OVER w)::numeric AS interval_secs,
-       round((pg_wal_lsn_diff(received_lsn, lag(received_lsn) OVER w) / 1048576
+       round((pg_wal_lsn_diff(nullif(received_lsn, '0/0'), nullif(lag(received_lsn) OVER w, '0/0')) / 1048576
               / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS recv_mbps,
-       round((pg_wal_lsn_diff(applied_lsn, lag(applied_lsn) OVER w) / 1048576
+       round((pg_wal_lsn_diff(nullif(applied_lsn, '0/0'), nullif(lag(applied_lsn) OVER w, '0/0')) / 1048576
               / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS apply_mbps,
-       round((pg_wal_lsn_diff(local_wal_lsn, lag(local_wal_lsn) OVER w) / 1048576
+       round((pg_wal_lsn_diff(nullif(local_wal_lsn, '0/0'), nullif(lag(local_wal_lsn) OVER w, '0/0')) / 1048576
               / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS local_wal_mbps
   FROM pg_lrstat_recv_history
 WINDOW w AS (PARTITION BY session_name, name ORDER BY ts);

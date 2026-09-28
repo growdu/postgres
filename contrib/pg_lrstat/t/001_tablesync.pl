@@ -212,10 +212,18 @@ is($node_subscriber->safe_psql('postgres', qq(
 	SELECT count(*) = 0 FROM pg_lrstat_recv_history
 	WHERE session_name = 'archived')),
 	't', 'memory history reset by newer session');
-my $archived_json = $node_subscriber->safe_psql('postgres',
+
+# export writes the report to pg_lrstat/exports and returns the path;
+# the archived session is rebuilt from its file
+my $archived_path = $node_subscriber->safe_psql('postgres',
 	"SELECT lrstat_export('archived', 'json')");
+$archived_path =~ s/^\s+|\s+$//g;
+like($archived_path, qr{pg_lrstat/exports/archived\.json$},
+	'export returns the report file path');
+ok(-f $archived_path, 'archived session exported by name from its file');
+my $archived_json = PostgreSQL::Test::Utils::slurp_file($archived_path);
 ok(index($archived_json, '"name": "archived"') >= 0,
-	'archived session exported by name from its file');
+	'archived export identifies the session');
 ok(index($archived_json, '"samples": [') >= 0
 	&& $archived_json =~ /"kind": "(send|recv)"/,
 	'archived export contains raw history samples');

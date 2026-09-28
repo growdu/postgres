@@ -59,7 +59,7 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 | --- | --- | --- |
 | `lrstat_start(name, persist)` | `SELECT lrstat_start('压测A', true)` | 开始会话。persist 默认 false（不写文件） |
 | `lrstat_stop(name)` | `SELECT lrstat_stop('压测A')` | 结束会话。名字必须与 start 一致 |
-| `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告。format='html'（默认）或 'json'。传归档会话名（persist 会话）时直接读会话文件，即使之后又跑过新会话 |
+| `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告**并直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`，返回文件绝对路径。format='html'（默认）或 'json'。传归档会话名（persist 会话）时直接读会话文件，即使之后又跑过新会话 |
 | `lrstat_delete(name)` | `SELECT lrstat_delete('压测A')` | 删除已归档会话文件（persist 会话） |
 | `pg_lrstat_reset()` | `SELECT pg_lrstat_reset()` | 强制清除当前数据（不影响归档文件） |
 
@@ -233,7 +233,9 @@ FROM pg_lrstat_send_history ORDER BY ts;
 
 -- 5. 导出报告（HTML 包含图表+分析结论）
 SELECT lrstat_export('mig_20260924');
--- 返回 HTML 文本，用 \o report.html 保存后浏览器打开
+-- 返回报告文件的绝对路径（同时 NOTICE 提示），例如
+--   /var/lib/pgsql/data/pg_lrstat/exports/mig_20260924.html
+-- 浏览器直接打开即可；json 同理
 ```
 
 ## 8. 常见问题

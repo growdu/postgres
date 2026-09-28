@@ -17,6 +17,7 @@
 
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
@@ -194,19 +195,13 @@ gather_archived(LRExportData *d, const char *name)
 			memcpy(&d->entries[i], &ents[skip + i], sizeof(LRHistoryEntry));
 	}
 
-	/* rebuild anchor/last per target from the entries */
+	/* rebuild anchor/last per target: the ts and the LSNs must come
+	 * from the SAME sample — the first/last one with non-zero LSNs —
+	 * or dt and bytes drift apart and the average rate comes out wrong */
 	for (i = 0; i < d->n_targets; i++)
 	{
 		LRExportTarget *et = &d->targets[i];
 
-		for (j = 0; j < n_ents; j++)
-		{
-			if (ents[j].target_idx != et->ctl_idx)
-				continue;
-			if (et->anchor.send.ts == 0)
-				et->anchor.send.ts = ents[j].ts;
-			et->last.send.ts = ents[j].ts;
-		}
 		for (j = 0; j < n_ents; j++)
 		{
 			LRHistoryEntry *e = &ents[j];
@@ -215,21 +210,37 @@ gather_archived(LRExportData *d, const char *name)
 				continue;
 			if (et->kind == LR_RECV)
 			{
-				if (e->received_lsn && et->anchor.recv.received_lsn == 0)
+				bool valid = (e->received_lsn != 0 || e->applied_lsn != 0);
+
+				if (valid && et->anchor.recv.ts == 0)
+				{
+					et->anchor.recv.ts = e->ts;
 					et->anchor.recv.received_lsn = e->received_lsn;
-				if (e->applied_lsn && et->anchor.recv.applied_lsn == 0)
 					et->anchor.recv.applied_lsn = e->applied_lsn;
-				et->last.recv.received_lsn = e->received_lsn;
-				et->last.recv.applied_lsn = e->applied_lsn;
+				}
+				if (valid)
+				{
+					et->last.recv.ts = e->ts;
+					et->last.recv.received_lsn = e->received_lsn;
+					et->last.recv.applied_lsn = e->applied_lsn;
+				}
 			}
 			else
 			{
-				if (e->current_lsn && et->anchor.send.current_lsn == 0)
+				bool valid = (e->current_lsn != 0 || e->sent_lsn != 0);
+
+				if (valid && et->anchor.send.ts == 0)
+				{
+					et->anchor.send.ts = e->ts;
 					et->anchor.send.current_lsn = e->current_lsn;
-				if (e->sent_lsn && et->anchor.send.sent_lsn == 0)
 					et->anchor.send.sent_lsn = e->sent_lsn;
-				et->last.send.current_lsn = e->current_lsn;
-				et->last.send.sent_lsn = e->sent_lsn;
+				}
+				if (valid)
+				{
+					et->last.send.ts = e->ts;
+					et->last.send.current_lsn = e->current_lsn;
+					et->last.send.sent_lsn = e->sent_lsn;
+				}
 			}
 		}
 		et->has_prev = false;
@@ -768,6 +779,58 @@ build_html(LRExportData *d, LRAnalysis *a)
 	if (d->degraded) appendStringInfoString(s, " <b>[degraded]</b>");
 	appendStringInfoString(s, "</p>\n</div>\n");
 
+	/* per-target rates card */
+	appendStringInfoString(s,
+		"<div class='card'>\n<h2>Targets</h2>\n"
+		"<table><tr><th>target</th><th>side</th><th>state</th>"
+		"<th>avg MB/s</th><th>last LSN</th></tr>\n");
+	{
+		int i;
+
+		for (i = 0; i < d->n_targets; i++)
+		{
+			LRExportTarget *t = &d->targets[i];
+			bool		is_recv = (t->kind == LR_RECV);
+
+			if (is_recv)
+			{
+				double rdt = (double)(t->last.recv.ts - t->anchor.recv.ts) / 1e6;
+				double rmb = (double)(t->last.recv.received_lsn -
+									  t->anchor.recv.received_lsn) / MB_DIV;
+				double amb = (double)(t->last.recv.applied_lsn -
+									  t->anchor.recv.applied_lsn) / MB_DIV;
+
+				if (rdt <= 0) rdt = 1.0;
+				appendStringInfo(s, "<tr><td>%s</td><td>recv</td><td>%s</td>"
+								 "<td>recv %.2f / apply %.2f</td><td>%s</td></tr>\n",
+								 t->name,
+								 t->meta.worker_type[0] ? t->meta.worker_type : "-",
+								 rmb / rdt, amb / rdt,
+								 t->last.recv.applied_lsn ?
+								 lsn_str(t->last.recv.applied_lsn) : "-");
+			}
+			else
+			{
+				double dt = (double)(t->last.send.ts - t->anchor.send.ts) / 1e6;
+				double gmb = (double)(t->last.send.current_lsn -
+									  t->anchor.send.current_lsn) / MB_DIV;
+				double smb = (double)(t->last.send.sent_lsn -
+									  t->anchor.send.sent_lsn) / MB_DIV;
+
+				if (dt <= 0) dt = 1.0;
+				appendStringInfo(s, "<tr><td>%s</td><td>%s</td><td>%s</td>"
+								 "<td>gen %.2f / send %.2f</td><td>%s</td></tr>\n",
+								 t->name,
+								 t->kind == LR_RSEND ? "send (polled)" : "send",
+								 t->meta.state[0] ? t->meta.state : "-",
+								 gmb / dt, smb / dt,
+								 t->last.send.sent_lsn ?
+								 lsn_str(t->last.send.sent_lsn) : "-");
+			}
+		}
+	}
+	appendStringInfoString(s, "</table>\n</div>\n");
+
 	/* charts */
 	appendStringInfoString(s, "<div class='card'>\n");
 	svg_rates(s, d, a);
@@ -809,9 +872,31 @@ build_html(LRExportData *d, LRAnalysis *a)
 }
 
 /* ----------------------------------------------------------------
- * lrstat_export entry point
+ * lrstat_export entry point: writes the report to
+ * $PGDATA/pg_lrstat/exports/<name>.<format> and returns the path.
  * ----------------------------------------------------------------
  */
+
+/* only allow filesystem-safe characters in the report file name */
+static void
+sanitize_name(const char *in, char *out, Size outlen)
+{
+	Size		o = 0;
+
+	for (; *in && o + 1 < outlen; in++)
+	{
+		char		c = *in;
+
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+			out[o++] = c;
+		else
+			out[o++] = '_';
+	}
+	out[o] = '\0';
+	if (o == 0)
+		strlcpy(out, "session", outlen);
+}
 
 PG_FUNCTION_INFO_V1(lrstat_export);
 Datum
@@ -820,6 +905,12 @@ lrstat_export(PG_FUNCTION_ARGS)
 	text	   *name_arg = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
 	text	   *format_arg = PG_ARGISNULL(1) ? NULL : PG_GETARG_TEXT_PP(1);
 	char	   *format = format_arg ? text_to_cstring(format_arg) : "html";
+	char	   *sess = "session";
+	char	   *dir1;
+	char	   *dir2;
+	char	   *path;
+	char		safe[NAMEDATALEN];
+	FILE	   *f;
 	LRExportData data;
 	LRAnalysis analysis;
 	StringInfo result;
@@ -830,6 +921,13 @@ lrstat_export(PG_FUNCTION_ARGS)
 	if (!lrstat_ready())
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("pg_lrstat not loaded")));
+	if (strcmp(format, "json") != 0 && strcmp(format, "html") != 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("unsupported format '%s' (use 'html' or 'json')",
+							   format)));
+
+	if (name_arg != NULL)
+		sess = text_to_cstring(name_arg);
 
 	/*
 	 * Export by name: an archived session file wins when the name is not
@@ -841,7 +939,7 @@ lrstat_export(PG_FUNCTION_ARGS)
 		char name[NAMEDATALEN];
 		char cur[NAMEDATALEN];
 
-		strlcpy(name, text_to_cstring(name_arg), NAMEDATALEN);
+		strlcpy(name, sess, NAMEDATALEN);
 		SpinLockAcquire(&lrstat->session.mutex);
 		strlcpy(cur, lrstat->session.name, NAMEDATALEN);
 		SpinLockRelease(&lrstat->session.mutex);
@@ -858,12 +956,35 @@ lrstat_export(PG_FUNCTION_ARGS)
 
 	if (strcmp(format, "json") == 0)
 		result = build_json(&data, &analysis);
-	else if (strcmp(format, "html") == 0)
-		result = build_html(&data, &analysis);
 	else
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("unsupported format '%s' (use 'html' or 'json')",
-							   format)));
+		result = build_html(&data, &analysis);
 
-	PG_RETURN_DATUM(CStringGetTextDatum(result->data));
+	/* write the report to $PGDATA/pg_lrstat/exports/<name>.<format> */
+	sanitize_name(sess, safe, sizeof(safe));
+	dir1 = psprintf("%s/pg_lrstat", DataDir);
+	dir2 = psprintf("%s/" EXPORT_DIR, DataDir);
+	if (MakePGDirectory(dir1) < 0 && errno != EEXIST)
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("pg_lrstat: could not create directory %s", dir1)));
+	if (MakePGDirectory(dir2) < 0 && errno != EEXIST)
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("pg_lrstat: could not create directory %s", dir2)));
+
+	path = psprintf("%s/" EXPORT_DIR "/%s.%s", DataDir, safe, format);
+	f = AllocateFile(path, PG_BINARY_W);
+	if (f == NULL)
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("pg_lrstat: could not open report file %s", path)));
+	if (fwrite(result->data, 1, result->len, f) != result->len)
+	{
+		FreeFile(f);
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("pg_lrstat: could not write report file %s", path)));
+	}
+	if (FreeFile(f) != 0)
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("pg_lrstat: could not close report file %s", path)));
+
+	ereport(NOTICE, (errmsg("pg_lrstat: report written to %s", path)));
+	PG_RETURN_DATUM(CStringGetTextDatum(path));
 }
