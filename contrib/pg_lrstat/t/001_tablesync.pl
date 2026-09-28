@@ -155,4 +155,56 @@ is($node_subscriber->safe_psql('postgres',
 	q(SELECT length(lrstat_export('sync_sess', 'json')) > 0)),
 	't', 'json export works after table sync');
 
+# ---- session-scoped data --------------------------------------------
+# History rows are stamped with the session they belong to; a second
+# (persist) session must still be exportable by name after a third
+# session has wiped the in-memory history.
+
+$result = $node_subscriber->poll_query_until(
+	'postgres', qq(
+	SELECT count(*) > 0 FROM pg_lrstat_recv_history
+	WHERE session_name = 'sync_sess'
+));
+is($result, 1, 'history rows carry the session name');
+
+# a persist session with some load to aggregate
+$node_publisher->safe_psql('postgres',
+	q(INSERT INTO lrstat_test SELECT g, repeat(md5(g::text), 50)
+	  FROM generate_series(100001, 110000) g));
+$node_subscriber->safe_psql('postgres',
+	"SELECT lrstat_start('archived', true)");
+$result = $node_subscriber->poll_query_until(
+	'postgres', qq(
+	SELECT count(*) > 0 FROM pg_lrstat_recv_history
+	WHERE session_name = 'archived'
+));
+is($result, 1, 'second session stamped in history');
+is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop('archived')"),
+	'archived', 'persist session stopped');
+
+# session_stat aggregates the current in-memory session
+$result = $node_subscriber->safe_psql('postgres', qq(
+	SELECT count(*) > 0 FROM pg_lrstat_session_stat
+	WHERE session_name = 'archived' AND n_samples > 0
+));
+is($result, 't', 'session_stat aggregates the archived session');
+
+# a third session resets the in-memory history; the archived session
+# remains queryable by name through its file
+$node_subscriber->safe_psql('postgres', "SELECT lrstat_start('wiper')");
+sleep(3);
+is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop('wiper')"),
+	'wiper', 'third session stopped');
+is($node_subscriber->safe_psql('postgres', qq(
+	SELECT count(*) = 0 FROM pg_lrstat_recv_history
+	WHERE session_name = 'archived')),
+	't', 'memory history reset by newer session');
+my $archived_json = $node_subscriber->safe_psql('postgres',
+	"SELECT lrstat_export('archived', 'json')");
+ok(index($archived_json, '"name": "archived"') >= 0,
+	'archived session exported by name from its file');
+ok(index($archived_json, '"samples": [') >= 0
+	&& $archived_json =~ /"kind": "(send|recv)"/,
+	'archived export contains raw history samples');
+
 done_testing();

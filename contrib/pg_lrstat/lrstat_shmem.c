@@ -49,6 +49,14 @@ entry_base(void)
 	return target_base() + (Size) lrstat->ntargets * target_stride();
 }
 
+/* Session registry starts after the history array */
+static char *
+sessions_base(void)
+{
+	return entry_base() + (Size) lrstat->ntargets * (Size) lrstat->ring_len *
+		sizeof(LRHistoryEntry);
+}
+
 Size
 lrstat_shmem_size(void)
 {
@@ -56,7 +64,8 @@ lrstat_shmem_size(void)
 	Size targets = (Size) lrstat_max_targets * MAXALIGN(sizeof(LRTargetCtl));
 	Size entries = (Size) lrstat_max_targets * (Size) lrstat_ring_len *
 		sizeof(LRHistoryEntry);
-	return header + targets + entries;
+	Size sessions = (Size) LRSTAT_MAX_SESSIONS * sizeof(LRSessionRegEntry);
+	return header + targets + entries + sessions;
 }
 
 void
@@ -114,6 +123,9 @@ lrstat_shmem_startup(void)
 		SpinLockInit(&t->mutex);
 	}
 
+	for (i = 0; i < LRSTAT_MAX_SESSIONS; i++)
+		MemSet(lrstat_sessionreg_at(i), 0, sizeof(LRSessionRegEntry));
+
 	/* Recover interrupted sessions from files */
 	lrstat_store_recover();
 }
@@ -138,6 +150,90 @@ lrstat_history_at(int idx)
 {
 	return (LRHistoryEntry *) (entry_base() +
 							   (Size) idx * sizeof(LRHistoryEntry));
+}
+
+LRSessionRegEntry *
+lrstat_sessionreg_at(int i)
+{
+	return (LRSessionRegEntry *) (sessions_base() +
+								  (Size) i * sizeof(LRSessionRegEntry));
+}
+
+/* map a session id to its name; false when unknown or idle (id 0) */
+bool
+lrstat_session_name(uint64 session_id, char *out, Size outlen)
+{
+	int i;
+
+	if (!lrstat_ready() || session_id == 0)
+		return false;
+
+	for (i = 0; i < LRSTAT_MAX_SESSIONS; i++)
+	{
+		LRSessionRegEntry *r = lrstat_sessionreg_at(i);
+
+		SpinLockAcquire(&lrstat->session.mutex);
+		if (r->in_use && r->session_id == session_id)
+		{
+			strlcpy(out, r->name, outlen);
+			SpinLockRelease(&lrstat->session.mutex);
+			return true;
+		}
+		SpinLockRelease(&lrstat->session.mutex);
+	}
+	return false;
+}
+
+/* remember a session in the registry ring (oldest slot reused) */
+void
+lrstat_sessionreg_add(uint64 session_id, const char *name,
+					  TimestampTz start_ts)
+{
+	LRSessionRegEntry *victim = NULL;
+	int i;
+
+	if (!lrstat_ready())
+		return;
+
+	SpinLockAcquire(&lrstat->session.mutex);
+	victim = lrstat_sessionreg_at(0);
+	for (i = 0; i < LRSTAT_MAX_SESSIONS; i++)
+	{
+		LRSessionRegEntry *r = lrstat_sessionreg_at(i);
+
+		if (!r->in_use)
+		{ victim = r; break; }
+		if (r->start_ts < victim->start_ts)
+			victim = r;
+	}
+	victim->in_use = true;
+	victim->session_id = session_id;
+	strlcpy(victim->name, name, NAMEDATALEN);
+	victim->start_ts = start_ts;
+	victim->stop_ts = 0;
+	SpinLockRelease(&lrstat->session.mutex);
+}
+
+void
+lrstat_sessionreg_close(uint64 session_id, TimestampTz stop_ts)
+{
+	int i;
+
+	if (!lrstat_ready())
+		return;
+
+	SpinLockAcquire(&lrstat->session.mutex);
+	for (i = 0; i < LRSTAT_MAX_SESSIONS; i++)
+	{
+		LRSessionRegEntry *r = lrstat_sessionreg_at(i);
+
+		if (r->in_use && r->session_id == session_id)
+		{
+			r->stop_ts = stop_ts;
+			break;
+		}
+	}
+	SpinLockRelease(&lrstat->session.mutex);
 }
 
 static bool
@@ -346,6 +442,10 @@ lrstat_session_start(const char *name)
 	lrstat->session.degraded = false;
 	SpinLockRelease(&lrstat->session.mutex);
 
+	/* remember the session so history rows can be mapped back to it */
+	lrstat_sessionreg_add(lrstat->session.session_id, name,
+						  lrstat->session.start_ts);
+
 	/* reset all targets and session log */
 	for (i = 0; i < lrstat->ntargets; i++)
 	{
@@ -378,6 +478,8 @@ lrstat_session_stop(void)
 	lrstat->session.running = false;
 	lrstat->session.stop_ts = GetCurrentTimestamp();
 	SpinLockRelease(&lrstat->session.mutex);
+	lrstat_sessionreg_close(lrstat->session.session_id,
+							lrstat->session.stop_ts);
 
 	/* Finalize session file only if it exists (persist session) */
 	{

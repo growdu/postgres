@@ -274,10 +274,16 @@ lrstat_record_history(void)
 {
 	LRHistoryEntry *newents = NULL;
 	int n_new = 0;
+	uint64 session_id;
 	int i;
 
 	if (!lrstat_ready())
 		return;
+
+	/* stamp entries with the running session (0 when idle) */
+	SpinLockAcquire(&lrstat->session.mutex);
+	session_id = lrstat->session.running ? lrstat->session.session_id : 0;
+	SpinLockRelease(&lrstat->session.mutex);
 
 	if (recorded_ts == NULL)
 	{
@@ -317,6 +323,7 @@ lrstat_record_history(void)
 			continue;
 
 		lrstat_history_from_sample(&e, i, &last);
+		e.session_id = session_id;
 		lrstat_append_history_entry(&e);
 		recorded_ts[i] = last.send.ts;
 		if (newents != NULL)

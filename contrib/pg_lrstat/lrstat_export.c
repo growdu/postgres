@@ -138,6 +138,110 @@ gather_data(LRExportData *d)
 	}
 }
 
+/*
+ * Build export data from an archived session file (export by name).
+ * Reconstructs per-target anchor/last samples from the first/last
+ * history entries of each target; passthrough metadata is not stored
+ * in files and stays empty.
+ */
+static bool
+gather_archived(LRExportData *d, const char *name)
+{
+	LRHistoryEntry *ents = NULL;
+	LRSessTargetInfo *tinfos = NULL;
+	int n_ents = 0, n_tinfos = 0;
+	int64		sid;
+	int			i, j;
+
+	MemSet(d, 0, sizeof(LRExportData));
+
+	if (lrstat_store_load(name, &sid, d->session_name, NAMEDATALEN,
+						  &d->start_ts, &d->stop_ts,
+						  &d->truncated, &d->degraded,
+						  &ents, &n_ents,
+						  &tinfos, &n_tinfos) != 0)
+		return false;
+
+	d->session_running = false;
+
+	/* targets from the file footer */
+	d->n_targets = Min(n_tinfos, 64);
+	for (i = 0; i < d->n_targets; i++)
+	{
+		LRExportTarget *et = &d->targets[i];
+
+		et->ctl_idx = tinfos[i].target_idx;
+		et->kind = (LRTargetKind) tinfos[i].kind;
+		strlcpy(et->name, tinfos[i].name, NAMEDATALEN);
+		/* the footer does not store worker_char/relid; treat every
+		 * archived recv target as an apply-leader candidate */
+		if (et->kind == LR_RECV)
+		{
+			et->worker_char = 'a';
+			et->relid = 0;
+		}
+	}
+
+	/* history copy (most recent EXPORT_MAX_HISTORY), chronological */
+	d->total_entries = n_ents;
+	d->n_entries = Min(n_ents, EXPORT_MAX_HISTORY);
+	if (d->n_entries > 0)
+	{
+		int skip = n_ents - d->n_entries;
+
+		d->entries = palloc(d->n_entries * sizeof(LRHistoryEntry));
+		for (i = 0; i < d->n_entries; i++)
+			memcpy(&d->entries[i], &ents[skip + i], sizeof(LRHistoryEntry));
+	}
+
+	/* rebuild anchor/last per target from the entries */
+	for (i = 0; i < d->n_targets; i++)
+	{
+		LRExportTarget *et = &d->targets[i];
+
+		for (j = 0; j < n_ents; j++)
+		{
+			if (ents[j].target_idx != et->ctl_idx)
+				continue;
+			if (et->anchor.send.ts == 0)
+				et->anchor.send.ts = ents[j].ts;
+			et->last.send.ts = ents[j].ts;
+		}
+		for (j = 0; j < n_ents; j++)
+		{
+			LRHistoryEntry *e = &ents[j];
+
+			if (e->target_idx != et->ctl_idx)
+				continue;
+			if (et->kind == LR_RECV)
+			{
+				if (e->received_lsn && et->anchor.recv.received_lsn == 0)
+					et->anchor.recv.received_lsn = e->received_lsn;
+				if (e->applied_lsn && et->anchor.recv.applied_lsn == 0)
+					et->anchor.recv.applied_lsn = e->applied_lsn;
+				et->last.recv.received_lsn = e->received_lsn;
+				et->last.recv.applied_lsn = e->applied_lsn;
+			}
+			else
+			{
+				if (e->current_lsn && et->anchor.send.current_lsn == 0)
+					et->anchor.send.current_lsn = e->current_lsn;
+				if (e->sent_lsn && et->anchor.send.sent_lsn == 0)
+					et->anchor.send.sent_lsn = e->sent_lsn;
+				et->last.send.current_lsn = e->current_lsn;
+				et->last.send.sent_lsn = e->sent_lsn;
+			}
+		}
+		et->has_prev = false;
+	}
+
+	if (ents != NULL)
+		pfree(ents);
+	if (tinfos != NULL)
+		pfree(tinfos);
+	return true;
+}
+
 /* ----------------------------------------------------------------
  * Analysis computation
  * ----------------------------------------------------------------
@@ -727,17 +831,29 @@ lrstat_export(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("pg_lrstat not loaded")));
 
-	/* TODO: if a name is given and differs from current, read from file */
+	/*
+	 * Export by name: an archived session file wins when the name is not
+	 * the current session (its in-memory history was reset by a newer
+	 * session); otherwise export the current session's live data.
+	 */
 	if (name_arg != NULL)
 	{
 		char name[NAMEDATALEN];
-		strlcpy(name, text_to_cstring(name_arg), NAMEDATALEN);
-		if (strcmp(name, lrstat->session.name) != 0)
-			ereport(NOTICE, (errmsg("exporting current session %s (archived reads P4)",
-									 lrstat->session.name)));
-	}
+		char cur[NAMEDATALEN];
 
-	gather_data(&data);
+		strlcpy(name, text_to_cstring(name_arg), NAMEDATALEN);
+		SpinLockAcquire(&lrstat->session.mutex);
+		strlcpy(cur, lrstat->session.name, NAMEDATALEN);
+		SpinLockRelease(&lrstat->session.mutex);
+
+		if (strcmp(name, cur) != 0 && !gather_archived(&data, name))
+			gather_data(&data);    /* no such file: fall back to current */
+		else if (strcmp(name, cur) == 0)
+			gather_data(&data);
+	}
+	else
+		gather_data(&data);
+
 	compute_analysis(&data, &analysis);
 
 	if (strcmp(format, "json") == 0)

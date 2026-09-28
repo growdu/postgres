@@ -156,8 +156,10 @@ lrstat_store_append(int n_entries, LRHistoryEntry *entries)
 
 /*
  * Finalize a session file (stop or interrupted).
- * Rewrites the header with final state; the entry count is derived
- * from the file size so wrapped in-memory rings don't undercount.
+ * Appends a footer mapping target_idx -> target name (so the archived
+ * session can be exported by name after restart), then rewrites the
+ * header with final state; the entry count is derived from the file
+ * size so wrapped in-memory rings don't undercount.
  */
 void
 lrstat_store_finalize(const char *name, const char *state,
@@ -179,6 +181,46 @@ lrstat_store_finalize(const char *name, const char *state,
 		return;
 	}
 
+	/* footer: magic + live target names, appended at end of file */
+	{
+		int32		foot[2];
+		int			n = 0, i;
+		LRSessTargetInfo *infos;
+
+		infos = palloc(lrstat->ntargets * sizeof(LRSessTargetInfo));
+		for (i = 0; i < lrstat->ntargets; i++)
+		{
+			LRTargetCtl *t = lrstat_target_at(i);
+
+			SpinLockAcquire(&t->mutex);
+			if (t->in_use)
+			{
+				infos[n].target_idx = i;
+				infos[n].kind = t->kind;
+				strlcpy(infos[n].name, t->name, NAMEDATALEN);
+				n++;
+			}
+			SpinLockRelease(&t->mutex);
+		}
+
+	/*
+	 * Footer layout: [target infos][magic, n] with the magic at the very
+	 * end of the file, so a reader can find it from EOF.
+	 */
+	if (lseek(fd, 0, SEEK_END) >= 0)
+	{
+		if (n == 0 ||
+			write(fd, infos, n * sizeof(LRSessTargetInfo)) ==
+			(size_t)(n * sizeof(LRSessTargetInfo)))
+		{
+			foot[0] = LRSTAT_MAGIC;
+			foot[1] = n;
+			write(fd, foot, sizeof(foot));
+		}
+	}
+	pfree(infos);
+	}
+
 	strlcpy(hdr.state, state, sizeof(hdr.state));
 	hdr.stop_ts = GetCurrentTimestamp();
 	hdr.n_targets = lrstat->ntargets;
@@ -198,6 +240,115 @@ lrstat_store_finalize(const char *name, const char *state,
 
 	pg_fsync(fd);
 	CloseTransientFile(fd);
+}
+
+/*
+ * Read an archived session file for export-by-name.  All out-parameters
+ * except entries/targets may be NULL.  Returns 0 on success, -1 if the
+ * file is missing or unreadable.
+ */
+int
+lrstat_store_load(const char *name,
+				  int64 *session_id, char *sess_name, int sess_name_len,
+				  TimestampTz *start_ts, TimestampTz *stop_ts,
+				  bool *truncated, bool *degraded,
+				  LRHistoryEntry **entries, int *n_entries,
+				  LRSessTargetInfo **targets, int *n_targets)
+{
+	char	   *path = lrstat_file_path(name);
+	LRFileHeader hdr;
+	struct stat st;
+	int			fd;
+	int32		foot[2] = {0, 0};
+	off_t		entries_end;
+
+	fd = OpenTransientFile(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	if (fstat(fd, &st) != 0 ||
+		read(fd, &hdr, sizeof(hdr)) != sizeof(hdr) ||
+		hdr.magic != LRSTAT_MAGIC ||
+		hdr.layout_version != LRSTAT_LAYOUT_VERSION)
+	{
+		CloseTransientFile(fd);
+		return -1;
+	}
+
+	/*
+	 * Optional footer at EOF: [target infos][magic, n].  The magic sits in
+	 * the last 8 bytes, so probe those first, then back up for the infos.
+	 */
+	entries_end = st.st_size;
+	if (st.st_size >= (off_t) (sizeof(hdr) + sizeof(foot)))
+	{
+		if (lseek(fd, -(off_t) sizeof(foot), SEEK_END) >= 0 &&
+			read(fd, foot, sizeof(foot)) == sizeof(foot) &&
+			foot[0] == LRSTAT_MAGIC &&
+			foot[1] >= 0 && foot[1] <= lrstat->ntargets &&
+			st.st_size >= (off_t) (sizeof(hdr) + sizeof(foot) +
+								   (off_t) foot[1] * sizeof(LRSessTargetInfo)))
+		{
+			entries_end = st.st_size - sizeof(foot) -
+				(off_t) foot[1] * sizeof(LRSessTargetInfo);
+			if (targets != NULL && foot[1] > 0)
+			{
+				*targets = palloc(foot[1] * sizeof(LRSessTargetInfo));
+				if (lseek(fd, entries_end, SEEK_SET) >= 0 &&
+					read(fd, *targets, foot[1] * sizeof(LRSessTargetInfo)) ==
+					(size_t) (foot[1] * sizeof(LRSessTargetInfo)))
+				{
+					*n_targets = foot[1];
+				}
+				else
+				{
+					pfree(*targets);
+					*targets = NULL;
+					*n_targets = 0;
+					entries_end = st.st_size;    /* footer unreadable */
+				}
+			}
+		}
+	}
+
+	if (entries != NULL && entries_end > (off_t) sizeof(hdr))
+	{
+		int			n = (int)((entries_end - sizeof(hdr)) /
+							   sizeof(LRHistoryEntry));
+
+		if (n > 0)
+		{
+			*entries = palloc(n * sizeof(LRHistoryEntry));
+			if (lseek(fd, sizeof(hdr), SEEK_SET) >= 0 &&
+				read(fd, *entries, n * sizeof(LRHistoryEntry)) ==
+				(size_t) (n * sizeof(LRHistoryEntry)))
+			{
+				*n_entries = n;
+			}
+			else
+			{
+				pfree(*entries);
+				*entries = NULL;
+				*n_entries = 0;
+			}
+		}
+	}
+
+	CloseTransientFile(fd);
+
+	if (session_id != NULL)
+		*session_id = (int64) hdr.session_id;
+	if (sess_name != NULL)
+		strlcpy(sess_name, hdr.name, sess_name_len);
+	if (start_ts != NULL)
+		*start_ts = hdr.start_ts;
+	if (stop_ts != NULL)
+		*stop_ts = hdr.stop_ts;
+	if (truncated != NULL)
+		*truncated = hdr.truncated;
+	if (degraded != NULL)
+		*degraded = hdr.degraded;
+	return 0;
 }
 
 /*

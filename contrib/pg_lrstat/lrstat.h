@@ -25,12 +25,14 @@
 #include "utils/pg_lsn.h"
 
 #define LRSTAT_MAGIC             0x4C525354   /* "LRST" */
-#define LRSTAT_LAYOUT_VERSION    2
+#define LRSTAT_LAYOUT_VERSION    3
 
 #define LR_TEXT_LEN     64
 #define LR_STATE_LEN    16
 /* worker_type: apply / parallel apply / table sync / recovery */
 #define LR_WTYPE_LEN    24
+/* remembered sessions (name -> id mapping for views) */
+#define LRSTAT_MAX_SESSIONS  16
 
 /*
  * Target kinds: send side (SEND), recv side (RECV), remote-polled
@@ -145,6 +147,7 @@ typedef struct LRHistoryEntry
 {
 	TimestampTz ts;
 	int32       target_idx;
+	uint64      session_id;         /* 0 = recorded outside any session */
 	/* send-side LSNs (SEND / RSEND targets) */
 	XLogRecPtr  current_lsn;        /* C0 */
 	XLogRecPtr  sent_lsn;           /* C2 */
@@ -158,8 +161,32 @@ typedef struct LRHistoryEntry
 	/* recv-side LSNs (RECV targets) */
 	XLogRecPtr  received_lsn;       /* C3' */
 	XLogRecPtr  applied_lsn;        /* C5' */
-	XLogRecPtr  local_wal_lsn;      /* recv pg_current_wal_lsn() */
+	XLogRecPtr  local_wal_lsn;      /* recv-side pg_current_wal_lsn() */
 } LRHistoryEntry;
+
+/*
+ * Remembered session (registry ring in shared memory).  Lets views map
+ * history rows back to the session they belong to.
+ */
+typedef struct LRSessionRegEntry
+{
+	bool        in_use;
+	uint64      session_id;
+	char        name[NAMEDATALEN];
+	TimestampTz start_ts;
+	TimestampTz stop_ts;            /* 0 while running */
+} LRSessionRegEntry;
+
+/*
+ * Target identity written to the session file footer at stop, so an
+ * archived session can be exported by name after a restart.
+ */
+typedef struct LRSessTargetInfo
+{
+	int32       target_idx;
+	int32       kind;              /* LRTargetKind */
+	char        name[NAMEDATALEN];
+} LRSessTargetInfo;
 
 /*
  * Global session state.
@@ -183,14 +210,16 @@ typedef struct LRSessionState
  *   [LRSessionState header]
  *   [LRTargetCtl array (max_targets)]
  *   [LRHistoryEntry array (session_max_samples × max_targets)]
+ *   [LRSessionRegEntry array (LRSTAT_MAX_SESSIONS)]
  */
 typedef struct LRStatShared
 {
 	LRSessionState session;
 	int         ntargets;
 	int         ring_len;           /* session_max_samples */
-	int         n_entries;         /* session log write position (worker only) */
-	/* targets and session entries follow, see lrstat_target_at/_entry_at */
+	int         n_entries;         /* history write cursor (worker only) */
+	/* targets, history entries and session registry follow, see
+	 * lrstat_target_at / lrstat_history_at / lrstat_sessionreg_at */
 } LRStatShared;
 
 /*
@@ -223,6 +252,12 @@ extern void lrstat_note_preload(void);
 extern bool lrstat_ready(void);
 extern LRTargetCtl *lrstat_target_at(int i);
 extern LRHistoryEntry *lrstat_history_at(int idx);
+extern LRSessionRegEntry *lrstat_sessionreg_at(int i);
+/* map a session id to its name (NULL when unknown); copies under lock */
+extern bool lrstat_session_name(uint64 session_id, char *out, Size outlen);
+extern void lrstat_sessionreg_add(uint64 session_id, const char *name,
+								  TimestampTz start_ts);
+extern void lrstat_sessionreg_close(uint64 session_id, TimestampTz stop_ts);
 extern LRTargetCtl *lrstat_find_or_create(LRTargetKind kind, const char *name,
 										  Oid relid, char worker_char);
 extern bool lrstat_lookup(LRTargetKind kind, const char *name,
@@ -256,6 +291,13 @@ extern int  lrstat_store_create(const char *name, uint64 session_id,
 extern void lrstat_store_append(int n_entries, LRHistoryEntry *entries);
 extern void lrstat_store_finalize(const char *name, const char *state,
 								  bool truncated, bool degraded);
+/* read an archived session file; returns 0 on success */
+extern int lrstat_store_load(const char *name,
+							 int64 *session_id, char *sess_name, int sess_name_len,
+							 TimestampTz *start_ts, TimestampTz *stop_ts,
+							 bool *truncated, bool *degraded,
+							 LRHistoryEntry **entries, int *n_entries,
+							 LRSessTargetInfo **targets, int *n_targets);
 extern void lrstat_store_recover(void);
 extern int  lrstat_store_list(char ***names_out);
 extern int  lrstat_store_delete(const char *name);

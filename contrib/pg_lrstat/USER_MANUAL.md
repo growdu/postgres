@@ -59,15 +59,15 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 | --- | --- | --- |
 | `lrstat_start(name, persist)` | `SELECT lrstat_start('压测A', true)` | 开始会话。persist 默认 false（不写文件） |
 | `lrstat_stop(name)` | `SELECT lrstat_stop('压测A')` | 结束会话。名字必须与 start 一致 |
-| `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告。format='html'（默认）或 'json' |
+| `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告。format='html'（默认）或 'json'。传归档会话名（persist 会话）时直接读会话文件，即使之后又跑过新会话 |
 | `lrstat_delete(name)` | `SELECT lrstat_delete('压测A')` | 删除已归档会话文件（persist 会话） |
 | `pg_lrstat_reset()` | `SELECT pg_lrstat_reset()` | 强制清除当前数据（不影响归档文件） |
 
 全部要求 superuser。
 
-## 4. 视图（只有 6 个）
+## 4. 视图（只有 7 个）
 
-日常巡检**只需要盯 `cluster_stat` 一个**。
+日常巡检**只需要盯 `cluster_stat` 一个**；按会话名查历史用 `session_stat`。
 
 ### 4.1 `pg_lrstat_info` — 健康自检（1 行）
 
@@ -87,7 +87,7 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 
 ### 4.2 `pg_lrstat_send_stat` — 发送端（一连接一行）
 
-关键列（完整 37 列见 `\d pg_lrstat_send_stat`）：
+关键列（完整 38 列见 `\d pg_lrstat_send_stat`；三个 stat 视图的首列都是 `session_name`——当前会话名，用于确认这行数据属于哪次测量）：
 
 | 列组 | 列 | 看什么 |
 | --- | --- | --- |
@@ -123,6 +123,7 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 
 | 列 | 含义 |
 | --- | --- |
+| `session_name` | 该样本所属的会话名；NULL = 会话之外一直空闲记录的样本 |
 | `name` `ts` | 哪个目标、哪个采样轮 |
 | `current_lsn` | 发送端当前 WAL 生成位点 |
 | `sent_lsn` | 已发给接收端的位点——与上一行作差即该轮发送量 |
@@ -135,12 +136,30 @@ SELECT loaded FROM pg_lrstat_info;  -- 必须为 t
 
 | 列 | 含义 |
 | --- | --- |
-| `name` `ts` | 同上 |
+| `session_name` `name` `ts` | 同上 |
 | `received_lsn` | 已从网络收到的位点 |
 | `applied_lsn` | 已应用的位点（提交边界）——与上一行作差即该轮应用量 |
 | `local_wal_lsn` | 接收端本地 WAL 写入位点 |
 
-> 历史环形写满后覆盖最旧样本（`pg_lrstat_info.session_truncated = true`），始终保留最近的记录。`lrstat_start` 会清空历史重新开始。
+> 历史环形写满后覆盖最旧样本（`pg_lrstat_info.session_truncated = true`），始终保留最近的记录。`lrstat_start` 会清空历史重新开始——**旧会话的数据只有 persist 会话留了文件，用 `lrstat_export(name)` 按名导出**。
+
+### 4.7 `pg_lrstat_session_stat` — 按会话汇总（回答"那次会话跑得怎么样"）
+
+对 history 按会话 × 目标聚合，一行一侧。会话结束后数据仍在（只要还在内存环形里）；stat 类视图（send/recv/cluster_stat）只反映当前会话窗口，**看历史会话用这个**。
+
+| 列 | 含义 |
+| --- | --- |
+| `session_name` `name` | 哪个会话、哪个目标 |
+| `n_samples` `first_ts` `last_ts` | 样本数与起止时间（即会话内实际采样时长） |
+| `gen_mb` `sent_mb` / `received_mb` `applied_mb` | 会话期间累计生成/发送、收到/应用量（MB） |
+| `gen_mbps` `send_mbps` / `recv_mbps` `apply_mbps` | 会话平均速率（MB/s） |
+
+```sql
+-- 例：查所有会话的平均应用速率排行
+SELECT session_name, name, round(applied_mb,1) 应用MB, apply_mbps 平均MBps
+FROM pg_lrstat_session_stat WHERE apply_mbps IS NOT NULL
+ORDER BY apply_mbps DESC;
+```
 
 ## 5. 速率是怎么算的
 

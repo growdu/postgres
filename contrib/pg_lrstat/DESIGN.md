@@ -165,7 +165,7 @@ shared_preload_libraries=pg_lrstat        shared_preload_libraries=pg_lrstat
 │  → SEND 目标          │ ◄────────────── │  凭连接串轮询发送端            │
 │  (逻辑+物理)           │  (远端轮询)      │  → RSEND 目标 + 两端合成       │
 └─────────┬────────────┘                 └──────────┬──────────────────┘
-          ▼ 共享内存（会话状态+目标+历史环形数组）       ▼
+          ▼ 共享内存（会话状态+目标+历史环形+会话注册表）   ▼
           └──────────────► SQL 视图 / 会话文件 / 报告导出 ◄┘
 ```
 
@@ -281,7 +281,7 @@ typedef struct LRHistoryEntry
 } LRHistoryEntry;                   /* 不存差值：差值由视图/导出按相邻样本现算    */
 ```
 
-**空间公式**：`MAXALIGN(头) + max_targets × MAXALIGN(sizeof(LRTargetCtl)+3×sizeof(LRSample)) + session_max_samples × max_targets × sizeof(LRHistoryEntry)`。默认（32 目标 / 2880 间隔）≈ 0.3MB + 10.3MB ≈ **11MB**，postmaster 启动期一次预留。
+**空间公式**：`MAXALIGN(头) + max_targets × MAXALIGN(sizeof(LRTargetCtl)+3×sizeof(LRSample)) + session_max_samples × max_targets × sizeof(LRHistoryEntry) + 16 × sizeof(LRSessionRegEntry)`。历史条目含 session_id（会话盖章，0=会话外）；会话注册表（16 槽环形）把 session_id 映射回会话名，视图据此输出 session_name 列。默认（32 目标 / 2880 间隔）≈ 0.3MB + 11MB ≈ **11MB**，postmaster 启动期一次预留。
 
 ### 4.4 会话机制
 
@@ -309,7 +309,7 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 3. 远端轮询（§4.5）+ 应用位点回填（§4.6）只在 running 时执行
 ```
 
-**stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`；persist 会话文件头置 `state=stopped`（条目数按文件大小回填）。停止后内存历史与视图继续可查，直到下一次 start 清零。
+**stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`；persist 会话文件追加**尾部目标表**（target_idx → 名字/类型，magic 落在文件末 8 字节便于从 EOF 定位）后置头 `state=stopped`（条目数按文件大小回填）。停止后内存历史与视图继续可查，直到下一次 start 清零；**归档文件支持 `lrstat_export(name)` 按名重建报告**（从条目恢复每目标首/末样本作锚点，重启后亦然）。
 
 **竞态规则**：状态转换与采样轮经 `LRSessionState.mutex` + worker latch 协调——先置状态再唤醒；增量以该轮醒来时读到的状态为准，首/末间隔并入或剔除一个采样周期属可接受误差，`duration` 以实际样本区间为准。
 
@@ -406,8 +406,9 @@ pg_lrstat_reset() → void
 | `pg_lrstat_send_stat` | 发送端一连接一行 | 发送端全量：位点 + 积压 + 双速率（gen/send/spill/stream） |
 | `pg_lrstat_recv_stat` | 接收端一 worker/恢复进程一行 | 接收端全量：位点 + 积压 + 双速率（recv/apply/local_wal） |
 | `pg_lrstat_cluster_stat` | 一复制对一行 | **唯一能看到两端合成数据的视图**：双端位点/速率/积压/追平预估 |
-| `pg_lrstat_send_history` | 发送端一目标一轮一行 | 发送端全量原始 LSN 序列（始终记录，画曲线） |
-| `pg_lrstat_recv_history` | 接收端一目标一轮一行 | 接收端全量原始 LSN 序列（始终记录，画曲线） |
+| `pg_lrstat_send_history` | 发送端一目标一轮一行 | 发送端全量原始 LSN 序列（始终记录，画曲线），首列 session_name 标归属 |
+| `pg_lrstat_recv_history` | 接收端一目标一轮一行 | 接收端全量原始 LSN 序列（始终记录，画曲线），首列 session_name 标归属 |
+| `pg_lrstat_session_stat` | 一会话×目标×侧一行 | 纯 SQL 视图：对 history 按会话聚合（总量 MB、平均 MB/s、样本区间）——按会话名查历史统计的入口 |
 
 - `stat` 视图**会话期间实时更新**（显示最新样本+当前速率），**stop 后冻结**（显示会话最终值）——不需要区分 live/report 两套；
 - `history` 视图**stop 后可查**（会话期内逐间隔数据）；持久会话跨重启可查；

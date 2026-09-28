@@ -66,6 +66,34 @@ static void lr_emit(ReturnSetInfo *rsinfo, LRRow *r)
 static int64 lsn_diff(XLogRecPtr a, XLogRecPtr b)
 { int64 d = (int64)a - (int64)b; return d < 0 ? 0 : d; }
 
+/* current session name (NULL when no session was ever started) */
+static void
+put_current_session(LRRow *r)
+{
+    char name[NAMEDATALEN];
+
+    name[0] = '\0';
+    if (lrstat_ready())
+    {
+        SpinLockAcquire(&lrstat->session.mutex);
+        strlcpy(name, lrstat->session.name, NAMEDATALEN);
+        SpinLockRelease(&lrstat->session.mutex);
+    }
+    lr_put_text(r, name);
+}
+
+/* session name a history entry belongs to (NULL outside sessions) */
+static void
+put_entry_session(LRRow *r, uint64 session_id)
+{
+    char name[NAMEDATALEN];
+
+    if (lrstat_session_name(session_id, name, sizeof(name)))
+        lr_put_text(r, name);
+    else
+        lr_put_text(r, NULL);
+}
+
 /* ---- rate helpers ---- */
 
 typedef int64 (*RateFn)(const LRSample *);
@@ -235,6 +263,7 @@ emit_send(const char *name, char wc, Oid relid,
     LRRow r;
 
     lr_row_reset(&r);
+    put_current_session(&r);
     lr_put_text(&r, name);
     lr_put_text(&r, m->plugin);
     lr_put_bool(&r, m->temporary);
@@ -317,6 +346,7 @@ emit_recv(const char *name, char wc, Oid relid,
     LRRow r;
 
     lr_row_reset(&r);
+    put_current_session(&r);
     lr_put_text(&r, name);
     lr_put_text(&r, m->worker_type);
     lr_put_pid(&r, m->worker_pid);
@@ -407,6 +437,7 @@ emit_cluster(const char *name, char wc, Oid relid,
         app_ao = (a->recv.ts > 0) && calc_rate(l, a, r_appl, &ok, &app_a);
 
         lr_row_reset(&r);
+        put_current_session(&r);
         lr_put_text(&r, name);
         lr_put_text(&r, has_rsend ? rm.remote_state : "n/a");
         lr_put_ts(&r, has_rsend ? rm.last_remote_poll : 0);
@@ -520,6 +551,7 @@ pg_lrstat_send_history(PG_FUNCTION_ARGS)
             continue;
 
         lr_row_reset(&r);
+        put_entry_session(&r, e->session_id);
         lr_put_text(&r, name);
         lr_put_ts(&r, e->ts);
         lr_put_lsn(&r, e->current_lsn);
@@ -564,6 +596,7 @@ pg_lrstat_recv_history(PG_FUNCTION_ARGS)
             continue;
 
         lr_row_reset(&r);
+        put_entry_session(&r, e->session_id);
         lr_put_text(&r, name);
         lr_put_ts(&r, e->ts);
         lr_put_lsn(&r, e->received_lsn);
