@@ -116,7 +116,9 @@ static bool
 calc_rate(const LRSample *last, const LRSample *ref, RateFn f,
           bool *is_first, double *mbps_out)
 {
-    double dt = (double)(last->send.ts - ref->send.ts) / 1e6;
+    /* clamp the window to the session stop so post-stop idle samples
+     * do not dilute the average */
+    double dt = (double)(lrstat_rate_end(last->send.ts) - ref->send.ts) / 1e6;
     int64 d;
     if (dt <= 0) return false;
     d = f(last) - f(ref);

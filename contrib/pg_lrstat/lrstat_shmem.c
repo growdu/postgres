@@ -236,6 +236,53 @@ lrstat_sessionreg_close(uint64 session_id, TimestampTz stop_ts)
 	SpinLockRelease(&lrstat->session.mutex);
 }
 
+/*
+ * End of the measurement window for average rates: samples keep being
+ * taken after lrstat_stop (the worker never sleeps), so without this
+ * clamp the denominator would keep growing with idle time and dilute
+ * every session average.  Returns min(last_ts, session stop_ts).
+ */
+TimestampTz
+lrstat_rate_end(TimestampTz last_ts)
+{
+	TimestampTz stop_ts;
+
+	if (!lrstat_ready())
+		return last_ts;
+
+	SpinLockAcquire(&lrstat->session.mutex);
+	stop_ts = lrstat->session.stop_ts;
+	SpinLockRelease(&lrstat->session.mutex);
+
+	if (stop_ts > 0 && stop_ts < last_ts)
+		return stop_ts;
+	return last_ts;
+}
+
+/* reverse lookup: session name -> id (0 when unknown) */
+uint64
+lrstat_session_id_by_name(const char *name)
+{
+	int i;
+
+	if (!lrstat_ready() || name == NULL || name[0] == '\0')
+		return 0;
+
+	for (i = 0; i < LRSTAT_MAX_SESSIONS; i++)
+	{
+		LRSessionRegEntry *r = lrstat_sessionreg_at(i);
+		bool match = false;
+
+		SpinLockAcquire(&lrstat->session.mutex);
+		if (r->in_use && strcmp(r->name, name) == 0)
+			match = true;
+		SpinLockRelease(&lrstat->session.mutex);
+		if (match)
+			return r->session_id;
+	}
+	return 0;
+}
+
 static bool
 target_key_equal(const LRTargetCtl *t, LRTargetKind kind,
 				 const char *name, Oid relid, char worker_char)

@@ -124,18 +124,39 @@ gather_data(LRExportData *d)
 			d->n_targets++;
 	}
 
-	/* history: chronological copy, capped to the most recent samples */
-	d->total_entries = lrstat_history_count();
-	d->n_entries = Min(d->total_entries, EXPORT_MAX_HISTORY);
-	if (d->n_entries > 0)
+	/* history: chronological copy of THIS session's samples (idle
+	 * samples recorded outside the session are excluded), capped to
+	 * the most recent EXPORT_MAX_HISTORY */
 	{
-		int skip = d->total_entries - d->n_entries;
+		uint64 sess_id = lrstat_session_id_by_name(d->session_name);
 
-		d->entries = palloc(d->n_entries * sizeof(LRHistoryEntry));
-		for (i = 0; i < d->n_entries; i++)
-			memcpy(&d->entries[i],
-				   lrstat_history_at(lrstat_history_slot(skip + i)),
-				   sizeof(LRHistoryEntry));
+		d->total_entries = 0;
+		for (i = 0; i < lrstat_history_count(); i++)
+		{
+			LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
+
+			if (e->session_id == sess_id && sess_id != 0)
+				d->total_entries++;
+		}
+		d->n_entries = Min(d->total_entries, EXPORT_MAX_HISTORY);
+		if (d->n_entries > 0)
+		{
+			int skip = d->total_entries - d->n_entries;
+			int copied = 0;
+
+			d->entries = palloc(d->n_entries * sizeof(LRHistoryEntry));
+			for (i = 0; i < lrstat_history_count() && copied < skip + d->n_entries; i++)
+			{
+				LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
+
+				if (e->session_id != sess_id || sess_id == 0)
+					continue;
+				if (copied >= skip)
+					memcpy(&d->entries[copied - skip], e,
+						   sizeof(LRHistoryEntry));
+				copied++;
+			}
+		}
 	}
 }
 
@@ -347,8 +368,10 @@ compute_analysis(LRExportData *d, LRAnalysis *a)
 		int64 d_gen, d_send, d_recv, d_apply;
 		int64 unsent, inflight, unapplied, total;
 
-		/* avg rates from anchor to last */
-		dt = (double)(rsend_t->last.send.ts - rsend_t->anchor.send.ts) / 1e6;
+		/* avg rates from anchor to last, with the window clamped to the
+		 * session stop so post-stop idle samples do not dilute them */
+		dt = (double)(lrstat_rate_end(rsend_t->last.send.ts) -
+					  rsend_t->anchor.send.ts) / 1e6;
 		if (dt <= 0) dt = 1.0;
 
 		d_gen = (int64)(rs->current_lsn - rsend_t->anchor.send.current_lsn);
@@ -357,7 +380,8 @@ compute_analysis(LRExportData *d, LRAnalysis *a)
 		a->send_avg = d_send > 0 ? (double)d_send / dt / MB_DIV : 0;
 
 		{
-			double rdt = (double)(recv_t->last.recv.ts - recv_t->anchor.recv.ts) / 1e6;
+			double rdt = (double)(lrstat_rate_end(recv_t->last.recv.ts) -
+								  recv_t->anchor.recv.ts) / 1e6;
 			if (rdt <= 0) rdt = dt;
 			d_recv = (int64)(rv->received_lsn - recv_t->anchor.recv.received_lsn);
 			d_apply = (int64)(rv->applied_lsn - recv_t->anchor.recv.applied_lsn);
