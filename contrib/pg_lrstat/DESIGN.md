@@ -719,7 +719,7 @@ SELECT recv_name,
        round(send_instant::numeric,1) AS 发送_瞬时,
        round(send_avg::numeric,1)     AS 发送_平均,
        round(apply_avg::numeric,1)    AS 应用_平均,
-       round(backlog_total,1)         AS 总积压MB,
+       round(backlog_total::numeric,1) AS 总积压MB,
        round(catchup_total_secs)      AS 追平秒
 FROM pg_lrstat_cluster_stat;
 
@@ -865,7 +865,7 @@ SELECT lrstat_start('bench_am', true);
 SELECT recv_name, round(send_instant::numeric,1) AS send_ins,
        round(send_avg::numeric,1) AS send_avg,
        round(apply_avg::numeric,1) AS apply_avg,
-       round(backlog_total,1) AS total_mb
+       round(backlog_total::numeric,1) AS total_mb
 FROM pg_lrstat_cluster_stat;
 
  recv_name | send_ins | send_avg | apply_avg | total

@@ -56,7 +56,7 @@ SELECT recv_name,
        round(gen_avg::numeric,1)   AS 生成,
        round(send_avg::numeric,1)  AS 发送,
        round(apply_avg::numeric,1) AS 应用,
-       round(backlog_total,1)      AS 总积压MB,
+       round(backlog_total::numeric,1) AS 总积压MB,
        round(catchup_total_secs)   AS 追平秒,
        bottleneck                  AS 瓶颈,
        send_blocked, apply_blocked
