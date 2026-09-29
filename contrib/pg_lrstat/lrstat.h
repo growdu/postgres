@@ -25,7 +25,7 @@
 #include "utils/pg_lsn.h"
 
 #define LRSTAT_MAGIC             0x4C525354   /* "LRST" */
-#define LRSTAT_LAYOUT_VERSION    4
+#define LRSTAT_LAYOUT_VERSION    5
 
 #define LR_TEXT_LEN     64
 #define LR_STATE_LEN    16
@@ -237,6 +237,7 @@ typedef struct LRStatShared
 {
 	LRSessionState session;
 	int         ntargets;
+	pid_t       worker_pid;         /* for wake-on-start (SIGUSR1) */
 	int         ring_len;           /* session_max_samples */
 	int         n_entries;         /* history write cursor (worker only) */
 	/* targets, history entries and session registry follow, see

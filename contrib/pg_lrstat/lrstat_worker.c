@@ -29,6 +29,7 @@
 
 #include "lrstat.h"
 
+static void lrstat_worker_wake(SIGNAL_ARGS);
 pg_noreturn void pg_lrstat_worker_main(Datum arg);
 
 static void lrstat_round(void);
@@ -130,9 +131,14 @@ pg_lrstat_worker_main(Datum main_arg)
 	(void) main_arg;
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
-	BackgroundWorkerUnblockSignals();
 
 	BackgroundWorkerInitializeConnection(lrstat_database, NULL, 0);
+
+	/* wake-on-start: lrstat_start() SIGUSR1s us to sample immediately */
+	pqsignal(SIGUSR1, lrstat_worker_wake);
+	BackgroundWorkerUnblockSignals();
+	if (lrstat_ready())
+		lrstat->worker_pid = MyProcPid;
 
 	round_ctx = AllocSetContextCreate(TopMemoryContext,
 									   "pg_lrstat round",
@@ -175,6 +181,12 @@ pg_lrstat_worker_main(Datum main_arg)
 	}
 
 	proc_exit(0);
+}
+
+static void
+lrstat_worker_wake(SIGNAL_ARGS)
+{
+	SetLatch(MyLatch);
 }
 
 static void

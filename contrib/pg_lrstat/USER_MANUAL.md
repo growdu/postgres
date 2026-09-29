@@ -364,7 +364,9 @@ FROM pg_lrstat_send_stat ORDER BY retained_wal DESC NULLS LAST LIMIT 5;
 | 问题 | 答案 |
 | --- | --- |
 | 视图全空 | 没预加载（`info.loaded=f`），或还没 `lrstat_start()`——只有 start 后才采样 |
-| 速率全是 NULL | 会话刚开始还没有两个有效样本，等一个采样周期 |
+| 速率全是 NULL | 首行没有前样本可差分（正常）；第二行起有值，等一个采样周期（默认 30s——测试时建议 `ALTER SYSTEM SET pg_lrstat.sample_interval='1s'; SELECT pg_reload_conf();`） |
+| stat 表只有一行 | start 后立即有一行（首行速率 NULL）；此后每个采样周期追加一行，默认 30s 一行。要更快出数据就调小 sample_interval |
+| apply 速率一直是 0 | 该间隔内没有事务提交（applied 只在提交边界推进）；跑持续负载后再看，或看报告 Evidence 表的提交轮跳变 |
 | cluster_stat 没数据 | 没有活跃订阅，或 remote_state = unreachable（检查订阅连接串） |
 | apply 速率 = 0 但积压在涨 | 应用被堵（锁冲突最常见）：拿 recv_stat 的 worker_pid 查 pg_stat_activity 的 wait_event |
 | applied 长时间不动然后跳 | 大事务：应用位只在提交边界推进，正常 |

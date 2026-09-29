@@ -256,8 +256,6 @@ pg_lrstat_send_stat(PG_FUNCTION_ARGS)
             spill = (double) lsn_diff(e->spill_bytes, ts->prev.spill_bytes)
                 / MB_DIV;
         }
-        ts->prev = *e;
-        ts->has_prev = true;
 
         lr_row_reset(&r);
         lr_put_text(&r, ts->known ? ts->name : "?");
@@ -289,6 +287,8 @@ pg_lrstat_send_stat(PG_FUNCTION_ARGS)
         lr_put_bool(&r, ts->has_prev && lsn_diff(e->current_lsn, e->sent_lsn) > 0
                     && snd < 0.001);
         lr_emit(rsinfo, &r);
+        ts->prev = *e;
+        ts->has_prev = true;
     }
     pfree(st);
     PG_RETURN_NULL();
@@ -333,8 +333,9 @@ pg_lrstat_recv_stat(PG_FUNCTION_ARGS)
             lwal = ival_mbps(e, &ts->prev, e->local_wal_lsn,
                              ts->prev.local_wal_lsn);
         }
-        ts->prev = *e;
-        ts->has_prev = true;
+        /* remember whether this row HAD a previous sample before
+         * overwriting prev — the first row of a target emits NULL
+         * rates, not zeros */
 
         lr_row_reset(&r);
         lr_put_text(&r, ts->known ? ts->name : "?");
@@ -359,6 +360,8 @@ pg_lrstat_recv_stat(PG_FUNCTION_ARGS)
                     && lsn_diff(e->received_lsn, e->applied_lsn) > 0
                     && appl < 0.001);
         lr_emit(rsinfo, &r);
+        ts->prev = *e;
+        ts->has_prev = true;
     }
     pfree(st);
     PG_RETURN_NULL();
@@ -444,9 +447,6 @@ pg_lrstat_cluster_stat(PG_FUNCTION_ARGS)
             appl = ival_mbps(e, &ts->prev, e->applied_lsn,
                              ts->prev.applied_lsn);
         }
-        ts->prev = *e;
-        ts->has_prev = true;
-
         if (peer_idx >= 0)
         {
             LRHistoryEntry *pe = &peers[peer_idx];
@@ -515,6 +515,8 @@ pg_lrstat_cluster_stat(PG_FUNCTION_ARGS)
         else
             lr_put_text(&r, "none");
         lr_emit(rsinfo, &r);
+        ts->prev = *e;
+        ts->has_prev = true;
     }
     pfree(st); pfree(peers); pfree(peers_prev); pfree(has_peer);
     pfree(has_peer_prev);
@@ -637,6 +639,12 @@ lrstat_start(PG_FUNCTION_ARGS)
              (long long) (lrstat->session.session_id + 1));
 
     lrstat_session_start(name);
+
+    /* wake the sampler for an immediate first round (design §1.3):
+     * without this the first sample waits out the whole interval */
+    if (lrstat->worker_pid > 0)
+        kill(lrstat->worker_pid, SIGUSR1);
+
     PG_RETURN_DATUM(CStringGetTextDatum(name));
 }
 

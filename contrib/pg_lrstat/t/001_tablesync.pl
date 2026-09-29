@@ -251,10 +251,13 @@ ok(index($archived_json, '"samples": [') >= 0
 	&& $archived_json =~ /"kind": "(send|recv)"/,
 	'archived export contains raw history samples');
 
-# a newer session wipes the previous session's data (clean slate)
+# a newer session wipes the previous session's data (clean slate).
+# start() wakes the sampler for an immediate first round, so the ring
+# may already hold the NEW session's first row here — the old
+# session's rows must be gone (hence the small bound, not exactly 0).
 $node_subscriber->safe_psql('postgres', 'SELECT lrstat_start()');
 is($node_subscriber->safe_psql('postgres', qq(
-	SELECT count(*) = 0 FROM pg_lrstat_recv_history)),
+	SELECT count(*) <= 2 FROM pg_lrstat_recv_history)),
 	't', 'new start wipes the previous session data');
 sleep(3);
 $node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
