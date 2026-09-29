@@ -63,95 +63,76 @@ static void lr_emit(ReturnSetInfo *rsinfo, LRRow *r)
     tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, r->v, r->isnull);
 }
 
+
+/* ---- history-driven stat views --------------------------------------------
+ * send_stat / recv_stat / cluster_stat emit one row per target per
+ * sampling round, derived from the history ring: interval rates are
+ * diffs against the previous sample of the same target, watermarks and
+ * per-round state come from the entry itself.  Passthrough columns
+ * (plugin, application_name, ...) are not historized and come from the
+ * live target slots.
+ */
+
 static int64 lsn_diff(XLogRecPtr a, XLogRecPtr b)
 { int64 d = (int64)a - (int64)b; return d < 0 ? 0 : d; }
 
-/* ---- rate helpers ---- */
-
-typedef int64 (*RateFn)(const LRSample *);
-
-#define SEND_FIELD(fn, member) \
-    static int64 fn(const LRSample *s) { return (int64) s->send.member; }
-#define RECV_FIELD(fn, member) \
-    static int64 fn(const LRSample *s) { return (int64) s->recv.member; }
-
-SEND_FIELD(r_curr, current_lsn)
-SEND_FIELD(r_sent, sent_lsn)
-SEND_FIELD(r_peer_app, peer_applied_lsn)
-SEND_FIELD(r_spill, spill_bytes)
-SEND_FIELD(r_stream, stream_bytes)
-RECV_FIELD(r_recv, received_lsn)
-RECV_FIELD(r_appl, applied_lsn)
-RECV_FIELD(r_lwal, local_wal_lsn)
-
-static bool
-calc_rate(const LRSample *last, const LRSample *ref, RateFn f,
-          bool *is_first, double *mbps_out)
+/* interval rate in MB/s between two consecutive samples of a target */
+static double
+ival_mbps(const LRHistoryEntry *cur, const LRHistoryEntry *prev,
+          XLogRecPtr lcur, XLogRecPtr lprev)
 {
-    /* clamp the window to the session stop so post-stop idle samples
-     * do not dilute the average */
-    double dt = (double)(lrstat_rate_end(last->send.ts) - ref->send.ts) / 1e6;
+    double dt = (double)(cur->ts - prev->ts) / 1e6;
     int64 d;
-    if (dt <= 0) return false;
-    d = f(last) - f(ref);
-    *mbps_out = d > 0 ? (double)d / dt / MB_DIV : 0.0;
-    *is_first = false;
-    return true;
+    if (dt <= 0) return 0.0;
+    d = (int64) lcur - (int64) lprev;
+    return d > 0 ? (double)d / dt / MB_DIV : 0.0;
 }
 
-/* ---- target iteration ---- */
-
-typedef void (*EmitFn)(const char *name, char wc, Oid relid,
-                       const LRSample *a, const LRSample *p,
-                       const LRSample *l, const LRTargetMeta *m,
-                       ReturnSetInfo *rsi);
+/* per-target scan state during one chronological pass */
+typedef struct HistTargetState
+{
+    bool known;                     /* slot resolved from live registry */
+    char name[NAMEDATALEN];
+    /* passthrough extras from the live slot */
+    char plugin[LR_TEXT_LEN];
+    char application_name[LR_TEXT_LEN];
+    char client_addr[LR_TEXT_LEN];
+    bool temporary;
+    char remote_state[LR_STATE_LEN];
+    bool have_meta;
+    /* previous entry of this target */
+    bool has_prev;
+    LRHistoryEntry prev;
+} HistTargetState;
 
 static void
-walk(LRTargetKind kind, EmitFn emit, ReturnSetInfo *rsi)
+hist_targets_init(HistTargetState *st, int n)
 {
     int i;
-    TimestampTz now = GetCurrentTimestamp();
-
-    if (!lrstat_ready()) return;
-
-    for (i = 0; i < lrstat->ntargets; i++)
+    memset(st, 0, n * sizeof(HistTargetState));
+    for (i = 0; i < n && i < lrstat->ntargets; i++)
     {
         LRTargetCtl *t = lrstat_target_at(i);
-        char name[NAMEDATALEN]; char wc; Oid relid;
-        LRSample a, p, l; LRTargetMeta m;
-        bool use;
-
         SpinLockAcquire(&t->mutex);
-        use = (t->in_use && t->kind == kind);
-        if (use)
+        if (t->in_use)
         {
-            /* expired: target vanished from sampling (e.g. finished
-             * table sync worker) longer than stale_target_ttl ago */
-            if (t->last_sample_ts > 0 &&
-                TimestampDifferenceMilliseconds(t->last_sample_ts, now) >=
-                (double) lrstat_stale_target_ttl_s * 1000.0)
-                use = false;
-            else
-            {
-                strlcpy(name, t->name, NAMEDATALEN);
-                wc = t->worker_char; relid = t->relid;
-                memcpy(&a, &t->anchor, sizeof(LRSample));
-                memcpy(&p, &t->prev, sizeof(LRSample));
-                memcpy(&l, &t->last, sizeof(LRSample));
-                memcpy(&m, &t->meta, sizeof(LRTargetMeta));
-            }
+            st[i].known = true;
+            strlcpy(st[i].name, t->name, NAMEDATALEN);
+            strlcpy(st[i].plugin, t->meta.plugin, LR_TEXT_LEN);
+            strlcpy(st[i].application_name, t->meta.application_name,
+                    LR_TEXT_LEN);
+            strlcpy(st[i].client_addr, t->meta.client_addr, LR_TEXT_LEN);
+            st[i].temporary = t->meta.temporary;
+            strlcpy(st[i].remote_state, t->meta.remote_state, LR_STATE_LEN);
+            st[i].have_meta = true;
         }
         SpinLockRelease(&t->mutex);
-
-        if (use && l.send.ts > 0)
-            emit(name, wc, relid, &a, &p, &l, &m, rsi);
     }
 }
 
-/* =================================================================
- * pg_lrstat_info (1 row)
- * =================================================================
- */
+/* side of an entry, from the recorded target kind */
+#define ENTRY_IS_RECV(e) ((e)->kind == LR_RECV)
+
 PG_FUNCTION_INFO_V1(pg_lrstat_info);
 Datum
 pg_lrstat_info(PG_FUNCTION_ARGS)
@@ -222,277 +203,302 @@ pg_lrstat_info(PG_FUNCTION_ARGS)
 }
 
 /* =================================================================
- * pg_lrstat_send_stat (one row per send-side connection)
+ * pg_lrstat_send_stat — one row per send-side target per round
  * =================================================================
  */
-
-static void
-emit_send(const char *name, char wc, Oid relid,
-          const LRSample *a, const LRSample *p, const LRSample *l,
-          const LRTargetMeta *m, ReturnSetInfo *rsi)
-{
-    const LRSendSample *s = &l->send;
-    double mbps;
-    bool ok;
-    LRRow r;
-
-    lr_row_reset(&r);
-    lr_put_text(&r, name);
-    lr_put_text(&r, m->plugin);
-    lr_put_bool(&r, m->temporary);
-    lr_put_bool(&r, m->active);
-    lr_put_pid(&r, m->sender_pid);
-    lr_put_text(&r, m->application_name);
-    lr_put_text(&r, m->client_addr);
-    lr_put_text(&r, m->state);
-    lr_put_text(&r, m->sync_state);
-    lr_put_text(&r, m->wal_status);
-    lr_put(&r, Float8GetDatum(m->safe_wal_size_valid ? (double)m->safe_wal_size/MB_DIV : 0),
-           !m->safe_wal_size_valid);
-    lr_put_ts(&r, s->ts);
-    lr_put_lsn(&r, s->current_lsn);
-    lr_put_lsn(&r, s->sent_lsn);
-    lr_put_lsn(&r, s->confirmed_lsn);
-
-    /* backlogs in MB */
-    lr_put_mb(&r, lsn_diff(s->current_lsn, s->sent_lsn));
-    lr_put_mb(&r, lsn_diff(s->sent_lsn, s->peer_recv_lsn));
-    lr_put_mb(&r, lsn_diff(s->peer_recv_lsn, s->peer_applied_lsn));
-    lr_put_mb(&r, lsn_diff(s->current_lsn, s->peer_applied_lsn));
-    lr_put_mb(&r, lsn_diff(s->current_lsn, s->restart_lsn));
-
-    /* rates: instant from prev→last, avg from anchor→last */
-    ok = (p->send.ts > 0) && calc_rate(l, p, r_curr, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* gen_instant */
-    ok = (a->send.ts > 0) && calc_rate(l, a, r_curr, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* gen_avg */
-    ok = (p->send.ts > 0) && calc_rate(l, p, r_sent, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* send_instant */
-    ok = (a->send.ts > 0) && calc_rate(l, a, r_sent, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* send_avg */
-    ok = (p->send.ts > 0) && calc_rate(l, p, r_peer_app, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* apply_instant */
-    ok = (a->send.ts > 0) && calc_rate(l, a, r_peer_app, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* apply_avg */
-    ok = (p->send.ts > 0) && calc_rate(l, p, r_spill, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* spill_instant */
-    ok = (a->send.ts > 0) && calc_rate(l, a, r_spill, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);       /* spill_avg */
-
-    lr_put_lag(&r, m->write_lag_us);
-    lr_put_lag(&r, m->flush_lag_us);
-    lr_put_lag(&r, m->replay_lag_us);
-
-    {
-        int64 unsent = lsn_diff(s->current_lsn, s->sent_lsn);
-        double send_avg = 0; bool sok = false;
-        calc_rate(l, a, r_sent, &sok, &send_avg);
-        lr_put_bool(&r, unsent > 0 && sok && send_avg < 0.001);
-    }
-
-    lr_emit(rsi, &r);
-}
-
 PG_FUNCTION_INFO_V1(pg_lrstat_send_stat);
 Datum
 pg_lrstat_send_stat(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    HistTargetState *st;
+    int n = lrstat->ntargets;
+    int i, cnt;
+
     InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
-    walk(LR_SEND, emit_send, rsinfo);
+    if (!lrstat_ready())
+        PG_RETURN_NULL();
+
+    st = palloc(n * sizeof(HistTargetState));
+    hist_targets_init(st, n);
+
+    cnt = lrstat_history_count();
+    for (i = 0; i < cnt; i++)
+    {
+        LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
+        HistTargetState *ts;
+        LRRow r;
+        double gen = 0, snd = 0, appl = 0, spill = 0;
+
+        if (ENTRY_IS_RECV(e))
+            continue;
+        ts = &st[e->target_idx];
+
+        if (ts->has_prev)
+        {
+            gen = ival_mbps(e, &ts->prev, e->current_lsn, ts->prev.current_lsn);
+            snd = ival_mbps(e, &ts->prev, e->sent_lsn, ts->prev.sent_lsn);
+            appl = ival_mbps(e, &ts->prev, e->peer_applied_lsn,
+                             ts->prev.peer_applied_lsn);
+            spill = (double) lsn_diff(e->spill_bytes, ts->prev.spill_bytes)
+                / MB_DIV;
+        }
+        ts->prev = *e;
+        ts->has_prev = true;
+
+        lr_row_reset(&r);
+        lr_put_text(&r, ts->known ? ts->name : "?");
+        lr_put_ts(&r, e->ts);
+        lr_put_text(&r, ts->have_meta ? ts->plugin : NULL);
+        lr_put_bool(&r, ts->have_meta && ts->temporary);
+        lr_put_bool(&r, e->active);
+        lr_put_pid(&r, (pid_t) e->sender_pid);
+        lr_put_text(&r, ts->have_meta ? ts->application_name : NULL);
+        lr_put_text(&r, ts->have_meta ? ts->client_addr : NULL);
+        lr_put_text(&r, e->state);
+        lr_put_text(&r, e->sync_state);
+        lr_put_text(&r, e->wal_status);
+        lr_put_lsn(&r, e->current_lsn);
+        lr_put_lsn(&r, e->sent_lsn);
+        lr_put_lsn(&r, e->confirmed_lsn);
+        lr_put_mb(&r, lsn_diff(e->current_lsn, e->sent_lsn));
+        lr_put_mb(&r, lsn_diff(e->sent_lsn, e->peer_recv_lsn));
+        lr_put_mb(&r, lsn_diff(e->peer_recv_lsn, e->peer_applied_lsn));
+        lr_put_mb(&r, lsn_diff(e->current_lsn, e->peer_applied_lsn));
+        lr_put_mb(&r, lsn_diff(e->current_lsn, e->restart_lsn));
+        lr_put_f8(&r, ts->has_prev, gen);
+        lr_put_f8(&r, ts->has_prev, snd);
+        lr_put_f8(&r, ts->has_prev, appl);
+        lr_put_f8(&r, ts->has_prev, spill);
+        lr_put_lag(&r, e->write_lag_us);
+        lr_put_lag(&r, e->flush_lag_us);
+        lr_put_lag(&r, e->replay_lag_us);
+        lr_put_bool(&r, ts->has_prev && lsn_diff(e->current_lsn, e->sent_lsn) > 0
+                    && snd < 0.001);
+        lr_emit(rsinfo, &r);
+    }
+    pfree(st);
     PG_RETURN_NULL();
 }
 
 /* =================================================================
- * pg_lrstat_recv_stat (one row per recv worker)
+ * pg_lrstat_recv_stat — one row per recv worker per round
  * =================================================================
  */
-
-static void
-emit_recv(const char *name, char wc, Oid relid,
-          const LRSample *a, const LRSample *p, const LRSample *l,
-          const LRTargetMeta *m, ReturnSetInfo *rsi)
-{
-    const LRRecvSample *s = &l->recv;
-    double mbps;
-    bool ok;
-    LRRow r;
-
-    lr_row_reset(&r);
-    lr_put_text(&r, name);
-    lr_put_text(&r, m->worker_type);
-    lr_put_pid(&r, m->worker_pid);
-    lr_put_pid(&r, m->leader_pid);
-    lr_put(&r, ObjectIdGetDatum(relid), relid == 0);
-    lr_put_ts(&r, s->ts);
-    lr_put_lsn(&r, s->received_lsn);
-    lr_put_lsn(&r, s->applied_lsn);
-    lr_put_ts(&r, m->last_msg_send_time);
-    lr_put_ts(&r, m->last_msg_receipt_time);
-    lr_put_mb(&r, lsn_diff(s->received_lsn, s->applied_lsn));
-
-    ok = (p->recv.ts > 0) && calc_rate(l, p, r_recv, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);
-    ok = (a->recv.ts > 0) && calc_rate(l, a, r_recv, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);
-    ok = (p->recv.ts > 0) && calc_rate(l, p, r_appl, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);
-    ok = (a->recv.ts > 0) && calc_rate(l, a, r_appl, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);
-    ok = (p->recv.ts > 0) && calc_rate(l, p, r_lwal, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);
-    ok = (a->recv.ts > 0) && calc_rate(l, a, r_lwal, &ok, &mbps);
-    lr_put_f8(&r, ok, mbps);
-
-    lr_put(&r, Int64GetDatum(m->apply_error_count), m->apply_error_count < 0);
-    lr_put(&r, Int64GetDatum(m->sync_error_count), m->sync_error_count < 0);
-
-    {
-        int64 bl = lsn_diff(s->received_lsn, s->applied_lsn);
-        double aa = 0; bool aok = false;
-        calc_rate(l, a, r_appl, &aok, &aa);
-        lr_put_bool(&r, bl > 0 && aok && aa < 0.001);
-    }
-
-    lr_emit(rsi, &r);
-}
-
 PG_FUNCTION_INFO_V1(pg_lrstat_recv_stat);
 Datum
 pg_lrstat_recv_stat(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    HistTargetState *st;
+    int n = lrstat->ntargets;
+    int i, cnt;
+
     InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
-    walk(LR_RECV, emit_recv, rsinfo);
+    if (!lrstat_ready())
+        PG_RETURN_NULL();
+
+    st = palloc(n * sizeof(HistTargetState));
+    hist_targets_init(st, n);
+
+    cnt = lrstat_history_count();
+    for (i = 0; i < cnt; i++)
+    {
+        LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
+        HistTargetState *ts;
+        LRRow r;
+        double rcv = 0, appl = 0, lwal = 0;
+
+        if (!ENTRY_IS_RECV(e))
+            continue;
+        ts = &st[e->target_idx];
+
+        if (ts->has_prev)
+        {
+            rcv = ival_mbps(e, &ts->prev, e->received_lsn, ts->prev.received_lsn);
+            appl = ival_mbps(e, &ts->prev, e->applied_lsn, ts->prev.applied_lsn);
+            lwal = ival_mbps(e, &ts->prev, e->local_wal_lsn,
+                             ts->prev.local_wal_lsn);
+        }
+        ts->prev = *e;
+        ts->has_prev = true;
+
+        lr_row_reset(&r);
+        lr_put_text(&r, ts->known ? ts->name : "?");
+        lr_put_ts(&r, e->ts);
+        lr_put_text(&r, e->worker_type);
+        lr_put_pid(&r, (pid_t) e->worker_pid);
+        lr_put_pid(&r, (pid_t) e->leader_pid);
+        lr_put(&r, ObjectIdGetDatum(e->relid), e->relid == 0);
+        lr_put_lsn(&r, e->received_lsn);
+        lr_put_lsn(&r, e->applied_lsn);
+        lr_put_ts(&r, e->last_msg_send_time);
+        lr_put_ts(&r, e->last_msg_receipt_time);
+        lr_put_mb(&r, lsn_diff(e->received_lsn, e->applied_lsn));
+        lr_put_f8(&r, ts->has_prev, rcv);
+        lr_put_f8(&r, ts->has_prev, appl);
+        lr_put_f8(&r, ts->has_prev, lwal);
+        lr_put(&r, Int64GetDatum(e->apply_error_count),
+               e->apply_error_count < 0);
+        lr_put(&r, Int64GetDatum(e->sync_error_count),
+               e->sync_error_count < 0);
+        lr_put_bool(&r, ts->has_prev
+                    && lsn_diff(e->received_lsn, e->applied_lsn) > 0
+                    && appl < 0.001);
+        lr_emit(rsinfo, &r);
+    }
+    pfree(st);
     PG_RETURN_NULL();
 }
 
 /* =================================================================
- * pg_lrstat_cluster_stat (one row per replication pair)
+ * pg_lrstat_cluster_stat — one row per replication pair per round;
+ * each recv row is paired with the newest RSEND sample at or before
+ * its timestamp (both sides advance chronologically in one pass).
  * =================================================================
  */
-
-static void
-emit_cluster(const char *name, char wc, Oid relid,
-             const LRSample *a, const LRSample *p, const LRSample *l,
-             const LRTargetMeta *m, ReturnSetInfo *rsi)
-{
-    /* only leader apply workers (relid==0, 'a') or physical ('p') */
-    if (wc == 't')
-        return;
-
-    {
-        /* look up RSEND mirror for this recv_name */
-        LRSample ra, rp, rl;
-        LRTargetMeta rm;
-        bool has_rsend = lrstat_lookup(LR_RSEND, name, &ra, &rp, &rl, &rm);
-        const LRRecvSample *sv = &l->recv;
-        const LRSendSample *rs_ = has_rsend ? &rl.send : NULL;
-        double mbps;
-        bool ok;
-        double gen_i=0, gen_a=0, snd_i=0, snd_a=0, app_a=0;
-        bool gen_io=false, gen_ao=false, snd_io=false, snd_ao=false, app_ao=false;
-        LRRow r;
-        int64 unsent=0, inflight=0, unapplied=0, total=0;
-
-        if (rs_)
-        {
-            unsent = lsn_diff(rs_->current_lsn, rs_->sent_lsn);
-            inflight = lsn_diff(rs_->sent_lsn, sv->received_lsn);
-            total = lsn_diff(rs_->current_lsn, sv->applied_lsn);
-            snd_io = (rp.send.ts > 0) && calc_rate(&rl, &rp, r_sent, &ok, &snd_i);
-            snd_ao = (ra.send.ts > 0) && calc_rate(&rl, &ra, r_sent, &ok, &snd_a);
-            gen_io = (rp.send.ts > 0) && calc_rate(&rl, &rp, r_curr, &ok, &gen_i);
-            gen_ao = (ra.send.ts > 0) && calc_rate(&rl, &ra, r_curr, &ok, &gen_a);
-        }
-        unapplied = lsn_diff(sv->received_lsn, sv->applied_lsn);
-        app_ao = (a->recv.ts > 0) && calc_rate(l, a, r_appl, &ok, &app_a);
-
-        lr_row_reset(&r);
-            lr_put_text(&r, name);
-        lr_put_text(&r, has_rsend ? rm.remote_state : "n/a");
-        lr_put_ts(&r, has_rsend ? rm.last_remote_poll : 0);
-        lr_put_ts(&r, sv->ts);
-        lr_put_lsn(&r, rs_ ? rs_->current_lsn : 0);
-        lr_put_lsn(&r, rs_ ? rs_->sent_lsn : 0);
-        lr_put_lsn(&r, sv->received_lsn);
-        lr_put_lsn(&r, sv->applied_lsn);
-        lr_put_lsn(&r, rs_ ? rs_->confirmed_lsn : 0);
-
-        lr_put_f8(&r, gen_io, gen_i);
-        lr_put_f8(&r, gen_ao, gen_a);
-        lr_put_f8(&r, snd_io, snd_i);
-        lr_put_f8(&r, snd_ao, snd_a);
-        ok = (p->recv.ts > 0) && calc_rate(l, p, r_recv, &ok, &mbps);
-        lr_put_f8(&r, ok, mbps);   /* recv_instant */
-        ok = (a->recv.ts > 0) && calc_rate(l, a, r_recv, &ok, &mbps);
-        lr_put_f8(&r, ok, mbps);   /* recv_avg */
-        ok = (p->recv.ts > 0) && calc_rate(l, p, r_appl, &ok, &mbps);
-        lr_put_f8(&r, ok, mbps);   /* apply_instant */
-        lr_put_f8(&r, app_ao, app_a);
-
-        lr_put_mb(&r, unsent);
-        lr_put_mb(&r, inflight);
-        lr_put_mb(&r, unapplied);
-        lr_put_mb(&r, total);
-        if (rs_)
-        {
-            lr_put_mb(&r, lsn_diff(rs_->current_lsn, rs_->restart_lsn));
-            lr_put_mb(&r, lsn_diff(sv->received_lsn, rs_->peer_recv_lsn));
-        }
-        else
-        {
-            lr_put_f8(&r, false, 0);
-            lr_put_f8(&r, false, 0);
-        }
-
-        lr_put_lag(&r, has_rsend ? rm.write_lag_us : -1);
-        lr_put_lag(&r, has_rsend ? rm.flush_lag_us : -1);
-        lr_put_lag(&r, has_rsend ? rm.replay_lag_us : -1);
-
-        /* catchup estimates */
-        if (snd_ao && snd_a > 0.001 && unsent > 0)
-            lr_put_f8(&r, true, (double)unsent / MB_DIV / snd_a);
-        else
-            lr_put_f8(&r, false, 0);
-        if (snd_ao && app_ao && snd_a > 0.001 && app_a > 0.001)
-            lr_put_f8(&r, true,
-                      (double)unsent / MB_DIV / snd_a +
-                      (double)(inflight + unapplied) / MB_DIV / app_a);
-        else
-            lr_put_f8(&r, false, 0);
-
-        lr_put_bool(&r, unsent > 0 && snd_ao && snd_a < 0.001);
-        lr_put_bool(&r, unapplied > 0 && app_ao && app_a < 0.001);
-
-        /* bottleneck: real-time CASE WHEN */
-        if (gen_ao && snd_ao && snd_a < gen_a && unsent > total / 2)
-            lr_put_text(&r, "send");
-        else if (app_ao && unapplied > total / 2)
-            lr_put_text(&r, "recv_apply");
-        else if (inflight > total / 2)
-            lr_put_text(&r, "network");
-        else
-            lr_put_text(&r, "none");
-
-        lr_emit(rsi, &r);
-    }
-}
-
 PG_FUNCTION_INFO_V1(pg_lrstat_cluster_stat);
 Datum
 pg_lrstat_cluster_stat(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    HistTargetState *st;
+    LRHistoryEntry *peers;          /* per target idx: newest send-side entry */
+    LRHistoryEntry *peers_prev;     /* per target idx: the one before it */
+    bool *has_peer, *has_peer_prev;
+    int n = lrstat->ntargets;
+    int i, j, cnt;
+
     InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
-    walk(LR_RECV, emit_cluster, rsinfo);
+    if (!lrstat_ready())
+        PG_RETURN_NULL();
+
+    st = palloc(n * sizeof(HistTargetState));
+    peers = palloc0(n * sizeof(LRHistoryEntry));
+    peers_prev = palloc0(n * sizeof(LRHistoryEntry));
+    has_peer = palloc0(n * sizeof(bool));
+    has_peer_prev = palloc0(n * sizeof(bool));
+    hist_targets_init(st, n);
+
+    cnt = lrstat_history_count();
+    for (i = 0; i < cnt; i++)
+    {
+        LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
+        HistTargetState *ts = &st[e->target_idx];
+        int peer_idx = -1;
+        LRRow r;
+        double gen = 0, snd = 0, rcv = 0, appl = 0;
+        int64 unsent = 0, inflight = 0, unapplied = 0, total = 0;
+        XLogRecPtr cur = 0, sent = 0, confirmed = 0, restart = 0,
+                   peer_recv = 0;
+        bool have_peer = false, peer_rates = false;
+
+        if (!ENTRY_IS_RECV(e))
+        {
+            /* send-side sample: advance this target's peer cursor */
+            if (has_peer[e->target_idx])
+            {
+                peers_prev[e->target_idx] = peers[e->target_idx];
+                has_peer_prev[e->target_idx] = true;
+            }
+            peers[e->target_idx] = *e;
+            has_peer[e->target_idx] = true;
+            continue;
+        }
+
+        /* pair with the newest send-side sample of the same name at or
+         * before this timestamp (both cursors move chronologically) */
+        for (j = 0; j < n; j++)
+        {
+            if (!has_peer[j] || !st[j].known || peers[j].ts > e->ts)
+                continue;
+            if (strcmp(st[j].name, ts->known ? ts->name : "?") == 0)
+            { peer_idx = j; break; }
+        }
+
+        if (ts->has_prev)
+        {
+            rcv = ival_mbps(e, &ts->prev, e->received_lsn,
+                            ts->prev.received_lsn);
+            appl = ival_mbps(e, &ts->prev, e->applied_lsn,
+                             ts->prev.applied_lsn);
+        }
+        ts->prev = *e;
+        ts->has_prev = true;
+
+        if (peer_idx >= 0)
+        {
+            LRHistoryEntry *pe = &peers[peer_idx];
+
+            have_peer = true;
+            cur = pe->current_lsn;
+            sent = pe->sent_lsn;
+            confirmed = pe->confirmed_lsn;
+            restart = pe->restart_lsn;
+            peer_recv = pe->peer_recv_lsn;
+            if (has_peer_prev[peer_idx])
+            {
+                LRHistoryEntry *pp = &peers_prev[peer_idx];
+
+                peer_rates = true;
+                gen = ival_mbps(pe, pp, pe->current_lsn, pp->current_lsn);
+                snd = ival_mbps(pe, pp, pe->sent_lsn, pp->sent_lsn);
+            }
+        }
+
+        unsent = lsn_diff(cur, sent);
+        inflight = lsn_diff(sent, e->received_lsn);
+        unapplied = lsn_diff(e->received_lsn, e->applied_lsn);
+        total = lsn_diff(cur, e->applied_lsn);
+
+        lr_row_reset(&r);
+        lr_put_text(&r, ts->known ? ts->name : "?");
+        lr_put_ts(&r, e->ts);
+        lr_put_text(&r, have_peer && st[peer_idx].have_meta
+                    ? st[peer_idx].remote_state : "n/a");
+        lr_put_lsn(&r, cur);
+        lr_put_lsn(&r, sent);
+        lr_put_lsn(&r, e->received_lsn);
+        lr_put_lsn(&r, e->applied_lsn);
+        lr_put_lsn(&r, confirmed);
+        lr_put_f8(&r, peer_rates, gen);
+        lr_put_f8(&r, peer_rates, snd);
+        lr_put_f8(&r, ts->has_prev, rcv);
+        lr_put_f8(&r, ts->has_prev, appl);
+        lr_put_mb(&r, unsent);
+        lr_put_mb(&r, inflight);
+        lr_put_mb(&r, unapplied);
+        lr_put_mb(&r, total);
+        lr_put_mb(&r, lsn_diff(cur, restart));
+        lr_put_mb(&r, lsn_diff(e->received_lsn, peer_recv));
+        lr_put_lag(&r, have_peer ? peers[peer_idx].write_lag_us : -1);
+        lr_put_lag(&r, have_peer ? peers[peer_idx].flush_lag_us : -1);
+        lr_put_lag(&r, have_peer ? peers[peer_idx].replay_lag_us : -1);
+        if (peer_rates && snd > 0.001 && unsent > 0)
+            lr_put_f8(&r, true, (double) unsent / MB_DIV / snd);
+        else
+            lr_put_f8(&r, false, 0);
+        if (ts->has_prev && appl > 0.001)
+            lr_put_f8(&r, true,
+                      (double) (unapplied + inflight) / MB_DIV / appl);
+        else
+            lr_put_f8(&r, false, 0);
+        lr_put_bool(&r, peer_rates && unsent > 0 && snd < 0.001);
+        lr_put_bool(&r, ts->has_prev && unapplied > 0 && appl < 0.001);
+        if (peer_rates && snd < gen && unsent > total / 2)
+            lr_put_text(&r, "send");
+        else if (unapplied > total / 2)
+            lr_put_text(&r, "recv_apply");
+        else if (inflight > total / 2)
+            lr_put_text(&r, "network");
+        else
+            lr_put_text(&r, "none");
+        lr_emit(rsinfo, &r);
+    }
+    pfree(st); pfree(peers); pfree(peers_prev); pfree(has_peer);
+    pfree(has_peer_prev);
     PG_RETURN_NULL();
 }
-
-/* =================================================================
- * pg_lrstat_send_history / pg_lrstat_recv_history
- * =================================================================
- */
 
 PG_FUNCTION_INFO_V1(pg_lrstat_send_history);
 Datum

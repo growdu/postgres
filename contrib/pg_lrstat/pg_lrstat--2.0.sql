@@ -43,56 +43,48 @@ RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_info'
 LANGUAGE C STABLE;
 
--- View: send_stat (one row per send-side connection)
+-- View: send_stat (one row per send-side target per sampling round)
 CREATE FUNCTION pg_lrstat_send_stat(
-    OUT slot_name text, OUT plugin text, OUT temporary bool,
-    OUT active bool, OUT sender_pid int4, OUT application_name text,
-    OUT client_addr text, OUT state text, OUT sync_state text,
-    OUT wal_status text, OUT safe_wal_size float8,
-    OUT sample_time timestamptz,
+    OUT slot_name text, OUT ts timestamptz,
+    OUT plugin text, OUT temporary bool,
+    OUT active bool, OUT sender_pid int4,
+    OUT application_name text, OUT client_addr text,
+    OUT state text, OUT sync_state text, OUT wal_status text,
     OUT current_lsn pg_lsn, OUT sent_lsn pg_lsn,
     OUT confirmed_flush_lsn pg_lsn,
     OUT backlog_unsent float8, OUT backlog_inflight float8,
     OUT backlog_peer_unapplied float8, OUT backlog_total float8,
     OUT retained_wal float8,
-    OUT gen_instant float8, OUT gen_avg float8,
-    OUT send_instant float8, OUT send_avg float8,
-    OUT apply_instant float8, OUT apply_avg float8,
-    OUT spill_instant float8, OUT spill_avg float8,
+    OUT gen_mbps float8, OUT send_mbps float8, OUT apply_mbps float8,
+    OUT spill_mb float8,
     OUT write_lag interval, OUT flush_lag interval,
     OUT replay_lag interval, OUT send_blocked bool)
 RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_send_stat'
 LANGUAGE C STABLE;
 
--- View: recv_stat (one row per recv worker/recovery)
+-- View: recv_stat (one row per recv worker per sampling round)
 CREATE FUNCTION pg_lrstat_recv_stat(
-    OUT recv_name text, OUT worker_type text,
+    OUT recv_name text, OUT ts timestamptz, OUT worker_type text,
     OUT worker_pid int4, OUT leader_pid int4, OUT relid oid,
-    OUT sample_time timestamptz,
     OUT received_lsn pg_lsn, OUT applied_lsn pg_lsn,
     OUT last_msg_send_time timestamptz, OUT last_msg_receipt_time timestamptz,
     OUT backlog_apply float8,
-    OUT recv_instant float8, OUT recv_avg float8,
-    OUT apply_instant float8, OUT apply_avg float8,
-    OUT local_wal_instant float8, OUT local_wal_avg float8,
+    OUT recv_mbps float8, OUT apply_mbps float8, OUT local_wal_mbps float8,
     OUT apply_error_count int8, OUT sync_error_count int8,
     OUT apply_blocked bool)
 RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_recv_stat'
 LANGUAGE C STABLE;
 
--- View: cluster_stat (one row per replication pair, both ends)
+-- View: cluster_stat (one row per replication pair per sampling round)
 CREATE FUNCTION pg_lrstat_cluster_stat(
-    OUT recv_name text, OUT remote_state text,
-    OUT last_remote_poll_time timestamptz, OUT sample_time timestamptz,
+    OUT recv_name text, OUT ts timestamptz, OUT remote_state text,
     OUT send_current_lsn pg_lsn, OUT sent_lsn pg_lsn,
     OUT received_lsn pg_lsn, OUT applied_lsn pg_lsn,
     OUT confirmed_flush_lsn pg_lsn,
-    OUT gen_instant float8, OUT gen_avg float8,
-    OUT send_instant float8, OUT send_avg float8,
-    OUT recv_instant float8, OUT recv_avg float8,
-    OUT apply_instant float8, OUT apply_avg float8,
+    OUT gen_mbps float8, OUT send_mbps float8,
+    OUT recv_mbps float8, OUT apply_mbps float8,
     OUT backlog_unsent float8, OUT backlog_inflight float8,
     OUT backlog_unapplied float8, OUT backlog_total float8,
     OUT retained_wal float8, OUT feedback_lag_mb float8,

@@ -316,18 +316,26 @@ lrstat_record_history(void)
 		LRTargetCtl *t = lrstat_target_at(i);
 		bool		use;
 		LRSample	last;
+		LRTargetMeta meta;
+		Oid			relid;
+		int			kind;
 		LRHistoryEntry e;
 
 		SpinLockAcquire(&t->mutex);
 		use = t->in_use;
 		if (use)
+		{
 			memcpy(&last, &t->last, sizeof(LRSample));
+			memcpy(&meta, &t->meta, sizeof(LRTargetMeta));
+			relid = t->relid;
+			kind = t->kind;
+		}
 		SpinLockRelease(&t->mutex);
 
 		if (!use || last.send.ts <= 0 || last.send.ts == recorded_ts[i])
 			continue;
 
-		lrstat_history_from_sample(&e, i, &last);
+		lrstat_history_from_sample(&e, i, &last, &meta, relid, kind);
 		e.session_id = session_id;
 		lrstat_append_history_entry(&e);
 		recorded_ts[i] = last.send.ts;

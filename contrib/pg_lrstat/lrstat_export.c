@@ -359,10 +359,8 @@ gather_memory_by_name(LRExportData *d, const char *name)
 		}
 		if (tinfos[n_tinfos].name[0] == '\0')
 		{
-			/* slot reused or gone: guess the side from the sample */
-			tinfos[n_tinfos].kind = (ents[i].received_lsn != 0 ||
-									 ents[i].applied_lsn != 0)
-				? LR_RECV : LR_SEND;
+			/* slot reused or gone: the entry carries its own kind */
+			tinfos[n_tinfos].kind = ents[i].kind;
 			snprintf(tinfos[n_tinfos].name, NAMEDATALEN, "?%d", idx);
 		}
 		n_tinfos++;

@@ -25,7 +25,7 @@
 #include "utils/pg_lsn.h"
 
 #define LRSTAT_MAGIC             0x4C525354   /* "LRST" */
-#define LRSTAT_LAYOUT_VERSION    3
+#define LRSTAT_LAYOUT_VERSION    4
 
 #define LR_TEXT_LEN     64
 #define LR_STATE_LEN    16
@@ -140,13 +140,15 @@ typedef struct LRTargetCtl
 /*
  * History entry: one full raw sample per target per sampling round.
  * This IS the primary data store — every round, every target's
- * complete LSN snapshot is recorded here.  Stat views and rates
- * derive from this; nothing is pre-computed at write time.
+ * complete LSN snapshot plus the per-round state is recorded here.
+ * Stat views and rates derive from this; nothing is pre-computed at
+ * write time.
  */
 typedef struct LRHistoryEntry
 {
 	TimestampTz ts;
 	int32       target_idx;
+	int32       kind;              /* LRTargetKind of the target */
 	uint64      session_id;         /* 0 = recorded outside any session */
 	/* send-side LSNs (SEND / RSEND targets) */
 	XLogRecPtr  current_lsn;        /* C0 */
@@ -160,8 +162,26 @@ typedef struct LRHistoryEntry
 	uint64      stream_bytes;       /* D1 */
 	/* recv-side LSNs (RECV targets) */
 	XLogRecPtr  received_lsn;       /* C3' */
-	XLogRecPtr  applied_lsn;        /* C5' */
+	XLogRecPtr  applied_lsn;        /* C5' (origin∪feedback, monotonic) */
 	XLogRecPtr  local_wal_lsn;      /* recv-side pg_current_wal_lsn() */
+	/* per-round state (send side) */
+	char        state[LR_STATE_LEN];       /* walsender state */
+	char        sync_state[LR_STATE_LEN];  /* async/sync/quorum */
+	char        wal_status[LR_STATE_LEN];  /* reserved/extended/... */
+	bool        active;
+	int32       sender_pid;
+	int64       write_lag_us;             /* -1 unknown */
+	int64       flush_lag_us;
+	int64       replay_lag_us;
+	/* per-round state (recv side) */
+	char        worker_type[LR_WTYPE_LEN];/* apply / table sync */
+	int32       worker_pid;
+	int32       leader_pid;
+	Oid         relid;                    /* tablesync target, else 0 */
+	TimestampTz last_msg_send_time;
+	TimestampTz last_msg_receipt_time;
+	int64       apply_error_count;        /* -1 unknown */
+	int64       sync_error_count;
 } LRHistoryEntry;
 
 /*
@@ -279,7 +299,9 @@ extern void lrstat_session_start(const char *name);
 extern void lrstat_session_stop(void);
 extern void lrstat_session_reset(void);
 extern void lrstat_history_from_sample(LRHistoryEntry *e, int target_idx,
-									   const LRSample *sample);
+									   const LRSample *sample,
+									   const LRTargetMeta *meta,
+									   Oid relid, int kind);
 extern void lrstat_append_history_entry(const LRHistoryEntry *e);
 extern void lrstat_reset_entries(void);
 extern int  lrstat_get_entry_count(void);

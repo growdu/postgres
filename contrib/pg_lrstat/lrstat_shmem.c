@@ -634,28 +634,70 @@ lrstat_session_reset(void)
 }
 
 /*
- * Fill one history entry from a raw sample (send fields for SEND/RSEND
- * targets, recv fields for RECV targets — the unused side stays zero).
+ * Fill one history entry from a raw sample plus its per-round state
+ * (send fields for SEND/RSEND targets, recv fields for RECV targets —
+ * the unused side stays zero).
  */
 void
 lrstat_history_from_sample(LRHistoryEntry *e, int target_idx,
-						   const LRSample *sample)
+						   const LRSample *sample,
+						   const LRTargetMeta *meta,
+						   Oid relid, int kind)
 {
 	memset(e, 0, sizeof(LRHistoryEntry));
 	e->ts = sample->send.ts;    /* ts is first member of both structs */
 	e->target_idx = target_idx;
-	e->current_lsn = sample->send.current_lsn;
-	e->sent_lsn = sample->send.sent_lsn;
-	e->peer_recv_lsn = sample->send.peer_recv_lsn;
-	e->peer_flush_lsn = sample->send.peer_flush_lsn;
-	e->peer_applied_lsn = sample->send.peer_applied_lsn;
-	e->confirmed_lsn = sample->send.confirmed_lsn;
-	e->restart_lsn = sample->send.restart_lsn;
-	e->spill_bytes = sample->send.spill_bytes;
-	e->stream_bytes = sample->send.stream_bytes;
-	e->received_lsn = sample->recv.received_lsn;
-	e->applied_lsn = sample->recv.applied_lsn;
-	e->local_wal_lsn = sample->recv.local_wal_lsn;
+	e->kind = kind;
+	/*
+	 * The sample is a union: only read the side that belongs to this
+	 * target kind, the other stays zero (reading both would alias
+	 * unrelated fields).
+	 */
+	if (kind != LR_RECV)
+	{
+		e->current_lsn = sample->send.current_lsn;
+		e->sent_lsn = sample->send.sent_lsn;
+		e->peer_recv_lsn = sample->send.peer_recv_lsn;
+		e->peer_flush_lsn = sample->send.peer_flush_lsn;
+		e->peer_applied_lsn = sample->send.peer_applied_lsn;
+		e->confirmed_lsn = sample->send.confirmed_lsn;
+		e->restart_lsn = sample->send.restart_lsn;
+		e->spill_bytes = sample->send.spill_bytes;
+		e->stream_bytes = sample->send.stream_bytes;
+	}
+	else
+	{
+		e->received_lsn = sample->recv.received_lsn;
+		e->applied_lsn = sample->recv.applied_lsn;
+		e->local_wal_lsn = sample->recv.local_wal_lsn;
+	}
+
+	if (meta == NULL)
+	{
+		e->write_lag_us = -1;
+		e->flush_lag_us = -1;
+		e->replay_lag_us = -1;
+		e->apply_error_count = -1;
+		e->sync_error_count = -1;
+		return;
+	}
+	/* per-round state */
+	strlcpy(e->state, meta->state, LR_STATE_LEN);
+	strlcpy(e->sync_state, meta->sync_state, LR_STATE_LEN);
+	strlcpy(e->wal_status, meta->wal_status, LR_STATE_LEN);
+	e->active = meta->active;
+	e->sender_pid = meta->sender_pid;
+	e->write_lag_us = meta->write_lag_us;
+	e->flush_lag_us = meta->flush_lag_us;
+	e->replay_lag_us = meta->replay_lag_us;
+	strlcpy(e->worker_type, meta->worker_type, LR_WTYPE_LEN);
+	e->worker_pid = meta->worker_pid;
+	e->leader_pid = meta->leader_pid;
+	e->relid = relid;
+	e->last_msg_send_time = meta->last_msg_send_time;
+	e->last_msg_receipt_time = meta->last_msg_receipt_time;
+	e->apply_error_count = meta->apply_error_count;
+	e->sync_error_count = meta->sync_error_count;
 }
 
 /*

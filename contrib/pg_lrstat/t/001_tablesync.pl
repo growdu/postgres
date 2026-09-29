@@ -133,13 +133,16 @@ $node_subscriber->wait_for_subscription_sync($node_publisher, 'lrstat_sub');
 is($node_subscriber->safe_psql('postgres', 'SELECT count(*) FROM lrstat_test2'),
 	50000, 'second table replicated through its sync worker');
 
-# Once the sync target expired (stale_target_ttl), only the apply
-# worker is left in the views.
+# Once the sync target expired (stale_target_ttl), the LATEST rows of
+# the per-round time series are apply-only (sync rounds stay in history).
 $result = $node_subscriber->poll_query_until(
 	'postgres', qq(
-	SELECT bool_and(worker_type = 'apply') FROM pg_lrstat_recv_stat
+	SELECT bool_and(worker_type = 'apply') FROM (
+		SELECT worker_type FROM pg_lrstat_recv_stat
+		ORDER BY ts DESC LIMIT 3
+	) latest
 ));
-is($result, 1, 'only apply worker left after sync finished');
+is($result, 1, 'latest recv_stat rows are apply-only after sync');
 
 # The publisher side sees the subscription's slot.
 $result = $node_publisher->poll_query_until(

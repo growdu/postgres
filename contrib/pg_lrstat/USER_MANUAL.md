@@ -46,9 +46,9 @@ SELECT lrstat_export('mig_20260924');
 | 视图 | 粒度 | 用途 |
 | --- | --- | --- |
 | `pg_lrstat_info` | 1 行 | 健康自检 + 当前会话状态 |
-| `pg_lrstat_send_stat` | 发送端一连接一行 | 发送端全量状态（在发送端部署时看） |
-| `pg_lrstat_recv_stat` | 接收端一 worker 一行 | 接收端全量状态 |
-| `pg_lrstat_cluster_stat` | 一复制对一行 | **两端合成，日常巡检只看这个** |
+| `pg_lrstat_send_stat` | 发送端一目标**一轮**一行 | 发送端逐轮时序：状态/水位/积压/本轮速率 |
+| `pg_lrstat_recv_stat` | 接收端一 worker**一轮**一行 | 接收端逐轮时序 |
+| `pg_lrstat_cluster_stat` | 一复制对**一轮**一行 | **两端合成逐轮时序，日常巡检只看这个** |
 | `pg_lrstat_send_history` | 一目标一轮一行 | 发送端原始 LSN 样本（始终记录） |
 | `pg_lrstat_recv_history` | 一目标一轮一行 | 接收端原始 LSN 样本（始终记录） |
 | `pg_lrstat_session_stat` | 一会话×目标一行 | 按会话名查历史统计（总量/平均速率） |
@@ -79,92 +79,61 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 | `remote_poll` | bool | 是否启用接收端→发送端轮询 |
 | `archived_session_names` | text[] | 归档会话名列表（persist 会话），供 export/delete 按名使用 |
 
-### 4.2 `pg_lrstat_send_stat` — 发送端（一连接一行，32 列）
+### 4.2 `pg_lrstat_send_stat` — 发送端时序（一目标一轮一行，27 列）
+
+每个采样轮、每个发送端目标一行：水位、当轮积压、本轮速率、当轮状态。
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `slot_name` | text | 复制槽名（逻辑复制槽或物理复制连接名） |
-| `plugin` | text | 逻辑解码插件名（pgoutput 等）；物理复制为空 |
-| `temporary` | bool | 是否临时槽 |
-| `active` | bool | 槽是否活跃（walsender 在用） |
-| `sender_pid` | int4 | walsender 进程 PID；无连接为 NULL |
-| `application_name` | text | 对端连接的应用名（订阅端为订阅名） |
-| `client_addr` | text | 对端 IP 地址 |
-| `state` | text | walsender 状态：streaming（稳态）/ catchup（追赶）/ startup 等 |
-| `sync_state` | text | 同步复制角色：async / sync / quorum；async 时不影响吞吐判定 |
-| `wal_status` | text | 槽的 WAL 保留状态：reserved（正常）/ extended / unreserved / **lost（对端太久没确认，WAL 已被回收，订阅会断）** |
-| `safe_wal_size` | float8 | 距离 wal_status 变 lost 还能保留的 WAL 量（MB）；仅扩展态有值 |
-| `sample_time` | timestamptz | 本行样本的采样时间 |
-| `current_lsn` | pg_lsn | 发送端当前 WAL **生成**位置 |
-| `sent_lsn` | pg_lsn | 已**发送**到对端的位置 |
-| `confirmed_flush_lsn` | pg_lsn | 对端已**确认**的位置——发送端可安全回收的边界 |
-| `backlog_unsent` | float8 | 未发送积压（current−sent，MB）——**解码/发送慢** |
-| `backlog_inflight` | float8 | 已发送未收到（sent−对端反馈写位置，MB）——**网络在途** |
-| `backlog_peer_unapplied` | float8 | 对端收到未应用（反馈写位置−反馈应用位置，MB）——**对端应用慢** |
-| `backlog_total` | float8 | 总积压（current−对端反馈应用位置，MB） |
-| `retained_wal` | float8 | 槽扣住的 WAL（current−restart_lsn，MB）——**磁盘占用风险** |
-| `gen_instant` / `gen_avg` | float8 | WAL 生成速率：上一采样间隔 / 会话至今平均（MB/s） |
-| `send_instant` / `send_avg` | float8 | 发送速率（MB/s） |
-| `apply_instant` / `apply_avg` | float8 | 对端应用速率（按反馈水位计算，MB/s） |
-| `spill_instant` / `spill_avg` | float8 | 解码溢写速率（MB/s）——大事务溢出到磁盘的速度 |
-| `write_lag` | interval | 发送端观测的对端写延迟 |
-| `flush_lag` | interval | 对端刷盘延迟 |
-| `replay_lag` | interval | 对端回放延迟（物理复制语义） |
-| `send_blocked` | bool | t = 有未发送积压且发送平均速率≈0——发送端堵住 |
+| `slot_name` `ts` | text, timestamptz | 目标（槽名）与采样时间 |
+| `plugin` `temporary` `application_name` `client_addr` | — | 直通属性（不随轮存储，取自当前槽位） |
+| `active` | bool | 本轮 walsender 是否在线 |
+| `sender_pid` | int4 | 本轮 walsender PID |
+| `state` `sync_state` `wal_status` | text | 本轮 walsender 状态 / 同步角色 / 槽 WAL 保留状态（lost=订阅会断） |
+| `current_lsn` `sent_lsn` `confirmed_flush_lsn` | pg_lsn | 本轮生成/发送/确认水位 |
+| `backlog_unsent` | float8 | 本轮未发送积压（MB）——解码/发送慢 |
+| `backlog_inflight` | float8 | 已发送未收到（MB）——网络在途 |
+| `backlog_peer_unapplied` | float8 | 对端收到未应用（MB）——对端应用慢 |
+| `backlog_total` `retained_wal` | float8 | 总积压 / 槽扣住 WAL（MB） |
+| `gen_mbps` `send_mbps` `apply_mbps` | float8 | 本轮间隔速率（MB/s，与前一轮同目标作差）；首轮为 NULL |
+| `spill_mb` | float8 | 本轮解码溢写增量（MB）——突增=解码压力大 |
+| `write_lag` `flush_lag` `replay_lag` | interval | 本轮发送端观测的三段延迟 |
+| `send_blocked` | bool | 本轮有未发送积压且发送速率≈0 |
 
-### 4.3 `pg_lrstat_recv_stat` — 接收端（一 worker 一行，20 列）
+### 4.3 `pg_lrstat_recv_stat` — 接收端时序（一 worker 一轮一行，17 列）
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `recv_name` | text | 订阅名 |
-| `worker_type` | text | apply（主应用 worker）/ table synchronization（初始同步 COPY） |
-| `worker_pid` | int4 | worker 进程 PID |
-| `leader_pid` | int4 | 并行 apply 的 leader PID；普通 worker 为 NULL |
-| `relid` | oid | tablesync 正在同步的目标表 OID；apply worker 为 NULL |
-| `sample_time` | timestamptz | 采样时间 |
-| `received_lsn` | pg_lsn | 已从网络**收到**的位置 |
-| `applied_lsn` | pg_lsn | 已**应用**的位置（提交边界——大事务提交时一次跳变是正常的） |
-| `last_msg_send_time` | timestamptz | 对端最后一次发心跳的时间 |
-| `last_msg_receipt_time` | timestamptz | 本端最后一次收到心跳的时间——两差过大说明链路断 |
-| `backlog_apply` | float8 | 收到未应用（received−applied，MB） |
-| `recv_instant` / `recv_avg` | float8 | 接收速率（MB/s） |
-| `apply_instant` / `apply_avg` | float8 | 应用速率（MB/s）——**追平能力的关键数字** |
-| `local_wal_instant` / `local_wal_avg` | float8 | 本地 WAL 写入速率（MB/s，接收端自身写放大观察） |
-| `apply_error_count` | int8 | 应用累计错误数（pg_stat_subscription_stats） |
-| `sync_error_count` | int8 | 初始同步累计错误数 |
-| `apply_blocked` | bool | t = 有未应用积压且应用速率≈0——典型原因是锁冲突 |
+| `recv_name` `ts` | text, timestamptz | 订阅名与采样时间 |
+| `worker_type` | text | apply / table synchronization |
+| `worker_pid` `leader_pid` `relid` | — | 本轮 worker PID / 并行 leader / tablesync 目标表 OID |
+| `received_lsn` `applied_lsn` | pg_lsn | 本轮收到/应用水位（applied 为提交边界） |
+| `last_msg_send_time` `last_msg_receipt_time` | timestamptz | 本轮心跳收发时间——差过大=链路断 |
+| `backlog_apply` | float8 | 本轮收到未应用（MB） |
+| `recv_mbps` `apply_mbps` `local_wal_mbps` | float8 | 本轮间隔速率（MB/s）；首轮为 NULL |
+| `apply_error_count` `sync_error_count` | int8 | 本轮累计错误数 |
+| `apply_blocked` | bool | 本轮有未应用积压且应用速率≈0——典型是锁冲突 |
 
-### 4.4 `pg_lrstat_cluster_stat` — 两端合成（一复制对一行，31 列，**日常只看这个**）
+### 4.4 `pg_lrstat_cluster_stat` — 两端合成时序（一对一轮一行，26 列，**日常只看这个**）
+
+每个采样轮把接收端行与**时间上最近的**发送端轮询样本配对成一行。
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `recv_name` | text | 订阅名（链路标识） |
-| `remote_state` | text | 发送端轮询状态：ok / stale（本轮预算内未完成）/ unreachable（连接失败退避中）/ n/a（未轮询） |
-| `last_remote_poll_time` | timestamptz | 上次成功轮询发送端的时间 |
-| `sample_time` | timestamptz | 接收端样本时间 |
-| `send_current_lsn` | pg_lsn | 发送端当前 WAL 生成位置（远端轮询值） |
-| `sent_lsn` | pg_lsn | 发送端已发送位置（远端轮询值） |
-| `received_lsn` | pg_lsn | 接收端已收到位置 |
-| `applied_lsn` | pg_lsn | 接收端已应用位置 |
-| `confirmed_flush_lsn` | pg_lsn | 发送端槽的确认边界（远端轮询值） |
-| `gen_instant` / `gen_avg` | float8 | 发送端 WAL 生成速率（MB/s） |
-| `send_instant` / `send_avg` | float8 | 发送速率（MB/s） |
-| `recv_instant` / `recv_avg` | float8 | 接收速率（MB/s） |
-| `apply_instant` / `apply_avg` | float8 | 应用速率（MB/s） |
-| `backlog_unsent` | float8 | 未发送积压（MB）——积压在发送端 |
-| `backlog_inflight` | float8 | 网络在途（MB）——积压在网络 |
-| `backlog_unapplied` | float8 | 收到未应用（MB）——积压在接收端 |
-| `backlog_total` | float8 | 总积压（MB） |
-| `retained_wal` | float8 | 发送端槽扣住的 WAL（MB）——磁盘风险 |
-| `feedback_lag_mb` | float8 | 反馈滞后（received−发送端反馈写位置，MB）——反馈延迟的量纲 |
-| `write_lag` / `flush_lag` / `replay_lag` | interval | 发送端观测的三段延迟 |
-| `catchup_send_secs` | float8 | 仅未发送积压按发送速率追平所需秒数 |
-| `catchup_total_secs` | float8 | 全部积压追平所需秒数（发送段+应用段）——**追平预估看这个** |
-| `send_blocked` | bool | 发送端堵住（有未发送积压且速率≈0） |
-| `apply_blocked` | bool | 接收端应用堵住 |
-| `bottleneck` | text | **自动瓶颈判定**：send（发送慢）/ recv_apply（应用慢）/ network（在途占比过半）/ none（健康） |
+| `recv_name` `ts` | text, timestamptz | 订阅名与接收端采样时间 |
+| `remote_state` | text | ok / stale / unreachable / n/a（当前轮询状态） |
+| `send_current_lsn` `sent_lsn` `confirmed_flush_lsn` | pg_lsn | 发送端水位（配对样本） |
+| `received_lsn` `applied_lsn` | pg_lsn | 接收端水位 |
+| `gen_mbps` `send_mbps` | float8 | 发送端本轮生成/发送速率（MB/s） |
+| `recv_mbps` `apply_mbps` | float8 | 接收端本轮接收/应用速率（MB/s） |
+| `backlog_unsent` `backlog_inflight` `backlog_unapplied` `backlog_total` | float8 | 本轮三段积压与总量（MB） |
+| `retained_wal` `feedback_lag_mb` | float8 | 槽扣住 WAL / 反馈滞后（MB） |
+| `write_lag` `flush_lag` `replay_lag` | interval | 发送端观测三段延迟（配对样本） |
+| `catchup_send_secs` `catchup_total_secs` | float8 | 按本轮速率的追平预估（秒） |
+| `send_blocked` `apply_blocked` | bool | 本轮发送/应用堵住 |
+| `bottleneck` | text | 本轮瓶颈判定：send / recv_apply / network / none |
 
-判定规则：`send` = 发送速率落后于生成速率且未发送积压过半；`recv_apply` = 未应用积压过半；`network` = 在途积压过半；否则 none（四速率相等=下游跟得上，正常）。
+**可验证性**：`*_mbps` 列 = 对 `*_history` 视图相邻两行作差÷间隔，可用窗口函数手工重算，逐位一致。
 
 ### 4.5 `pg_lrstat_send_history` — 发送端原始样本（一目标一轮一行，11 列）
 
@@ -199,10 +168,10 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 ## 5. 速率是怎么算的
 
 ```
-瞬时速率 instant = （最新样本 − 前一样本）÷ 采样间隔
-平均速率 avg     = （最新样本 − 会话锚点样本）÷ 已历时
-逐间隔速率 rate_history = 相邻两个原始样本作差 ÷ 间隔（视图现算）
+stat 视图的 *_mbps = 相邻两个原始样本作差 ÷ 间隔（每轮一行）
+报告的 avg        = （末样本 − 会话锚点样本）÷ 会话时长（含窗口截断）
 ```
+stat 视图自 v2.1 起是**逐轮时序**：每个采样周期、每个目标一行。
 
 - 会话锚点 = 会话内**首个含有效位置的样本**（全零样本不锚定，避免把 WAL 历史位置当增量）
 - 应用位置只在事务提交边界推进——大事务期间 `applied` 不动、提交时跳变，属正常内核行为
