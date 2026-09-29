@@ -14,6 +14,7 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -315,33 +316,6 @@ rebuild_from_history(LRExportData *d,
 		}
 		et->has_prev = false;
 	}
-}
-
-static bool
-gather_archived(LRExportData *d, const char *name)
-{
-	LRHistoryEntry *ents = NULL;
-	LRSessTargetInfo *tinfos = NULL;
-	int n_ents = 0, n_tinfos = 0;
-	int64		sid;
-
-	MemSet(d, 0, sizeof(LRExportData));
-
-	if (lrstat_store_load(name, &sid, d->session_name, NAMEDATALEN,
-						  &d->start_ts, &d->stop_ts,
-						  &d->truncated, &d->degraded,
-						  &ents, &n_ents,
-						  &tinfos, &n_tinfos) != 0)
-		return false;
-
-	d->session_running = false;
-	rebuild_from_history(d, ents, n_ents, tinfos, n_tinfos);
-
-	if (ents != NULL)
-		pfree(ents);
-	if (tinfos != NULL)
-		pfree(tinfos);
-	return true;
 }
 
 /*
@@ -1168,6 +1142,69 @@ build_html(LRExportData *d, LRAnalysis *a)
 	return s;
 }
 
+
+/*
+ * List the report files in $PGDATA/pg_lrstat/exports (for the info
+ * view's exported_report_names column) — the reports ARE the durable
+ * artifact of a session now.
+ */
+int
+lrstat_export_list(char ***names_out)
+{
+	char	   *dir_path = psprintf("%s/" EXPORT_DIR, DataDir);
+	DIR		   *dir;
+	struct dirent *de;
+	char	  **names = NULL;
+	int			n = 0, nalloc = 0;
+
+	*names_out = NULL;
+	dir = AllocateDir(dir_path);
+	if (dir == NULL)
+		return 0;
+
+	while ((de = ReadDir(dir, dir_path)) != NULL)
+	{
+		char	   *fname = de->d_name;
+		size_t		len = strlen(fname);
+
+		/* strip .html / .json suffix, dedup by report name */
+		if (len > 5 && (strcmp(fname + len - 5, ".html") == 0 ||
+						strcmp(fname + len - 5, ".json") == 0))
+		{
+			char	base[NAMEDATALEN];
+			int		i;
+			bool	dup = false;
+
+			strlcpy(base, fname, (int) Min(len - 4, NAMEDATALEN));
+			for (i = 0; i < n; i++)
+				if (strcmp(names[i], base) == 0)
+				{ dup = true; break; }
+			if (dup)
+				continue;
+
+			if (n >= nalloc)
+			{
+				nalloc = nalloc == 0 ? 8 : nalloc * 2;
+				if (names == NULL)
+					names = palloc(nalloc * sizeof(char *));
+				else
+				{
+					char **grow = palloc(nalloc * sizeof(char *));
+
+					memcpy(grow, names, n * sizeof(char *));
+					pfree(names);
+					names = grow;
+				}
+			}
+			names[n++] = pstrdup(base);
+		}
+	}
+
+	FreeDir(dir);
+	*names_out = names;
+	return n;
+}
+
 /* ----------------------------------------------------------------
  * lrstat_export entry point: writes the report to
  * $PGDATA/pg_lrstat/exports/<name>.<format> and returns the path.
@@ -1227,9 +1264,10 @@ lrstat_export(PG_FUNCTION_ARGS)
 		sess = text_to_cstring(name_arg);
 
 	/*
-	 * Export by name, three tiers: an archived session file wins; a
-	 * remembered session still in the in-memory ring comes next (works
-	 * for persist=false sessions); anything else is an error.
+	 * Export by name: the current session, or a remembered session
+	 * still in the in-memory ring; anything else is an error.  The
+	 * written report files are the durable artifact — export right
+	 * after stop to keep a session.
 	 */
 	if (name_arg == NULL)
 		gather_data(&data);
@@ -1245,12 +1283,12 @@ lrstat_export(PG_FUNCTION_ARGS)
 
 		if (strcmp(name, cur) == 0)
 			gather_data(&data);
-		else if (!gather_archived(&data, name) &&
-				 !gather_memory_by_name(&data, name))
+		else if (!gather_memory_by_name(&data, name))
 			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
 							errmsg("pg_lrstat: no data for session '%s' "
-								   "(no archived file, and the in-memory "
-								   "ring no longer holds it)", name)));
+								   "in the in-memory ring (older sessions "
+								   "age out; run lrstat_export right after "
+								   "stop to keep a report)", name)));
 	}
 
 	compute_analysis(&data, &analysis);

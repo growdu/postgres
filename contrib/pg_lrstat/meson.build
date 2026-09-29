@@ -5,7 +5,6 @@ pg_lrstat_sources = files(
   'lrstat_shmem.c',
   'lrstat_export.c',
   'lrstat_sql.c',
-  'lrstat_store.c',
   'lrstat_worker.c',
   'pg_lrstat.c',
 )

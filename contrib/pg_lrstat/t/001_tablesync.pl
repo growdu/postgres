@@ -163,11 +163,11 @@ is($node_subscriber->safe_psql('postgres',
 # start/stop/export: the export's evidence tables must carry the raw
 # samples the conclusions are built on
 
-# a persist session with some load so the report has intervals to show
+# a session with some load so the report has intervals to show
 my $hist_baseline = $node_subscriber->safe_psql('postgres',
 	'SELECT count(*) FROM pg_lrstat_recv_history');
 my $sess_archived = $node_subscriber->safe_psql('postgres',
-	'SELECT lrstat_start(true)');
+	'SELECT lrstat_start()');
 chomp $sess_archived;
 $node_publisher->safe_psql('postgres',
 	q(INSERT INTO lrstat_test SELECT g, repeat(md5(g::text), 50)
@@ -185,7 +185,7 @@ sleep(3);
 $node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
 
 # export writes the report to pg_lrstat/exports and returns the path;
-# the archived session is rebuilt from its file
+# the named session is rebuilt from the in-memory ring
 my $archived_path = $node_subscriber->safe_psql('postgres',
 	"SELECT lrstat_export('$sess_archived', 'html')");
 $archived_path =~ s/^\s+|\s+$//g;
@@ -214,8 +214,8 @@ ok(index($archived_json, '"samples": [') >= 0
 	&& $archived_json =~ /"kind": "(send|recv)"/,
 	'archived export contains raw history samples');
 
-# a persist=false session is exportable by name from memory alone
-# (sync_sess was not persisted; it predates wiper)
+# an older session is exportable by name from memory alone
+# (it only predates the wiper session)
 my $mem_path = $node_subscriber->safe_psql('postgres',
 	"SELECT lrstat_export('$sess_sync', 'json')");
 $mem_path =~ s/^\s+|\s+$//g;

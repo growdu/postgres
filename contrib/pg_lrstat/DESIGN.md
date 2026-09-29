@@ -23,7 +23,6 @@ lrstat_start(true)      lrstat_stop()      lrstat_export()
    ┌──────────────── 会话进行中 ────────────────────────┐
    │  采样 worker 每 30s 采集一次全链路位点               │
    │  随时查询：瞬时速率（最近一个采样间隔）＋平均速率（自 start） │
-   │  persist=true 时逐间隔数据双写会话文件                │
    └──────────────────────────────────────────────────┘
         │
         ▼
@@ -39,7 +38,7 @@ lrstat_start(true)      lrstat_stop()      lrstat_export()
 | **锚点样本（anchor）** | 会话首轮采到的样本，平均速率的起算基准 |
 | **逐轮速率（*_mbps）** | 相邻两个样本的差分 ÷ 间隔——stat 视图每轮一行输出 |
 | **平均速率（avg）** | 最新样本 − 锚点 ÷ 经过时间——"这轮从头到现在平均多少" |
-| **历史数组** | 每轮每目标一条**全量原始 LSN 样本**的环形记录（始终在记；persist 会话另落盘一份不覆盖的完整副本） |
+| **历史数组** | 每轮每目标一条**全量原始 LSN 样本 + 逐轮状态**的环形记录（始终在记）——唯一数据源 |
 | **会话报告** | stop 后由历史数组聚合出的完整统计（总量、平均、峰值、堵住等） |
 
 ### 1.3 目标与非目标
@@ -181,10 +180,9 @@ shared_preload_libraries=pg_lrstat        shared_preload_libraries=pg_lrstat
 | 组件 | 文件 | 职责 |
 | --- | --- | --- |
 | 入口 | `pg_lrstat.c` | GUC 定义、共享内存请求/启动 hook、worker 注册、wait event 惰性注册点 |
-| 采样器 | `lrstat_worker.c` | bgworker 主循环：采样三槽位轮转、全量样本入历史、persist 会话双写文件 |
+| 采样器 | `lrstat_worker.c` | bgworker 主循环：采样三槽位轮转、全量样本入历史 |
 | 远端轮询 | `lrstat_remote.c` | 接收端→发送端只读轮询（libpqsrv、预算/退避、反馈位回填） |
 | 共享内存 | `lrstat_shmem.c` | 会话状态、目标表（anchor/prev/last）、历史环形数组（覆盖最旧） |
-| 会话文件 | `lrstat_store.c` | persist 会话的文件读写（双写/fsync/原子头尾/启动恢复） |
 | SQL 层 | `lrstat_sql.c` | start/stop/export/delete 命令、全部视图 SRF、报告聚合 |
 | 导出渲染 | `lrstat_export.c` | HTML（内嵌 SVG+JS）+ JSON 两格式 + 分析结论计算 |
 
@@ -291,15 +289,15 @@ typedef struct LRHistoryEntry
 **状态机**：
 
 ```
-idle ──start(persist)──► running ──stop()──► stopped ──start(name')──► running(...)
+idle ──start()──► running ──stop()──► stopped ──start()──► running(...)
   │                             │  ▲
   │                             │  └─ 采样轮：prev=last; last=新样本;
-  │                             │     每轮把全量样本 append 历史（+persist 会话文件）
-  │                             └ 实例重启：恢复线程把 persist 会话收尾为 interrupted
-  └ 历史（环形）始终在记，非 persist 会话数据随重启消失；目录中的历史会话任意可查
+  │                             │     每轮把全量样本 append 历史
+  │                             └ 实例重启：内存清空；已 export 的报告文件仍在
+  └ 历史（环形）始终在记（跨会话保留至被覆盖）；要留档的会话在 stop 后 export
 ```
 
-**start(persist)**：superuser，无名字（全局唯一会话；重复 start 报错）。自动名 `sess_<n>` 仅标识报告文件与归档条目。动作：`session_id++`、记录 `start_ts`、**只重置全部目标的 anchor/prev/last**（重新锚点；历史数组不清——条目按 session_id 盖章，旧会话在环形内仍可按名导出直到被自然覆盖）、`persist=true` 时创建会话文件（头 `state=running`）；**唤醒 worker 立即执行一轮采样**——该轮样本即锚点。
+**start()**：superuser，无参（全局唯一会话；重复 start 报错）。自动名 `sess_<n>` 仅标识报告与按名补导。动作：`session_id++`、记录 `start_ts`、**只重置全部目标的 anchor/prev/last**（重新锚点；历史数组不清——条目按 session_id 盖章，旧会话在环形内仍可按名导出直到被自然覆盖）、**唤醒 worker 立即执行一轮采样**——该轮样本即锚点。
 
 **采样轮**（每 `sample_interval`）：
 
@@ -311,13 +309,12 @@ idle ──start(persist)──► running ──stop()──► stopped ──s
 2. 远端轮询（§4.5，仅 running）+ 反馈 apply 位折入 last（§4.6）
    ——放在历史记录之前，保证记录值与视图/报告同源（速率可验证）
 3. 历史 append：每目标本轮 last 的全量快照（LSN + kind + 每轮状态字段）
-   → 内存环形数组（环满覆盖最旧置 truncated）；persist 会话同步追加
-   会话文件并 fsync；样本时间戳未前进则跳过（防重复刷屏）
+   → 内存环形数组（环满覆盖最旧置 truncated）；样本时间戳未前进则跳过（防重复刷屏）
 4. 错误恢复：PG_CATCH 内 SPI_finish + AbortOutOfAnyTransaction，
    仅成功路径 Commit——吞错的残留事务会卡死下一轮
 ```
 
-**stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`；persist 会话文件追加**尾部目标表**（target_idx → 名字/类型，magic 落在文件末 8 字节便于从 EOF 定位）后置头 `state=stopped`（条目数按文件大小回填）。停止后内存历史与视图继续可查。**`lrstat_export(name)` 三级查找**：归档文件（重启后亦然）→ 内存环形中该会话的盖章条目（persist=false 也可，目标名取自当前槽位、槽位已复用时按样本字段推断侧别）→ 两者皆无则明确报错。
+**stop()**：superuser，无参。置 `running=false`、记录 `stop_ts`。停止后内存历史与视图继续可查。**`lrstat_export(name)` 查找**：当前会话（name 省略或等于当前）→ 内存环形中该会话的盖章条目（目标名取自当前槽位、槽位已复用时按条目 kind 推断侧别）→ 明确报错并提示 stop 后立即 export。
 
 **竞态规则**：状态转换与采样轮经 `LRSessionState.mutex` + worker latch 协调——先置状态再唤醒；增量以该轮醒来时读到的状态为准，首/末间隔并入或剔除一个采样周期属可接受误差，`duration` 以实际样本区间为准。
 
@@ -349,29 +346,7 @@ idle ──start(persist)──► running ──stop()──► stopped ──s
 
 效果：速率与积压共用同一条既本地又连续的序列，行内自洽。逻辑的 `origin_local_lsn` 列保留 origin 原值（重启续传位点，排障对照用；物理复制此列恒 NULL）。
 
-### 4.7 会话文件与持久化机制（仅 `persist=true`）
-
-文件位于 `$PGDATA/pg_lrstat/sessions/<name>.sess`，worker 直接读写（不经 SQL 目录、不产生 WAL）。**默认 persist=false 不创建任何文件与目录**。
-
-```
-<name>.sess 布局（小端、layout_version 与共享内存共用）：
-┌ 会话头 ─ magic, layout_version, session_name, session_id,
-│          start_ts, stop_ts, state(running/stopped/interrupted),
-│          truncated, degraded, n_targets, n_entries(按文件大小回填)
-├ LRHistoryEntry[] ─ 与内存环形同步双写的全量每轮快照（每轮 fsync）
-└ 会话尾 ─ [LRSessTargetInfo[](target_idx, kind, name)][magic, n]
-           —— magic 落在文件末 8 字节，读取方从 EOF 定位；
-              stop 时写入，重启后按名导出据此还原目标身份
-```
-
-- **原子性**：头重写与尾部追加均为单次 write（短块），fsync 后生效；
-- **崩溃语义**：双写 + fsync 使崩溃至多丢最后一个未落盘间隔；
-- **启动恢复**：shmem 启动 hook 扫描会话目录（目录不存在即跳过——默认常态）；`state=running` 的文件自动补写会话尾、标 `interrupted` 归档；内存会话索引（名/id/状态/时间戳）随之重建。**不做跨重启续跑**（锚点失效，速率语义不可靠）；
-- **降级**：文件写失败（磁盘满/权限）不阻断采样——内存侧继续、`degraded=true`、stop 时 WARNING；
-- **清理**：`lrstat_delete(name)` 删除归档（superuser，不可恢复；非持久会话提示无归档）；无自动过期，目录大小靠巡检。
-- **版本迁移**：`layout_version` 变更后，启动恢复**跳过**不匹配的旧文件并限频 WARNING（列出文件名），不做自动迁移——保留原文件不损坏，用户可手动删除。
-
-### 4.8 并发、锁与内存安全规则
+### 4.7 并发、锁与内存安全规则
 
 - **单写者**：采样 worker 是共享内存唯一写者（bump_applied 的只增更新除外）；每目标 spinlock 保护本块，持锁只做 memcpy 级操作；
 - **锁序**：会话状态 mutex → 目标 mutex，单向，无嵌套反转；
@@ -387,26 +362,22 @@ idle ──start(persist)──► running ──stop()──► stopped ──s
 ### 5.1 命令
 
 ```sql
-lrstat_start(persist boolean DEFAULT false) → text
+lrstat_start() → text
     -- superuser。开始采样（全局唯一会话；已有 running 会话则报错）。
-    -- 唯一参数 persist：true 时数据落 $PGDATA/pg_lrstat/sessions/ 文件。
-    -- 返回自动名 sess_<n>——仅用于报告文件名与归档检索，用户不需要记。
+    -- 返回自动名 sess_<n>——仅用于报告文件名与按名补导。
 
 lrstat_stop() → text
     -- superuser。停止采样（无参数）。返回会话名。
 
 lrstat_export(name text DEFAULT NULL, format text DEFAULT 'html') → text
     -- 导出报告并直接写文件到 $PGDATA/pg_lrstat/exports/<name>.<format>，
-    -- 返回绝对路径。不传 name 导当前/最近会话；传 name（如 sess_3，
-    -- 见 info 的 archived_session_names）导指定归档。查找三级：
-    -- 归档文件（persist，重启后可用）→ 内存环形（任意最近会话）→ 报错。
-    -- 名字只在此处出现——用于标识报告或选取归档。
-
-lrstat_delete(name text) → void
-    -- superuser。删除归档会话文件
+    -- 返回绝对路径。**export 即持久化**——写出的报告文件是会话唯一的
+    -- 持久产物。不传 name 导当前/最近会话；传 name（如 sess_3，见
+    -- info 的 exported_report_names）补导环形内的指定会话；找不到报错
+    -- 并提示 stop 后立即 export。
 
 pg_lrstat_reset() → void
-    -- superuser。会话回 idle 并清内存数据；不动归档文件
+    -- superuser。会话回 idle 并清内存数据
 ```
 
 ### 5.2 视图总览（6 个）
@@ -431,11 +402,10 @@ pg_lrstat_reset() → void
 | `loaded` | bool | 第一步自检：false = 没预加载，其余视图全空，先修配置 |
 | `session_name` | text | 当前/最近会话名——确认你在看的确实是刚跑的那轮 |
 | `session_state` | text | idle/running/stopped/interrupted——是还在跑、已结束、还是崩溃了 |
-| `session_persisted` | bool | false = 重启后数据丢失——决定要不要在重启前导出报告 |
 | `session_start_ts` / `session_stop_ts` | timestamptz | 会话起止时间——和其他系统日志对时间线 |
 | `session_truncated` | bool | true = 日志超上限有丢失——报告数据不完整，需扩容 |
 | `session_degraded` | bool | true = 文件写失败——持久化不完整，导出可能缺数据 |
-| `archived_session_names` | text[] | 归档会话名列表——`lrstat_export(name)` 和 `lrstat_delete(name)` 需要知道名字，从这里查 |
+| `exported_report_names` | text[] | 已导出报告名列表（exports 目录）——报告即持久化产物 |
 | `sample_interval_ms` | int8 | 瞬时速率的粒度——读数前先知道"30 秒内的平均"是什么概念 |
 | `last_round_ts` | timestamptz | 采样 worker 最近一次成功——长期不更新 = worker 挂了 |
 | `last_round_ok` | bool | 上一轮采样成功与否 |
@@ -527,7 +497,7 @@ pg_lrstat_reset() → void
 
 ### 5.5 报告导出 `lrstat_export(name, format)`
 
-导出会话报告并**直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`（名字做文件系统安全字符清洗），返回绝对路径。数据源三级查找（归档文件 → 内存环形 → 报错）。
+导出会话报告并**直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`（名字做文件系统安全字符清洗），返回绝对路径。**export 即持久化**：数据源为当前会话或内存环形内的按名会话，报告文件是唯一持久产物（无独立会话文件）。
 
 #### 5.5.1 自动分析结论（导出的核心价值）
 
@@ -657,7 +627,7 @@ pg_lrstat_reset() → void
 ### 5.7 使用示例（完整流程）
 
 ```sql
-SELECT lrstat_start(true);          -- 开始测量（persist 落文件）
+SELECT lrstat_start();               -- 开始测量
 
 -- 压测进行中，看两端合成时序（日常巡检只盯这一个）：
 SELECT ts, recv_name, bottleneck,
@@ -761,10 +731,8 @@ FROM pg_stat_wal_receiver wr;
 | 场景 | 行为 |
 | --- | --- |
 | 会话中目标中途加入（建新订阅/槽） | 锚点取首见样本，报告 `partial=true` |
-| 历史环形写满 | `truncated=true`，覆盖最旧样本（persist 文件不覆盖），报告标注 |
-| persist 会话文件写失败 | 采样不中断，`degraded=true`，stop 时 WARNING |
-| 实例在 persist 会话中崩溃 | 重启后自动收尾为 `interrupted` 归档，丢失 ≤1 间隔 |
-| 非 persist 会话遇重启 | 会话与报告消失（设计行为） |
+| 历史环形写满 | `truncated=true`，覆盖最旧样本，报告标注 |
+| 实例重启 | 内存会话数据清空；**已 export 的报告文件保留**——export 即持久化 |
 | 接收端锁堵塞应用（逻辑） | `apply_blocked=t`；逐间隔序列呈台阶形（起点/拐点=被堵/放开时刻） |
 | 单个大事务回放 | apply 瞬时速率归 0（位点仅提交边界推进），`blocked` 区分，报告 min 值体现 |
 | 远端发送端宕机 | `remote_state='unreachable'`，指数退避重连，本地采样不受影响 |
@@ -781,11 +749,10 @@ FROM pg_stat_wal_receiver wr;
 | 回归（pg_regress，--temp-config 预加载） | 注入驱动：start('t1') 后注入样本 → 瞬时=末间隔差分、avg=全程差分精确断言；单间隔时瞬时=NULL、avg=首段值；stop 报告 total/min/max/峰值与手算一致；重复 start/重名/错名 stop 报错；报告按名可查 |
 | TAP 001 | 同上注入算术 |
 | TAP 002 / scripts/logical_rep_test.sh | 真实发布订阅：start → pgbench -T N → stat 时序速率非零、逐轮波动 → stop → stat 总量与 pgbench WAL 量级一致、history 行数 ≈ N/30 |
-| 持久化专项（persist=true） | stop 后 restart 报告完整；kill -9 mid-session → interrupted、丢失 ≤1 间隔；只读目录注入 → degraded；delete 生效 |
-| 默认零文件路径 | persist=false 全流程不创建任何文件/目录；重启后无痕 |
+| 持久化专项 | stop 后 export → restart → 报告文件仍在；未 export 的会话重启后按名导出报错并提示 |
 | 报告导出 | html 可解析且含三类图数据点与瓶颈判定；json 与视图逐字段对拍（含 analysis/capacity）；dest 越界拒绝；dest='-' 与落盘一致 |
 | 分析结论 | 注入已知速率/积压 → 验证 `cluster_stat.bottleneck` 判定：send<gen+unsent>50%→'send'；apply<recv+unapplied>50%→'recv_apply'；四速率同频→'none'；spill>0 时 deep_cause 正确；export JSON 的 analysis/capacity 与手算对拍 |
-| 会话边界 | 目标中途加入 partial；stop 恰逢采样轮；混用 persist 模式 |
+| 会话边界 | 目标中途加入 partial；stop 恰逢采样轮；stop 后延迟 export |
 | 物理复制 | primary+standby 集群：send_stat 列出物理连接（kind=physical）、recv_stat 列出 recovery 行、cluster_stat 合成两端；pgbench 负载下四速率一致；standby 断连→remote_state 转 unreachable；级联场景两侧独立 |
 
 ## 10. 实施计划
@@ -794,7 +761,7 @@ FROM pg_stat_wal_receiver wr;
 | --- | --- |
 | P0 | 会话状态机 + start/stop + 三槽位采样 + live 视图族（双速率，逻辑复制） |
 | P1 | 内存会话日志 + send/recv/cluster_stat + send/recv_history + 回归/TAP 重写 |
-| P2 | 可选持久化（persist 路径：双写/fsync/原子头尾）、启动恢复、sessions/delete、专项测试 |
+| P2 | （历史阶段）持久化文件路径——后被移除，export 报告即持久化 |
 | P3 | 报告导出（json → html+SVG）+ bottleneck 列 + 分析结论测试 |
 | P4 | 物理复制支持（send SQL kind 过滤、standby 采样 SQL、pg_stat_wal_receiver 视角）+ 物理专项测试 |
 | P5 | 用户文档（USER_MANUAL/BEST_PRACTICES 按会话模型改写，含物理复制） |

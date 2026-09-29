@@ -8,8 +8,8 @@ pg_lrstat 是一个测量**逻辑/物理复制性能**的扩展。部署在复�
 -- 0. postgresql.conf: shared_preload_libraries = 'pg_lrstat'，重启后
 CREATE EXTENSION pg_lrstat;
 
--- 1. 开始测量（persist=true 时数据落文件，可长期追溯）
-SELECT lrstat_start(true);
+-- 1. 开始测量
+SELECT lrstat_start();
 
 -- 2. 迁移/压测期间随时看链路健康（日常只需要这一个视图）
 SELECT recv_name, bottleneck,
@@ -22,23 +22,22 @@ FROM pg_lrstat_cluster_stat;
 -- 3. 结束测量
 SELECT lrstat_stop();
 
--- 4. 导出报告（直接写文件，返回路径，浏览器打开）
+-- 4. 导出报告（直接写文件 = 持久化，返回路径，浏览器打开）
 SELECT lrstat_export();
 -- -> /var/lib/pgsql/data/pg_lrstat/exports/session.html
--- 需要事后追溯时: SELECT session_name FROM pg_lrstat_info;  -- 如 sess_3
---               SELECT lrstat_export('sess_3');             -- 按名导归档
+-- 环形内仍可按名补导: SELECT lrstat_export('sess_3');
+--   （会话名查 info.session_name / exported_report_names）
 ```
 
 单位约定：**所有字节量输出为 MB（1MB = 1048576 字节），所有速度为 MB/s，时间为秒**。
 
-## 2. 命令（共 5 个，均要求 superuser）
+## 2. 命令（共 4 个，均要求 superuser）
 
 | 命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `lrstat_start(persist)` | `SELECT lrstat_start(true)` | 开始采样（全局唯一会话，无需名字）；persist 默认 false。自动名 sess_N 仅用于报告文件与归档检索 |
+| `lrstat_start()` | `SELECT lrstat_start()` | 开始采样（无参数，全局唯一会话）。自动名 sess_N 仅用于报告与按名导出 |
 | `lrstat_stop()` | `SELECT lrstat_stop()` | 停止采样（无参数） |
 | `lrstat_export(name, format)` | `SELECT lrstat_export()` | 导出报告并**直接写文件**，返回绝对路径；format='html'（默认）或 'json'。不传 name 导出当前/最近会话；传 name（如 `sess_3`，见 info 的 archived_session_names）导出指定归档。名字只在这里出现——用于标识报告或本次测试 |
-| `lrstat_delete(name)` | `SELECT lrstat_delete('压测A')` | 删除归档会话文件（persist 会话）；运行中的会话拒绝删除 |
 | `pg_lrstat_reset()` | `SELECT pg_lrstat_reset()` | 强制清除当前内存数据（不影响归档文件） |
 
 报告内容（HTML）：分析结论卡（瓶颈判定、四速率、积压构成、追平预估、50/100/200GB 容量推算）、Session 卡、**Targets 卡**（每个目标的状态/平均速率/最新 LSN）、速率折线图（gen/send/apply 三线）、原始样本表。
@@ -66,7 +65,7 @@ SELECT lrstat_export();
 | `session_name` | text | 当前/最近一次会话名；从未 start 过为 NULL |
 | `session_state` | text | idle（从未 start）/ running / stopped |
 | `session_truncated` | bool | t = 历史环形写满，覆盖过最旧样本 |
-| `session_degraded` | bool | t = persist 会话文件写入失败，落盘不完整 |
+| `session_degraded` | bool | t = 历史环形曾有写异常（保留位，正常恒 f） |
 | `session_start_ts` | timestamptz | 当前会话开始时间 |
 | `session_stop_ts` | timestamptz | 会话结束时间；运行中为 NULL |
 | `sample_interval_ms` | int8 | 采样周期（毫秒）——瞬时速率的时间粒度 |
@@ -76,7 +75,7 @@ SELECT lrstat_export();
 | `nrounds` | int8 | 累计采样轮数 |
 | `dropped_samples` | int8 | 因目标槽满被丢弃的目标数；>0 需调大 max_targets |
 | `remote_poll` | bool | 是否启用接收端→发送端轮询 |
-| `archived_session_names` | text[] | 归档会话名列表（persist 会话），供 export/delete 按名使用 |
+| `exported_report_names` | text[] | 已导出的报告名列表（exports 目录）——报告即持久化产物 |
 
 ### 4.2 `pg_lrstat_send_stat` — 发送端时序（一目标一轮一行，27 列）
 
@@ -162,7 +161,7 @@ SELECT lrstat_export();
 | `applied_lsn` | pg_lsn | 已应用位置（提交边界） |
 | `local_wal_lsn` | pg_lsn | 接收端本地 WAL 写入位置 |
 
-> 环形写满覆盖最旧（`info.session_truncated = true`）。**数据生命周期**：新会话 start 只重置测量锚点，不清历史——已结束的会话（含 persist=false）在环形内仍可 `lrstat_export(name)` 导出，直到被更新的采样自然挤出环形（默认约 2880 样本/目标）。要**永久**追溯的会话用 `persist=true`（落文件，重启后也能导出）。
+> 环形写满覆盖最旧（`info.session_truncated = true`）。**数据生命周期**：新会话 start 只重置测量锚点，不清历史——已结束的会话在环形内仍可 `lrstat_export(name)` 补导，直到被更新的采样自然挤出环形（默认约 2880 样本/目标）；实例重启后内存清空。**要留档就在 stop 后立即 export——写出的报告文件就是持久化**。
 
 ## 5. 速率是怎么算的（公式与算例）
 
@@ -297,7 +296,7 @@ export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv �
 
 ## 6. 输出报告内容（lrstat_export）
 
-报告直接写文件到 `$PGDATA/pg_lrstat/exports/<name>.<format>` 并返回绝对路径；HTML 浏览器双击即看，JSON 给机器。数据源三级查找：归档文件（persist 会话，重启后可用）→ 内存环形（任意最近会话）→ 明确报错。
+报告直接写文件到 `$PGDATA/pg_lrstat/exports/<name>.<format>` 并返回绝对路径；HTML 浏览器双击即看，JSON 给机器。**export 就是持久化**：数据源是当前会话或内存环形内的指定会话（按名），找不到则明确报错。
 
 ### 6.1 HTML 报告（五个区块，自上而下）
 
@@ -352,7 +351,7 @@ export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv �
 
 ```sql
 -- 迁移前评估：起会话，跑一轮试迁移，看应用速率和容量推算
-SELECT lrstat_start(true);
+SELECT lrstat_start();
 -- ... 跑 10 分钟代表性负载 ...
 SELECT lrstat_stop();
 SELECT lrstat_export(NULL, 'json');   -- 容量表：50/100/200GB 需要多久
@@ -381,6 +380,6 @@ FROM pg_lrstat_send_stat ORDER BY retained_wal DESC NULLS LAST;
 | cluster_stat 没数据 | 没有活跃订阅，或 remote_state = unreachable（检查订阅连接串可达性） |
 | apply 速率 = 0 但积压在涨 | 应用被堵（锁冲突最常见）：拿 recv_stat 的 worker_pid 查 pg_stat_activity 的 wait_event |
 | applied 长时间不动然后突然跳 | 大事务：应用位置只在提交边界推进，正常 |
-| 想看已结束的会话 | `lrstat_export(name)` 即可：环形内直接内存导出（含 persist=false）；被挤出环形或重启后仅 persist 会话可从文件导出 |
+| 想看已结束的会话 | 环形内 `lrstat_export(name)` 补导；已 export 过的直接开 exports 目录下的报告文件 |
 | 四个速率相等 | 健康！下游跟得上，都被"生成"定节奏 |
 | round(x, 1) 报错 | 视图速率/积压列是 float8，需 `round(x::numeric, 1)` |

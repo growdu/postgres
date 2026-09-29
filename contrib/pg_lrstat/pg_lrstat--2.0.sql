@@ -3,7 +3,7 @@
 \echo Use "CREATE EXTENSION pg_lrstat" to load this file. \quit
 
 -- Session commands
-CREATE FUNCTION lrstat_start(persist boolean DEFAULT false)
+CREATE FUNCTION lrstat_start()
 RETURNS text
 AS 'MODULE_PATHNAME', 'lrstat_start'
 LANGUAGE C VOLATILE;
@@ -16,11 +16,6 @@ LANGUAGE C VOLATILE;
 CREATE FUNCTION pg_lrstat_reset()
 RETURNS void
 AS 'MODULE_PATHNAME', 'pg_lrstat_reset'
-LANGUAGE C VOLATILE;
-
-CREATE FUNCTION lrstat_delete(name text)
-RETURNS void
-AS 'MODULE_PATHNAME', 'lrstat_delete'
 LANGUAGE C VOLATILE;
 
 CREATE FUNCTION lrstat_export(
@@ -38,7 +33,7 @@ CREATE FUNCTION pg_lrstat_info(
     OUT sample_interval_ms int8, OUT last_round_ts timestamptz,
     OUT last_round_ok bool, OUT last_round_error text,
     OUT nrounds int8, OUT dropped_samples int8,
-    OUT remote_poll bool, OUT archived_session_names text[])
+    OUT remote_poll bool, OUT exported_report_names text[])
 RETURNS setof record
 AS 'MODULE_PATHNAME', 'pg_lrstat_info'
 LANGUAGE C STABLE;

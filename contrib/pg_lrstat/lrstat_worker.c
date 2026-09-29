@@ -277,8 +277,6 @@ static TimestampTz *recorded_ts = NULL;    /* per target, worker-lifetime */
 static void
 lrstat_record_history(void)
 {
-	LRHistoryEntry *newents = NULL;
-	int n_new = 0;
 	uint64 session_id;
 	int i;
 
@@ -296,19 +294,6 @@ lrstat_record_history(void)
 
 		recorded_ts = palloc0(lrstat->ntargets * sizeof(TimestampTz));
 		MemoryContextSwitchTo(old);
-	}
-
-	/* persist sessions write their full history to a file */
-	if (lrstat->session.running)
-	{
-		char	   *path = psprintf("%s/pg_lrstat/sessions/%s.sess",
-									DataDir, lrstat->session.name);
-		struct stat st;
-		bool		persist = (stat(path, &st) == 0);
-
-		pfree(path);
-		if (persist)
-			newents = palloc(lrstat->ntargets * sizeof(LRHistoryEntry));
 	}
 
 	for (i = 0; i < lrstat->ntargets; i++)
@@ -339,15 +324,6 @@ lrstat_record_history(void)
 		e.session_id = session_id;
 		lrstat_append_history_entry(&e);
 		recorded_ts[i] = last.send.ts;
-		if (newents != NULL)
-			newents[n_new++] = e;
-	}
-
-	if (newents != NULL)
-	{
-		if (n_new > 0)
-			lrstat_store_append(n_new, newents);
-		pfree(newents);
 	}
 }
 

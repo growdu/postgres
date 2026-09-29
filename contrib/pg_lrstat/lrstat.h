@@ -313,22 +313,8 @@ extern void lrstat_note_dropped(const char *name);
 /* lrstat_worker.c */
 extern PGDLLEXPORT pg_noreturn void pg_lrstat_worker_main(Datum arg);
 
-/* lrstat_store.c */
-extern int  lrstat_store_create(const char *name, uint64 session_id,
-								TimestampTz start_ts);
-extern void lrstat_store_append(int n_entries, LRHistoryEntry *entries);
-extern void lrstat_store_finalize(const char *name, const char *state,
-								  bool truncated, bool degraded);
-/* read an archived session file; returns 0 on success */
-extern int lrstat_store_load(const char *name,
-							 int64 *session_id, char *sess_name, int sess_name_len,
-							 TimestampTz *start_ts, TimestampTz *stop_ts,
-							 bool *truncated, bool *degraded,
-							 LRHistoryEntry **entries, int *n_entries,
-							 LRSessTargetInfo **targets, int *n_targets);
-extern void lrstat_store_recover(void);
-extern int  lrstat_store_list(char ***names_out);
-extern int  lrstat_store_delete(const char *name);
+/* lrstat_export.c */
+extern int  lrstat_export_list(char ***names_out);
 
 /* lrstat_remote.c */
 extern void lrstat_run_remote_poll(const LRPollTarget *targets, int ntargets,

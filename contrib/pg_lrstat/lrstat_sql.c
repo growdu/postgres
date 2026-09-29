@@ -175,12 +175,12 @@ pg_lrstat_info(PG_FUNCTION_ARGS)
     lr_put_i8(&r, 0);
     lr_put_bool(&r, lrstat_remote_poll);
 
-    /* archived session names */
+    /* exported report names */
     {
         char **names = NULL;
         int count = 0;
         if (ready)
-            count = lrstat_store_list(&names);
+            count = lrstat_export_list(&names);
         if (count > 0 && names != NULL)
         {
             ArrayType *arr;
@@ -615,7 +615,6 @@ lrstat_start(PG_FUNCTION_ARGS)
     snprintf(name, sizeof(name), "sess_%lld",
              (long long) (lrstat->session.session_id + 1));
 
-    lrstat_persist_requested = PG_ARGISNULL(0) ? false : PG_GETARG_BOOL(0);
     lrstat_session_start(name);
     PG_RETURN_DATUM(CStringGetTextDatum(name));
 }
@@ -658,37 +657,3 @@ pg_lrstat_reset(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
-PG_FUNCTION_INFO_V1(lrstat_delete);
-Datum
-lrstat_delete(PG_FUNCTION_ARGS)
-{
-    text *name_arg = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
-    char name[NAMEDATALEN];
-
-    if (!superuser())
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                        errmsg("must be superuser")));
-    if (name_arg == NULL)
-        ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                        errmsg("session name is required")));
-    if (!lrstat_ready())
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                        errmsg("pg_lrstat not loaded")));
-
-    strlcpy(name, text_to_cstring(name_arg), NAMEDATALEN);
-
-    /* refuse to delete a running session */
-    SpinLockAcquire(&lrstat->session.mutex);
-    if (lrstat->session.running && strcmp(lrstat->session.name, name) == 0)
-    {
-        SpinLockRelease(&lrstat->session.mutex);
-        ereport(ERROR, (errcode(ERRCODE_OBJECT_IN_USE),
-                        errmsg("session %s is still running, stop it first", name)));
-    }
-    SpinLockRelease(&lrstat->session.mutex);
-
-    if (lrstat_store_delete(name) != 0)
-        ereport(NOTICE, (errmsg("no archived session named %s", name)));
-
-    PG_RETURN_VOID();
-}

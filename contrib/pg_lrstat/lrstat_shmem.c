@@ -24,9 +24,6 @@
 
 LRStatShared *lrstat = NULL;
 
-/* set by lrstat_start() before lrstat_session_start() */
-bool lrstat_persist_requested = false;
-
 static bool lrstat_was_preloaded = false;
 
 /* Target array starts right after the shared header */
@@ -126,8 +123,7 @@ lrstat_shmem_startup(void)
 	for (i = 0; i < LRSTAT_MAX_SESSIONS; i++)
 		MemSet(lrstat_sessionreg_at(i), 0, sizeof(LRSessionRegEntry));
 
-	/* Recover interrupted sessions from files */
-	lrstat_store_recover();
+
 }
 
 bool
@@ -574,12 +570,6 @@ lrstat_session_start(const char *name)
 		SpinLockRelease(&t->mutex);
 	}
 
-	/* Create session file only when persist was explicitly requested */
-	if (lrstat_persist_requested &&
-		lrstat_store_create(name, lrstat->session.session_id,
-							 lrstat->session.start_ts) != 0)
-		lrstat->session.degraded = true;
-	lrstat_persist_requested = false;  /* reset for next session */
 }
 
 void
@@ -595,17 +585,6 @@ lrstat_session_stop(void)
 	lrstat_sessionreg_close(lrstat->session.session_id,
 							lrstat->session.stop_ts);
 
-	/* Finalize session file only if it exists (persist session) */
-	{
-		char *path = psprintf("%s/pg_lrstat/sessions/%s.sess", DataDir,
-							  lrstat->session.name);
-		struct stat st;
-		if (stat(path, &st) == 0)
-			lrstat_store_finalize(lrstat->session.name, "stopped",
-								  lrstat->session.truncated,
-								  lrstat->session.degraded);
-		pfree(path);
-	}
 }
 
 void
