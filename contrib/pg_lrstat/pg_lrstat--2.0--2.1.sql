@@ -1,6 +1,37 @@
+-- pg_lrstat 2.0 -> 2.1
+--
+-- 2.1 changed function signatures (argument-free start/stop) and
+-- removed the session_stat / *_rate_history views.  Drop every
+-- historical signature and view, then recreate the current set.
+-- The layout-version sentinel at the end fails loudly if the
+-- postmaster still runs an older library (restart required).
+
+DROP VIEW IF EXISTS
+    pg_lrstat_info, pg_lrstat_send_stat, pg_lrstat_recv_stat,
+    pg_lrstat_cluster_stat, pg_lrstat_send_history,
+    pg_lrstat_recv_history, pg_lrstat_session_stat,
+    pg_lrstat_send_rate_history, pg_lrstat_recv_rate_history;
+
+DROP FUNCTION IF EXISTS pg_lrstat_info();
+DROP FUNCTION IF EXISTS pg_lrstat_send_stat();
+DROP FUNCTION IF EXISTS pg_lrstat_recv_stat();
+DROP FUNCTION IF EXISTS pg_lrstat_cluster_stat();
+DROP FUNCTION IF EXISTS pg_lrstat_send_history();
+DROP FUNCTION IF EXISTS pg_lrstat_recv_history();
+DROP FUNCTION IF EXISTS pg_lrstat_session_stat();
+DROP FUNCTION IF EXISTS pg_lrstat_send_rate_history();
+DROP FUNCTION IF EXISTS pg_lrstat_recv_rate_history();
+DROP FUNCTION IF EXISTS lrstat_start();            -- 2.0 signature
+DROP FUNCTION IF EXISTS lrstat_start(text, boolean); -- pre-2.0 signature
+DROP FUNCTION IF EXISTS lrstat_stop();
+DROP FUNCTION IF EXISTS lrstat_stop(text);
+DROP FUNCTION IF EXISTS lrstat_export(text, text);
+DROP FUNCTION IF EXISTS lrstat_delete(text);
+DROP FUNCTION IF EXISTS pg_lrstat_reset();
+DROP FUNCTION IF EXISTS pg_lrstat_layout_version();
+
 /* pg_lrstat--2.0.sql */
 
-\echo Use "CREATE EXTENSION pg_lrstat" to load this file. \quit
 
 -- Session commands
 CREATE FUNCTION lrstat_start()
@@ -24,6 +55,13 @@ CREATE FUNCTION lrstat_export(
 RETURNS text
 AS 'MODULE_PATHNAME', 'lrstat_export'
 LANGUAGE C VOLATILE;
+
+-- Sentinel: fails loudly when the postmaster still runs an older
+-- library (create/upgrade after replacing the .so but before restart).
+CREATE FUNCTION pg_lrstat_layout_version()
+RETURNS int4
+AS 'MODULE_PATHNAME', 'pg_lrstat_layout_version'
+LANGUAGE C STABLE;
 
 -- View: info (1 row, health + session state)
 CREATE FUNCTION pg_lrstat_info(
@@ -137,3 +175,7 @@ GRANT SELECT ON
     pg_lrstat_recv_stat, pg_lrstat_cluster_stat,
     pg_lrstat_send_history, pg_lrstat_recv_history
 TO pg_monitor;
+
+-- Creating the extension gives a clean slate: shared memory may hold
+-- data from a previous install (the ring survives DROP EXTENSION).
+SELECT pg_lrstat_reset();

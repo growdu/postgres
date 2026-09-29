@@ -610,6 +610,10 @@ lrstat_session_reset(void)
 		t->in_use = false;
 		SpinLockRelease(&t->mutex);
 	}
+	/* reset is the "clean slate" primitive (also used by the install
+	 * script): wipe the history ring too, not just the targets */
+	lrstat->n_entries = 0;
+	lrstat->session.truncated = false;
 }
 
 /*

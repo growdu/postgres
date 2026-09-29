@@ -133,6 +133,19 @@ hist_targets_init(HistTargetState *st, int n)
 /* side of an entry, from the recorded target kind */
 #define ENTRY_IS_RECV(e) ((e)->kind == LR_RECV)
 
+/*
+ * Sentinel referenced by the 2.1 install/upgrade scripts: if the
+ * postmaster still has an older library loaded (no restart after
+ * replacing the .so), CREATE/ALTER EXTENSION fails here with
+ * "could not find function" instead of silently mixing versions.
+ */
+PG_FUNCTION_INFO_V1(pg_lrstat_layout_version);
+Datum
+pg_lrstat_layout_version(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_INT32(LRSTAT_LAYOUT_VERSION);
+}
+
 PG_FUNCTION_INFO_V1(pg_lrstat_info);
 Datum
 pg_lrstat_info(PG_FUNCTION_ARGS)

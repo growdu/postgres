@@ -1,6 +1,6 @@
 # pg_lrstat extension
 comment = 'replication measurement sessions: named start/stop, dual-rate, visual export'
-default_version = '2.0'
+default_version = '2.1'
 module_pathname = '$libdir/pg_lrstat'
 superuser = true
 relocatable = false

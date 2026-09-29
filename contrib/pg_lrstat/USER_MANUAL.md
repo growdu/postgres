@@ -29,6 +29,22 @@ SELECT lrstat_export();
 
 单位约定：**字节量 = MB（1MB = 1,048,576 字节），速率 = MB/s**。
 
+### 部署与升级（重要）
+
+更换版本后按此顺序操作，避免新旧混跑：
+
+```sh
+# 1. 替换 .so 后必须重启实例——运行中的 postmaster 仍持有旧代码在内存
+pg_ctl restart -D $PGDATA
+
+# 2. 已有 2.0 目录的实例升级到 2.1（函数签名变了）：
+psql -c "ALTER EXTENSION pg_lrstat UPDATE;"
+#    或彻底重建：
+psql -c "DROP EXTENSION pg_lrstat CASCADE; CREATE EXTENSION pg_lrstat;"
+```
+
+内置防护：安装/升级脚本引用 `pg_lrstat_layout_version()` 哨兵——若实例未重启（内存中还是旧库），`CREATE/ALTER EXTENSION` 会直接报 "could not find function" 而不是静默混版本；`CREATE EXTENSION` 会清空共享内存中的残留数据。
+
 ## 2. 数据生命周期（一张图）
 
 ```

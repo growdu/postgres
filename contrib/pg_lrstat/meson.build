@@ -25,7 +25,8 @@ contrib_targets += pg_lrstat
 
 install_data(
   'pg_lrstat.control',
-  'pg_lrstat--2.0.sql',
+  'pg_lrstat--2.1.sql',
+  'pg_lrstat--2.0--2.1.sql',
   kwargs: contrib_data_args,
 )
 

@@ -39,6 +39,16 @@ pg_lrstat.stale_target_ttl = '5s'
 $node_subscriber->start;
 $node_subscriber->safe_psql('postgres', 'CREATE EXTENSION pg_lrstat');
 
+# No sampling before lrstat_start(): views stay empty on a fresh
+# extension (regression guard for the ring surviving reinstalls).
+sleep(3);
+is($node_subscriber->safe_psql('postgres',
+	q(SELECT count(*) FROM pg_lrstat_recv_history)),
+	0, 'no samples before the first lrstat_start()');
+is($node_subscriber->safe_psql('postgres',
+	q(SELECT count(*) FROM pg_lrstat_recv_stat)),
+	0, 'recv_stat empty before the first lrstat_start()');
+
 # The first table synchronizes as part of CREATE SUBSCRIPTION.
 $node_publisher->safe_psql(
 	'postgres', q(
@@ -177,6 +187,35 @@ $result = $node_subscriber->poll_query_until('postgres', qq(
 	SELECT count(*) >= 3 FROM pg_lrstat_recv_history
 ));
 is($result, 1, 'session records history samples');
+
+# stat views are per-round time series with derived rates (guards
+# the one-row-per-target and always-NULL-rate regressions)
+$result = $node_subscriber->safe_psql('postgres', qq(
+	SELECT count(*) >= 3 FROM pg_lrstat_recv_stat));
+is($result, 't', 'recv_stat has one row per round');
+$result = $node_subscriber->safe_psql('postgres', qq(
+	SELECT count(*) >= 2 FROM pg_lrstat_recv_stat
+	WHERE apply_mbps IS NOT NULL));
+is($result, 't', 'apply_mbps derived from round 2 onwards');
+
+# ---- record every table into the test report ----------------------
+# Full dumps of all six views plus the exported HTML are appended to
+# the test log and copied into the node's data directory so a failed
+# run leaves the exact evidence behind.
+my $datadir = $node_subscriber->data_dir;
+my $report_dir = "$datadir/pg_lrstat_test_report";
+mkdir($report_dir) unless -d $report_dir;
+for my $view (
+	qw(pg_lrstat_info pg_lrstat_send_stat pg_lrstat_recv_stat
+	   pg_lrstat_cluster_stat pg_lrstat_send_history
+	   pg_lrstat_recv_history))
+{
+	my $dump = $node_subscriber->safe_psql('postgres',
+		"SELECT * FROM $view");
+	note("===== $view (full dump) =====\n$dump");
+	PostgreSQL::Test::Utils::append_to_file("$report_dir/$view.txt",
+		"$view\n$dump\n");
+}
 $node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
 
 # export the named session BEFORE starting another one: start() wipes
@@ -188,6 +227,11 @@ like($archived_path, qr{pg_lrstat/exports/\Q$sess_archived\E\.html$},
 	'export returns the report file path');
 ok(-f $archived_path, 'named session exported to a report file');
 my $archived_html = PostgreSQL::Test::Utils::slurp_file($archived_path);
+# keep the exported report with the test evidence
+PostgreSQL::Test::Utils::append_to_file(
+	"$report_dir/exported_report.html", $archived_html);
+note("exported HTML report saved to $report_dir/exported_report.html "
+	. "(" . length($archived_html) . " bytes)");
 ok(index($archived_html, '<h1>Evidence</h1>') >= 0
 	&& index($archived_html, 'send history samples') >= 0
 	&& index($archived_html, 'recv history samples') >= 0,
