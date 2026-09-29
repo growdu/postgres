@@ -33,9 +33,9 @@ SELECT lrstat_export('mig_20260924');
 
 | 命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `lrstat_start(name, persist)` | `SELECT lrstat_start('压测A', true)` | 开始会话；persist 默认 false（不写文件）。会清空上一会话的内存数据 |
+| `lrstat_start(name, persist)` | `SELECT lrstat_start('压测A', true)` | 开始会话；persist 默认 false。只重置测量锚点，不清历史——旧会话在环形内仍按名可查 |
 | `lrstat_stop(name)` | `SELECT lrstat_stop('压测A')` | 结束会话；名字必须与 start 一致否则报错 |
-| `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告并**直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`，返回绝对路径；format='html'（默认）或 'json'。传归档会话名时直接读会话文件，重启后也能导 |
+| `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告并**直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`，返回绝对路径；format='html'（默认）或 'json'。查找顺序：归档文件（persist 会话，重启后可用）→ 内存环形（任意最近会话，含 persist=false）；都没有则报错 |
 | `lrstat_delete(name)` | `SELECT lrstat_delete('压测A')` | 删除归档会话文件（persist 会话）；运行中的会话拒绝删除 |
 | `pg_lrstat_reset()` | `SELECT pg_lrstat_reset()` | 强制清除当前内存数据（不影响归档文件） |
 
@@ -55,7 +55,7 @@ SELECT lrstat_export('mig_20260924');
 | `pg_lrstat_send_rate_history` | 一目标一间隔一行 | 发送端逐间隔速率（窗口函数现算） |
 | `pg_lrstat_recv_rate_history` | 一目标一间隔一行 | 接收端逐间隔速率（窗口函数现算） |
 
-stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终值，下一次 start 清零。要看历史会话用 `session_stat` / `*_rate_history`（内存环形内）或 `lrstat_export(name)`（persist 会话文件）。
+stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终值，新会话 start 后重新锚定。要看历史会话用 `session_stat` / `*_rate_history`（按 session_name 过滤）或 `lrstat_export(name)`（文件或内存）。
 
 ## 4. 视图字段详解
 
@@ -199,7 +199,7 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 | `applied_lsn` | pg_lsn | 已应用位置（提交边界） |
 | `local_wal_lsn` | pg_lsn | 接收端本地 WAL 写入位置 |
 
-> 环形写满覆盖最旧（`info.session_truncated = true`）。`lrstat_start` 清空内存历史——旧会话只有 persist 会话留了文件，用 `lrstat_export(name)` 取回。
+> 环形写满覆盖最旧（`info.session_truncated = true`）。**数据生命周期**：新会话 start 只重置测量锚点，不清历史——已结束的会话（含 persist=false）在环形内仍可按 `session_name` 查询、可 `lrstat_export(name)` 导出，直到被更新的采样自然挤出环形（默认容量约 2880 样本/目标）。要**永久**追溯的会话用 `persist=true`（落文件，重启后也能导出）。
 
 ### 4.7 `pg_lrstat_session_stat` — 按会话汇总（13 列）
 
@@ -309,6 +309,6 @@ FROM pg_lrstat_send_stat ORDER BY retained_wal DESC NULLS LAST;
 | apply 速率 = 0 但积压在涨 | 应用被堵（锁冲突最常见）：拿 recv_stat 的 worker_pid 查 pg_stat_activity 的 wait_event |
 | applied 长时间不动然后突然跳 | 大事务：应用位置只在提交边界推进，正常 |
 | history 里 session_name 是 NULL | 会话之外的空闲期采样，正常；过滤掉即可 |
-| 想看已结束多时的会话 | 当时 persist=true 了吗？是则 `lrstat_export(name)` 从文件重建；否则内存环形已覆盖 |
+| 想看已结束的会话 | `lrstat_export(name)` 即可：环形内直接内存导出（含 persist=false）；被挤出环形或重启后仅 persist 会话可从文件导出 |
 | 四个速率相等 | 健康！下游跟得上，都被"生成"定节奏 |
 | round(x, 1) 报错 | 视图速率/积压列是 float8，需 `round(x::numeric, 1)` |

@@ -202,16 +202,16 @@ $result = $node_subscriber->safe_psql('postgres', qq(
 ));
 cmp_ok($result, '>=', 1, 'first sample of a session has NULL rate');
 
-# a third session resets the in-memory history; the archived session
-# remains queryable by name through its file
+# a third session only re-anchors targets; previous sessions stay in
+# the in-memory history until the ring overwrites them
 $node_subscriber->safe_psql('postgres', "SELECT lrstat_start('wiper')");
 sleep(3);
 is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop('wiper')"),
 	'wiper', 'third session stopped');
 is($node_subscriber->safe_psql('postgres', qq(
-	SELECT count(*) = 0 FROM pg_lrstat_recv_history
+	SELECT count(*) > 0 FROM pg_lrstat_recv_history
 	WHERE session_name = 'archived')),
-	't', 'memory history reset by newer session');
+	't', 'older session survives a newer session start');
 
 # export writes the report to pg_lrstat/exports and returns the path;
 # the archived session is rebuilt from its file
@@ -227,5 +227,23 @@ ok(index($archived_json, '"name": "archived"') >= 0,
 ok(index($archived_json, '"samples": [') >= 0
 	&& $archived_json =~ /"kind": "(send|recv)"/,
 	'archived export contains raw history samples');
+
+# a persist=false session is exportable by name from memory alone
+# (sync_sess was not persisted; it predates wiper)
+my $mem_path = $node_subscriber->safe_psql('postgres',
+	"SELECT lrstat_export('sync_sess', 'json')");
+$mem_path =~ s/^\s+|\s+$//g;
+like($mem_path, qr{pg_lrstat/exports/sync_sess\.json$},
+	'non-persist session exported by name from memory');
+my $mem_json = PostgreSQL::Test::Utils::slurp_file($mem_path);
+ok(index($mem_json, '"name": "sync_sess"') >= 0,
+	'memory export identifies the session');
+
+# an unknown session is a clear error, not a wrong report
+my ($ret, $out, $err) = $node_subscriber->psql('postgres',
+	"SELECT lrstat_export('does_not_exist', 'json')");
+isnt($ret, 0, 'unknown session name errors out');
+like($err, qr/no data for session/,
+	'error mentions the missing session');
 
 done_testing();

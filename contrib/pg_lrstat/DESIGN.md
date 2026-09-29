@@ -296,7 +296,7 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
   └ 历史（环形）始终在记，非 persist 会话数据随重启消失；目录中的历史会话任意可查
 ```
 
-**start(name, persist)**：superuser。校验：当前无 running 会话、名字不与历史会话冲突（重名报错，提示换名或 `lrstat_delete`）。动作：`session_id++`、记录名字与 `start_ts`、清空历史数组与全部目标的 anchor/prev/last、`persist=true` 时创建会话文件（头 `state=running`）；**唤醒 worker 立即执行一轮采样**——该轮样本即锚点，保证 start 后一个采样间隔内即可查到双速率。
+**start(name, persist)**：superuser。校验：当前无 running 会话、名字不与历史会话冲突（重名报错，提示换名或 `lrstat_delete`）。动作：`session_id++`、记录名字与 `start_ts`、**只重置全部目标的 anchor/prev/last**（新会话重新锚点；历史数组不清——条目按 session_id 盖章，旧会话在环形内仍按名可查直到被自然覆盖）、`persist=true` 时创建会话文件（头 `state=running`）；**唤醒 worker 立即执行一轮采样**——该轮样本即锚点，保证 start 后一个采样间隔内即可查到双速率。
 
 **采样轮**（每 `sample_interval`）：
 
@@ -309,7 +309,7 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 3. 远端轮询（§4.5）+ 应用位点回填（§4.6）只在 running 时执行
 ```
 
-**stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`；persist 会话文件追加**尾部目标表**（target_idx → 名字/类型，magic 落在文件末 8 字节便于从 EOF 定位）后置头 `state=stopped`（条目数按文件大小回填）。停止后内存历史与视图继续可查，直到下一次 start 清零；**归档文件支持 `lrstat_export(name)` 按名重建报告**（从条目恢复每目标首/末样本作锚点，重启后亦然）。
+**stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`；persist 会话文件追加**尾部目标表**（target_idx → 名字/类型，magic 落在文件末 8 字节便于从 EOF 定位）后置头 `state=stopped`（条目数按文件大小回填）。停止后内存历史与视图继续可查。**`lrstat_export(name)` 三级查找**：归档文件（重启后亦然）→ 内存环形中该会话的盖章条目（persist=false 也可，目标名取自当前槽位、槽位已复用时按样本字段推断侧别）→ 两者皆无则明确报错。
 
 **竞态规则**：状态转换与采样轮经 `LRSessionState.mutex` + worker latch 协调——先置状态再唤醒；增量以该轮醒来时读到的状态为准，首/末间隔并入或剔除一个采样周期属可接受误差，`duration` 以实际样本区间为准。
 

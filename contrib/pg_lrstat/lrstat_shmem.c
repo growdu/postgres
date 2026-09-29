@@ -283,6 +283,39 @@ lrstat_session_id_by_name(const char *name)
 	return 0;
 }
 
+/* full registry lookup by name; false when the session is unknown */
+bool
+lrstat_sessionreg_lookup(const char *name, uint64 *session_id,
+						 TimestampTz *start_ts, TimestampTz *stop_ts)
+{
+	int i;
+
+	if (!lrstat_ready() || name == NULL || name[0] == '\0')
+		return false;
+
+	for (i = 0; i < LRSTAT_MAX_SESSIONS; i++)
+	{
+		LRSessionRegEntry *r = lrstat_sessionreg_at(i);
+		bool match = false;
+
+		SpinLockAcquire(&lrstat->session.mutex);
+		if (r->in_use && strcmp(r->name, name) == 0)
+		{
+			match = true;
+			if (session_id != NULL)
+				*session_id = r->session_id;
+			if (start_ts != NULL)
+				*start_ts = r->start_ts;
+			if (stop_ts != NULL)
+				*stop_ts = r->stop_ts;
+		}
+		SpinLockRelease(&lrstat->session.mutex);
+		if (match)
+			return true;
+	}
+	return false;
+}
+
 static bool
 target_key_equal(const LRTargetCtl *t, LRTargetKind kind,
 				 const char *name, Oid relid, char worker_char)
@@ -507,7 +540,12 @@ lrstat_session_start(const char *name)
 	lrstat_sessionreg_add(lrstat->session.session_id, name,
 						  lrstat->session.start_ts);
 
-	/* reset all targets and session log */
+	/*
+	 * Reset only the measurement anchors: the new session re-anchors
+	 * every target.  History is NOT cleared — entries are stamped with
+	 * the session id, so previous sessions stay queryable by name until
+	 * the ring naturally overwrites them.
+	 */
 	for (i = 0; i < lrstat->ntargets; i++)
 	{
 		LRTargetCtl *t = lrstat_target_at(i);
@@ -519,7 +557,6 @@ lrstat_session_start(const char *name)
 		t->last_sample_ts = 0;
 		SpinLockRelease(&t->mutex);
 	}
-	lrstat->n_entries = 0;
 
 	/* Create session file only when persist was explicitly requested */
 	if (lrstat_persist_requested &&

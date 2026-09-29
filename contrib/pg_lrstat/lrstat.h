@@ -261,6 +261,9 @@ extern void lrstat_sessionreg_close(uint64 session_id, TimestampTz stop_ts);
 /* average-rate window clamp: min(last_ts, session stop_ts) */
 extern TimestampTz lrstat_rate_end(TimestampTz last_ts);
 extern uint64 lrstat_session_id_by_name(const char *name);
+extern bool lrstat_sessionreg_lookup(const char *name, uint64 *session_id,
+									 TimestampTz *start_ts,
+									 TimestampTz *stop_ts);
 extern LRTargetCtl *lrstat_find_or_create(LRTargetKind kind, const char *name,
 										  Oid relid, char worker_char);
 extern bool lrstat_lookup(LRTargetKind kind, const char *name,

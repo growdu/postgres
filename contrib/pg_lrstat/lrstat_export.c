@@ -166,27 +166,21 @@ gather_data(LRExportData *d)
  * history entries of each target; passthrough metadata is not stored
  * in files and stays empty.
  */
-static bool
-gather_archived(LRExportData *d, const char *name)
+/*
+ * Shared rebuild from a raw entry array + target info list: fills the
+ * export targets and history copy, reconstructs per-target anchor/last
+ * samples.  The ts and the LSNs must come from the SAME sample — the
+ * first/last one with non-zero LSNs — or dt and bytes drift apart and
+ * the average rate comes out wrong.
+ */
+static void
+rebuild_from_history(LRExportData *d,
+					 const LRHistoryEntry *ents, int n_ents,
+					 const LRSessTargetInfo *tinfos, int n_tinfos)
 {
-	LRHistoryEntry *ents = NULL;
-	LRSessTargetInfo *tinfos = NULL;
-	int n_ents = 0, n_tinfos = 0;
-	int64		sid;
-	int			i, j;
+	int i, j;
 
-	MemSet(d, 0, sizeof(LRExportData));
-
-	if (lrstat_store_load(name, &sid, d->session_name, NAMEDATALEN,
-						  &d->start_ts, &d->stop_ts,
-						  &d->truncated, &d->degraded,
-						  &ents, &n_ents,
-						  &tinfos, &n_tinfos) != 0)
-		return false;
-
-	d->session_running = false;
-
-	/* targets from the file footer */
+	/* targets */
 	d->n_targets = Min(n_tinfos, 64);
 	for (i = 0; i < d->n_targets; i++)
 	{
@@ -195,8 +189,8 @@ gather_archived(LRExportData *d, const char *name)
 		et->ctl_idx = tinfos[i].target_idx;
 		et->kind = (LRTargetKind) tinfos[i].kind;
 		strlcpy(et->name, tinfos[i].name, NAMEDATALEN);
-		/* the footer does not store worker_char/relid; treat every
-		 * archived recv target as an apply-leader candidate */
+		/* target info carries no worker_char/relid; treat every recv
+		 * target as an apply-leader candidate */
 		if (et->kind == LR_RECV)
 		{
 			et->worker_char = 'a';
@@ -216,16 +210,14 @@ gather_archived(LRExportData *d, const char *name)
 			memcpy(&d->entries[i], &ents[skip + i], sizeof(LRHistoryEntry));
 	}
 
-	/* rebuild anchor/last per target: the ts and the LSNs must come
-	 * from the SAME sample — the first/last one with non-zero LSNs —
-	 * or dt and bytes drift apart and the average rate comes out wrong */
+	/* anchor/last per target */
 	for (i = 0; i < d->n_targets; i++)
 	{
 		LRExportTarget *et = &d->targets[i];
 
 		for (j = 0; j < n_ents; j++)
 		{
-			LRHistoryEntry *e = &ents[j];
+			const LRHistoryEntry *e = &ents[j];
 
 			if (e->target_idx != et->ctl_idx)
 				continue;
@@ -266,11 +258,120 @@ gather_archived(LRExportData *d, const char *name)
 		}
 		et->has_prev = false;
 	}
+}
+
+static bool
+gather_archived(LRExportData *d, const char *name)
+{
+	LRHistoryEntry *ents = NULL;
+	LRSessTargetInfo *tinfos = NULL;
+	int n_ents = 0, n_tinfos = 0;
+	int64		sid;
+
+	MemSet(d, 0, sizeof(LRExportData));
+
+	if (lrstat_store_load(name, &sid, d->session_name, NAMEDATALEN,
+						  &d->start_ts, &d->stop_ts,
+						  &d->truncated, &d->degraded,
+						  &ents, &n_ents,
+						  &tinfos, &n_tinfos) != 0)
+		return false;
+
+	d->session_running = false;
+	rebuild_from_history(d, ents, n_ents, tinfos, n_tinfos);
 
 	if (ents != NULL)
 		pfree(ents);
 	if (tinfos != NULL)
 		pfree(tinfos);
+	return true;
+}
+
+/*
+ * Export a remembered (non-current) session straight from the in-memory
+ * history ring by name.  Works for persist=false sessions as long as
+ * the ring has not overwritten their samples yet.
+ */
+static bool
+gather_memory_by_name(LRExportData *d, const char *name)
+{
+	uint64		sid;
+	TimestampTz start_ts, stop_ts;
+	LRHistoryEntry *ents = NULL;
+	LRSessTargetInfo *tinfos;
+	int n_ents = 0, n_tinfos = 0;
+	int i, j;
+
+	MemSet(d, 0, sizeof(LRExportData));
+
+	if (!lrstat_sessionreg_lookup(name, &sid, &start_ts, &stop_ts))
+		return false;
+
+	strlcpy(d->session_name, name, NAMEDATALEN);
+	d->start_ts = start_ts;
+	d->stop_ts = stop_ts;
+	d->session_running = false;
+
+	/* collect this session's entries in chronological order */
+	for (i = 0; i < lrstat_history_count(); i++)
+	{
+		LRHistoryEntry *e = lrstat_history_at(lrstat_history_slot(i));
+
+		if (e->session_id != sid)
+			continue;
+		if (ents == NULL)
+			ents = palloc(sizeof(LRHistoryEntry) *
+						  Max(16, lrstat_history_count()));
+		ents[n_ents++] = *e;
+	}
+	if (n_ents == 0)
+	{
+		/* known session but the ring no longer holds its samples */
+		pfree(ents);
+		return false;
+	}
+
+	/* build the target list from the entries; prefer live ctl names */
+	tinfos = palloc0(Max(16, n_ents) * sizeof(LRSessTargetInfo));
+	for (i = 0; i < n_ents; i++)
+	{
+		int idx = ents[i].target_idx;
+		bool known = false;
+
+		for (j = 0; j < n_tinfos; j++)
+			if (tinfos[j].target_idx == idx)
+			{ known = true; break; }
+		if (known || n_tinfos >= 64)
+			continue;
+
+		tinfos[n_tinfos].target_idx = idx;
+		if (idx >= 0 && idx < lrstat->ntargets)
+		{
+			LRTargetCtl *t = lrstat_target_at(idx);
+
+			SpinLockAcquire(&t->mutex);
+			if (t->in_use)
+			{
+				tinfos[n_tinfos].kind = t->kind;
+				strlcpy(tinfos[n_tinfos].name, t->name, NAMEDATALEN);
+			}
+			SpinLockRelease(&t->mutex);
+		}
+		if (tinfos[n_tinfos].name[0] == '\0')
+		{
+			/* slot reused or gone: guess the side from the sample */
+			tinfos[n_tinfos].kind = (ents[i].received_lsn != 0 ||
+									 ents[i].applied_lsn != 0)
+				? LR_RECV : LR_SEND;
+			snprintf(tinfos[n_tinfos].name, NAMEDATALEN, "?%d", idx);
+		}
+		n_tinfos++;
+	}
+
+	rebuild_from_history(d, ents, n_ents, tinfos, n_tinfos);
+
+	pfree(ents);
+	pfree(tinfos);
 	return true;
 }
 
@@ -954,11 +1055,13 @@ lrstat_export(PG_FUNCTION_ARGS)
 		sess = text_to_cstring(name_arg);
 
 	/*
-	 * Export by name: an archived session file wins when the name is not
-	 * the current session (its in-memory history was reset by a newer
-	 * session); otherwise export the current session's live data.
+	 * Export by name, three tiers: an archived session file wins; a
+	 * remembered session still in the in-memory ring comes next (works
+	 * for persist=false sessions); anything else is an error.
 	 */
-	if (name_arg != NULL)
+	if (name_arg == NULL)
+		gather_data(&data);
+	else
 	{
 		char name[NAMEDATALEN];
 		char cur[NAMEDATALEN];
@@ -968,13 +1071,15 @@ lrstat_export(PG_FUNCTION_ARGS)
 		strlcpy(cur, lrstat->session.name, NAMEDATALEN);
 		SpinLockRelease(&lrstat->session.mutex);
 
-		if (strcmp(name, cur) != 0 && !gather_archived(&data, name))
-			gather_data(&data);    /* no such file: fall back to current */
-		else if (strcmp(name, cur) == 0)
+		if (strcmp(name, cur) == 0)
 			gather_data(&data);
+		else if (!gather_archived(&data, name) &&
+				 !gather_memory_by_name(&data, name))
+			ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+							errmsg("pg_lrstat: no data for session '%s' "
+								   "(no archived file, and the in-memory "
+								   "ring no longer holds it)", name)));
 	}
-	else
-		gather_data(&data);
 
 	compute_analysis(&data, &analysis);
 
