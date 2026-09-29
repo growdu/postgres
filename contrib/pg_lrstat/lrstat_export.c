@@ -568,10 +568,10 @@ build_json(LRExportData *d, LRAnalysis *a)
 	appendStringInfo(s, "  \"analysis\": {\n");
 	appendStringInfo(s, "    \"bottleneck\": \"%s\",\n", a->bottleneck);
 	appendStringInfo(s, "    \"deep_cause\": \"%s\",\n", a->deep_cause);
-	appendStringInfo(s, "    \"gen_avg\": %.2f,\n", a->gen_avg);
-	appendStringInfo(s, "    \"send_avg\": %.2f,\n", a->send_avg);
-	appendStringInfo(s, "    \"recv_avg\": %.2f,\n", a->recv_avg);
-	appendStringInfo(s, "    \"apply_avg\": %.2f,\n", a->apply_avg);
+	appendStringInfo(s, "    \"gen_avg\": %.4f,\n", a->gen_avg);
+	appendStringInfo(s, "    \"send_avg\": %.4f,\n", a->send_avg);
+	appendStringInfo(s, "    \"recv_avg\": %.4f,\n", a->recv_avg);
+	appendStringInfo(s, "    \"apply_avg\": %.4f,\n", a->apply_avg);
 	appendStringInfo(s, "    \"backlog_unsent_mb\": %.1f,\n", a->backlog_unsent_mb);
 	appendStringInfo(s, "    \"backlog_inflight_mb\": %.1f,\n", a->backlog_inflight_mb);
 	appendStringInfo(s, "    \"backlog_unapplied_mb\": %.1f,\n", a->backlog_unapplied_mb);
@@ -581,7 +581,7 @@ build_json(LRExportData *d, LRAnalysis *a)
 	/* capacity */
 	appendStringInfo(s, "  \"capacity\": {\n");
 	appendStringInfo(s, "    \"catchup_secs\": %.0f,\n", a->catchup_secs);
-	appendStringInfo(s, "    \"net_catchup_mbps\": %.2f,\n", a->net_catchup_mbps);
+	appendStringInfo(s, "    \"net_catchup_mbps\": %.4f,\n", a->net_catchup_mbps);
 	appendStringInfo(s, "    \"sync_50g_secs\": %.0f,\n", a->sync_50g_secs);
 	appendStringInfo(s, "    \"sync_100g_secs\": %.0f,\n", a->sync_100g_secs);
 	appendStringInfo(s, "    \"sync_200g_secs\": %.0f\n", a->sync_200g_secs);
@@ -606,7 +606,7 @@ build_json(LRExportData *d, LRAnalysis *a)
 			{
 				int64 dg = (int64)(t->last.send.current_lsn - t->prev.send.current_lsn);
 				int64 ds = (int64)(t->last.send.sent_lsn - t->prev.send.sent_lsn);
-				appendStringInfo(s, ", \"gen_instant\": %.2f, \"send_instant\": %.2f",
+				appendStringInfo(s, ", \"gen_instant\": %.4f, \"send_instant\": %.4f",
 								 dg > 0 ? (double)dg/dt/MB_DIV : 0,
 								 ds > 0 ? (double)ds/dt/MB_DIV : 0);
 			}
