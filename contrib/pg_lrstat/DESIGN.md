@@ -17,7 +17,7 @@
 复制链路（逻辑或物理）出问题时，运维要回答的永远是四个问题：**货压在哪一段？谁干得慢？从什么时候开始、越来越差还是正在好转？还要多久清完？** PostgreSQL 自带的系统视图只提供瞬时快照（LSN 位点、状态），没有速率、没有趋势、没有"这一轮压测跑完到底什么水平"。本扩展用显式的**测量会话**补齐这一层：
 
 ```
-lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
+lrstat_start(true)      lrstat_stop()      lrstat_export()
         │                                              │
         ▼                                              ▼
    ┌──────────────── 会话进行中 ────────────────────────┐
@@ -37,7 +37,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | **会话（session）** | 一次 `lrstat_start` 到 `lrstat_stop` 的测量窗口，有唯一名字、编号、起止时间 |
 | **目标（target）** | 被监测的对象：发送端一条复制连接/一个复制槽（SEND）、接收端一个 worker 或恢复进程（RECV）、接收端远端轮询到的发送端镜像（RSEND） |
 | **锚点样本（anchor）** | 会话首轮采到的样本，平均速率的起算基准 |
-| **瞬时速率（instant）** | 最近两个样本的差分 ÷ 采样间隔——"刚刚 30 秒怎么样" |
+| **逐轮速率（*_mbps）** | 相邻两个样本的差分 ÷ 间隔——stat 视图每轮一行输出 |
 | **平均速率（avg）** | 最新样本 − 锚点 ÷ 经过时间——"这轮从头到现在平均多少" |
 | **历史数组** | 每轮每目标一条**全量原始 LSN 样本**的环形记录（始终在记；persist 会话另落盘一份不覆盖的完整副本） |
 | **会话报告** | stop 后由历史数组聚合出的完整统计（总量、平均、峰值、堵住等） |
@@ -112,17 +112,20 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 
 发送端视图另提供 `backlog_peer_unapplied`（C3−C5，反馈口径，最多滞后 10s）。
 
-### 3.2 双速率
+### 3.2 速率（逐轮 + 会话平均）
 
 对任一速率字段 f ∈ {gen(C0), send(C2), recv(C3′), apply(C5′), spill(D1), stream(D1), confirm(C6)}——apply 在逻辑复制=应用速率、在物理复制=回放速率，列名统一为 apply：
 
 ```
-瞬时 instant(f) = (f(S_last) − f(S_prev)) / (ts(S_last) − ts(S_prev))
-平均 avg(f)     = (f(S_last) − f(S_anchor)) / (ts(S_last) − ts(S_anchor))
+逐轮速率（stat 视图 *_mbps）= (f(S_i) − f(S_{i-1})) / (ts(S_i) − ts(S_{i-1}))
+    ——同一目标相邻两个样本；首行无前值输出 NULL
+会话平均（报告 analysis 的 *_avg）= (f(S_last) − f(S_anchor)) / (stop_ts − ts(S_anchor))
+    ——锚点=会话内首个含有效位置的样本；分母截断到 stop_ts
 ```
 
 - 单位：**MB/s**（内部按 LSN 差分得到字节/秒，输出前 ÷ 1048576 转为 MB/s）；
-- 瞬时速率的粒度 = `sample_interval`（默认 30s，可调至 1s）；
+- 逐轮速率的粒度 = `sample_interval`（默认 30s，可调至 1s）；
+- 两种速率都可从 history 手工重算（§5.5.2 容量口径）；
 - 数值示例：两样本相隔 110s，`sent_lsn` 从 `0/0` 到 `0/800000`（8 MB）→ `send` 瞬时 = 平均 = 8 ÷ 110 ≈ 0.0727 MB/s；
 - 有效性规则：最新样本距查询超过 3×采样间隔（采样中断）→ 速率列 NULL；`S_prev` 缺失（会话首轮）→ 瞬时列 NULL，平均列=首段值；
 - **速率是页码（LSN）差不是网线字节**：与带宽对比需乘解码膨胀率（`total_bytes` 增量 ÷ C0 增量）。
@@ -134,7 +137,7 @@ lrstat_start('mig_20260924', persist := true)      lrstat_stop('mig_20260924')
 | `duration_secs` | 实际首末样本区间 | 以样本为准，非命令时刻 |
 | `total_f_mb` | f(S_last) − f(S_anchor)（÷ 1048576） | 各字段会话总量（MB） |
 | `avg_f` | total ÷ duration | 会话平均（= stop 时刻 live 的 avg） |
-| `f_instant_min/max/avg` | 历史相邻样本差值的统计 | 瞬时速率分布（峰值/谷值/均值） |
+| 逐轮速率分布 | stat 时序的 min/max/avg（SQL 聚合即可得） | 速率波动与稳定性 |
 | `peak_backlog_*` | 锚点起增量前缀和重建各水位，取逐间隔最大 | 峰值积压 |
 | `blocked_intervals` | 瞬时 apply/send ≈0 且对应积压 >0 的间隔数 | 堵住时长占比 |
 | `polls_ok / polls_fail` | 远端轮询成功/失败次数 | 整体视图专有 |
@@ -281,14 +284,14 @@ typedef struct LRHistoryEntry
 } LRHistoryEntry;                   /* 不存差值：差值由视图/导出按相邻样本现算    */
 ```
 
-**空间公式**：`MAXALIGN(头) + max_targets × MAXALIGN(sizeof(LRTargetCtl)+3×sizeof(LRSample)) + session_max_samples × max_targets × sizeof(LRHistoryEntry) + 16 × sizeof(LRSessionRegEntry)`。历史条目含 session_id（会话盖章，0=会话外）；会话注册表（16 槽环形）把 session_id 映射回会话名，视图据此输出 session_name 列。默认（32 目标 / 2880 间隔）≈ 0.3MB + 11MB ≈ **11MB**，postmaster 启动期一次预留。
+**空间公式**：`MAXALIGN(头) + max_targets × MAXALIGN(sizeof(LRTargetCtl)+3×sizeof(LRSample)) + session_max_samples × max_targets × sizeof(LRHistoryEntry) + 16 × sizeof(LRSessionRegEntry)`。**历史条目（布局 v4）**是完整的每轮快照：目标 kind（读写按侧、防 union 别名）、session_id 盖章（0=会话外）、两侧全量 LSN、以及逐轮状态（walsender state/sync/wal_status、PID、三段 lag、worker_type、心跳、错误计数）——stat 视图的时序输出全部来自条目现算。会话注册表（16 槽环形）把 session_id 映射回会话名。默认（32 目标 / 2880 样本）约 **20MB**，postmaster 启动期一次预留。
 
 ### 4.4 会话机制
 
 **状态机**：
 
 ```
-idle ──start(name,persist)──► running ──stop(name)──► stopped ──start(name')──► running(...)
+idle ──start(persist)──► running ──stop()──► stopped ──start(name')──► running(...)
   │                             │  ▲
   │                             │  └─ 采样轮：prev=last; last=新样本;
   │                             │     每轮把全量样本 append 历史（+persist 会话文件）
@@ -296,17 +299,22 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
   └ 历史（环形）始终在记，非 persist 会话数据随重启消失；目录中的历史会话任意可查
 ```
 
-**start(name, persist)**：superuser。校验：当前无 running 会话、名字不与历史会话冲突（重名报错，提示换名或 `lrstat_delete`）。动作：`session_id++`、记录名字与 `start_ts`、**只重置全部目标的 anchor/prev/last**（新会话重新锚点；历史数组不清——条目按 session_id 盖章，旧会话在环形内仍按名可查直到被自然覆盖）、`persist=true` 时创建会话文件（头 `state=running`）；**唤醒 worker 立即执行一轮采样**——该轮样本即锚点，保证 start 后一个采样间隔内即可查到双速率。
+**start(persist)**：superuser，无名字（全局唯一会话；重复 start 报错）。自动名 `sess_<n>` 仅标识报告文件与归档条目。动作：`session_id++`、记录 `start_ts`、**只重置全部目标的 anchor/prev/last**（重新锚点；历史数组不清——条目按 session_id 盖章，旧会话在环形内仍可按名导出直到被自然覆盖）、`persist=true` 时创建会话文件（头 `state=running`）；**唤醒 worker 立即执行一轮采样**——该轮样本即锚点。
 
 **采样轮**（每 `sample_interval`）：
 
 ```
-1. 三槽位轮转：首见样本入 anchor；prev=last; last=新样本（非 running 同样轮转）
-2. 历史 append：每目标本轮 last 的全量 LSN 快照 → 内存环形数组；
-   环满覆盖最旧并置 truncated=true（视图按时间升序读）；
-   persist 会话同步追加会话文件并 fsync（文件不覆盖，落全量）
-   同一目标样本时间戳未前进（如 stop 后远端镜像冻结）则跳过，防止重复刷屏
-3. 远端轮询（§4.5）+ 应用位点回填（§4.6）只在 running 时执行
+1. 采样（SPI，worker_spi 式单会话：StartTransaction+Push 快照+SPI_connect）：
+   SEND_SQL/RECV_SQL → 目标三槽位轮转（prev=last; last=新样本；
+   首个"含有效位置"的样本才入 anchor——全零样本污染锚点会把整个
+   WAL 历史当增量）；recv.applied_lsn 单调融合（GREATEST(origin, 反馈apply)）
+2. 远端轮询（§4.5，仅 running）+ 反馈 apply 位折入 last（§4.6）
+   ——放在历史记录之前，保证记录值与视图/报告同源（速率可验证）
+3. 历史 append：每目标本轮 last 的全量快照（LSN + kind + 每轮状态字段）
+   → 内存环形数组（环满覆盖最旧置 truncated）；persist 会话同步追加
+   会话文件并 fsync；样本时间戳未前进则跳过（防重复刷屏）
+4. 错误恢复：PG_CATCH 内 SPI_finish + AbortOutOfAnyTransaction，
+   仅成功路径 Commit——吞错的残留事务会卡死下一轮
 ```
 
 **stop(name)**：superuser，名字与 running 会话一致否则报错。置 `running=false`、记录 `stop_ts`；persist 会话文件追加**尾部目标表**（target_idx → 名字/类型，magic 落在文件末 8 字节便于从 EOF 定位）后置头 `state=stopped`（条目数按文件大小回填）。停止后内存历史与视图继续可查。**`lrstat_export(name)` 三级查找**：归档文件（重启后亦然）→ 内存环形中该会话的盖章条目（persist=false 也可，目标名取自当前槽位、槽位已复用时按样本字段推断侧别）→ 两者皆无则明确报错。
@@ -329,11 +337,12 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 **逻辑复制**：origin 的 `remote_lsn` 只在事务提交边界推进（§2.3-2），单大事务/初始同步期间恒为 0 会让应用速率与积压失真。融合规则：
 
 ```
-采样时：applied = origin.remote_lsn（§6 接收端 SQL）
-每轮远端轮询成功后：
-    lrstat_bump_applied(recv_name, 反馈 flush 位)   ← 只增更新 last 槽位的 applied，
-                                                    时间戳不动（差分序列保持单调）
-视图/报告使用：max(origin, 反馈 flush)
+采样时：applied = GREATEST(origin.remote_lsn, 上一轮融合值)   ← push 单调融合
+每轮远端轮询成功后（在历史记录之前执行）：
+    lrstat_bump_applied(recv_name, 反馈 apply 位)   ← 折入 last 槽位
+    ——必须用反馈 apply 位（walsender 的 replay_lsn），不是 flush 位：
+      flush 领先于应用，会把应用进度报高、速率虚快
+视图/报告/history 使用同一条单调融合序列（速率可验证的基础）
 ```
 
 **物理复制**：`pg_last_wal_replay_lsn()` 由恢复进程实时推进，物理反馈的 replay 位也是 walreceiver 直接上报的真实值——**无需融合**，直接采样即准确。
@@ -345,16 +354,17 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 文件位于 `$PGDATA/pg_lrstat/sessions/<name>.sess`，worker 直接读写（不经 SQL 目录、不产生 WAL）。**默认 persist=false 不创建任何文件与目录**。
 
 ```
-<name>.sess 布局（小端、带 layout_version）：
+<name>.sess 布局（小端、layout_version 与共享内存共用）：
 ┌ 会话头 ─ magic, layout_version, session_name, session_id,
 │          start_ts, stop_ts, state(running/stopped/interrupted),
-│          truncated, degraded, n_targets, 目标键数组[(kind,name,relid,worker_char)]
-├ 逐间隔记录[] ─ 每采样轮一条：{round_ts, n_entries, LRSessionEntry[n]}
-│                （与内存日志同步双写，每轮 fsync——30s 一次的开销）
-└ 会话尾 ─ stop 时聚合写入：§3.3 全部报告指标 + 每目标统计
+│          truncated, degraded, n_targets, n_entries(按文件大小回填)
+├ LRHistoryEntry[] ─ 与内存环形同步双写的全量每轮快照（每轮 fsync）
+└ 会话尾 ─ [LRSessTargetInfo[](target_idx, kind, name)][magic, n]
+           —— magic 落在文件末 8 字节，读取方从 EOF 定位；
+              stop 时写入，重启后按名导出据此还原目标身份
 ```
 
-- **原子性**：头/尾更新走"同目录临时文件 + rename"，避免半写；
+- **原子性**：头重写与尾部追加均为单次 write（短块），fsync 后生效；
 - **崩溃语义**：双写 + fsync 使崩溃至多丢最后一个未落盘间隔；
 - **启动恢复**：shmem 启动 hook 扫描会话目录（目录不存在即跳过——默认常态）；`state=running` 的文件自动补写会话尾、标 `interrupted` 归档；内存会话索引（名/id/状态/时间戳）随之重建。**不做跨重启续跑**（锚点失效，速率语义不可靠）；
 - **降级**：文件写失败（磁盘满/权限）不阻断采样——内存侧继续、`degraded=true`、stop 时 WARNING；
@@ -377,43 +387,40 @@ idle ──start(name,persist)──► running ──stop(name)──► stoppe
 ### 5.1 命令
 
 ```sql
-lrstat_start(name text DEFAULT NULL, persist boolean DEFAULT false)
-    → (session_id bigint, session_name text, persisted boolean, started_at timestamptz)
-    -- superuser。重复 start / 名字冲突 / 名字非法（路径字符）报错；
-    -- 名字省略自动生成 sess_<id>_<yyyymmdd_hhmmss>；persist 默认 false
+lrstat_start(persist boolean DEFAULT false) → text
+    -- superuser。开始采样（全局唯一会话；已有 running 会话则报错）。
+    -- 唯一参数 persist：true 时数据落 $PGDATA/pg_lrstat/sessions/ 文件。
+    -- 返回自动名 sess_<n>——仅用于报告文件名与归档检索，用户不需要记。
 
-lrstat_stop(name text)
-    → (session_name, started_at, stopped_at)
-    -- superuser。结束指定名字的会话（须与 start 一致，防误停）；
-    -- stop 后查 cluster_stat / send_stat / recv_stat 看完整报告
+lrstat_stop() → text
+    -- superuser。停止采样（无参数）。返回会话名。
 
-lrstat_export(name text, format text DEFAULT 'html', dest text DEFAULT NULL)
-    → (path text, content text, bytes bigint)
-    -- format: 'html'（自包含可视化）/ 'json'（机器可读）；详见 §5.5
+lrstat_export(name text DEFAULT NULL, format text DEFAULT 'html') → text
+    -- 导出报告并直接写文件到 $PGDATA/pg_lrstat/exports/<name>.<format>，
+    -- 返回绝对路径。不传 name 导当前/最近会话；传 name（如 sess_3，
+    -- 见 info 的 archived_session_names）导指定归档。查找三级：
+    -- 归档文件（persist，重启后可用）→ 内存环形（任意最近会话）→ 报错。
+    -- 名字只在此处出现——用于标识报告或选取归档。
 
 lrstat_delete(name text) → void
-    -- superuser。删除一个已归档会话文件；运行中/非持久会话相应报错或提示
+    -- superuser。删除归档会话文件
 
 pg_lrstat_reset() → void
-    -- superuser。强制会话回 idle 并清内存数据；不动已归档文件
+    -- superuser。会话回 idle 并清内存数据；不动归档文件
 ```
 
-### 5.2 视图总览（仅 6 个）
+### 5.2 视图总览（6 个）
 
-| 视图 | 粒度 | 一句话 |
+| 视图 | 粒度 | 用途 |
 | --- | --- | --- |
-| `pg_lrstat_info` | 一行 | 扩件健康 + 当前会话状态 + 配置生效值 |
-| `pg_lrstat_send_stat` | 发送端一连接一行 | 发送端全量：位点 + 积压 + 双速率（gen/send/spill/stream） |
-| `pg_lrstat_recv_stat` | 接收端一 worker/恢复进程一行 | 接收端全量：位点 + 积压 + 双速率（recv/apply/local_wal） |
-| `pg_lrstat_cluster_stat` | 一复制对一行 | **唯一能看到两端合成数据的视图**：双端位点/速率/积压/追平预估 |
-| `pg_lrstat_send_history` | 发送端一目标一轮一行 | 发送端全量原始 LSN 序列（始终记录，画曲线），首列 session_name 标归属 |
-| `pg_lrstat_recv_history` | 接收端一目标一轮一行 | 接收端全量原始 LSN 序列（始终记录，画曲线），首列 session_name 标归属 |
-| `pg_lrstat_session_stat` | 一会话×目标×侧一行 | 纯 SQL 视图：对 history 按会话聚合（总量 MB、平均 MB/s、样本区间）——按会话名查历史统计的入口 |
-| `pg_lrstat_send/recv_rate_history` | 一目标一间隔一行 | 纯 SQL 视图：窗口函数对相邻样本现算逐间隔速率（MB/s）——不预存派生值，history 仍是唯一数据源 |
+| `pg_lrstat_info` | 1 行 | 健康自检 + 当前会话状态 + 归档会话名列表 |
+| `pg_lrstat_send_stat` | 发送端一目标**一轮**一行 | 发送端逐轮时序：状态/水位/积压/本轮速率/本轮判定 |
+| `pg_lrstat_recv_stat` | 接收端一 worker**一轮**一行 | 接收端逐轮时序 |
+| `pg_lrstat_cluster_stat` | 一复制对**一轮**一行 | 两端合成逐轮时序（recv 行 × 时间最近的发送端轮询样本配对）——日常巡检只看这个 |
+| `pg_lrstat_send_history` | 一目标一轮一行 | 发送端全量原始样本（含每轮状态），**唯一数据源** |
+| `pg_lrstat_recv_history` | 一目标一轮一行 | 接收端全量原始样本 |
 
-- `stat` 视图**会话期间实时更新**（显示最新样本+当前速率），**stop 后冻结**（显示会话最终值）——不需要区分 live/report 两套；
-- `history` 视图**stop 后可查**（会话期内逐间隔数据）；持久会话跨重启可查；
-- `cluster_stat` 是唯一的"两端"视图——`send_stat`/`recv_stat` 只看各自端，运维日常巡检/排障只需盯 `cluster_stat` 一个。
+三个 stat 视图完全从 history 现算（相邻同目标样本作差 = 本轮速率；条目自带每轮状态与水位），不预存任何派生量；会话平均速率只在导出报告里聚合。
 
 ### 5.3 视图字段详解（每列注明"为什么需要它"）
 
@@ -438,135 +445,70 @@ pg_lrstat_reset() → void
 
 **删除的列**（及原因）：`layout_version`（内部机制，运维无需感知）；`session_running`（`session_state='running'` 已覆盖）；`session_id`（运维用名字不用编号）；`elapsed_secs`（`session_start_ts` 可推算）；`max_targets`/`session_max_samples`/`remote_poll`（GUC 回显，不应在视图重复）。
 
-#### `pg_lrstat_send_stat`（发送端，一复制连接一行，37 列）
+#### `pg_lrstat_send_stat`（发送端一目标一轮一行，27 列）
 
-| 列 | 类型 | 为什么需要 |
-| --- | --- | --- |
-| **标识（11 列）** | | |
-| `slot_name` | text | 目标标识——与 cluster_stat/日志对位 |
-| `kind` | text | logical/physical——一种 SQL 适配两种复制 |
-| `sample_time` | timestamptz | 数据新鲜度——距今多久 |
-| `session_name` | text | 属于哪个测量会话 |
-| `database` | text | 槽属于哪个库——多库集群区分 |
-| `plugin` | text | 输出插件（pgoutput/wal2json）——解码排障要知道 |
-| `temporary` | bool | true=tablesync 临时槽——别和主槽混淆 |
-| `active` | bool | walsender 是否在线——false=订阅端断开 |
-| `sender_pid` | int4 | 关联 pg_stat_activity 排查 walsender 进程 |
-| `application_name` | text | 订阅端标识——定位是哪个订阅连的 |
-| `client_addr` | text | 订阅端 IP——网络排障 |
-| **状态（4 列）** | | |
-| `state` | text | walsender 状态（streaming/catchup）——catchup=正在追 |
-| `sync_state` | text | async/sync——sync 时的"慢"是在等备库不是真慢 |
-| `wal_status` | text | reserved/unreserved/lost——**lost=数据已丢必须重建** |
-| `safe_wal_size` | float8 | 距 WAL 上限余量（MB）——磁盘风险预警 |
-| **位点（3 列）** | | |
-| `current_lsn` | pg_lsn | WAL 生成顶端——与外部工具（pg_waldump）交叉对照 |
-| `sent_lsn` | pg_lsn | 已发送位——同上 |
-| `confirmed_flush_lsn` | pg_lsn | 槽确认水位——WAL 回收决策位 |
-| **积压（5 列）** | | |
-| `backlog_unsent` | float8 | 已生成未发送（MB） |
-| `backlog_inflight` | float8 | 已发送对端未确认接收（MB） |
-| `backlog_peer_unapplied` | float8 | 对端已收未应用（MB，反馈口径） |
-| `backlog_total` | float8 | 端到端总积压（MB） |
-| `retained_wal` | float8 | 槽扣住的 WAL（MB）——磁盘风险指标 |
-| **速率（14 列，MB/s）** | | |
-| `gen_instant` / `gen_avg` | float8 | WAL 生成——是否上游产出突增 |
-| `send_instant` / `send_avg` | float8 | 发送——发送是否跟得上生成 |
-| `apply_instant` / `apply_avg` | float8 | 对端应用（经反馈）——发布端视角看订阅端 |
-| `spill_instant` / `spill_avg` | float8 | 解码溢写——>0 = 大事务解码压力 |
-| `stream_instant` / `stream_avg` | float8 | 解码流式——>0 = 流式大事务 |
-| **延迟与判定（5 列）** | | |
-| `write_lag` / `flush_lag` / `replay_lag` | interval | 内核反馈延迟（唯一跨机时间源）——定位延迟在网络还是对端 |
-| `send_blocked` | bool | **发送堵住**：unsent>0 且最近间隔 send≈0 |
+| 列 | 为什么需要 |
+| --- | --- |
+| `slot_name` / `ts` | 目标标识与本轮采样时间——时序图的坐标轴 |
+| `plugin` / `temporary` / `application_name` / `client_addr` | 直通属性（不随轮存储，取自当前槽位）——识别对端 |
+| `active` / `sender_pid` | 本轮 walsender 是否在线——连接闪断可见 |
+| `state` / `sync_state` / `wal_status` | 本轮 walsender 状态 / 同步角色 / 槽保留状态（lost=订阅会断）——逐轮追踪恶化 |
+| `current_lsn` / `sent_lsn` / `confirmed_flush_lsn` | 本轮生成/发送/确认水位——与 history 同源 |
+| `backlog_unsent` / `backlog_inflight` / `backlog_peer_unapplied` / `backlog_total` | 本轮三段积压（MB）——定位积压在哪一段 |
+| `retained_wal` | 本轮槽扣住 WAL（MB）——磁盘风险 |
+| `gen_mbps` / `send_mbps` / `apply_mbps` | 本轮速率（与前一同目标样本作差÷间隔）；首轮为 NULL——可手工从 history 复算 |
+| `spill_mb` | 本轮解码溢写增量——解码压力瞬时尖峰 |
+| `write_lag` / `flush_lag` / `replay_lag` | 本轮发送端观测三段延迟 |
+| `send_blocked` | 本轮有未发送积压且发送速率≈0 |
 
-**删除的列**（及原因）：`peer_recv_lsn`/`peer_flush_lsn`/`peer_applied_lsn`（三个中间位点——积压列已总结，运维不需要原值）；`restart_lsn`（retained_wal 已总结）；`spill_bytes`/`stream_bytes`/`total_bytes` 累计原值（速率列已总结，原值在 history 可查）；`confirm_instant`/`confirm_avg`（运维看 retained_wal 趋势，不看确认速率）；`reply_time`（active+state 已覆盖）；`elapsed_secs`（可推算）。
+#### `pg_lrstat_recv_stat`（接收端一 worker 一轮一行，17 列）
 
-#### `pg_lrstat_recv_stat`（接收端，一 worker/恢复进程一行，23 列）
+| 列 | 为什么需要 |
+| --- | --- |
+| `recv_name` / `ts` | 订阅与本轮时间 |
+| `worker_type` / `worker_pid` / `leader_pid` / `relid` | 本轮 worker 类型（apply/table sync）、PID、并行 leader、tablesync 目标表——worker 生灭逐轮可见 |
+| `received_lsn` / `applied_lsn` | 本轮收到/应用水位（applied=origin∪反馈的单调融合，提交边界） |
+| `last_msg_send_time` / `last_msg_receipt_time` | 本轮心跳——链路中断的时间证据 |
+| `backlog_apply` | 本轮收到未应用（MB） |
+| `recv_mbps` / `apply_mbps` / `local_wal_mbps` | 本轮速率；首轮为 NULL |
+| `apply_error_count` / `sync_error_count` | 本轮累计错误数 |
+| `apply_blocked` | 本轮有未应用积压且速率≈0——锁冲突信号 |
 
-| 列 | 类型 | 为什么需要 |
-| --- | --- | --- |
-| **标识（8 列）** | | |
-| `recv_name` | text | 逻辑=订阅名 物理=standby 标识 |
-| `kind` | text | logical/physical |
-| `sample_time` / `session_name` | — | 同 send_stat |
-| `worker_type` | text | apply/tablesync/recovery——区分 worker 角色 |
-| `worker_pid` | int4 | 关联 pg_stat_activity **查锁堵**——排障第一步 |
-| `slot_name` | text | 与 send_stat 对位的键（= 目标键 name） |
-| `leader_pid` / `relid` | int4/oid | 并行 apply 拓扑 / tablesync 目标表 |
-| **位点（2 列）** | | |
-| `received_lsn` | pg_lsn | 本地实收位——无反馈延迟，判断分仓状态首选 |
-| `applied_lsn` | pg_lsn | 已应用位——origin∪反馈融合后 |
-| **消息时间（2 列）** | | |
-| `last_msg_send_time` / `last_msg_receipt_time` | timestamptz | 一对时间戳给出**单条消息的网络延迟**——网络排障原始素材 |
-| **积压（1 列）** | | |
-| `backlog_apply` | float8 | 已收未应用（MB） |
-| **速率（6 列，MB/s）** | | |
-| `recv_instant` / `recv_avg` | float8 | 接收速率——分仓收货能力 |
-| `apply_instant` / `apply_avg` | float8 | 应用/回放速率——分仓上架能力（瓶颈最常见的列） |
-| `local_wal_instant` / `local_wal_avg` | float8 | 分仓本地 WAL 速率——应用产生的写入量 |
-| **错误与判定（3 列）** | | |
-| `apply_error_count` / `sync_error_count` | int8 | 冲突/错误计数——在涨 = 反复重试 |
-| `apply_blocked` | bool | **应用堵住**：backlog>0 且最近间隔 apply≈0——查 worker_pid 的 wait_event |
+#### `pg_lrstat_cluster_stat`（一复制对一轮一行，26 列，**两端合成**）
 
-**删除的列**：`origin_local_lsn`（重启续传位点，日常运维不用，排障时从系统视图查）；`local_wal_lsn`（速率列已总结）；`latest_end_lsn`（received_lsn 的回退源，不直接展示）；`latest_end_time`（last_msg_receipt_time 已覆盖）。
+每个 recv 轮与**时间最近的**发送端轮询样本（RSEND，同名目标）配对成行；两端游标在时间序扫描中单调前进。
 
-#### `pg_lrstat_cluster_stat`（一复制对一行，**唯一两端合成视图**，38 列）
-
-| 列组 | 列 | 为什么需要 |
-| --- | --- | --- |
-| **标识（5 列）** | | |
-| | `recv_name` / `slot_name` / `kind` / `session_name` | 复制对标识 |
-| | `sample_time` | 数据新鲜度 |
-| **轮询健康（2 列）** | | |
-| | `remote_state` / `last_remote_poll_time` | 接收端能否轮到发送端——unreachable=网络问题 |
-| **位点（5 列）** | | |
-| | `send_current_lsn` / `sent_lsn` | 发送端两个主检查点——与外部工具交叉对照 |
-| | `received_lsn` / `applied_lsn` | 接收端两个主检查点 |
-| | `confirmed_flush_lsn` | WAL 回收水位 |
-| **速率（16 列，MB/s）** | | |
-| | `gen_instant`/`gen_avg` | 生成——上游是否突增 |
-| | `send_instant`/`send_avg` | 发送——是否跟得上 |
-| | `recv_instant`/`recv_avg` | 接收——分仓收货 |
-| | `apply_instant`/`apply_avg` | 应用——分仓上架（最常见瓶颈列） |
-| | `spill_instant`/`spill_avg` | 解码溢写——大事务压力 |
-| | `stream_instant`/`stream_avg` | 解码流式——流式大事务 |
-| **积压（6 列）** | | |
-| | `backlog_unsent` | 没发货 |
-| | `backlog_inflight` | 在路上 |
-| | `backlog_unapplied` | 到了没上架 |
-| | `backlog_total` | 总积压（三段之和） |
-| | `retained_wal` | 磁盘风险 |
-| | `feedback_lag_mb` | 反馈滞后（MB）——区分"真在途"和"10s 回执假象" |
-| **延迟（3 列）** | | |
-| | `write_lag`/`flush_lag`/`replay_lag` | 时间维度延迟——定位网络 vs 应用 |
-| **追平与堵住（4 列）** | | |
-| | `catchup_send_secs` / `catchup_total_secs` | 还要多久追平（秒） |
-| | `send_blocked` / `apply_blocked` | 告警源——哪个环节停了 |
-| | `bottleneck` | text：`send`/`recv_apply`/`network`/`none`——SQL CASE WHEN 实时判定（§5.5.1），**会话期间随时可查** |
-
-**删除的列**：`restart_lsn`（retained_wal 已总结）；`elapsed_secs`（可推算）。
+| 列 | 为什么需要 |
+| --- | --- |
+| `recv_name` / `ts` / `remote_state` | 链路标识、本轮时间、远端轮询状态 |
+| `send_current_lsn` / `sent_lsn` / `confirmed_flush_lsn` | 发送端水位（配对样本） |
+| `received_lsn` / `applied_lsn` | 接收端水位 |
+| `gen_mbps` / `send_mbps` | 发送端本轮生成/发送速率（配对样本相邻差） |
+| `recv_mbps` / `apply_mbps` | 接收端本轮速率 |
+| `backlog_unsent` / `backlog_inflight` / `backlog_unapplied` / `backlog_total` | 本轮三段积压与总量（MB）——瓶颈归因的依据 |
+| `retained_wal` / `feedback_lag_mb` | 槽扣住 WAL / 反馈滞后 |
+| `write_lag` / `flush_lag` / `replay_lag` | 发送端观测三段延迟 |
+| `catchup_send_secs` / `catchup_total_secs` | 按本轮速率的追平预估（秒） |
+| `send_blocked` / `apply_blocked` | 本轮发送/应用堵住 |
+| `bottleneck` | **本轮瓶颈判定**：send（发送速率落后生成且未发送积压过半）/ recv_apply / network / none——时序上可见瓶颈何时开始/结束 |
 
 #### `pg_lrstat_send_history`（发送端一目标一轮一行，全量原始样本，始终记录）
 
 | 列 | 为什么需要 |
 | --- | --- |
-| `name` / `ts` | 画曲线的坐标轴 |
-| `current_lsn` / `sent_lsn` | 生成与发送水位——相邻行作差即逐间隔速率（MB/s） |
-| `peer_recv_lsn` / `peer_flush_lsn` / `peer_applied_lsn` | 接收端反馈三水位——网络/落盘/应用逐段延迟定位 |
-| `confirmed_flush_lsn` / `restart_lsn` | 槽位点与保水起点（retained_wal = current − restart） |
-| `spill_bytes` / `stream_bytes` | 解码溢出/流式计数——解码压力时序 |
+| `name` / `ts` | 坐标轴 |
+| `current_lsn` / `sent_lsn` / `peer_recv_lsn` / `peer_flush_lsn` / `peer_applied_lsn` | 生成、发送与反馈三水位——相邻作差即速率 |
+| `confirmed_flush_lsn` / `restart_lsn` | 槽确认边界与保水起点（retained_wal = current − restart） |
+| `spill_bytes` / `stream_bytes` | 解码溢写/流式累计计数 |
 
 #### `pg_lrstat_recv_history`（接收端一目标一轮一行，全量原始样本，始终记录）
 
 | 列 | 为什么需要 |
 | --- | --- |
 | `name` / `ts` | 同上 |
-| `received_lsn` / `applied_lsn` | 收到与应用水位——相邻行作差即 recv/apply 速率 |
-| `local_wal_lsn` | 接收端本地 WAL 位点——与 received 对比看重放写入速率 |
+| `received_lsn` / `applied_lsn` / `local_wal_lsn` | 收到/应用（单调融合）/本地 WAL 水位 |
 
-**设计原则**：history 只存**原始 LSN 快照**，不预存差值/水位/积压——一切派生量（速率、积压、峰值）由查询或导出时对相邻样本现算，history 是其他状态表与报告的**最原始数据来源**。
-
-**删除的列**（history 视图）：`level_restart`（retained_wal 可由 level_current - level_restart 算，但 export 不画保水曲线，不预存）；`kind`（视图名已区分侧）。
+> stat 视图的逐轮状态列（state、worker_type、lag 等）同样落在 `LRHistoryEntry` 中（§4.3），但为控制宽度不在 history 视图输出——导出报告的 Evidence 区带全量。
 
 ### 5.4 GUC
 
@@ -583,9 +525,9 @@ pg_lrstat_reset() → void
 | `pg_lrstat.database` | `postgres` | 重启 | 采样 worker 连接库 |
 | `pg_lrstat.allow_inject` | off | SUSET | 测试注入口（superuser + 前缀约束） |
 
-### 5.5 报告导出 `lrstat_export(name, format, dest)`
+### 5.5 报告导出 `lrstat_export(name, format)`
 
-导出指定会话的全部 6 个视图数据 **+ 自动分析结论**。非持久会话从内存渲染（窗口期至下次 start），持久会话从归档渲染。
+导出会话报告并**直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`（名字做文件系统安全字符清洗），返回绝对路径。数据源三级查找（归档文件 → 内存环形 → 报错）。
 
 #### 5.5.1 自动分析结论（导出的核心价值）
 
@@ -670,40 +612,41 @@ pg_lrstat_reset() → void
 
 #### 5.5.2 导出格式
 
-**`format='html'`（默认）——自包含单文件**：无 CDN、全部 CSS/JS 内嵌，浏览器双击即开：
+**`format='html'`（默认）——自包含单文件**，无 CDN、浏览器双击即开：
 
 | 区块 | 内容 |
 | --- | --- |
-| **分析结论卡片**（最顶部） | 瓶颈判定 + 深层原因 + 追平预估 + 容量外推表 + 净追平速率——运维第一眼就看这里 |
-| 头部卡片 | 会话名/时间窗/时长/目标数/状态/三大总量 |
-| 速率时序图 | gen/send/recv/apply 逐间隔曲线 + 平均线，内嵌 SVG + 原生 JS |
-| 积压堆叠面积图 | unsent/inflight/unapplied 堆叠 + total 总线，峰值标注 |
-| 四水位阶梯图 | current/sent/received/applied |
-| 统计表 | send_stat / recv_stat / cluster_stat 全列，每目标一行可排序 |
-| 解码压力 | spill/stream 逐间隔柱状图（有数据才渲染） |
+| **Analysis**（最顶部） | 瓶颈判定徽章 + 四速率（gen/send/recv/apply avg）+ 三段积压 + 追平预估 + 50/100/200GB 容量表 + 净追平速率 |
+| **Chart**（紧随其后） | gen/send/apply 逐间隔速率折线（内嵌 SVG，无 JS 依赖） |
+| Session | 会话名/起止/样本数/truncated/degraded 标记 |
+| Targets | 每目标一行：侧别、状态、平均速率、最新 LSN |
+| **Evidence**（底部佐证区，四张表） | send history samples（7 水位+spill/stream）、recv history samples（3 水位）、send rate history（逐间隔 gen/send/反馈apply/spill）、recv rate history（逐间隔 recv/apply）——头部每个结论都能从此手工重算 |
 
-**`format='json'`**：机器可读完整数据包：
+**`format='json'`**——机器可读（速率 4 位小数，可与容量推算精确互算）：
 
 ```json
 {
-  "session": { "name": "...", "start": "...", "stop": "...", "state": "stopped" },
-  "analysis": { ... },           // §5.5.1 的四项结论
-  "capacity": {                   // §5.5.1-③ 的容量外推
-    "avg_apply_mbps": 3.2,
-    "catchup_current": { "backlog_mb": 85, "est_secs": 27 },
-    "sync_50g_secs": 16000, "sync_100g_secs": 32000, "sync_200g_secs": 64000,
-    "net_catchup_mbps": -0.1      // §5.5.1-④
-  },
-  "send_stat": [ ... ],
+  "session": { "name": "sess_3", "running": false, "start": "...", "stop": "...",
+               "truncated": false, "degraded": false },
+  "analysis": { "bottleneck": "none", "gen_avg": 0.0518, "send_avg": 0.0518,
+                "recv_avg": 0.0518, "apply_avg": 0.0518,
+                "backlog_unsent_mb": 0.0, "backlog_inflight_mb": 0.0,
+                "backlog_unapplied_mb": 0.0, "backlog_total_mb": 0.0 },
+  "capacity": { "catchup_secs": 0, "net_catchup_mbps": 0.0,
+                "sync_50g_secs": 988181, "sync_100g_secs": 1976362,
+                "sync_200g_secs": 3952725 },
+  "send_stat": [ ... ],          /* 每目标状态摘要 */
   "recv_stat": [ ... ],
   "history": {
-    "total_samples": 101, "exported_samples": 101,
-    "samples": [ ... ]              /* 全量原始 LSN 样本（最近 500 条） */
+    "total_samples": 22, "exported_samples": 22,
+    "samples": [ { "name": "...", "ts": "...", "kind": "recv",
+                   "received_lsn": "0/...", "applied_lsn": "0/...",
+                   "local_wal_lsn": "0/..." }, ... ]   /* 最近 500 条 */
   }
 }
 ```
 
-**`dest`**：默认 `$PGDATA/pg_lrstat/exports/`；`dest := '-'` 直接返回内容。返回 `(path, content, bytes)`。
+**容量口径**：`sync_50g_secs = 50×1024 MB ÷ apply_avg`（MB 按 1048576 字节）；100G/200G 严格 2×/4×。平均速率窗口从**首个含有效位置的样本**到 stop_ts（clamp），不受 stop 后空闲稀释。
 
 ### 5.6 权限
 
@@ -714,31 +657,28 @@ pg_lrstat_reset() → void
 ### 5.7 使用示例（完整流程）
 
 ```sql
-SELECT lrstat_start('mig_20260924', persist := true);
+SELECT lrstat_start(true);          -- 开始测量（persist 落文件）
 
--- 压测进行中，看两端合成视图（日常巡检只盯这一个）：
-SELECT recv_name,
-       round(send_instant::numeric,1) AS 发送_瞬时,
-       round(send_avg::numeric,1)     AS 发送_平均,
-       round(apply_avg::numeric,1)    AS 应用_平均,
-       round(backlog_total::numeric,1) AS 总积压MB,
-       round(catchup_total_secs)      AS 追平秒
-FROM pg_lrstat_cluster_stat;
+-- 压测进行中，看两端合成时序（日常巡检只盯这一个）：
+SELECT ts, recv_name, bottleneck,
+       round(gen_mbps::numeric,2)   AS 生成,
+       round(send_mbps::numeric,2)  AS 发送,
+       round(apply_mbps::numeric,2) AS 应用,
+       round(backlog_total::numeric,1) AS 总积压MB
+FROM pg_lrstat_cluster_stat ORDER BY ts DESC LIMIT 10;
 
-SELECT lrstat_stop('mig_20260924');
+SELECT lrstat_stop();               -- 停止测量
 
--- 会话结束后看逐间隔发送速率（相邻样本 sent_lsn 作差）：
-SELECT ts, round(pg_wal_lsn_diff(sent_lsn, lag(sent_lsn) OVER (ORDER BY ts)) / 1024 / 1024
-                 / extract(epoch FROM ts - lag(ts) OVER (ORDER BY ts)), 1) AS 发送MBps
-FROM pg_lrstat_send_history WHERE name = 'asub' ORDER BY ts;
+SELECT lrstat_export();             -- 导出报告（含 Evidence 佐证表）
 
--- 会话期间实时查瓶颈（不需要导出）：
-SELECT recv_name, bottleneck, round(catchup_total_secs) AS 追平秒
-FROM pg_lrstat_cluster_stat;
+-- 事后追溯：名字查 info 的归档列表，按名导出
+SELECT archived_session_names FROM pg_lrstat_info;
+SELECT lrstat_export('sess_3');
 
--- 可视化导出（全部视图数据 + 分析结论）：
-SELECT lrstat_export('mig_20260924');            -- HTML 报告
-SELECT lrstat_export('mig_20260924','json');     -- 机器可读
+-- 手工复核任意一条速率（可验证性）：
+SELECT pg_wal_lsn_diff(applied_lsn, lag(applied_lsn) OVER (ORDER BY ts))
+       / 1048576 / extract(epoch FROM ts - lag(ts) OVER (ORDER BY ts))
+FROM pg_lrstat_recv_history WHERE name = 'asub';
 ```
 
 ---
@@ -840,7 +780,7 @@ FROM pg_stat_wal_receiver wr;
 | --- | --- |
 | 回归（pg_regress，--temp-config 预加载） | 注入驱动：start('t1') 后注入样本 → 瞬时=末间隔差分、avg=全程差分精确断言；单间隔时瞬时=NULL、avg=首段值；stop 报告 total/min/max/峰值与手算一致；重复 start/重名/错名 stop 报错；报告按名可查 |
 | TAP 001 | 同上注入算术 |
-| TAP 002 / scripts/logical_rep_test.sh | 真实发布订阅：start → pgbench -T N → stat 双速率非零、instant 波动、avg 单调收敛 → stop → stat 总量与 pgbench WAL 量级一致、history 行数 ≈ N/30 |
+| TAP 002 / scripts/logical_rep_test.sh | 真实发布订阅：start → pgbench -T N → stat 时序速率非零、逐轮波动 → stop → stat 总量与 pgbench WAL 量级一致、history 行数 ≈ N/30 |
 | 持久化专项（persist=true） | stop 后 restart 报告完整；kill -9 mid-session → interrupted、丢失 ≤1 间隔；只读目录注入 → degraded；delete 生效 |
 | 默认零文件路径 | persist=false 全流程不创建任何文件/目录；重启后无痕 |
 | 报告导出 | html 可解析且含三类图数据点与瓶颈判定；json 与视图逐字段对拍（含 analysis/capacity）；dest 越界拒绝；dest='-' 与落盘一致 |
@@ -862,24 +802,18 @@ FROM pg_stat_wal_receiver wr;
 ## 附录：示例输出（目标形态）
 
 ```sql
-SELECT lrstat_start('bench_am', true);
--- 压测 60s 期间（cluster_stat 是日常巡检唯一需要盯的视图）：
-SELECT recv_name, round(send_instant::numeric,1) AS send_ins,
-       round(send_avg::numeric,1) AS send_avg,
-       round(apply_avg::numeric,1) AS apply_avg,
-       round(backlog_total::numeric,1) AS total_mb
-FROM pg_lrstat_cluster_stat;
+SELECT lrstat_start(true);
+-- 压测期间（cluster_stat 是日常巡检唯一需要盯的视图，逐轮时序）：
+SELECT ts, recv_name, bottleneck,
+       round(send_mbps::numeric,1) AS 发送,
+       round(apply_mbps::numeric,1) AS 应用,
+       round(backlog_total::numeric,1) AS 总积压MB
+FROM pg_lrstat_cluster_stat ORDER BY ts DESC LIMIT 3;
 
- recv_name | send_ins | send_avg | apply_avg | total
-----------+----------+----------+-----------+--------
- sub_a    |      7.4 |      7.5 |       7.5 | 8 kB
+     ts      | recv_name | bottleneck | 发送 | 应用 | 总积压mb
+------------+-----------+------------+------+------+----------
+ 11:26:02   | asub      | none       |  0.1 |  0.1 |         
 
-SELECT lrstat_stop('bench_am');
-SELECT session_name, state, round(duration_secs) AS secs,
-       round(total_current,0)        AS 生成MB, round(avg_send::numeric,1) AS 平均发送
-FROM pg_lrstat_cluster_stat;
-
- session_name | state   | secs | 生成总量 | 平均发送
---------------+---------+------+----------+----------
- bench_am     | stopped |   62 | 453 MB   |     7.5
+SELECT lrstat_stop();
+SELECT lrstat_export();       -- 报告 + Evidence 佐证表
 ```

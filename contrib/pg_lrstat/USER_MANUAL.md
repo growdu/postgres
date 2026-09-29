@@ -43,25 +43,22 @@ SELECT lrstat_export();
 
 报告内容（HTML）：分析结论卡（瓶颈判定、四速率、积压构成、追平预估、50/100/200GB 容量推算）、Session 卡、**Targets 卡**（每个目标的状态/平均速率/最新 LSN）、速率折线图（gen/send/apply 三线）、原始样本表。
 
-## 3. 视图总览（9 个）
+## 3. 视图总览（6 个）
 
 | 视图 | 粒度 | 用途 |
 | --- | --- | --- |
-| `pg_lrstat_info` | 1 行 | 健康自检 + 当前会话状态 |
+| `pg_lrstat_info` | 1 行 | 健康自检 + 当前会话状态 + 归档会话名列表 |
 | `pg_lrstat_send_stat` | 发送端一目标**一轮**一行 | 发送端逐轮时序：状态/水位/积压/本轮速率 |
 | `pg_lrstat_recv_stat` | 接收端一 worker**一轮**一行 | 接收端逐轮时序 |
 | `pg_lrstat_cluster_stat` | 一复制对**一轮**一行 | **两端合成逐轮时序，日常巡检只看这个** |
 | `pg_lrstat_send_history` | 一目标一轮一行 | 发送端原始 LSN 样本（始终记录） |
 | `pg_lrstat_recv_history` | 一目标一轮一行 | 接收端原始 LSN 样本（始终记录） |
-| `pg_lrstat_session_stat` | 一会话×目标一行 | 按会话名查历史统计（总量/平均速率） |
-| `pg_lrstat_send_rate_history` | 一目标一间隔一行 | 发送端逐间隔速率（窗口函数现算） |
-| `pg_lrstat_recv_rate_history` | 一目标一间隔一行 | 接收端逐间隔速率（窗口函数现算） |
 
-stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终值，新会话 start 后重新锚定。历史会话用 `lrstat_export(name)`（文件或内存），报告自带佐证数据。
+前四张 stat/info 视图可随时查（每轮一行，含会话外空闲轮，速率空闲轮为 0）；逐间隔速率与原始样本也进导出报告的 Evidence 区（§6）。
 
 ## 4. 视图字段详解
 
-### 4.1 `pg_lrstat_info` — 健康自检（1 行）
+### 4.1 `pg_lrstat_info` — 健康自检（1 行，15 列）
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
@@ -193,7 +190,45 @@ SELECT pg_wal_lsn_diff(max(applied_lsn), min(applied_lsn))/1048576
 
 export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv 原始样本、send/recv 逐间隔速率），报告头部的分析结论即由此推导。
 
-## 6. 配置（GUC）
+## 6. 输出报告内容（lrstat_export）
+
+报告直接写文件到 `$PGDATA/pg_lrstat/exports/<name>.<format>` 并返回绝对路径；HTML 浏览器双击即看，JSON 给机器。数据源三级查找：归档文件（persist 会话，重启后可用）→ 内存环形（任意最近会话）→ 明确报错。
+
+### 6.1 HTML 报告（五个区块，自上而下）
+
+| 区块 | 内容 | 怎么用 |
+| --- | --- | --- |
+| **Analysis**（最顶部） | ① 瓶颈判定徽章：`send`（发送慢，红）/ `recv_apply`（应用慢，黄）/ `network`（在途过半，蓝）/ `none`（健康，绿）② 四个平均速率 gen/send/recv/apply（MB/s）③ 三段积压 unsent/inflight/unapplied 与总量（MB）④ 追平预估（秒）与净追平速率（负值=追不上，标注 CANNOT catch up）⑤ **容量外推表**：当前积压、50G、100G、200G 按平均应用速率的耗时 | 运维第一眼看徽章；容量表回答“这次迁移要多久/再压 100G 行不行” |
+| **Chart**（紧随其后） | gen/send/apply 三条逐间隔速率折线（内嵌 SVG） | 看速率何时掉下来、瓶颈何时开始 |
+| **Session** | 会话名、起止时间、目标数、样本数；`[truncated]`（环形覆盖过最旧）/`[degraded]`（文件写失败）标记 | 确认测量窗口与数据完整性 |
+| **Targets** | 每目标一行：侧别（send/recv）、状态（walsender state 或 worker 类型）、平均速率（`gen x / send y` 或 `recv x / apply y`）、最新 LSN | 多订阅/多槽时逐目标对比 |
+| **Evidence**（底部佐证区，四张表） | ① send history samples：ts、目标、7 个 LSN 水位、spill/stream MB ② recv history samples：ts、目标、received/applied/local_wal ③ send rate history：每间隔的 gen/send/反馈apply MB/s 与 spill MB ④ recv rate history：每间隔的 recv/apply MB/s | **报告头部的每个数字都能从这里手工重算**——审计/质疑结论时用 |
+
+### 6.2 JSON 报告（速率 4 位小数，可精确互算）
+
+```json
+{
+  "session":  { "name", "running", "start", "stop", "truncated", "degraded" },
+  "analysis": { "bottleneck", "gen_avg", "send_avg", "recv_avg", "apply_avg",
+                "backlog_unsent_mb", "backlog_inflight_mb",
+                "backlog_unapplied_mb", "backlog_total_mb" },
+  "capacity": { "catchup_secs", "net_catchup_mbps",
+                "sync_50g_secs", "sync_100g_secs", "sync_200g_secs" },
+  "send_stat": [ 每目标摘要 ],
+  "recv_stat": [ 每目标摘要 ],
+  "history":   { "total_samples", "exported_samples",
+                 "samples": [ 最近 500 条原始样本（kind 区分 send/recv）] }
+}
+```
+
+### 6.3 数字口径（全部可手工复核）
+
+- **平均速率**（analysis 的 `*_avg`）：会话内**首个含有效位置的样本** → 末样本，时间分母截断到 `stop_ts`（stop 后的空闲采样不稀释均值）。
+- **容量外推**：`sync_50g_secs = 50×1024 MB ÷ apply_avg`；100G/200G 严格 2 倍/4 倍。用 JSON 的 4 位小数 `apply_avg` 复算应与 `sync_*_secs` 一致。
+- **逐间隔速率**（Evidence 表）：相邻同目标样本作差 ÷ 间隔，与 SQL 里 `pg_wal_lsn_diff(x, lag(x)) ÷ extract(epoch ...)` 完全同式。
+- `applied` 位置是 origin 与发送端反馈 apply 位的单调融合——大事务期间停在提交边界、提交时一次跳变属正常。
+
+## 7. 配置（GUC）
 
 | GUC | 默认 | 生效 | 含义 |
 | --- | --- | --- | --- |
@@ -208,7 +243,7 @@ export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv �
 
 改运行时参数用 `SELECT pg_reload_conf();` 即可，不用重启。
 
-## 7. 典型工作流
+## 8. 典型工作流
 
 ```sql
 -- 迁移前评估：起会话，跑一轮试迁移，看应用速率和容量推算
@@ -232,7 +267,7 @@ SELECT slot_name, round(retained_wal::numeric,0) MB, wal_status
 FROM pg_lrstat_send_stat ORDER BY retained_wal DESC NULLS LAST;
 ```
 
-## 8. 常见问题
+## 9. 常见问题
 
 | 问题 | 答案 |
 | --- | --- |
