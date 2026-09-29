@@ -156,72 +156,55 @@ is($node_subscriber->safe_psql('postgres',
 	't', 'json export works after table sync');
 
 # ---- session-scoped data --------------------------------------------
-# History rows are stamped with the session they belong to; a second
-# (persist) session must still be exportable by name after a third
-# session has wiped the in-memory history.
+# start/stop/export: the export's evidence tables must carry the raw
+# samples the conclusions are built on
 
-$result = $node_subscriber->poll_query_until(
-	'postgres', qq(
-	SELECT count(*) > 0 FROM pg_lrstat_recv_history
-	WHERE session_name = 'sync_sess'
-));
-is($result, 1, 'history rows carry the session name');
-
-# a persist session with some load to aggregate; keep it alive for at
-# least three sampling rounds so the rate views have intervals
+# a persist session with some load so the report has intervals to show
+my $hist_baseline = $node_subscriber->safe_psql('postgres',
+	'SELECT count(*) FROM pg_lrstat_recv_history');
 $node_subscriber->safe_psql('postgres',
 	"SELECT lrstat_start('archived', true)");
 $node_publisher->safe_psql('postgres',
 	q(INSERT INTO lrstat_test SELECT g, repeat(md5(g::text), 50)
 	  FROM generate_series(100001, 110000) g));
-$result = $node_subscriber->poll_query_until(
-	'postgres', qq(
-	SELECT count(*) >= 3 FROM pg_lrstat_recv_history
-	WHERE session_name = 'archived'
-));
-is($result, 1, 'second session stamped in history');
-is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop('archived')"),
-	'archived', 'persist session stopped');
-
-# session_stat aggregates the current in-memory session
-$result = $node_subscriber->safe_psql('postgres', qq(
-	SELECT count(*) > 0 FROM pg_lrstat_session_stat
-	WHERE session_name = 'archived' AND n_samples > 0
-));
-is($result, 't', 'session_stat aggregates the archived session');
-
-# per-interval rate views derive rates between consecutive samples
 $result = $node_subscriber->poll_query_until('postgres', qq(
-	SELECT count(*) > 0 FROM pg_lrstat_recv_rate_history
-	WHERE session_name = 'archived' AND recv_mbps IS NOT NULL
+	SELECT count(*) >= $hist_baseline + 3 FROM pg_lrstat_recv_history
 ));
-is($result, 1, 'recv_rate_history derives per-interval rates');
-$result = $node_subscriber->safe_psql('postgres', qq(
-	SELECT count(*) FROM pg_lrstat_send_rate_history
-	WHERE session_name = 'archived' AND interval_secs IS NULL
-));
-cmp_ok($result, '>=', 1, 'first sample of a session has NULL rate');
+is($result, 1, 'session records history samples');
+is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop()"),
+	'archived', 'stop without a name stops the running session');
 
-# a third session only re-anchors targets; previous sessions stay in
-# the in-memory history until the ring overwrites them
+# a newer session only re-anchors targets; the older session stays
+# exportable by name from memory
 $node_subscriber->safe_psql('postgres', "SELECT lrstat_start('wiper')");
 sleep(3);
 is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop('wiper')"),
 	'wiper', 'third session stopped');
-is($node_subscriber->safe_psql('postgres', qq(
-	SELECT count(*) > 0 FROM pg_lrstat_recv_history
-	WHERE session_name = 'archived')),
-	't', 'older session survives a newer session start');
 
 # export writes the report to pg_lrstat/exports and returns the path;
 # the archived session is rebuilt from its file
 my $archived_path = $node_subscriber->safe_psql('postgres',
-	"SELECT lrstat_export('archived', 'json')");
+	"SELECT lrstat_export('archived', 'html')");
 $archived_path =~ s/^\s+|\s+$//g;
-like($archived_path, qr{pg_lrstat/exports/archived\.json$},
+like($archived_path, qr{pg_lrstat/exports/archived\.html$},
 	'export returns the report file path');
 ok(-f $archived_path, 'archived session exported by name from its file');
-my $archived_json = PostgreSQL::Test::Utils::slurp_file($archived_path);
+my $archived_html = PostgreSQL::Test::Utils::slurp_file($archived_path);
+ok(index($archived_html, '<h1>Evidence</h1>') >= 0
+	&& index($archived_html, 'send history samples') >= 0
+	&& index($archived_html, 'recv history samples') >= 0,
+	'report carries the raw history evidence tables');
+ok(index($archived_html, 'send rate history (evidence)') >= 0
+	&& index($archived_html, 'recv rate history (evidence)') >= 0,
+	'report carries the per-interval rate evidence tables');
+ok(index($archived_html, 'recv MB/s') >= 0 && index($archived_html, 'apply MB/s') >= 0,
+	'rate evidence includes recv and apply rates');
+
+# the JSON export still carries the raw samples
+my $json_path = $node_subscriber->safe_psql('postgres',
+	"SELECT lrstat_export('archived', 'json')");
+$json_path =~ s/^\s+|\s+$//g;
+my $archived_json = PostgreSQL::Test::Utils::slurp_file($json_path);
 ok(index($archived_json, '"name": "archived"') >= 0,
 	'archived export identifies the session');
 ok(index($archived_json, '"samples": [') >= 0

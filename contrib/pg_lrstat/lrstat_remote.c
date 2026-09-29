@@ -272,8 +272,14 @@ lrstat_run_remote_poll(const LRPollTarget *targets, int ntargets,
 			}
 
 			/* keep recv applied consistent with feedback */
+			/*
+			 * Fold the feedback APPLY position (walsender's replay_lsn)
+			 * into the newest recv sample's applied_lsn.  The flush slot
+			 * must NOT be used here: it is ahead of the apply position
+			 * and would overstate applied progress.
+			 */
 			lrstat_bump_applied(targets[j].recv_name,
-								s.send.peer_flush_lsn);
+								s.send.peer_applied_lsn);
 
 			c->failures = 0;
 			c->next_retry = 0;

@@ -238,16 +238,21 @@ lrstat_round(void)
 	}
 
 	/*
+	 * Remote polling outside the transaction, BEFORE history recording:
+	 * the poll folds the feedback apply position into the newest recv
+	 * sample, so the recorded history matches what the views and report
+	 * derive from (verifiable rates).
+	 */
+	if (running && lrstat_remote_poll && targets != NULL && n_targets > 0)
+		lrstat_run_remote_poll(targets, n_targets,
+							   now + (int64) lrstat_remote_poll_budget_ms * 1000);
+
+	/*
 	 * History: record full raw samples for every active target,
 	 * every round, regardless of session state.  This IS the
 	 * primary data store — rates and stat views derive from it.
 	 */
 	lrstat_record_history();
-
-	/* remote polling outside the transaction */
-	if (running && lrstat_remote_poll && targets != NULL && n_targets > 0)
-		lrstat_run_remote_poll(targets, n_targets,
-							   now + (int64) lrstat_remote_poll_budget_ms * 1000);
 
 	if (targets != NULL)
 	{

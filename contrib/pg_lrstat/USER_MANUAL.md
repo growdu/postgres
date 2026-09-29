@@ -33,8 +33,8 @@ SELECT lrstat_export('mig_20260924');
 
 | 命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `lrstat_start(name, persist)` | `SELECT lrstat_start('压测A', true)` | 开始会话；persist 默认 false。只重置测量锚点，不清历史——旧会话在环形内仍按名可查 |
-| `lrstat_stop(name)` | `SELECT lrstat_stop('压测A')` | 结束会话；名字必须与 start 一致否则报错 |
+| `lrstat_start(name, persist)` | `SELECT lrstat_start('压测A', true)` | 开始采样；persist 默认 false。只重置测量锚点，不清历史——旧会话在环形内仍按名可导 |
+| `lrstat_stop(name)` | `SELECT lrstat_stop()` | 停止采样。名字可省略（停当前会话）；传了则必须与 start 的一致 |
 | `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告并**直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`，返回绝对路径；format='html'（默认）或 'json'。查找顺序：归档文件（persist 会话，重启后可用）→ 内存环形（任意最近会话，含 persist=false）；都没有则报错 |
 | `lrstat_delete(name)` | `SELECT lrstat_delete('压测A')` | 删除归档会话文件（persist 会话）；运行中的会话拒绝删除 |
 | `pg_lrstat_reset()` | `SELECT pg_lrstat_reset()` | 强制清除当前内存数据（不影响归档文件） |
@@ -55,7 +55,7 @@ SELECT lrstat_export('mig_20260924');
 | `pg_lrstat_send_rate_history` | 一目标一间隔一行 | 发送端逐间隔速率（窗口函数现算） |
 | `pg_lrstat_recv_rate_history` | 一目标一间隔一行 | 接收端逐间隔速率（窗口函数现算） |
 
-stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终值，新会话 start 后重新锚定。要看历史会话用 `session_stat` / `*_rate_history`（按 session_name 过滤）或 `lrstat_export(name)`（文件或内存）。
+stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终值，新会话 start 后重新锚定。历史会话用 `lrstat_export(name)`（文件或内存），报告自带佐证数据。
 
 ## 4. 视图字段详解
 
@@ -79,11 +79,10 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 | `remote_poll` | bool | 是否启用接收端→发送端轮询 |
 | `archived_session_names` | text[] | 归档会话名列表（persist 会话），供 export/delete 按名使用 |
 
-### 4.2 `pg_lrstat_send_stat` — 发送端（一连接一行，33 列）
+### 4.2 `pg_lrstat_send_stat` — 发送端（一连接一行，32 列）
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `session_name` | text | 本行数据所属的当前会话名 |
 | `slot_name` | text | 复制槽名（逻辑复制槽或物理复制连接名） |
 | `plugin` | text | 逻辑解码插件名（pgoutput 等）；物理复制为空 |
 | `temporary` | bool | 是否临时槽 |
@@ -113,11 +112,10 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 | `replay_lag` | interval | 对端回放延迟（物理复制语义） |
 | `send_blocked` | bool | t = 有未发送积压且发送平均速率≈0——发送端堵住 |
 
-### 4.3 `pg_lrstat_recv_stat` — 接收端（一 worker 一行，21 列）
+### 4.3 `pg_lrstat_recv_stat` — 接收端（一 worker 一行，20 列）
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `session_name` | text | 本行数据所属的当前会话名 |
 | `recv_name` | text | 订阅名 |
 | `worker_type` | text | apply（主应用 worker）/ table synchronization（初始同步 COPY） |
 | `worker_pid` | int4 | worker 进程 PID |
@@ -136,11 +134,10 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 | `sync_error_count` | int8 | 初始同步累计错误数 |
 | `apply_blocked` | bool | t = 有未应用积压且应用速率≈0——典型原因是锁冲突 |
 
-### 4.4 `pg_lrstat_cluster_stat` — 两端合成（一复制对一行，32 列，**日常只看这个**）
+### 4.4 `pg_lrstat_cluster_stat` — 两端合成（一复制对一行，31 列，**日常只看这个**）
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `session_name` | text | 本行数据所属的当前会话名 |
 | `recv_name` | text | 订阅名（链路标识） |
 | `remote_state` | text | 发送端轮询状态：ok / stale（本轮预算内未完成）/ unreachable（连接失败退避中）/ n/a（未轮询） |
 | `last_remote_poll_time` | timestamptz | 上次成功轮询发送端的时间 |
@@ -169,13 +166,12 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 
 判定规则：`send` = 发送速率落后于生成速率且未发送积压过半；`recv_apply` = 未应用积压过半；`network` = 在途积压过半；否则 none（四速率相等=下游跟得上，正常）。
 
-### 4.5 `pg_lrstat_send_history` — 发送端原始样本（一目标一轮一行，12 列）
+### 4.5 `pg_lrstat_send_history` — 发送端原始样本（一目标一轮一行，11 列）
 
-**始终记录**（会话外样本 `session_name` 为 NULL）。这是所有派生统计的最原始数据来源。
+**始终记录**。这是所有派生统计的最原始数据来源；报告中的每条速率都可从这两张表手工重算。
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `session_name` | text | 样本所属会话名；NULL = 会话之外的空闲期样本 |
 | `name` | text | 目标名（槽名） |
 | `ts` | timestamptz | 采样时间 |
 | `current_lsn` | pg_lsn | 发送端当前 WAL 生成位置 |
@@ -188,63 +184,17 @@ stat 三视图反映**当前会话窗口**；会话结束后冻结显示最终�
 | `spill_bytes` | int8 | 解码溢写累计字节 |
 | `stream_bytes` | int8 | 解码流式（streaming large txn）累计字节 |
 
-### 4.6 `pg_lrstat_recv_history` — 接收端原始样本（6 列）
+### 4.6 `pg_lrstat_recv_history` — 接收端原始样本（5 列）
 
 | 列 | 类型 | 含义 |
 | --- | --- | --- |
-| `session_name` | text | 同上 |
 | `name` | text | 订阅名 |
 | `ts` | timestamptz | 采样时间 |
 | `received_lsn` | pg_lsn | 已收到位置 |
 | `applied_lsn` | pg_lsn | 已应用位置（提交边界） |
 | `local_wal_lsn` | pg_lsn | 接收端本地 WAL 写入位置 |
 
-> 环形写满覆盖最旧（`info.session_truncated = true`）。**数据生命周期**：新会话 start 只重置测量锚点，不清历史——已结束的会话（含 persist=false）在环形内仍可按 `session_name` 查询、可 `lrstat_export(name)` 导出，直到被更新的采样自然挤出环形（默认容量约 2880 样本/目标）。要**永久**追溯的会话用 `persist=true`（落文件，重启后也能导出）。
-
-### 4.7 `pg_lrstat_session_stat` — 按会话汇总（13 列）
-
-回答"**那次**会话跑得怎么样"。对 history 按会话×目标聚合，会话结束后仍可查（在内存环形内）。
-
-| 列 | 类型 | 含义 |
-| --- | --- | --- |
-| `session_name` | text | 会话名 |
-| `name` | text | 目标名 |
-| `n_samples` | int8 | 会话内样本数 |
-| `first_ts` / `last_ts` | timestamptz | 会话内首/末样本时间（即实际测量区间） |
-| `gen_mb` | numeric | 会话期间累计 WAL 生成量（MB） |
-| `sent_mb` | numeric | 累计发送量（MB）；接收侧行为 NULL |
-| `received_mb` | numeric | 累计接收量（MB）；发送侧行为 NULL |
-| `applied_mb` | numeric | 累计应用量（MB）；发送侧行为 NULL |
-| `gen_mbps` | numeric | 会话平均生成速率（MB/s）；区间不足为 NULL |
-| `send_mbps` | numeric | 平均发送速率（MB/s） |
-| `recv_mbps` | numeric | 平均接收速率（MB/s） |
-| `apply_mbps` | numeric | 平均应用速率（MB/s）——**容量规划的依据** |
-
-### 4.8 `pg_lrstat_send_rate_history` / `pg_lrstat_recv_rate_history` — 逐间隔速率
-
-对 history 用窗口函数现算的**每两次采样之间**的速率（不额外存储）。画速率曲线直接查。
-
-send_rate_history（9 列）：
-
-| 列 | 类型 | 含义 |
-| --- | --- | --- |
-| `session_name` / `name` / `ts` | — | 本间隔结束时刻的样本 |
-| `interval_secs` | numeric | 与上一样本的间隔秒数 |
-| `gen_mbps` | numeric | 本间隔平均生成速率（MB/s） |
-| `send_mbps` | numeric | 本间隔平均发送速率（MB/s） |
-| `peer_apply_mbps` | numeric | 对端反馈应用速率（MB/s） |
-| `spill_mb` | numeric | 本间隔解码溢写增量（MB）——突增=该轮解码压力大 |
-| `stream_mb` | numeric | 本间隔流式解码增量（MB） |
-
-recv_rate_history（7 列）：`session_name / name / ts / interval_secs` 同上，加：
-
-| 列 | 类型 | 含义 |
-| --- | --- | --- |
-| `recv_mbps` | numeric | 本间隔平均接收速率（MB/s） |
-| `apply_mbps` | numeric | 本间隔平均应用速率（MB/s） |
-| `local_wal_mbps` | numeric | 本地 WAL 写入速率（MB/s） |
-
-会话首行（无前一样本）rate 为 NULL；LSN 为 0 的样本（目标尚未产生有效位置）自动跳过。
+> 环形写满覆盖最旧（`info.session_truncated = true`）。**数据生命周期**：新会话 start 只重置测量锚点，不清历史——已结束的会话（含 persist=false）在环形内仍可 `lrstat_export(name)` 导出，直到被更新的采样自然挤出环形（默认约 2880 样本/目标）。要**永久**追溯的会话用 `persist=true`（落文件，重启后也能导出）。
 
 ## 5. 速率是怎么算的
 
@@ -258,6 +208,19 @@ recv_rate_history（7 列）：`session_name / name / ts / interval_secs` 同上
 - 应用位置只在事务提交边界推进——大事务期间 `applied` 不动、提交时跳变，属正常内核行为
 - 瞬时回答"刚过去一个间隔怎么样"，平均回答"整场会话怎么样"
 - 速率是 LSN（页码）差，不是网线字节；与带宽对比需考虑解码膨胀率
+
+**可验证性**：报告/视图中的每条速率都能从 `pg_lrstat_recv_history` / `pg_lrstat_send_history` 手工重算：
+
+```sql
+-- 例：手工重算 apply 平均速率（与 cluster_stat.apply_avg 一致）
+WITH h AS (SELECT ts, applied_lsn FROM pg_lrstat_recv_history
+            WHERE name='asub' AND applied_lsn>'0/0' ORDER BY ts)
+SELECT pg_wal_lsn_diff(max(applied_lsn), min(applied_lsn))/1048576
+       / extract(epoch FROM max(ts)-min(ts)) AS apply_mbps
+  FROM h;
+```
+
+export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv 原始样本、send/recv 逐间隔速率），报告头部的分析结论即由此推导。
 
 ## 6. 配置（GUC）
 
@@ -288,11 +251,10 @@ SELECT recv_name, bottleneck, round(backlog_total::numeric,1) 积压MB,
        round(catchup_total_secs) 追平秒
 FROM pg_lrstat_cluster_stat;
 
--- 事后分析：那次会话到底跑成什么样
-SELECT * FROM pg_lrstat_session_stat WHERE session_name = 'mig_eval';
-SELECT to_char(ts,'HH24:MI:SS'), apply_mbps
-FROM pg_lrstat_recv_rate_history
-WHERE session_name = 'mig_eval' ORDER BY ts;
+-- 事后分析：导出那次会话的报告（含佐证数据）
+SELECT lrstat_export('mig_eval');
+-- 报告 Evidence 区四张表：send/recv 原始样本 + send/recv 逐间隔速率，
+-- 与 Analysis 的结论一一对应，可手工重算核对
 
 -- 空间占用风险：槽扣住了多少 WAL
 SELECT slot_name, round(retained_wal::numeric,0) MB, wal_status
@@ -308,7 +270,6 @@ FROM pg_lrstat_send_stat ORDER BY retained_wal DESC NULLS LAST;
 | cluster_stat 没数据 | 没有活跃订阅，或 remote_state = unreachable（检查订阅连接串可达性） |
 | apply 速率 = 0 但积压在涨 | 应用被堵（锁冲突最常见）：拿 recv_stat 的 worker_pid 查 pg_stat_activity 的 wait_event |
 | applied 长时间不动然后突然跳 | 大事务：应用位置只在提交边界推进，正常 |
-| history 里 session_name 是 NULL | 会话之外的空闲期采样，正常；过滤掉即可 |
 | 想看已结束的会话 | `lrstat_export(name)` 即可：环形内直接内存导出（含 persist=false）；被挤出环形或重启后仅 persist 会话可从文件导出 |
 | 四个速率相等 | 健康！下游跟得上，都被"生成"定节奏 |
 | round(x, 1) 报错 | 视图速率/积压列是 float8，需 `round(x::numeric, 1)` |

@@ -820,6 +820,82 @@ svg_rates(StringInfo s, LRExportData *d, LRAnalysis *a)
 	if (app) pfree(app);
 }
 
+/*
+ * Per-interval rate evidence table: derives each interval's rate from
+ * two consecutive samples of the same target, exactly the way an
+ * auditor would recompute it by hand from the history tables below.
+ */
+static void
+html_rate_table(StringInfo s, const LRExportData *d, bool recv_side)
+{
+	const char *title = recv_side ? "recv rate history (evidence)"
+		: "send rate history (evidence)";
+	int i;
+
+	appendStringInfo(s,
+		"<div class='card'>\n<h2>%s</h2>\n"
+		"<table><tr><th>ts</th><th>target</th><th>interval s</th>",
+		title);
+	if (recv_side)
+		appendStringInfoString(s,
+			"<th>recv MB/s</th><th>apply MB/s</th></tr>\n");
+	else
+		appendStringInfoString(s,
+			"<th>gen MB/s</th><th>send MB/s</th><th>feedback apply MB/s</th>"
+			"<th>spill MB</th></tr>\n");
+
+	for (i = 0; i < d->n_entries; i++)
+	{
+		const LRHistoryEntry *e = &d->entries[i];
+		const LRExportTarget *t = find_target_by_ctl(d, e->target_idx);
+		const LRHistoryEntry *prev = NULL;
+		int j;
+
+		/* find the previous sample of the same target */
+		for (j = i - 1; j >= 0; j--)
+			if (d->entries[j].target_idx == e->target_idx)
+			{ prev = &d->entries[j]; break; }
+		if (prev == NULL)
+			continue;
+
+		{
+			double ival = (double)(e->ts - prev->ts) / 1e6;
+			double r1, r2, r3, spill;
+
+			if (ival <= 0)
+				continue;
+			if (recv_side)
+			{
+				if (t == NULL || t->kind != LR_RECV)
+					continue;
+				r1 = (double)(e->received_lsn - prev->received_lsn) / ival / MB_DIV;
+				r2 = (double)(e->applied_lsn - prev->applied_lsn) / ival / MB_DIV;
+				appendStringInfo(s, "<tr><td>%s</td><td>%s</td><td>%.1f</td>"
+								 "<td>%.3f</td><td>%.3f</td></tr>\n",
+								 timestamptz_to_str(e->ts),
+								 t ? t->name : "?", ival,
+								 r1 > 0 ? r1 : 0, r2 > 0 ? r2 : 0);
+			}
+			else
+			{
+				if (t == NULL || t->kind == LR_RECV)
+					continue;
+				r1 = (double)(e->current_lsn - prev->current_lsn) / ival / MB_DIV;
+				r2 = (double)(e->sent_lsn - prev->sent_lsn) / ival / MB_DIV;
+				r3 = (double)(e->peer_applied_lsn - prev->peer_applied_lsn) / ival / MB_DIV;
+				spill = (double)(e->spill_bytes - prev->spill_bytes) / MB_DIV;
+				appendStringInfo(s, "<tr><td>%s</td><td>%s</td><td>%.1f</td>"
+								 "<td>%.3f</td><td>%.3f</td><td>%.3f</td><td>%.3f</td></tr>\n",
+								 timestamptz_to_str(e->ts),
+								 t ? t->name : "?", ival,
+								 r1 > 0 ? r1 : 0, r2 > 0 ? r2 : 0,
+								 r3 > 0 ? r3 : 0, spill > 0 ? spill : 0);
+			}
+		}
+	}
+	appendStringInfoString(s, "</table>\n</div>\n");
+}
+
 static StringInfo
 build_html(LRExportData *d, LRAnalysis *a)
 {
@@ -890,6 +966,11 @@ build_html(LRExportData *d, LRAnalysis *a)
 	}
 	appendStringInfoString(s, "</table>\n</div>\n");
 
+	/* charts, right after the analysis */
+	appendStringInfoString(s, "<div class='card'>\n");
+	svg_rates(s, d, a);
+	appendStringInfoString(s, "</div>\n");
+
 	/* session info card */
 	appendStringInfoString(s, "<div class='card'>\n<h2>Session</h2>\n");
 	appendStringInfo(s, "<p><b>%s</b> &mdash; %s", d->session_name,
@@ -956,41 +1037,77 @@ build_html(LRExportData *d, LRAnalysis *a)
 	}
 	appendStringInfoString(s, "</table>\n</div>\n");
 
-	/* charts */
-	appendStringInfoString(s, "<div class='card'>\n");
-	svg_rates(s, d, a);
-	appendStringInfoString(s, "</div>\n");
+	/*
+	 * Evidence section at the bottom: the raw samples and the derived
+	 * per-interval rates each conclusion is built on, so any number in
+	 * the report can be recomputed by hand.
+	 */
+	appendStringInfoString(s,
+		"<h1>Evidence</h1>\n<p class='label'>the raw samples and "
+		"per-interval rates behind the analysis above</p>\n");
 
-	/* raw history table */
+	/* send history table */
 	if (d->n_entries > 0)
 	{
 		int i;
 		appendStringInfo(s,
-			"<div class='card'>\n<h2>Raw history samples</h2>\n"
+			"<div class='card'>\n<h2>send history samples</h2>\n"
 			"<p class='label'>showing the most recent %d of %d samples</p>\n"
-			"<table><tr><th>ts</th><th>name</th><th>kind</th>"
-			"<th>current_lsn</th><th>sent_lsn</th>"
-			"<th>received_lsn</th><th>applied_lsn</th></tr>\n",
+			"<table><tr><th>ts</th><th>target</th>"
+			"<th>current_lsn</th><th>sent_lsn</th><th>confirmed</th>"
+			"<th>restart_lsn</th><th>spill MB</th><th>stream MB</th></tr>\n",
 			d->n_entries, d->total_entries);
 		for (i = 0; i < d->n_entries; i++)
 		{
 			LRHistoryEntry *e = &d->entries[i];
 			const LRExportTarget *t = find_target_by_ctl(d, e->target_idx);
-			bool is_recv = (t != NULL && t->kind == LR_RECV);
-			const char *cur = !is_recv && e->current_lsn ? lsn_str(e->current_lsn) : "-";
-			const char *snt = !is_recv && e->sent_lsn ? lsn_str(e->sent_lsn) : "-";
-			const char *rcv = is_recv && e->received_lsn ? lsn_str(e->received_lsn) : "-";
-			const char *apl = is_recv && e->applied_lsn ? lsn_str(e->applied_lsn) : "-";
 
-			appendStringInfo(s, "<tr><td>%s</td><td>%s</td><td>%s</td>"
-							 "<td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n",
+			if (t != NULL && t->kind == LR_RECV)
+				continue;
+			appendStringInfo(s, "<tr><td>%s</td><td>%s</td>"
+							 "<td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+							 "<td>%.1f</td><td>%.1f</td></tr>\n",
 							 timestamptz_to_str(e->ts),
 							 t ? t->name : "?",
-							 is_recv ? "recv" : "send",
-							 cur, snt, rcv, apl);
+							 lsn_str(e->current_lsn),
+							 lsn_str(e->sent_lsn),
+							 lsn_str(e->confirmed_lsn),
+							 lsn_str(e->restart_lsn),
+							 (double) e->spill_bytes / MB_DIV,
+							 (double) e->stream_bytes / MB_DIV);
 		}
 		appendStringInfoString(s, "</table>\n</div>\n");
 	}
+
+	/* recv history table */
+	if (d->n_entries > 0)
+	{
+		int i;
+		appendStringInfo(s,
+			"<div class='card'>\n<h2>recv history samples</h2>\n"
+			"<table><tr><th>ts</th><th>target</th>"
+			"<th>received_lsn</th><th>applied_lsn</th><th>local_wal_lsn</th></tr>\n");
+		for (i = 0; i < d->n_entries; i++)
+		{
+			LRHistoryEntry *e = &d->entries[i];
+			const LRExportTarget *t = find_target_by_ctl(d, e->target_idx);
+
+			if (t == NULL || t->kind != LR_RECV)
+				continue;
+			appendStringInfo(s, "<tr><td>%s</td><td>%s</td>"
+							 "<td>%s</td><td>%s</td><td>%s</td></tr>\n",
+							 timestamptz_to_str(e->ts),
+							 t ? t->name : "?",
+							 lsn_str(e->received_lsn),
+							 lsn_str(e->applied_lsn),
+							 lsn_str(e->local_wal_lsn));
+		}
+		appendStringInfoString(s, "</table>\n</div>\n");
+	}
+
+	/* per-interval rate evidence tables */
+	html_rate_table(s, d, false);
+	html_rate_table(s, d, true);
 
 	appendStringInfoString(s, "</body>\n</html>\n");
 	return s;

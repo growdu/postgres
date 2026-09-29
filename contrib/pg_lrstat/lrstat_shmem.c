@@ -438,12 +438,15 @@ lrstat_lookup(LRTargetKind kind, const char *name,
  * A sample with all-zero LSNs (e.g. a subscription whose worker is not
  * running) is not a valid measurement baseline; never let it become
  * the anchor — avg rates would count the whole WAL history as delta.
+ * For recv targets the anchor additionally requires a non-zero
+ * applied_lsn: received can be populated while applied is still
+ * uninitialized, and a zero apply anchor would overstate apply rates.
  */
 static bool
 sample_valid(const LRTargetCtl *t, const LRSample *s)
 {
 	if (t->kind == LR_RECV)
-		return s->recv.received_lsn != 0 || s->recv.applied_lsn != 0;
+		return s->recv.applied_lsn != 0;
 	return s->send.current_lsn != 0 || s->send.sent_lsn != 0 ||
 		s->send.restart_lsn != 0;
 }
@@ -454,17 +457,30 @@ lrstat_push_sample(LRTargetCtl *target, const LRSample *sample)
 	SpinLockAcquire(&target->mutex);
 	if (sample->send.ts > target->last_sample_ts)
 	{
+		LRSample s = *sample;
+
+		/*
+		 * applied_lsn is fed by two sources: the replication origin
+		 * (advances at commit boundaries) and the sender-side feedback
+		 * apply position folded in by lrstat_bump_applied().  Keep it
+		 * monotonic so history, anchors, views and reports all see the
+		 * same fused position and rates stay verifiable.
+		 */
+		if (target->kind == LR_RECV &&
+			s.recv.applied_lsn < target->last.recv.applied_lsn)
+			s.recv.applied_lsn = target->last.recv.applied_lsn;
+
 		/* rotate: prev = last; last = new; first valid sample sets anchor */
 		if (target->last.send.ts > 0)
 		{
 			target->prev = target->last;
 		}
-		if (target->anchor.send.ts == 0 && sample_valid(target, sample))
+		if (target->anchor.send.ts == 0 && sample_valid(target, &s))
 		{
-			target->anchor = *sample;
+			target->anchor = s;
 		}
-		target->last = *sample;
-		target->last_sample_ts = sample->send.ts;
+		target->last = s;
+		target->last_sample_ts = s.send.ts;
 	}
 	SpinLockRelease(&target->mutex);
 }

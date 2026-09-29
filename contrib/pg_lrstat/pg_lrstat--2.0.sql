@@ -8,7 +8,7 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'lrstat_start'
 LANGUAGE C VOLATILE;
 
-CREATE FUNCTION lrstat_stop(name text)
+CREATE FUNCTION lrstat_stop(name text DEFAULT NULL)
 RETURNS text
 AS 'MODULE_PATHNAME', 'lrstat_stop'
 LANGUAGE C VOLATILE;
@@ -45,7 +45,6 @@ LANGUAGE C STABLE;
 
 -- View: send_stat (one row per send-side connection)
 CREATE FUNCTION pg_lrstat_send_stat(
-    OUT session_name text,
     OUT slot_name text, OUT plugin text, OUT temporary bool,
     OUT active bool, OUT sender_pid int4, OUT application_name text,
     OUT client_addr text, OUT state text, OUT sync_state text,
@@ -68,7 +67,6 @@ LANGUAGE C STABLE;
 
 -- View: recv_stat (one row per recv worker/recovery)
 CREATE FUNCTION pg_lrstat_recv_stat(
-    OUT session_name text,
     OUT recv_name text, OUT worker_type text,
     OUT worker_pid int4, OUT leader_pid int4, OUT relid oid,
     OUT sample_time timestamptz,
@@ -86,7 +84,6 @@ LANGUAGE C STABLE;
 
 -- View: cluster_stat (one row per replication pair, both ends)
 CREATE FUNCTION pg_lrstat_cluster_stat(
-    OUT session_name text,
     OUT recv_name text, OUT remote_state text,
     OUT last_remote_poll_time timestamptz, OUT sample_time timestamptz,
     OUT send_current_lsn pg_lsn, OUT sent_lsn pg_lsn,
@@ -110,7 +107,6 @@ LANGUAGE C STABLE;
 
 -- View: send_history (full raw samples with all LSNs, always recording)
 CREATE FUNCTION pg_lrstat_send_history(
-    OUT session_name text,
     OUT name text, OUT ts timestamptz,
     OUT current_lsn pg_lsn, OUT sent_lsn pg_lsn,
     OUT peer_recv_lsn pg_lsn, OUT peer_flush_lsn pg_lsn,
@@ -123,7 +119,6 @@ LANGUAGE C STABLE;
 
 -- View: recv_history (full raw samples with all LSNs, always recording)
 CREATE FUNCTION pg_lrstat_recv_history(
-    OUT session_name text,
     OUT name text, OUT ts timestamptz,
     OUT received_lsn pg_lsn, OUT applied_lsn pg_lsn,
     OUT local_wal_lsn pg_lsn)
@@ -138,87 +133,6 @@ CREATE VIEW pg_lrstat_cluster_stat AS SELECT * FROM pg_lrstat_cluster_stat();
 CREATE VIEW pg_lrstat_send_history AS SELECT * FROM pg_lrstat_send_history();
 CREATE VIEW pg_lrstat_recv_history AS SELECT * FROM pg_lrstat_recv_history();
 
--- View: session_stat — per-session aggregates over history (both sides).
--- session_name groups the raw samples by the session they belong to;
--- rates are totals divided by the session's sampled duration.
-CREATE VIEW pg_lrstat_session_stat AS
-WITH s AS (
-    SELECT session_name, name,
-           count(*)::int8                     AS n_samples,
-           min(ts)                            AS first_ts,
-           max(ts)                            AS last_ts,
-           pg_wal_lsn_diff(max(current_lsn), min(nullif(current_lsn, '0/0'))) AS gen_bytes,
-           pg_wal_lsn_diff(max(sent_lsn), min(nullif(sent_lsn, '0/0')))       AS sent_bytes,
-           NULL::numeric                      AS received_bytes,
-           NULL::numeric                      AS applied_bytes
-      FROM pg_lrstat_send_history
-     WHERE session_name IS NOT NULL
-     GROUP BY session_name, name
-    UNION ALL
-    SELECT session_name, name,
-           count(*)::int8,
-           min(ts),
-           max(ts),
-           NULL::numeric,
-           NULL::numeric,
-           pg_wal_lsn_diff(max(received_lsn), min(nullif(received_lsn, '0/0'))),
-           pg_wal_lsn_diff(max(applied_lsn), min(nullif(applied_lsn, '0/0')))
-      FROM pg_lrstat_recv_history
-     WHERE session_name IS NOT NULL
-     GROUP BY session_name, name
-)
-SELECT session_name, name, n_samples, first_ts, last_ts,
-       round((gen_bytes    / 1048576)::numeric, 1)  AS gen_mb,
-       round((sent_bytes   / 1048576)::numeric, 1)  AS sent_mb,
-       round((received_bytes / 1048576)::numeric, 1) AS received_mb,
-       round((applied_bytes  / 1048576)::numeric, 1) AS applied_mb,
-       CASE WHEN last_ts > first_ts
-            THEN round((gen_bytes    / 1048576 /
-                        extract(epoch FROM last_ts - first_ts))::numeric, 2)
-       END AS gen_mbps,
-       CASE WHEN last_ts > first_ts
-            THEN round((sent_bytes   / 1048576 /
-                        extract(epoch FROM last_ts - first_ts))::numeric, 2)
-       END AS send_mbps,
-       CASE WHEN last_ts > first_ts AND received_bytes IS NOT NULL
-            THEN round((received_bytes / 1048576 /
-                        extract(epoch FROM last_ts - first_ts))::numeric, 2)
-       END AS recv_mbps,
-       CASE WHEN last_ts > first_ts AND applied_bytes IS NOT NULL
-            THEN round((applied_bytes / 1048576 /
-                        extract(epoch FROM last_ts - first_ts))::numeric, 2)
-       END AS apply_mbps
-  FROM s;
-
--- Views: send/recv_rate_history — per-interval rates between two
--- consecutive samples, derived from the raw history views with window
--- functions.  No extra storage: the raw samples stay the single source
--- of truth, these views fix the derivation once for everyone.
-CREATE VIEW pg_lrstat_send_rate_history AS
-SELECT session_name, name, ts,
-       extract(epoch FROM ts - lag(ts) OVER w)::numeric AS interval_secs,
-       round((pg_wal_lsn_diff(nullif(current_lsn, '0/0'), nullif(lag(current_lsn) OVER w, '0/0')) / 1048576
-              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS gen_mbps,
-       round((pg_wal_lsn_diff(nullif(sent_lsn, '0/0'), nullif(lag(sent_lsn) OVER w, '0/0')) / 1048576
-              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS send_mbps,
-       round((pg_wal_lsn_diff(nullif(peer_applied_lsn, '0/0'), nullif(lag(peer_applied_lsn) OVER w, '0/0')) / 1048576
-              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS peer_apply_mbps,
-       round((spill_bytes  - lag(spill_bytes)  OVER w)::numeric / 1048576, 3) AS spill_mb,
-       round((stream_bytes - lag(stream_bytes) OVER w)::numeric / 1048576, 3) AS stream_mb
-  FROM pg_lrstat_send_history
-WINDOW w AS (PARTITION BY session_name, name ORDER BY ts);
-
-CREATE VIEW pg_lrstat_recv_rate_history AS
-SELECT session_name, name, ts,
-       extract(epoch FROM ts - lag(ts) OVER w)::numeric AS interval_secs,
-       round((pg_wal_lsn_diff(nullif(received_lsn, '0/0'), nullif(lag(received_lsn) OVER w, '0/0')) / 1048576
-              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS recv_mbps,
-       round((pg_wal_lsn_diff(nullif(applied_lsn, '0/0'), nullif(lag(applied_lsn) OVER w, '0/0')) / 1048576
-              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS apply_mbps,
-       round((pg_wal_lsn_diff(nullif(local_wal_lsn, '0/0'), nullif(lag(local_wal_lsn) OVER w, '0/0')) / 1048576
-              / nullif(extract(epoch FROM ts - lag(ts) OVER w), 0))::numeric, 3) AS local_wal_mbps
-  FROM pg_lrstat_recv_history
-WINDOW w AS (PARTITION BY session_name, name ORDER BY ts);
 
 REVOKE ALL ON FUNCTION
     pg_lrstat_info(), pg_lrstat_send_stat(),
@@ -229,14 +143,10 @@ FROM PUBLIC;
 REVOKE ALL ON
     pg_lrstat_info, pg_lrstat_send_stat,
     pg_lrstat_recv_stat, pg_lrstat_cluster_stat,
-    pg_lrstat_send_history, pg_lrstat_recv_history,
-    pg_lrstat_session_stat,
-    pg_lrstat_send_rate_history, pg_lrstat_recv_rate_history
+    pg_lrstat_send_history, pg_lrstat_recv_history
 FROM PUBLIC;
 GRANT SELECT ON
     pg_lrstat_info, pg_lrstat_send_stat,
     pg_lrstat_recv_stat, pg_lrstat_cluster_stat,
-    pg_lrstat_send_history, pg_lrstat_recv_history,
-    pg_lrstat_session_stat,
-    pg_lrstat_send_rate_history, pg_lrstat_recv_rate_history
+    pg_lrstat_send_history, pg_lrstat_recv_history
 TO pg_monitor;
