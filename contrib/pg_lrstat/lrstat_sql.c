@@ -591,9 +591,7 @@ PG_FUNCTION_INFO_V1(lrstat_start);
 Datum
 lrstat_start(PG_FUNCTION_ARGS)
 {
-    text *name_arg = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
     char name[NAMEDATALEN];
-    char auto_name[64];
 
     if (!superuser())
         ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -612,17 +610,12 @@ lrstat_start(PG_FUNCTION_ARGS)
     }
     SpinLockRelease(&lrstat->session.mutex);
 
-    if (name_arg != NULL)
-        strlcpy(name, text_to_cstring(name_arg), NAMEDATALEN);
-    else
-    {
-        snprintf(auto_name, sizeof(auto_name), "sess_%lld_%s",
-                 (long long)(lrstat->session.session_id + 1),
-                 timestamptz_to_str(GetCurrentTimestamp()));
-        strlcpy(name, auto_name, NAMEDATALEN);
-    }
+    /* the session is global and unnamed; the auto name only identifies
+     * the report file and the archived-session list for export */
+    snprintf(name, sizeof(name), "sess_%lld",
+             (long long) (lrstat->session.session_id + 1));
 
-    lrstat_persist_requested = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
+    lrstat_persist_requested = PG_ARGISNULL(0) ? false : PG_GETARG_BOOL(0);
     lrstat_session_start(name);
     PG_RETURN_DATUM(CStringGetTextDatum(name));
 }
@@ -631,9 +624,7 @@ PG_FUNCTION_INFO_V1(lrstat_stop);
 Datum
 lrstat_stop(PG_FUNCTION_ARGS)
 {
-    text *name_arg = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
     char name[NAMEDATALEN];
-    TimestampTz start_ts, stop_ts;
 
     if (!superuser())
         ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -650,18 +641,7 @@ lrstat_stop(PG_FUNCTION_ARGS)
                         errmsg("no running session")));
     }
     strlcpy(name, lrstat->session.name, NAMEDATALEN);
-    start_ts = lrstat->session.start_ts;
     SpinLockRelease(&lrstat->session.mutex);
-
-    if (name_arg != NULL)
-    {
-        char expect[NAMEDATALEN];
-        strlcpy(expect, text_to_cstring(name_arg), NAMEDATALEN);
-        if (strcmp(expect, name) != 0)
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                            errmsg("session name mismatch: running=%s given=%s",
-                                   name, expect)));
-    }
 
     lrstat_session_stop();
     PG_RETURN_DATUM(CStringGetTextDatum(name));

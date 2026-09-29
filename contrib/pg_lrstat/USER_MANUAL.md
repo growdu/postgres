@@ -8,8 +8,8 @@ pg_lrstat 是一个测量**逻辑/物理复制性能**的扩展。部署在复�
 -- 0. postgresql.conf: shared_preload_libraries = 'pg_lrstat'，重启后
 CREATE EXTENSION pg_lrstat;
 
--- 1. 开始一次命名测量（persist=true 时数据落文件，可长期追溯）
-SELECT lrstat_start('mig_20260924', true);
+-- 1. 开始测量（persist=true 时数据落文件，可长期追溯）
+SELECT lrstat_start(true);
 
 -- 2. 迁移/压测期间随时看链路健康（日常只需要这一个视图）
 SELECT recv_name, bottleneck,
@@ -20,11 +20,13 @@ SELECT recv_name, bottleneck,
 FROM pg_lrstat_cluster_stat;
 
 -- 3. 结束测量
-SELECT lrstat_stop('mig_20260924');
+SELECT lrstat_stop();
 
 -- 4. 导出报告（直接写文件，返回路径，浏览器打开）
-SELECT lrstat_export('mig_20260924');
--- -> /var/lib/pgsql/data/pg_lrstat/exports/mig_20260924.html
+SELECT lrstat_export();
+-- -> /var/lib/pgsql/data/pg_lrstat/exports/session.html
+-- 需要事后追溯时: SELECT session_name FROM pg_lrstat_info;  -- 如 sess_3
+--               SELECT lrstat_export('sess_3');             -- 按名导归档
 ```
 
 单位约定：**所有字节量输出为 MB（1MB = 1048576 字节），所有速度为 MB/s，时间为秒**。
@@ -33,9 +35,9 @@ SELECT lrstat_export('mig_20260924');
 
 | 命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `lrstat_start(name, persist)` | `SELECT lrstat_start('压测A', true)` | 开始采样；persist 默认 false。只重置测量锚点，不清历史——旧会话在环形内仍按名可导 |
-| `lrstat_stop(name)` | `SELECT lrstat_stop()` | 停止采样。名字可省略（停当前会话）；传了则必须与 start 的一致 |
-| `lrstat_export(name, format)` | `SELECT lrstat_export('压测A')` | 导出报告并**直接写文件**到 `$PGDATA/pg_lrstat/exports/<name>.<format>`，返回绝对路径；format='html'（默认）或 'json'。查找顺序：归档文件（persist 会话，重启后可用）→ 内存环形（任意最近会话，含 persist=false）；都没有则报错 |
+| `lrstat_start(persist)` | `SELECT lrstat_start(true)` | 开始采样（全局唯一会话，无需名字）；persist 默认 false。自动名 sess_N 仅用于报告文件与归档检索 |
+| `lrstat_stop()` | `SELECT lrstat_stop()` | 停止采样（无参数） |
+| `lrstat_export(name, format)` | `SELECT lrstat_export()` | 导出报告并**直接写文件**，返回绝对路径；format='html'（默认）或 'json'。不传 name 导出当前/最近会话；传 name（如 `sess_3`，见 info 的 archived_session_names）导出指定归档。名字只在这里出现——用于标识报告或本次测试 |
 | `lrstat_delete(name)` | `SELECT lrstat_delete('压测A')` | 删除归档会话文件（persist 会话）；运行中的会话拒绝删除 |
 | `pg_lrstat_reset()` | `SELECT pg_lrstat_reset()` | 强制清除当前内存数据（不影响归档文件） |
 
@@ -210,18 +212,18 @@ export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv �
 
 ```sql
 -- 迁移前评估：起会话，跑一轮试迁移，看应用速率和容量推算
-SELECT lrstat_start('mig_eval', true);
+SELECT lrstat_start(true);
 -- ... 跑 10 分钟代表性负载 ...
-SELECT lrstat_stop('mig_eval');
-SELECT lrstat_export('mig_eval', 'json');   -- 容量表：50/100/200GB 需要多久
+SELECT lrstat_stop();
+SELECT lrstat_export(NULL, 'json');   -- 容量表：50/100/200GB 需要多久
 
 -- 日常巡检：瓶颈在哪、还要多久追平
 SELECT recv_name, bottleneck, round(backlog_total::numeric,1) 积压MB,
        round(catchup_total_secs) 追平秒
 FROM pg_lrstat_cluster_stat;
 
--- 事后分析：导出那次会话的报告（含佐证数据）
-SELECT lrstat_export('mig_eval');
+-- 事后分析：导出那次会话的报告（含佐证数据；名字查 info 的归档列表）
+SELECT lrstat_export('sess_3');
 -- 报告 Evidence 区四张表：send/recv 原始样本 + send/recv 逐间隔速率，
 -- 与 Analysis 的结论一一对应，可手工重算核对
 

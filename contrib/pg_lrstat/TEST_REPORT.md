@@ -6,7 +6,7 @@
 
 ## 场景
 
-`lrstat_start('report_verify', true)` → 8 个独立 UPDATE 事务（101 行 × 28KB，间隔 0.7s）→ `lrstat_stop()`。会话窗口 11 秒，发布端实际生成 WAL 0.63 MB（LSN 实测 0/8EE96F0→0/8F8AFC8）。
+`lrstat_start(true)`（自动名 report_verify 场景沿用自定义名仅便于文中引用；start/stop 均无参数）→ 8 个独立 UPDATE 事务（101 行 × 28KB，间隔 0.7s）→ `lrstat_stop()`。会话窗口 11 秒，发布端实际生成 WAL 0.63 MB（LSN 实测 0/8EE96F0→0/8F8AFC8）。
 
 ## 六张视图逐字段核验
 

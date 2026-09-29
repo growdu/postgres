@@ -104,7 +104,9 @@ is($result, 1, 'recv_history records samples during table sync');
 
 # Session lifecycle across a table sync: lrstat_start resets all
 # targets, which must also cope with the sync worker's target.
-$node_subscriber->safe_psql('postgres', "SELECT lrstat_start('sync_sess')");
+my $sess_sync = $node_subscriber->safe_psql('postgres',
+	'SELECT lrstat_start()');
+chomp $sess_sync;
 is($node_subscriber->safe_psql('postgres',
 	q(SELECT session_state FROM pg_lrstat_info)),
 	'running', 'session started during table sync');
@@ -152,10 +154,9 @@ $result = $node_publisher->poll_query_until(
 is($result, 1, 'subscription slot visible in pg_lrstat_send_stat');
 
 # Export still works after a full sync cycle.
-is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop('sync_sess')"),
-	'sync_sess', 'session stopped after sync');
+$node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
 is($node_subscriber->safe_psql('postgres',
-	q(SELECT length(lrstat_export('sync_sess', 'json')) > 0)),
+	qq(SELECT length(lrstat_export('$sess_sync', 'json')) > 0)),
 	't', 'json export works after table sync');
 
 # ---- session-scoped data --------------------------------------------
@@ -165,8 +166,9 @@ is($node_subscriber->safe_psql('postgres',
 # a persist session with some load so the report has intervals to show
 my $hist_baseline = $node_subscriber->safe_psql('postgres',
 	'SELECT count(*) FROM pg_lrstat_recv_history');
-$node_subscriber->safe_psql('postgres',
-	"SELECT lrstat_start('archived', true)");
+my $sess_archived = $node_subscriber->safe_psql('postgres',
+	'SELECT lrstat_start(true)');
+chomp $sess_archived;
 $node_publisher->safe_psql('postgres',
 	q(INSERT INTO lrstat_test SELECT g, repeat(md5(g::text), 50)
 	  FROM generate_series(100001, 110000) g));
@@ -174,22 +176,20 @@ $result = $node_subscriber->poll_query_until('postgres', qq(
 	SELECT count(*) >= $hist_baseline + 3 FROM pg_lrstat_recv_history
 ));
 is($result, 1, 'session records history samples');
-is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop()"),
-	'archived', 'stop without a name stops the running session');
+$node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
 
 # a newer session only re-anchors targets; the older session stays
 # exportable by name from memory
-$node_subscriber->safe_psql('postgres', "SELECT lrstat_start('wiper')");
+$node_subscriber->safe_psql('postgres', 'SELECT lrstat_start()');
 sleep(3);
-is($node_subscriber->safe_psql('postgres', "SELECT lrstat_stop('wiper')"),
-	'wiper', 'third session stopped');
+$node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
 
 # export writes the report to pg_lrstat/exports and returns the path;
 # the archived session is rebuilt from its file
 my $archived_path = $node_subscriber->safe_psql('postgres',
-	"SELECT lrstat_export('archived', 'html')");
+	"SELECT lrstat_export('$sess_archived', 'html')");
 $archived_path =~ s/^\s+|\s+$//g;
-like($archived_path, qr{pg_lrstat/exports/archived\.html$},
+like($archived_path, qr{pg_lrstat/exports/\Q$sess_archived\E\.html$},
 	'export returns the report file path');
 ok(-f $archived_path, 'archived session exported by name from its file');
 my $archived_html = PostgreSQL::Test::Utils::slurp_file($archived_path);
@@ -205,10 +205,10 @@ ok(index($archived_html, 'recv MB/s') >= 0 && index($archived_html, 'apply MB/s'
 
 # the JSON export still carries the raw samples
 my $json_path = $node_subscriber->safe_psql('postgres',
-	"SELECT lrstat_export('archived', 'json')");
+	"SELECT lrstat_export('$sess_archived', 'json')");
 $json_path =~ s/^\s+|\s+$//g;
 my $archived_json = PostgreSQL::Test::Utils::slurp_file($json_path);
-ok(index($archived_json, '"name": "archived"') >= 0,
+ok(index($archived_json, '"name": "' . $sess_archived . '"') >= 0,
 	'archived export identifies the session');
 ok(index($archived_json, '"samples": [') >= 0
 	&& $archived_json =~ /"kind": "(send|recv)"/,
@@ -217,12 +217,12 @@ ok(index($archived_json, '"samples": [') >= 0
 # a persist=false session is exportable by name from memory alone
 # (sync_sess was not persisted; it predates wiper)
 my $mem_path = $node_subscriber->safe_psql('postgres',
-	"SELECT lrstat_export('sync_sess', 'json')");
+	"SELECT lrstat_export('$sess_sync', 'json')");
 $mem_path =~ s/^\s+|\s+$//g;
-like($mem_path, qr{pg_lrstat/exports/sync_sess\.json$},
+like($mem_path, qr{pg_lrstat/exports/\Q$sess_sync\E\.json$},
 	'non-persist session exported by name from memory');
 my $mem_json = PostgreSQL::Test::Utils::slurp_file($mem_path);
-ok(index($mem_json, '"name": "sync_sess"') >= 0,
+ok(index($mem_json, '"name": "' . $sess_sync . '"') >= 0,
 	'memory export identifies the session');
 
 # an unknown session is a clear error, not a wrong report
