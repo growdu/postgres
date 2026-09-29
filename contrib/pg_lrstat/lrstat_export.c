@@ -157,6 +157,63 @@ gather_data(LRExportData *d)
 				copied++;
 			}
 		}
+
+	}
+
+	/*
+	 * Re-anchor every target from THIS session's first/last valid
+	 * samples instead of the live three-slot anchor/last: the slot
+	 * values carry post-sampling feedback folds that are not in the
+	 * recorded history, which made the report's averages differ
+	 * from a manual recomputation over the history views.
+	 */
+	if (d->n_entries > 0)
+	{
+		int ti, ei;
+
+		for (ti = 0; ti < d->n_targets; ti++)
+		{
+			LRExportTarget *et = &d->targets[ti];
+
+			MemSet(&et->anchor, 0, sizeof(LRSample));
+			MemSet(&et->last, 0, sizeof(LRSample));
+			et->has_prev = false;
+			for (ei = 0; ei < d->n_entries; ei++)
+			{
+					LRHistoryEntry *e = &d->entries[ei];
+
+					if (e->target_idx != et->ctl_idx)
+						continue;
+					if (et->kind == LR_RECV)
+					{
+						if (e->applied_lsn == 0 && e->received_lsn == 0)
+							continue;
+						if (et->anchor.recv.ts == 0)
+						{
+							et->anchor.recv.ts = e->ts;
+							et->anchor.recv.received_lsn = e->received_lsn;
+							et->anchor.recv.applied_lsn = e->applied_lsn;
+						}
+						et->last.recv.ts = e->ts;
+						et->last.recv.received_lsn = e->received_lsn;
+						et->last.recv.applied_lsn = e->applied_lsn;
+					}
+					else
+					{
+						if (e->current_lsn == 0 && e->sent_lsn == 0)
+							continue;
+						if (et->anchor.send.ts == 0)
+						{
+							et->anchor.send.ts = e->ts;
+							et->anchor.send.current_lsn = e->current_lsn;
+							et->anchor.send.sent_lsn = e->sent_lsn;
+						}
+						et->last.send.ts = e->ts;
+						et->last.send.current_lsn = e->current_lsn;
+						et->last.send.sent_lsn = e->sent_lsn;
+					}
+				}
+			}
 	}
 }
 

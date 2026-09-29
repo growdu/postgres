@@ -164,31 +164,136 @@ SELECT lrstat_export();
 
 > 环形写满覆盖最旧（`info.session_truncated = true`）。**数据生命周期**：新会话 start 只重置测量锚点，不清历史——已结束的会话（含 persist=false）在环形内仍可 `lrstat_export(name)` 导出，直到被更新的采样自然挤出环形（默认约 2880 样本/目标）。要**永久**追溯的会话用 `persist=true`（落文件，重启后也能导出）。
 
-## 5. 速率是怎么算的
+## 5. 速率是怎么算的（公式与算例）
+
+所有速率都从 `pg_lrstat_send_history` / `pg_lrstat_recv_history` 的**原始 LSN 样本**推导，没有任何预存派生量——这意味着每个数字都能手工复算。单位约定：LSN 差为字节，**1 MB = 1,048,576 字节**，速率 MB/s。
+
+### 5.1 两个基本公式
+
+**公式一：逐轮速率**（stat 视图每行的 `*_mbps` 列）——同一目标相邻两个样本作差：
 
 ```
-stat 视图的 *_mbps = 相邻两个原始样本作差 ÷ 间隔（每轮一行）
-报告的 avg        = （末样本 − 会话锚点样本）÷ 会话时长（含窗口截断）
+rate(第i轮) = pg_wal_lsn_diff(LSN_i, LSN_{i-1}) ÷ 1048576 ÷ (ts_i − ts_{i-1})
 ```
-stat 视图自 v2.1 起是**逐轮时序**：每个采样周期、每个目标一行。
 
-- 会话锚点 = 会话内**首个含有效位置的样本**（全零样本不锚定，避免把 WAL 历史位置当增量）
-- 应用位置只在事务提交边界推进——大事务期间 `applied` 不动、提交时跳变，属正常内核行为
-- 瞬时回答"刚过去一个间隔怎么样"，平均回答"整场会话怎么样"
-- 速率是 LSN（页码）差，不是网线字节；与带宽对比需考虑解码膨胀率
+- LSN 十六进制差直接用 `pg_wal_lsn_diff()`（= 高 32 位×2^32 + 低 32 位之差，字节）
+- 首行没有前一样本 → `*_mbps` 为 NULL
+- 样本轮转空闲（位置不变）→ 0.000
 
-**可验证性**：报告/视图中的每条速率都能从 `pg_lrstat_recv_history` / `pg_lrstat_send_history` 手工重算：
+**公式二：会话平均速率**（导出报告 analysis 的 `*_avg`）：
+
+```
+avg = pg_wal_lsn_diff(LSN_末, LSN_锚点) ÷ 1048576 ÷ (ts_末 − ts_锚点)
+```
+
+- 锚点 = 会话内**首个含有效位置的样本**，末样本 = 会话内最后一条（全零样本两头都不参与——否则会把整个 WAL 历史位置当增量，得出荒谬大速率）
+- 分母取 min(末样本时间, stop_ts)：采样在 stop 后仍继续（空闲轮位置不动），不截断的话均值会随导出时间推迟被不断稀释
+
+### 5.2 每条速率用哪个 LSN
+
+| 速率列 | 差分字段 | 含义 |
+| --- | --- | --- |
+| `gen_mbps` | send_history.`current_lsn` | 发送端 WAL **生成**速率 |
+| `send_mbps` | send_history.`sent_lsn` | 发送端**发送**速率 |
+| `apply_mbps`（send 侧） | send_history.`peer_applied_lsn` | 发送端反馈观测的对端应用速率 |
+| `recv_mbps` | recv_history.`received_lsn` | 接收端**接收**速率 |
+| `apply_mbps`（recv 侧） | recv_history.`applied_lsn` | 接收端**应用**速率 |
+| `local_wal_mbps` | recv_history.`local_wal_lsn` | 接收端本地 WAL 写入速率 |
+| `spill_mb`（增量列） | send_history.`spill_bytes` | 本间隔解码溢写量（MB，不除时间） |
+
+### 5.3 积压、追平与容量公式
+
+```
+backlog_unsent     = current_lsn − sent_lsn          （发送端没发出去的）
+backlog_inflight   = sent_lsn − received_lsn         （网络上在途的）
+backlog_unapplied  = received_lsn − applied_lsn      （收到但没应用的）
+backlog_total      = current_lsn − applied_lsn       （端到端总积压）
+retained_wal       = current_lsn − restart_lsn       （槽扣住的磁盘空间）
+
+catchup_send_secs  = backlog_unsent ÷ send 速率        （发送段追平秒数）
+catchup_total_secs = backlog_unsent ÷ send 速率
+                     + (inflight + unapplied) ÷ apply 速率   （全链路追平）
+
+sync_50g_secs      = 50 × 1024 ÷ apply_avg           （容量外推；100G/200G 严格 2×/4×）
+```
+
+### 5.4 完整算例（真实数据逐步走）
+
+一次真实测量（1s 采样，两笔小事务），`pg_lrstat_recv_history` 原始样本：
+
+| ts | applied_lsn |
+| --- | --- |
+| 14:12:29.307 | 0/8FE9D88 |
+| 14:12:30.316 ~ 33.328 | 0/8FE9D88（4 行不变，空闲轮） |
+| **14:12:34.332** | **0/9001E10**（第二笔事务提交，跳变） |
+| 14:12:35.336 ~ 37.344 | 0/9001E10（3 行不变） |
+
+**第一步：逐轮速率**（recv_stat 中 14:12:34.332 行的 `apply_mbps`）：
+
+```
+分子 = pg_wal_lsn_diff('0/9001E10', '0/8FE9D88')
+     = 0x9001E10 − 0x8FE9D88 = 0x18088 = 98,440 字节 = 0.0939 MB
+分母 = 34.332 − 33.328 = 1.004 s
+apply_mbps = 0.0939 ÷ 1.004 = 0.0935 MB/s          ← 视图输出 0.0935 ✓
+```
+
+空闲轮（LSN 不变）差分为 0 → 视图输出 0.0000；提交轮把**整个事务的量**归到提交那一轮。
+
+**第二步：会话平均**（报告 analysis 的 `apply_avg`）：
+
+```
+锚点 = 首个有效样本 29.307 的 0/8FE9D88；末样本 = 37.344 的 0/9001E10
+分子 = 同上 0.0939 MB
+分母 = 37.344 − 29.307 = 8.037 s（首末有效样本，非会话墙上时长）
+apply_avg = 0.0939 ÷ 8.037 = 0.0117 MB/s           ← 报告输出 0.0117 ✓
+```
+
+注意分子分母同源（都来自 history 的有效行）：如果分母用"stop 时刻 − 开始时刻"（8.16s）会得到 0.0115——**错**，因为会话首尾各有一段没有数据的空窗。
+
+**第三步：容量外推**（报告 capacity）：
+
+```
+sync_50g_secs = 50 × 1024 ÷ 0.0117 = 4,382,793 s ≈ 1,217 小时   ← 报告输出 ✓
+sync_100g_secs / sync_200g_secs = 严格 2 × / 4 × 上述值          ✓
+```
+
+（本例速率极小是因为负载只有 0.09MB；真实迁移压测下数字同公式。）
+
+**第四步：端到端闭合**：接收端 applied 推进 0.0939 MB == 发布端该窗口 `pg_current_wal_lsn()` 实测推进量（读者可用两端 history 互验）。
+
+### 5.5 手工复算 SQL（可验证性）
 
 ```sql
--- 例：手工重算 apply 平均速率（与 cluster_stat.apply_avg 一致）
+-- 复算某轮的 apply 速率（与 recv_stat.apply_mbps 对齐 ts 逐位一致）
+WITH h AS (SELECT ts, applied_lsn,
+                  lag(applied_lsn) OVER w AS pl, lag(ts) OVER w AS pt
+             FROM pg_lrstat_recv_history WHERE name='asub'
+           WINDOW w AS (ORDER BY ts))
+SELECT ts, round((pg_wal_lsn_diff(applied_lsn, pl)/1048576
+                  / extract(epoch FROM ts-pt))::numeric, 4) AS apply_mbps
+  FROM h WHERE pl IS NOT NULL ORDER BY ts;
+
+-- 复算会话平均（与报告 analysis.apply_avg 逐位一致）
 WITH h AS (SELECT ts, applied_lsn FROM pg_lrstat_recv_history
-            WHERE name='asub' AND applied_lsn>'0/0' ORDER BY ts)
-SELECT pg_wal_lsn_diff(max(applied_lsn), min(applied_lsn))/1048576
-       / extract(epoch FROM max(ts)-min(ts)) AS apply_mbps
+            WHERE name='asub' AND applied_lsn > '0/0'
+              AND ts BETWEEN (SELECT session_start_ts FROM pg_lrstat_info)
+                         AND (SELECT session_stop_ts  FROM pg_lrstat_info))
+SELECT round((pg_wal_lsn_diff(max(applied_lsn), min(applied_lsn))/1048576
+              / extract(epoch FROM max(ts) - min(ts)))::numeric, 4) AS apply_avg
   FROM h;
 ```
 
-export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv 原始样本、send/recv 逐间隔速率），报告头部的分析结论即由此推导。
+export 报告底部的 **Evidence** 区直接给出四张佐证表（send/recv 原始样本 + 逐间隔速率），头部结论即由此推导。
+
+### 5.6 特殊情形（都不是 bug）
+
+| 情形 | 表现 | 原因 |
+| --- | --- | --- |
+| 会话首行速率 | NULL | 无前一样本可差分 |
+| 负载结束后的行 | 0.000 | 位置不推进，差分为 0 |
+| 大事务期间 applied 不动，提交时一次跳变 | 该轮 apply_mbps 突然很大 | 应用位置只在提交边界推进（内核语义）；跳变量 = 整个事务的量，归属于提交那一轮 |
+| 会话开始前已有积压 | 首轮 apply 速率即很高 | 追赶存量属于会话期间的真实工作；锚点从会话首样本起算，不会计入会话前的量 |
+| applied 与 origin 不完全同步 | 微小偏差 | applied 是 origin 与发送端反馈 apply 位的单调融合（取更及时者），两者都是提交边界 |
 
 ## 6. 输出报告内容（lrstat_export）
 
