@@ -406,6 +406,14 @@ pg_lrstat_cluster_stat(PG_FUNCTION_ARGS)
             continue;
         }
 
+        /*
+         * Skip table-sync workers here: their received/applied are the
+         * COPY position of one table, not the subscription's chain
+         * progress — pairing them into the cluster view is noise.
+         */
+        if (e->relid != 0)
+            continue;
+
         /* pair with the newest send-side sample of the same name at or
          * before this timestamp (both cursors move chronologically) */
         for (j = 0; j < n; j++)

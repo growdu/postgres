@@ -205,6 +205,7 @@ typedef struct LRSessTargetInfo
 {
 	int32       target_idx;
 	int32       kind;              /* LRTargetKind */
+	int32       relid;             /* tablesync target table, else 0 */
 	char        name[NAMEDATALEN];
 } LRSessTargetInfo;
 

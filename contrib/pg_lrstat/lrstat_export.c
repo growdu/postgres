@@ -249,12 +249,13 @@ rebuild_from_history(LRExportData *d,
 		et->ctl_idx = tinfos[i].target_idx;
 		et->kind = (LRTargetKind) tinfos[i].kind;
 		strlcpy(et->name, tinfos[i].name, NAMEDATALEN);
-		/* target info carries no worker_char/relid; treat every recv
-		 * target as an apply-leader candidate */
+		/* worker_char is not historized; the relid is (from the
+		 * entries) — table-sync targets must not become the analysis
+		 * leader, which selects on worker_char='a' && relid==0 */
 		if (et->kind == LR_RECV)
 		{
 			et->worker_char = 'a';
-			et->relid = 0;
+			et->relid = tinfos[i].relid;
 		}
 	}
 
