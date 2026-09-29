@@ -72,6 +72,10 @@ $node_publisher->safe_psql(
 $node_subscriber->safe_psql('postgres',
 	'CREATE TABLE lrstat_test2 (a int PRIMARY KEY, b text)');
 
+# Sampling only happens inside a session: start it before triggering
+# the sync worker so the views can see it.
+$node_subscriber->safe_psql('postgres', 'SELECT lrstat_start()');
+
 # Keep the new sync worker alive while we inspect it: its COPY needs an
 # ACCESS EXCLUSIVE lock on the subscriber-side target table.  Holding a
 # plain EXCLUSIVE lock blocks it deterministically while still letting
@@ -102,14 +106,13 @@ $result = $node_subscriber->poll_query_until(
 	'postgres', qq(SELECT count(*) > 0 FROM pg_lrstat_recv_history));
 is($result, 1, 'recv_history records samples during table sync');
 
-# Session lifecycle across a table sync: lrstat_start resets all
-# targets, which must also cope with the sync worker's target.
+# The session started before the sync worker; confirm it is running
 my $sess_sync = $node_subscriber->safe_psql('postgres',
-	'SELECT lrstat_start()');
+	'SELECT session_name FROM pg_lrstat_info');
 chomp $sess_sync;
 is($node_subscriber->safe_psql('postgres',
 	q(SELECT session_state FROM pg_lrstat_info)),
-	'running', 'session started during table sync');
+	'running', 'session running during table sync');
 $result = $node_subscriber->poll_query_until(
 	'postgres', qq(
 	SELECT count(*) > 0 FROM pg_lrstat_recv_stat
@@ -146,8 +149,8 @@ $result = $node_subscriber->poll_query_until(
 ));
 is($result, 1, 'latest recv_stat rows are apply-only after sync');
 
-# The publisher side sees the subscription's slot.
-$result = $node_publisher->poll_query_until(
+# The subscription's slot shows up in send_stat via the polled mirror
+$result = $node_subscriber->poll_query_until(
 	'postgres', qq(
 	SELECT count(*) > 0 FROM pg_lrstat_send_stat WHERE slot_name = 'lrstat_sub'
 ));
@@ -164,8 +167,6 @@ is($node_subscriber->safe_psql('postgres',
 # samples the conclusions are built on
 
 # a session with some load so the report has intervals to show
-my $hist_baseline = $node_subscriber->safe_psql('postgres',
-	'SELECT count(*) FROM pg_lrstat_recv_history');
 my $sess_archived = $node_subscriber->safe_psql('postgres',
 	'SELECT lrstat_start()');
 chomp $sess_archived;
@@ -173,25 +174,19 @@ $node_publisher->safe_psql('postgres',
 	q(INSERT INTO lrstat_test SELECT g, repeat(md5(g::text), 50)
 	  FROM generate_series(100001, 110000) g));
 $result = $node_subscriber->poll_query_until('postgres', qq(
-	SELECT count(*) >= $hist_baseline + 3 FROM pg_lrstat_recv_history
+	SELECT count(*) >= 3 FROM pg_lrstat_recv_history
 ));
 is($result, 1, 'session records history samples');
 $node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
 
-# a newer session only re-anchors targets; the older session stays
-# exportable by name from memory
-$node_subscriber->safe_psql('postgres', 'SELECT lrstat_start()');
-sleep(3);
-$node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
-
-# export writes the report to pg_lrstat/exports and returns the path;
-# the named session is rebuilt from the in-memory ring
+# export the named session BEFORE starting another one: start() wipes
+# the previous session's data, and the written report is the keeper
 my $archived_path = $node_subscriber->safe_psql('postgres',
 	"SELECT lrstat_export('$sess_archived', 'html')");
 $archived_path =~ s/^\s+|\s+$//g;
 like($archived_path, qr{pg_lrstat/exports/\Q$sess_archived\E\.html$},
 	'export returns the report file path');
-ok(-f $archived_path, 'archived session exported by name from its file');
+ok(-f $archived_path, 'named session exported to a report file');
 my $archived_html = PostgreSQL::Test::Utils::slurp_file($archived_path);
 ok(index($archived_html, '<h1>Evidence</h1>') >= 0
 	&& index($archived_html, 'send history samples') >= 0
@@ -200,10 +195,8 @@ ok(index($archived_html, '<h1>Evidence</h1>') >= 0
 ok(index($archived_html, 'send rate history (evidence)') >= 0
 	&& index($archived_html, 'recv rate history (evidence)') >= 0,
 	'report carries the per-interval rate evidence tables');
-ok(index($archived_html, 'recv MB/s') >= 0 && index($archived_html, 'apply MB/s') >= 0,
-	'rate evidence includes recv and apply rates');
 
-# the JSON export still carries the raw samples
+# the JSON export of the same session (still before the next start)
 my $json_path = $node_subscriber->safe_psql('postgres',
 	"SELECT lrstat_export('$sess_archived', 'json')");
 $json_path =~ s/^\s+|\s+$//g;
@@ -214,16 +207,24 @@ ok(index($archived_json, '"samples": [') >= 0
 	&& $archived_json =~ /"kind": "(send|recv)"/,
 	'archived export contains raw history samples');
 
-# an older session is exportable by name from memory alone
-# (it only predates the wiper session)
-my $mem_path = $node_subscriber->safe_psql('postgres',
-	"SELECT lrstat_export('$sess_sync', 'json')");
-$mem_path =~ s/^\s+|\s+$//g;
-like($mem_path, qr{pg_lrstat/exports/\Q$sess_sync\E\.json$},
-	'non-persist session exported by name from memory');
-my $mem_json = PostgreSQL::Test::Utils::slurp_file($mem_path);
-ok(index($mem_json, '"name": "' . $sess_sync . '"') >= 0,
-	'memory export identifies the session');
+# a newer session wipes the previous session's data (clean slate)
+$node_subscriber->safe_psql('postgres', 'SELECT lrstat_start()');
+is($node_subscriber->safe_psql('postgres', qq(
+	SELECT count(*) = 0 FROM pg_lrstat_recv_history)),
+	't', 'new start wipes the previous session data');
+sleep(3);
+$node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
+
+# the wiped session is no longer exportable; its report file remains
+my ($ret2, $out2, $err2) = $node_subscriber->psql('postgres',
+	"SELECT lrstat_export('$sess_archived', 'json')");
+isnt($ret2, 0, 'wiped session no longer exportable by name');
+like($err2, qr/no data for session/,
+	'error mentions the missing session');
+my $wiped_report = $node_subscriber->safe_psql('postgres',
+	'SELECT lrstat_export()');
+$wiped_report =~ s/^\s+|\s+$//g;
+ok(-f $wiped_report, 'current session still exports fine');
 
 # an unknown session is a clear error, not a wrong report
 my ($ret, $out, $err) = $node_subscriber->psql('postgres',

@@ -170,7 +170,8 @@ gather_data(LRExportData *d)
 	 */
 	if (d->n_entries > 0)
 	{
-		int ti, ei;
+		int			ti,
+					ei;
 
 		for (ti = 0; ti < d->n_targets; ti++)
 		{
@@ -179,45 +180,46 @@ gather_data(LRExportData *d)
 			MemSet(&et->anchor, 0, sizeof(LRSample));
 			MemSet(&et->last, 0, sizeof(LRSample));
 			et->has_prev = false;
+
 			for (ei = 0; ei < d->n_entries; ei++)
 			{
-					LRHistoryEntry *e = &d->entries[ei];
+				LRHistoryEntry *e = &d->entries[ei];
 
-					if (e->target_idx != et->ctl_idx)
+				if (e->target_idx != et->ctl_idx)
+					continue;
+
+				if (et->kind == LR_RECV)
+				{
+					if (e->applied_lsn == 0 && e->received_lsn == 0)
 						continue;
-					if (et->kind == LR_RECV)
+					if (et->anchor.recv.ts == 0)
 					{
-						if (e->applied_lsn == 0 && e->received_lsn == 0)
-							continue;
-						if (et->anchor.recv.ts == 0)
-						{
-							et->anchor.recv.ts = e->ts;
-							et->anchor.recv.received_lsn = e->received_lsn;
-							et->anchor.recv.applied_lsn = e->applied_lsn;
-						}
-						et->last.recv.ts = e->ts;
-						et->last.recv.received_lsn = e->received_lsn;
-						et->last.recv.applied_lsn = e->applied_lsn;
+						et->anchor.recv.ts = e->ts;
+						et->anchor.recv.received_lsn = e->received_lsn;
+						et->anchor.recv.applied_lsn = e->applied_lsn;
 					}
-					else
+					et->last.recv.ts = e->ts;
+					et->last.recv.received_lsn = e->received_lsn;
+					et->last.recv.applied_lsn = e->applied_lsn;
+				}
+				else
+				{
+					if (e->current_lsn == 0 && e->sent_lsn == 0)
+						continue;
+					if (et->anchor.send.ts == 0)
 					{
-						if (e->current_lsn == 0 && e->sent_lsn == 0)
-							continue;
-						if (et->anchor.send.ts == 0)
-						{
-							et->anchor.send.ts = e->ts;
-							et->anchor.send.current_lsn = e->current_lsn;
-							et->anchor.send.sent_lsn = e->sent_lsn;
-						}
-						et->last.send.ts = e->ts;
-						et->last.send.current_lsn = e->current_lsn;
-						et->last.send.sent_lsn = e->sent_lsn;
+						et->anchor.send.ts = e->ts;
+						et->anchor.send.current_lsn = e->current_lsn;
+						et->anchor.send.sent_lsn = e->sent_lsn;
 					}
+					et->last.send.ts = e->ts;
+					et->last.send.current_lsn = e->current_lsn;
+					et->last.send.sent_lsn = e->sent_lsn;
 				}
 			}
+		}
 	}
 }
-
 /*
  * Build export data from an archived session file (export by name).
  * Reconstructs per-target anchor/last samples from the first/last
@@ -358,7 +360,8 @@ gather_memory_by_name(LRExportData *d, const char *name)
 	if (n_ents == 0)
 	{
 		/* known session but the ring no longer holds its samples */
-		pfree(ents);
+		if (ents != NULL)
+			pfree(ents);
 		return false;
 	}
 

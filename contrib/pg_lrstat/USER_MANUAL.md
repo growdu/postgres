@@ -35,8 +35,8 @@ SELECT lrstat_export();
 
 | 命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `lrstat_start()` | `SELECT lrstat_start()` | 开始采样（无参数，全局唯一会话）。自动名 sess_N 仅用于报告与按名导出 |
-| `lrstat_stop()` | `SELECT lrstat_stop()` | 停止采样（无参数） |
+| `lrstat_start()` | `SELECT lrstat_start()` | 开始采样（无参数）。**清空上一会话的全部数据**，干净起点。自动名 sess_N 用于报告与按名导出 |
+| `lrstat_stop()` | `SELECT lrstat_stop()` | 停止采样（无参数）；数据冻结在内存，可继续查询和 export，直到下一次 start |
 | `lrstat_export(name, format)` | `SELECT lrstat_export()` | 导出报告并**直接写文件**，返回绝对路径；format='html'（默认）或 'json'。不传 name 导出当前/最近会话；传 name（如 `sess_3`，见 info 的 archived_session_names）导出指定归档。名字只在这里出现——用于标识报告或本次测试 |
 | `pg_lrstat_reset()` | `SELECT pg_lrstat_reset()` | 强制清除当前内存数据（不影响归档文件） |
 
@@ -53,7 +53,7 @@ SELECT lrstat_export();
 | `pg_lrstat_send_history` | 一目标一轮一行 | 发送端原始 LSN 样本（始终记录） |
 | `pg_lrstat_recv_history` | 一目标一轮一行 | 接收端原始 LSN 样本（始终记录） |
 
-前四张 stat/info 视图可随时查（每轮一行，含会话外空闲轮，速率空闲轮为 0）；逐间隔速率与原始样本也进导出报告的 Evidence 区（§6）。
+**采样生命周期**：只有 start→stop 之间才采样——没有 start 时视图为空，stop 后数据冻结（不再新增行），下一次 start 清空重来。stat/info 视图在会话期间逐轮增长；逐间隔速率与原始样本也进导出报告的 Evidence 区（§6）。
 
 ## 4. 视图字段详解
 
@@ -161,7 +161,7 @@ SELECT lrstat_export();
 | `applied_lsn` | pg_lsn | 已应用位置（提交边界） |
 | `local_wal_lsn` | pg_lsn | 接收端本地 WAL 写入位置 |
 
-> 环形写满覆盖最旧（`info.session_truncated = true`）。**数据生命周期**：新会话 start 只重置测量锚点，不清历史——已结束的会话在环形内仍可 `lrstat_export(name)` 补导，直到被更新的采样自然挤出环形（默认约 2880 样本/目标）；实例重启后内存清空。**要留档就在 stop 后立即 export——写出的报告文件就是持久化**。
+> **数据生命周期**：`start()` 清空上一会话全部数据；`stop()` 冻结当前数据（可继续查询/按名 export）；环形写满时覆盖最旧（`info.session_truncated = true`，默认约 2880 样本/目标）；实例重启后内存清空。**要留档就在 stop 后、下一次 start 前 export——写出的报告文件就是持久化**。
 
 ## 5. 速率是怎么算的（公式与算例）
 
@@ -375,7 +375,7 @@ FROM pg_lrstat_send_stat ORDER BY retained_wal DESC NULLS LAST;
 
 | 问题 | 答案 |
 | --- | --- |
-| 视图全空 | `info.loaded = f`：没预加载，检查 shared_preload_libraries 并重启 |
+| 视图全空 | `info.loaded = f`（没预加载），或还没有 start 过——**只有 start 后才采样** |
 | 速率全是 NULL | 会话刚开始还没有两个有效样本，等一个采样周期 |
 | cluster_stat 没数据 | 没有活跃订阅，或 remote_state = unreachable（检查订阅连接串可达性） |
 | apply 速率 = 0 但积压在涨 | 应用被堵（锁冲突最常见）：拿 recv_stat 的 worker_pid 查 pg_stat_activity 的 wait_event |

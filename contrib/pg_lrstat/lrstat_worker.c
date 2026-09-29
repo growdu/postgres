@@ -195,6 +195,14 @@ lrstat_round(void)
 	SpinLockRelease(&lrstat->session.mutex);
 
 	/*
+	 * Sampling only happens inside a session: nothing is recorded
+	 * before lrstat_start() or after lrstat_stop(), and start() has
+	 * already wiped the previous session's data.
+	 */
+	if (!running)
+		return;
+
+	/*
 	 * The poll target list and its conninfo copies must outlive the
 	 * round's SPI session, so remember this (pre-SPI) context for them.
 	 */

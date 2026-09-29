@@ -553,10 +553,9 @@ lrstat_session_start(const char *name)
 						  lrstat->session.start_ts);
 
 	/*
-	 * Reset only the measurement anchors: the new session re-anchors
-	 * every target.  History is NOT cleared — entries are stamped with
-	 * the session id, so previous sessions stay queryable by name until
-	 * the ring naturally overwrites them.
+	 * start() wipes the previous session's data: every target and the
+	 * history ring are reset, so each session measures on a clean
+	 * slate.  Export right after stop to keep a report.
 	 */
 	for (i = 0; i < lrstat->ntargets; i++)
 	{
@@ -569,7 +568,8 @@ lrstat_session_start(const char *name)
 		t->last_sample_ts = 0;
 		SpinLockRelease(&t->mutex);
 	}
-
+	lrstat->n_entries = 0;
+	lrstat->session.truncated = false;
 }
 
 void

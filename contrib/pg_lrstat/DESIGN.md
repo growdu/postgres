@@ -297,11 +297,12 @@ idle ──start()──► running ──stop()──► stopped ──start()�
   └ 历史（环形）始终在记（跨会话保留至被覆盖）；要留档的会话在 stop 后 export
 ```
 
-**start()**：superuser，无参（全局唯一会话；重复 start 报错）。自动名 `sess_<n>` 仅标识报告与按名补导。动作：`session_id++`、记录 `start_ts`、**只重置全部目标的 anchor/prev/last**（重新锚点；历史数组不清——条目按 session_id 盖章，旧会话在环形内仍可按名导出直到被自然覆盖）、**唤醒 worker 立即执行一轮采样**——该轮样本即锚点。
+**start()**：superuser，无参（全局唯一会话；重复 start 报错）。自动名 `sess_<n>` 仅标识报告与按名导出。动作：`session_id++`、记录 `start_ts`、**清空历史环形与全部目标**（每个会话干净起点——上一会话数据作废，要留档须在其 stop 后 export）、**唤醒 worker 立即执行一轮采样**——该轮样本即锚点。
 
 **采样轮**（每 `sample_interval`）：
 
 ```
+0. 仅 running 时执行整轮（无 start 不采样；stop 后冻结直到下一次 start）
 1. 采样（SPI，worker_spi 式单会话：StartTransaction+Push 快照+SPI_connect）：
    SEND_SQL/RECV_SQL → 目标三槽位轮转（prev=last; last=新样本；
    首个"含有效位置"的样本才入 anchor——全零样本污染锚点会把整个
