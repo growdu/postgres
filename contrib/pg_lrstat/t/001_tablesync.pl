@@ -39,6 +39,89 @@ pg_lrstat.stale_target_ttl = '5s'
 $node_subscriber->start;
 $node_subscriber->safe_psql('postgres', 'CREATE EXTENSION pg_lrstat');
 
+# ---- schema verification -------------------------------------------
+# Every view's column list (order, name, type) is pinned here; any
+# signature drift in pg_lrstat--2.1.sql fails these assertions.
+my %expected_cols = (
+	pg_lrstat_info => [
+		qw(loaded:boolean session_name:text session_state:text
+		   session_truncated:boolean session_degraded:boolean
+		   session_start_ts:timestamptz session_stop_ts:timestamptz
+		   sample_interval_ms:bigint last_round_ts:timestamptz
+		   last_round_ok:boolean last_round_error:text nrounds:bigint
+		   dropped_samples:bigint remote_poll:boolean
+		   exported_report_names:text[])],
+	pg_lrstat_send_stat => [
+		qw(slot_name:text ts:timestamptz plugin:text temporary:boolean
+		   active:boolean sender_pid:integer application_name:text
+		   client_addr:text state:text sync_state:text wal_status:text
+		   current_lsn:pg_lsn sent_lsn:pg_lsn
+		   confirmed_flush_lsn:pg_lsn backlog_unsent:double precision
+		   backlog_inflight:double precision
+		   backlog_peer_unapplied:double precision
+		   backlog_total:double precision retained_wal:double precision
+		   gen_mbps:double precision send_mbps:double precision
+		   apply_mbps:double precision spill_mb:double precision
+		   write_lag:interval flush_lag:interval replay_lag:interval
+		   send_blocked:boolean)],
+	pg_lrstat_recv_stat => [
+		qw(recv_name:text ts:timestamptz worker_type:text
+		   worker_pid:integer leader_pid:integer relid:oid
+		   received_lsn:pg_lsn applied_lsn:pg_lsn
+		   last_msg_send_time:timestamptz
+		   last_msg_receipt_time:timestamptz
+		   backlog_apply:double precision recv_mbps:double precision
+		   apply_mbps:double precision local_wal_mbps:double precision
+		   apply_error_count:bigint sync_error_count:bigint
+		   apply_blocked:boolean)],
+	pg_lrstat_cluster_stat => [
+		qw(recv_name:text ts:timestamptz remote_state:text
+		   send_current_lsn:pg_lsn sent_lsn:pg_lsn
+		   received_lsn:pg_lsn applied_lsn:pg_lsn
+		   confirmed_flush_lsn:pg_lsn gen_mbps:double precision
+		   send_mbps:double precision recv_mbps:double precision
+		   apply_mbps:double precision backlog_unsent:double precision
+		   backlog_inflight:double precision
+		   backlog_unapplied:double precision
+		   backlog_total:double precision
+		   retained_wal:double precision
+		   feedback_lag_mb:double precision write_lag:interval
+		   flush_lag:interval replay_lag:interval
+		   catchup_send_secs:double precision
+		   catchup_total_secs:double precision
+		   send_blocked:boolean apply_blocked:boolean
+		   bottleneck:text)],
+	pg_lrstat_send_history => [
+		qw(name:text ts:timestamptz current_lsn:pg_lsn
+		   sent_lsn:pg_lsn peer_recv_lsn:pg_lsn
+		   peer_flush_lsn:pg_lsn peer_applied_lsn:pg_lsn
+		   confirmed_flush_lsn:pg_lsn restart_lsn:pg_lsn
+		   spill_bytes:bigint stream_bytes:bigint)],
+	pg_lrstat_recv_history => [
+		qw(name:text ts:timestamptz received_lsn:pg_lsn
+		   applied_lsn:pg_lsn local_wal_lsn:pg_lsn)],
+);
+for my $view (sort keys %expected_cols)
+{
+	my $got = $node_subscriber->safe_psql('postgres', qq(
+		SELECT string_agg(column_name || ':' ||
+			CASE data_type
+				WHEN 'character varying' THEN 'text'
+				WHEN 'timestamp with time zone' THEN 'timestamptz'
+				WHEN 'double precision' THEN 'double precision'
+				ELSE data_type END,
+			' ' ORDER BY ordinal_position)
+		  FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = '$view'));
+	my $got_norm = $got;
+	$got_norm =~ s/\btimestamp with time zone\b/timestamptz/g;
+	$got_norm =~ s/\bcharacter varying\b/text/g;
+	$got_norm =~ s/\bARRAY(?!\()\b/text[]/g;
+	my $want = join(' ', @{ $expected_cols{$view} });
+	my $ncols = () = $want =~ /:/g;
+	is($got_norm, $want, "schema of $view ($ncols columns)");
+}
+
 # No sampling before lrstat_start(): views stay empty on a fresh
 # extension (regression guard for the ring surviving reinstalls).
 sleep(3);
