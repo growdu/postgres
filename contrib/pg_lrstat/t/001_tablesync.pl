@@ -293,11 +293,18 @@ for my $view (
 	   pg_lrstat_cluster_stat pg_lrstat_send_history
 	   pg_lrstat_recv_history))
 {
+	# schema line (every field with its type) + CSV with header row, so
+	# the report shows all fields of the table with example values
+	my $schema = $node_subscriber->safe_psql('postgres', qq(
+		SELECT string_agg(column_name || ':' || data_type, ', '
+			ORDER BY ordinal_position)
+		  FROM information_schema.columns
+		 WHERE table_schema = 'public' AND table_name = '$view'));
 	my $dump = $node_subscriber->safe_psql('postgres',
-		"SELECT * FROM $view");
-	note("===== $view (full dump) =====\n$dump");
-	PostgreSQL::Test::Utils::append_to_file("$report_dir/$view.txt",
-		"$view\n$dump\n");
+		"COPY (SELECT * FROM $view) TO STDOUT WITH (FORMAT csv, HEADER true)");
+	note("===== $view =====\n[$schema]\n$dump");
+	PostgreSQL::Test::Utils::append_to_file("$report_dir/$view.csv",
+		"[$schema]\n$dump\n");
 }
 $node_subscriber->safe_psql('postgres', 'SELECT lrstat_stop()');
 
