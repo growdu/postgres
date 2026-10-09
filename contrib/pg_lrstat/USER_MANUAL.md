@@ -337,6 +337,7 @@ SELECT round((pg_wal_lsn_diff(max(applied_lsn), min(applied_lsn))/1048576
 | `pg_lrstat.remote_poll` | `true` | SIGHUP | 接收端轮询发送端（关闭则 cluster_stat 无远端数据） |
 | `pg_lrstat.remote_connect_timeout` | `5s` | SIGHUP | 轮询连接超时 |
 | `pg_lrstat.remote_poll_budget` | `500ms` | SIGHUP | 单轮轮询总预算；超时标 stale |
+| `pg_lrstat.catchup_min_rate` | `0.001` | SIGHUP | 追平预估输出的最低平均速率（MB/s），低于此值不给出预估 |
 
 运行时参数用 `SELECT pg_reload_conf();` 即可，不用重启。
 

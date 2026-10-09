@@ -135,7 +135,7 @@ current_lsn            sent_lsn              received_lsn         applied_lsn
 视图/报告/history ──► 同一条单调融合序列
 ```
 
-### 3.3 共享内存布局（布局版本 4）
+### 3.3 共享内存布局（布局版本 5）
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -241,6 +241,9 @@ pg_lrstat_reset()             → void   -- 强制清内存 (不动报告文件)
 | `pg_lrstat.remote_poll` | `true` | SIGHUP | 是否从接收端轮询发送端 |
 | `pg_lrstat.remote_connect_timeout` | `5s` | SIGHUP | 轮询连接超时 |
 | `pg_lrstat.remote_poll_budget` | `500ms` | SIGHUP | 单轮轮询总预算 |
+| `pg_lrstat.catchup_min_rate` | `0.001` | SIGHUP | 追平预估输出的最低平均速率 (MB/s) |
+| `pg_lrstat.database` | `postgres` | 重启 | 采样 worker 连接的库（视图数据集群级，任意库可查） |
+| `pg_lrstat.allow_inject` | `false` | SUSET | 测试注入函数开关（内部） |
 
 ### 5.4 导出报告
 
