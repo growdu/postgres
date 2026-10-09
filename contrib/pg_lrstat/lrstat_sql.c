@@ -181,10 +181,10 @@ pg_lrstat_info(PG_FUNCTION_ARGS)
     lr_put_ts(&r, start_ts);
     lr_put_ts(&r, stop_ts);
     lr_put_i8(&r, lrstat_sample_interval_ms);
-    lr_put_ts(&r, GetCurrentTimestamp());
-    lr_put_bool(&r, true);
+    lr_put_ts(&r, lrstat->last_round_ts);
+    lr_put_bool(&r, lrstat->last_round_ok);
     lr_put_text(&r, NULL);
-    lr_put_i8(&r, 0);
+    lr_put_i8(&r, (int64) lrstat->nrounds);
     lr_put_i8(&r, 0);
     lr_put_bool(&r, lrstat_remote_poll);
 

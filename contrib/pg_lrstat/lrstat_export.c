@@ -28,7 +28,7 @@
 
 #define MB_DIV (1024.0 * 1024.0)
 #define EXPORT_DIR "pg_lrstat/exports"
-#define EXPORT_MAX_HISTORY 500    /* most recent samples in a report */
+#define EXPORT_MAX_HISTORY 6000   /* samples in a report; default ring holds 2 targets x 2880 */
 
 /* ----------------------------------------------------------------
  * Data gathering: snapshot of everything needed for the report
@@ -559,10 +559,15 @@ compute_analysis(LRExportData *d, LRAnalysis *a)
 		else
 			a->bottleneck = "none";
 
-		/* catchup + capacity */
+		/* catchup + capacity: two-stage like the cluster view —
+		 * unsent drains at send rate, inflight+unapplied at apply rate */
 		if (a->apply_avg > 0.001)
 		{
-			a->catchup_secs = a->backlog_unapplied_mb / a->apply_avg;
+			a->catchup_secs =
+				(a->send_avg > 0.001
+				 ? a->backlog_unsent_mb / a->send_avg : 0) +
+				(a->backlog_inflight_mb + a->backlog_unapplied_mb)
+				/ a->apply_avg;
 			a->sync_50g_secs = 50.0 * 1024 / a->apply_avg;
 			a->sync_100g_secs = 100.0 * 1024 / a->apply_avg;
 			a->sync_200g_secs = 200.0 * 1024 / a->apply_avg;
@@ -622,51 +627,80 @@ build_json(LRExportData *d, LRAnalysis *a)
 	appendStringInfo(s, "    \"sync_200g_secs\": %.0f\n", a->sync_200g_secs);
 	appendStringInfo(s, "  },\n");
 
-	/* send_stat */
+	/* send_stat: per-target session averages (same source as the HTML
+ * Targets card — anchor to last valid sample) */
 	appendStringInfo(s, "  \"send_stat\": [\n");
-	for (i = 0; i < d->n_targets; i++)
 	{
-		LRExportTarget *t = &d->targets[i];
-		if (t->kind != LR_SEND && t->kind != LR_RSEND) continue;
-		appendStringInfo(s, "    {\"name\": \"%s\", \"kind\": \"%s\","
-						 " \"state\": \"%s\", \"active\": %s,"
-						 " \"wal_status\": \"%s\"",
-						 t->name, t->kind == LR_SEND ? "send" : "rsend",
-						 t->meta.state, t->meta.active ? "true" : "false",
-						 t->meta.wal_status);
-		if (t->has_prev)
+		bool first = true;
+		for (i = 0; i < d->n_targets; i++)
 		{
-			double dt = (double)(t->last.send.ts - t->prev.send.ts) / 1e6;
-			if (dt > 0)
-			{
-				int64 dg = (int64)(t->last.send.current_lsn - t->prev.send.current_lsn);
-				int64 ds = (int64)(t->last.send.sent_lsn - t->prev.send.sent_lsn);
-				appendStringInfo(s, ", \"gen_instant\": %.4f, \"send_instant\": %.4f",
-								 dg > 0 ? (double)dg/dt/MB_DIV : 0,
-								 ds > 0 ? (double)ds/dt/MB_DIV : 0);
-			}
-		}
-		appendStringInfo(s, "}%s\n", i < d->n_targets - 1 ? "," : "");
-	}
-	appendStringInfo(s, "  ],\n");
+			LRExportTarget *t = &d->targets[i];
+			double dt, gmb, smb, amb;
 
-	/* recv_stat */
+			if (t->kind != LR_SEND && t->kind != LR_RSEND)
+				continue;
+			if (!first)
+				appendStringInfoString(s, ",\n");
+			first = false;
+
+			dt = (double)(t->last.send.ts - t->anchor.send.ts) / 1e6;
+			if (dt <= 0)
+				dt = 1.0;
+			gmb = (double)(t->last.send.current_lsn -
+						   t->anchor.send.current_lsn) / MB_DIV;
+			smb = (double)(t->last.send.sent_lsn -
+						   t->anchor.send.sent_lsn) / MB_DIV;
+			amb = (double)(t->last.send.peer_applied_lsn -
+						   t->anchor.send.peer_applied_lsn) / MB_DIV;
+			appendStringInfo(s,
+				"    {\"name\": \"%s\", \"kind\": \"%s\","
+				" \"state\": \"%s\", \"wal_status\": \"%s\","
+				" \"gen_avg\": %.4f, \"send_avg\": %.4f,"
+				" \"feedback_apply_avg\": %.4f,"
+				" \"last_sent_lsn\": \"%s\"}",
+				t->name, t->kind == LR_SEND ? "send" : "rsend",
+				t->meta.state, t->meta.wal_status,
+				gmb / dt, smb / dt, amb / dt,
+				t->last.send.sent_lsn ? lsn_str(t->last.send.sent_lsn) : "");
+		}
+		appendStringInfo(s, "\n  ],\n");
+	}
+
+	/* recv_stat: per-target session averages */
 	appendStringInfo(s, "  \"recv_stat\": [\n");
 	{
 		bool first = true;
 		for (i = 0; i < d->n_targets; i++)
 		{
 			LRExportTarget *t = &d->targets[i];
-			if (t->kind != LR_RECV) continue;
-			if (!first) appendStringInfoString(s, ",\n");
+			double rdt, rmb, amb;
+
+			if (t->kind != LR_RECV)
+				continue;
+			if (!first)
+				appendStringInfoString(s, ",\n");
 			first = false;
-			appendStringInfo(s, "    {\"name\": \"%s\", \"worker_type\": \"%s\"}",
-							 t->name, t->meta.worker_type);
+
+			rdt = (double)(t->last.recv.ts - t->anchor.recv.ts) / 1e6;
+			if (rdt <= 0)
+				rdt = 1.0;
+			rmb = (double)(t->last.recv.received_lsn -
+						   t->anchor.recv.received_lsn) / MB_DIV;
+			amb = (double)(t->last.recv.applied_lsn -
+						   t->anchor.recv.applied_lsn) / MB_DIV;
+			appendStringInfo(s,
+				"    {\"name\": \"%s\", \"worker_type\": \"%s\","
+				" \"recv_avg\": %.4f, \"apply_avg\": %.4f,"
+				" \"last_applied_lsn\": \"%s\"}",
+				t->name, t->meta.worker_type,
+				rmb / rdt, amb / rdt,
+				t->last.recv.applied_lsn ?
+				lsn_str(t->last.recv.applied_lsn) : "");
 		}
 		appendStringInfo(s, "\n  ],\n");
 	}
 
-	/* history: raw samples (most recent EXPORT_MAX_HISTORY) */
+/* history: raw samples (most recent EXPORT_MAX_HISTORY) */
 	appendStringInfo(s, "  \"history\": {\n");
 	appendStringInfo(s, "    \"total_samples\": %d,\n", d->total_entries);
 	appendStringInfo(s, "    \"exported_samples\": %d,\n", d->n_entries);

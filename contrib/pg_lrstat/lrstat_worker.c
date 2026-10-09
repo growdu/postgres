@@ -147,6 +147,7 @@ pg_lrstat_worker_main(Datum main_arg)
 	for (;;)
 	{
 		MemoryContext old;
+		bool		round_ok = true;
 		ProcessMainLoopInterrupts();
 
 		old = MemoryContextSwitchTo(round_ctx);
@@ -168,10 +169,20 @@ pg_lrstat_worker_main(Datum main_arg)
 				 edata->backtrace ? "\nbacktrace: " : "",
 				 edata->backtrace ? edata->backtrace : "");
 			FreeErrorData(edata);
+			round_ok = false;
 		}
 		PG_END_TRY();
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(round_ctx);
+
+		/* honest bookkeeping for the info view: every completed round
+		 * (idle skips included) counts; failures keep the flag false */
+		SpinLockAcquire(&lrstat->session.mutex);
+		lrstat->last_round_ts = GetCurrentTimestamp();
+		lrstat->last_round_ok = round_ok;
+		if (round_ok)
+			lrstat->nrounds++;
+		SpinLockRelease(&lrstat->session.mutex);
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
