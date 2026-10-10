@@ -269,8 +269,8 @@ JSON: session/analysis/capacity/send_stat/recv_stat/history
 ### 6.1 目标键与生命周期
 
 - 键 = `(kind, name, relid, worker_char)`；`parallel apply` 行跳过（leader 是规范源）。
-- 消失超过 `stale_target_ttl` 的目标从视图剔除（槽位可复用）。
-- 满载时丢弃计数（`info.dropped_samples`），需调大 `max_targets`。
+- 视图数据生命周期与 start/stop 严格对齐：目标中途消失（如 tablesync 结束）其历史行保留到会话结束——历史是会话的完整记录。
+- `stale_target_ttl` 仅管槽位复用：目标消失超过阈值后其槽位可让给新目标（`max_targets` 不够时）；满载丢弃计数入 `info.dropped_samples`。
 
 ### 6.2 远端轮询（RSEND）
 

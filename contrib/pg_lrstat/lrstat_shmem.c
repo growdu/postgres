@@ -570,6 +570,7 @@ lrstat_session_start(const char *name)
 	}
 	lrstat->n_entries = 0;
 	lrstat->session.truncated = false;
+	lrstat->nrounds = 0;         /* per-session round count */
 }
 
 void
@@ -614,6 +615,7 @@ lrstat_session_reset(void)
 	 * script): wipe the history ring too, not just the targets */
 	lrstat->n_entries = 0;
 	lrstat->session.truncated = false;
+	lrstat->nrounds = 0;         /* per-session round count */
 }
 
 /*
@@ -718,6 +720,7 @@ lrstat_reset_entries(void)
 		return;
 	lrstat->n_entries = 0;
 	lrstat->session.truncated = false;
+	lrstat->nrounds = 0;         /* per-session round count */
 }
 
 int

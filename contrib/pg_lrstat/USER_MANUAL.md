@@ -94,7 +94,7 @@ psql -c "DROP EXTENSION pg_lrstat CASCADE; CREATE EXTENSION pg_lrstat;"
 | `session_start_ts` / `session_stop_ts` | 会话起止时间 |
 | `sample_interval_ms` | 采样周期（= 时序粒度） |
 | `last_round_ts` / `last_round_ok` / `last_round_error` | 上一轮采样状态 |
-| `nrounds` / `dropped_samples` | 累计轮数 / 目标槽满丢弃数（>0 调大 max_targets） |
+| `nrounds` / `dropped_samples` | 本会话内完成的采样轮数（start 清零）/ 目标槽满丢弃数（>0 调大 max_targets） |
 | `remote_poll` | 是否启用发送端轮询 |
 | `exported_report_names` | **已导出的报告名列表**（exports 目录） |
 
@@ -333,7 +333,7 @@ SELECT round((pg_wal_lsn_diff(max(applied_lsn), min(applied_lsn))/1048576
 | `pg_lrstat.sample_interval` | `30s` | SIGHUP | 采样周期 = 时序粒度（最小 1s） |
 | `pg_lrstat.session_max_samples` | `2880` | 重启 | 历史环形容量（每目标样本数；写满覆盖最旧） |
 | `pg_lrstat.max_targets` | `32` | 重启 | 最多同时监测目标数 |
-| `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标消失后从视图剔除（如 tablesync 结束） |
+| `pg_lrstat.stale_target_ttl` | `10min` | SIGHUP | 目标槽位复用阈值：目标消失多久后其槽位可让给新目标（仅影响 `max_targets` 不够时的复用；视图数据随会话保留到下一次 start） |
 | `pg_lrstat.remote_poll` | `true` | SIGHUP | 接收端轮询发送端（关闭则 cluster_stat 无远端数据） |
 | `pg_lrstat.remote_connect_timeout` | `5s` | SIGHUP | 轮询连接超时 |
 | `pg_lrstat.remote_poll_budget` | `500ms` | SIGHUP | 单轮轮询总预算；超时标 stale |

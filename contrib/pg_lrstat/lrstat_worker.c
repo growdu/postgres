@@ -175,12 +175,14 @@ pg_lrstat_worker_main(Datum main_arg)
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(round_ctx);
 
-		/* honest bookkeeping for the info view: every completed round
-		 * (idle skips included) counts; failures keep the flag false */
+		/* honest bookkeeping for the info view: last_round_* report
+		 * worker liveness (always advances, even idle); nrounds is the
+		 * SESSION round count — only rounds that sampled count, so it
+		 * freezes at stop alongside the data views */
 		SpinLockAcquire(&lrstat->session.mutex);
 		lrstat->last_round_ts = GetCurrentTimestamp();
 		lrstat->last_round_ok = round_ok;
-		if (round_ok)
+		if (round_ok && lrstat->session.running)
 			lrstat->nrounds++;
 		SpinLockRelease(&lrstat->session.mutex);
 
