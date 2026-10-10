@@ -185,7 +185,7 @@ pg_lrstat_info(PG_FUNCTION_ARGS)
     lr_put_bool(&r, lrstat->last_round_ok);
     lr_put_text(&r, NULL);
     lr_put_i8(&r, (int64) lrstat->nrounds);
-    lr_put_i8(&r, 0);
+    lr_put_i8(&r, (int64) lrstat->dropped_samples);
     lr_put_bool(&r, lrstat_remote_poll);
 
     /* exported report names */

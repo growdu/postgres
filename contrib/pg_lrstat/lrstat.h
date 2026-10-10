@@ -242,6 +242,7 @@ typedef struct LRStatShared
 	TimestampTz last_round_ts;
 	bool        last_round_ok;
 	uint64      nrounds;
+	uint64      dropped_samples;    /* targets dropped: slot table full */
 	int         ring_len;           /* session_max_samples */
 	int         n_entries;         /* history write cursor (worker only) */
 	/* targets, history entries and session registry follow, see

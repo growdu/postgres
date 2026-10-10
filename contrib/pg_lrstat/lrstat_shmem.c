@@ -764,5 +764,11 @@ lrstat_note_dropped(const char *name)
 {
 	if (!lrstat_ready())
 		return;
-	/* counted via pg_atomic; simplified for P0 */
+	/* best-effort counter: the sampler is the only caller, so a plain
+	 * increment under the session mutex is enough (no atomics needed) */
+	SpinLockAcquire(&lrstat->session.mutex);
+	lrstat->dropped_samples++;
+	SpinLockRelease(&lrstat->session.mutex);
+	elog(LOG, "pg_lrstat: target slot full, dropping samples for %s "
+		 "(consider raising pg_lrstat.max_targets)", name);
 }
