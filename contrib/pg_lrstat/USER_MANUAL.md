@@ -172,6 +172,8 @@ psql -c "DROP EXTENSION pg_lrstat CASCADE; CREATE EXTENSION pg_lrstat;"
 
 ## 5. 速率是怎么算的（公式与算例）
 
+> 完整的数据来源映射、每张表的公式清单与生命周期矩阵见 [DATA_FLOW.md](DATA_FLOW.md)。
+
 ### 5.1 两个基本公式
 
 ```
