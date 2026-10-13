@@ -213,6 +213,7 @@ StartupDecodingContext(List *output_plugin_options,
 				 errdetail("Failed while allocating a WAL reading processor.")));
 
 	ctx->reorder = ReorderBufferAllocate();
+	ctx->parallel_pool = NULL;	/* serial by default; set by walsender */
 	ctx->snapshot_builder =
 		AllocateSnapshotBuilder(ctx->reorder, xmin_horizon, start_lsn,
 								need_full_snapshot, in_create, slot->data.two_phase_at);

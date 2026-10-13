@@ -73,6 +73,7 @@
 #include "postmaster/walsummarizer.h"
 #include "postmaster/walwriter.h"
 #include "replication/logicallauncher.h"
+#include "replication/paralleldecode.h"
 #include "replication/slot.h"
 #include "replication/slotsync.h"
 #include "replication/syncrep.h"
@@ -1269,6 +1270,17 @@ struct config_bool ConfigureNamesBool[] =
 			NULL
 		},
 		&log_replication_commands,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"parallel_decode",
+			PGC_SIGHUP,
+			REPLICATION_SENDING,
+			gettext_noop("Enables publisher-side parallel logical decoding."),
+			gettext_noop("When on, DML record decoding is dispatched to parallel decode workers."),
+		},
+		&parallel_decode,
 		false,
 		NULL, NULL, NULL
 	},
@@ -3382,6 +3394,44 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&max_parallel_apply_workers_per_subscription,
 		2, 0, MAX_PARALLEL_WORKER_LIMIT,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"max_parallel_decode_workers_per_walsender",
+			PGC_SIGHUP,
+			REPLICATION_SENDING,
+			gettext_noop("Maximum number of parallel decode workers per walsender."),
+			NULL,
+		},
+		&max_parallel_decode_workers_per_walsender,
+		2, 0, MAX_PARALLEL_WORKER_LIMIT,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_input_queue_size",
+			PGC_SIGHUP,
+			REPLICATION_SENDING,
+			gettext_noop("Sets the maximum size of pending input buffer for parallel decoding."),
+			gettext_noop("The default is 64MB. This constrains the task/event queue shared memory."),
+			GUC_UNIT_KB,
+		},
+		&parallel_decode_input_queue_size,
+		65536, 1024, INT_MAX / 2,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_result_queue_size",
+			PGC_SIGHUP,
+			REPLICATION_SENDING,
+			gettext_noop("Sets the maximum size of the Result Store for parallel decoding."),
+			gettext_noop("The default is 16MB. Transactions exceeding this are spilled to disk."),
+			GUC_UNIT_KB,
+		},
+		&parallel_decode_result_queue_size,
+		16384, 1024, INT_MAX / 2,
 		NULL, NULL, NULL
 	},
 

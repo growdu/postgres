@@ -1,0 +1,74 @@
+CREATE EXTENSION test_parallel_decode;
+SELECT pd_create_pool(2);
+ pd_create_pool
+----------------
+
+(1 row)
+
+SELECT worker_id, state FROM pd_pool_states() ORDER BY worker_id;
+ worker_id | state
+-----------+-------
+         0 | IDLE
+         1 | IDLE
+(2 rows)
+
+SELECT pd_echo(0, 'hello from leader');
+     pd_echo
+------------------
+ hello from leader
+(1 row)
+
+SELECT pd_echo(1, 'second worker test');
+   pd_echo
+----------------
+ second worker test
+(1 row)
+
+SELECT worker_id, state FROM pd_pool_states() ORDER BY worker_id;
+ worker_id | state
+-----------+-------
+         0 | IDLE
+         1 | IDLE
+(2 rows)
+
+SELECT pd_pool_health();
+ pd_pool_health
+----------------
+ t
+(1 row)
+
+SELECT pd_echo(0, '');
+ pd_echo
+---------
+
+(1 row)
+
+SELECT length(pd_echo(0, repeat('x', 1000)));
+ length
+--------
+   1000
+(1 row)
+
+SELECT worker_id, state FROM pd_pool_states() ORDER BY worker_id;
+ worker_id | state
+-----------+-------
+         0 | IDLE
+         1 | IDLE
+(2 rows)
+
+SELECT pd_test_error(0);
+ERROR:  parallel decode worker 0: test error from parallel decode worker 0
+SELECT pd_pool_health();
+ pd_pool_health
+----------------
+ f
+(1 row)
+
+SELECT pd_destroy_pool();
+ pd_destroy_pool
+-----------------
+
+(1 row)
+
+SELECT pd_echo(0, 'should fail');
+ERROR:  parallel decode pool is not created

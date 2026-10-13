@@ -43,6 +43,9 @@ typedef struct LogicalDecodingContext
 	struct ReorderBuffer *reorder;
 	struct SnapBuild *snapshot_builder;
 
+	/* parallel decode pool (NULL = serial mode) */
+	struct ParallelDecodePool *parallel_pool;
+
 	/*
 	 * Marks the logical decoding context as fast forward decoding one. Such a
 	 * context does not have plugin loaded so most of the following properties

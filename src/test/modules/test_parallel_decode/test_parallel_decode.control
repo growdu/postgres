@@ -1,0 +1,5 @@
+# test_parallel_decode extension
+comment = 'Test module for parallel logical decoding infrastructure'
+default_version = '1.0'
+module_pathname = '$libdir/test_parallel_decode'
+relocatable = false

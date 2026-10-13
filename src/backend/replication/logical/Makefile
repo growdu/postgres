@@ -23,6 +23,9 @@ OBJS = \
 	logicalfuncs.o \
 	message.o \
 	origin.o \
+	paralleldecode.o \
+	paralleldecodeworker.o \
+	paralleldecode_walsender.o \
 	proto.o \
 	relation.o \
 	reorderbuffer.o \

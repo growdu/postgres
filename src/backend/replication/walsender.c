@@ -73,6 +73,7 @@
 #include "replication/logical.h"
 #include "replication/slotsync.h"
 #include "replication/slot.h"
+#include "replication/paralleldecode.h"
 #include "replication/snapbuild.h"
 #include "replication/syncrep.h"
 #include "replication/walreceiver.h"
@@ -1484,6 +1485,54 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 							  WalSndUpdateProgress);
 	xlogreader = logical_decoding_ctx->reader;
 
+	/*
+	 * Parallel decode: create the worker pool if enabled (§3.2).
+	 * Eligibility checks per §5.6: streaming and two_phase slots
+	 * fall back to serial decoding.
+	 */
+	if (parallel_decode && max_parallel_decode_workers_per_walsender > 0 &&
+		MyReplicationSlot != NULL)
+	{
+		bool		eligible = true;
+
+		/* Check streaming: subscriber requested streaming → serial (§5.6.5) */
+		if (cmd->options != NULL)
+		{
+			ListCell   *lc;
+
+			foreach(lc, cmd->options)
+			{
+				DefElem    *elem = lfirst(lc);
+
+				if (strcmp(elem->defname, "streaming") == 0)
+				{
+					char	   *optval = defGetString(elem);
+
+					if (strcmp(optval, "on") == 0 ||
+						strcmp(optval, "parallel") == 0)
+						eligible = false;
+				}
+			}
+		}
+
+		/* Check two_phase: slot has two_phase enabled → serial (§5.6.2) */
+		if (MyReplicationSlot->data.two_phase ||
+			MyReplicationSlot->data.two_phase_at != InvalidXLogRecPtr)
+			eligible = false;
+
+		if (eligible)
+		{
+			logical_decoding_ctx->parallel_pool =
+				ParallelDecodePoolCreate(max_parallel_decode_workers_per_walsender);
+		}
+		else
+		{
+			elog(DEBUG1, "parallel decode disabled for slot %s: "
+				 "streaming or two_phase slot falls back to serial",
+				 NameStr(MyReplicationSlot->data.name));
+		}
+	}
+
 	WalSndSetState(WALSNDSTATE_CATCHUP);
 
 	/* Send a CopyBothResponse message, and start streaming */
@@ -1514,6 +1563,13 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 
 	/* Main loop of walsender */
 	WalSndLoop(XLogSendLogical);
+
+	/* Parallel decode: destroy the pool before freeing context. */
+	if (logical_decoding_ctx->parallel_pool != NULL)
+	{
+		ParallelDecodePoolDestroy(logical_decoding_ctx->parallel_pool);
+		logical_decoding_ctx->parallel_pool = NULL;
+	}
 
 	FreeDecodingContext(logical_decoding_ctx);
 	ReplicationSlotRelease();
@@ -3463,6 +3519,18 @@ XLogSendLogical(void)
 		LogicalDecodingProcessRecord(logical_decoding_ctx, logical_decoding_ctx->reader);
 
 		sentPtr = logical_decoding_ctx->reader->EndRecPtr;
+	}
+
+	/*
+	 * Parallel decode: collect results from workers and output pending
+	 * transactions in commit order (detailed design §4.1/§4.4).
+	 */
+	if (logical_decoding_ctx->parallel_pool != NULL)
+	{
+		ParallelDecodeCollectResults(logical_decoding_ctx->parallel_pool);
+		ParallelDecodeOutputPending(logical_decoding_ctx->parallel_pool,
+									logical_decoding_ctx);
+		ParallelDecodeAdvanceSlotPositions(logical_decoding_ctx->parallel_pool);
 	}
 
 	/*

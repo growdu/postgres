@@ -36,12 +36,14 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/message.h"
+#include "replication/paralleldecode.h"
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
 #include "storage/standbydefs.h"
 
 /* individual record(group)'s handlers */
 static void DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
+static bool rmgr_has_dml(RmgrId rmid);
 static void DecodeUpdate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeDelete(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
 static void DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -108,6 +110,19 @@ LogicalDecodingProcessRecord(LogicalDecodingContext *ctx, XLogReaderState *recor
 								 txid,
 								 XLogRecGetXid(record),
 								 buf.origptr);
+	}
+
+	/*
+	 * Parallel decode dispatch: DML records go to workers; snapshot and
+	 * transaction boundary records stay local (detailed design §4.2).
+	 */
+	if (ctx->parallel_pool != NULL &&
+		TransactionIdIsValid(txid) &&
+		rmgr_has_dml(XLogRecGetRmid(record)))
+	{
+		ParallelDecodeDispatchRecord(ctx->parallel_pool, record,
+									 txid, XLogRecGetXid(record));
+		return;
 	}
 
 	rmgr = GetRmgr(XLogRecGetRmid(record));
@@ -373,6 +388,17 @@ standby_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 				SnapBuildProcessRunningXacts(builder, buf->origptr, running);
 
 				/*
+				 * Parallel decode: publish new snapshot version if the
+				 * builder's snapshot changed (§4.3).  Workers receive it
+				 * on the Event Queue and store it in their version table.
+				 */
+				if (ctx->parallel_pool != NULL)
+				{
+					ParallelDecodePublishSnapshot(ctx->parallel_pool,
+												  builder, buf->origptr);
+				}
+
+				/*
 				 * Abort all transactions that we keep track of, that are
 				 * older than the record's oldestRunningXid. This is the most
 				 * convenient spot for doing so since, in contrast to shutdown
@@ -608,6 +634,20 @@ logicalmsg_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		FilterByOrigin(ctx, origin_id))
 		return;
 
+	/*
+	 * Parallel decode: non-transactional messages must be output at their
+	 * exact WAL position (§5.6.1).  When parallel decoding is active,
+	 * flush the output queue up to this LSN before emitting the message,
+	 * then flush again after.  This ensures ordering with surrounding
+	 * transactions that are being decoded in parallel.
+	 */
+	if (ctx->parallel_pool != NULL && !message->transactional)
+	{
+		/* Flush pending parallel results up to this LSN */
+		ParallelDecodeCollectResults(ctx->parallel_pool);
+		ParallelDecodeOutputPending(ctx->parallel_pool, ctx);
+	}
+
 	if (message->transactional &&
 		!SnapBuildProcessChange(builder, xid, buf->origptr))
 		return;
@@ -716,6 +756,29 @@ DecodeCommit(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	{
 		ReorderBufferCommitChild(ctx->reorder, xid, parsed->subxacts[i],
 								 buf->origptr, buf->endptr);
+	}
+
+	/*
+	 * Parallel decode: dispatch commit to workers (§4.2).
+	 * Extract and publish invalidations first (§4.5), then send the
+	 * commit marker.  The serial ReorderBufferCommit is skipped; the
+	 * worker executes it with its local ReorderBuffer.
+	 */
+	if (ctx->parallel_pool != NULL && !two_phase)
+	{
+		/* Publish invalidations embedded in this commit record */
+		if (parsed->nmsgs > 0)
+		{
+			ParallelDecodePublishInvalidations(ctx->parallel_pool,
+											   parsed->nmsgs, parsed->msgs,
+											   buf->origptr);
+		}
+
+		ParallelDecodeDispatchCommit(ctx->parallel_pool, xid,
+									 buf->origptr, buf->endptr,
+									 commit_time, origin_id, origin_lsn);
+		UpdateDecodingStats(ctx);
+		return;
 	}
 
 	/*
@@ -857,6 +920,18 @@ DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	 * transaction.
 	 */
 	skip_xact = DecodeTXNNeedSkip(ctx, buf, parsed->dbId, origin_id);
+
+	/*
+	 * Parallel decode: dispatch abort to workers (§4.2).  The worker
+	 * discards its local ReorderBuffer content for this transaction.
+	 */
+	if (ctx->parallel_pool != NULL && !skip_xact)
+	{
+		ParallelDecodeDispatchAbort(ctx->parallel_pool, xid,
+									buf->origptr);
+		UpdateDecodingStats(ctx);
+		return;
+	}
 
 	/*
 	 * Send the final rollback record for a prepared transaction unless we
@@ -1313,4 +1388,14 @@ DecodeTXNNeedSkip(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	}
 
 	return false;
+}
+
+/*
+ * Return true if the resource manager produces DML records that need to
+ * be dispatched to parallel decode workers.
+ */
+static bool
+rmgr_has_dml(RmgrId rmid)
+{
+	return rmid == RM_HEAP_ID || rmid == RM_HEAP2_ID;
 }
