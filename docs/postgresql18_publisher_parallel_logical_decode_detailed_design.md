@@ -1,43 +1,43 @@
-# [RFC-Detail] Publisher-Side Parallel Logical Decoding — Detailed Design
+# [RFC-Detail] 发布端并行逻辑解码——详细设计
 
-## Summary
+## 概述
 
-Coding-level specification for implementing publisher-side parallel logical decoding in PostgreSQL 18. Covers file layout, DSM/message wire formats, function signatures, startup sequences, main loops, concurrency rules, error handling, and build integration. All function names and API signatures are verified against the PG 18 source tree.
+PostgreSQL 18 发布端并行逻辑解码的编码级规格。覆盖文件布局、DSM 布局与消息格式、函数签名、启动序列、主循环、并发规则、错误处理和构建接线。所有函数名和 API 签名均在 PG 18 源码树上核实。
 
-## Motivation
+## 动机
 
-The companion RFC (`postgresql18_publisher_parallel_logical_decode_overview.md`) defines the architecture and rationale. This document provides the implementation-level detail needed to write code: every structure, message format, and function call sequence.
+配套 RFC（`postgresql18_publisher_parallel_logical_decode_overview.md`）定义了架构与动机。本文档提供编写代码所需的实现级细节：每个结构体、消息格式和函数调用序列。
 
-## Detailed Design
+## 详细设计
 
-### API
+### 接口
 
-#### New Files
+#### 新增文件
 
-| File | Content |
+| 文件 | 内容 |
 |---|---|
-| `src/include/replication/paralleldecode.h` | Shared structures, DSM keys, message contract, pool API |
-| `src/backend/replication/logical/paralleldecode.c` | Leader side: pool lifecycle, record dispatch, event publication, result replay |
-| `src/backend/replication/logical/paralleldecodeworker.c` | Worker side: startup, decode pipeline, event consumption, heartbeat |
-| `src/backend/replication/logical/paralleldecode_walsender.c` | Walsender integration entry points |
-| `src/test/modules/test_parallel_decode/` | SQL-callable test functions |
+| `src/include/replication/paralleldecode.h` | 共享结构体、DSM 键、消息契约、池 API |
+| `src/backend/replication/logical/paralleldecode.c` | Leader 侧：池生命周期、记录分发、事件发布、结果回放 |
+| `src/backend/replication/logical/paralleldecodeworker.c` | Worker 侧：启动、解码管线、事件消费、心跳 |
+| `src/backend/replication/logical/paralleldecode_walsender.c` | walsender 集成入口 |
+| `src/test/modules/test_parallel_decode/` | SQL 可调用的测试函数 |
 
-#### Modified Files
+#### 修改文件
 
-| File | Change |
+| 文件 | 改动 |
 |---|---|
-| `decode.c` | Dispatch hook in `LogicalDecodingProcessRecord`; COMMIT/ABORT routing; RUNNING_XACTS snapshot publication; non-transactional message ordering |
-| `walsender.c` | Pool creation with eligibility check; result collection in `XLogSendLogical`; pool destruction |
-| `logical.h` | `parallel_pool` field on `LogicalDecodingContext` |
-| `logical.c` | `parallel_pool = NULL` initialization |
-| `bgworker.c` | `InternalBGWorkers` registration |
-| `guc_tables.c` | Four GUC entries |
-| `Makefile`/`meson.build` | Object file additions |
+| `decode.c` | `LogicalDecodingProcessRecord` 分流钩子；COMMIT/ABORT 路由；RUNNING_XACTS 快照发布；非事务消息排序 |
+| `walsender.c` | 池创建（含资格检查）；`XLogSendLogical` 中收集结果；连接断开时销毁池 |
+| `logical.h` | `LogicalDecodingContext` 新增 `parallel_pool` 字段 |
+| `logical.c` | `parallel_pool = NULL` 初始化 |
+| `bgworker.c` | `InternalBGWorkers` 注册 |
+| `guc_tables.c` | 四个 GUC 条目 |
+| `Makefile` / `meson.build` | 目标文件添加 |
 
-#### Public Function Signatures
+#### 公开函数签名
 
 ```c
-/* Pool lifecycle */
+/* 池生命周期 */
 ParallelDecodePool *ParallelDecodePoolCreate(int nworkers);
 void ParallelDecodePoolDestroy(ParallelDecodePool *pool);
 bool ParallelDecodePoolCheckHealth(ParallelDecodePool *pool);
@@ -45,7 +45,7 @@ int ParallelDecodePoolGetWorkerStates(ParallelDecodePool *pool,
                                       uint32 *states, int nstates);
 int ParallelDecodePoolGetNWorkers(ParallelDecodePool *pool);
 
-/* Record dispatch (called from decode.c) */
+/* 记录分发（从 decode.c 调用） */
 void ParallelDecodeDispatchRecord(ParallelDecodePool *pool,
                                   XLogReaderState *record,
                                   TransactionId top_xid,
@@ -61,7 +61,7 @@ void ParallelDecodeDispatchAbort(ParallelDecodePool *pool,
                                  TransactionId top_xid,
                                  XLogRecPtr abort_lsn);
 
-/* Event publication */
+/* 事件发布 */
 void ParallelDecodePublishSnapshot(ParallelDecodePool *pool,
                                    SnapBuild *builder,
                                    XLogRecPtr lsn);
@@ -70,214 +70,214 @@ void ParallelDecodePublishInvalidations(ParallelDecodePool *pool,
                                         SharedInvalidationMessage *msgs,
                                         XLogRecPtr commit_lsn);
 
-/* Result handling */
+/* 结果处理 */
 void ParallelDecodeCollectResults(ParallelDecodePool *pool);
 void ParallelDecodeOutputPending(ParallelDecodePool *pool,
                                  LogicalDecodingContext *ctx);
 void ParallelDecodeAdvanceSlotPositions(ParallelDecodePool *pool);
 
-/* Statistics */
+/* 统计 */
 void ParallelDecodePoolGetMetrics(ParallelDecodePool *pool,
                                   ParallelDecodePoolMetrics *metrics);
 
-/* Worker entry point */
+/* Worker 入口 */
 void ParallelDecodeWorkerMain(Datum main_arg);
 ```
 
-### Implementation
+### 实现
 
-#### DSM Layout (per Worker)
+#### DSM 布局（每 Worker）
 
-Seven `shm_toc` entries in each Worker's DSM segment:
+每个 Worker 的 DSM 段内有七个 `shm_toc` 条目：
 
-| Key | Content | Default Size |
+| 键 | 内容 | 默认大小 |
 |---|---|---|
 | 1 | `ParallelDecodeWorkerInfo` | sizeof |
-| 2 | Task MQ (walsender → Worker) | 512 kB |
-| 3 | Event MQ (walsender → Worker) | 256 kB |
-| 4 | Result MQ (Worker → walsender) | 1 MB |
-| 5 | Error MQ (Worker → walsender) | 16 kB |
-| 6 | Control Request MQ (Worker → walsender) | 8 kB |
-| 7 | Control Command MQ (walsender → Worker) | 8 kB |
+| 2 | Task MQ（walsender → Worker） | 512 kB |
+| 3 | Event MQ（walsender → Worker） | 256 kB |
+| 4 | Result MQ（Worker → walsender） | 1 MB |
+| 5 | Error MQ（Worker → walsender） | 16 kB |
+| 6 | Control Request MQ（Worker → walsender） | 8 kB |
+| 7 | Control Command MQ（walsender → Worker） | 8 kB |
 
-#### Message Wire Contract
+#### 消息契约
 
-All messages begin with `PdMsgHeader`:
+所有消息以 `PdMsgHeader` 开头：
 
 ```c
 typedef struct PdMsgHeader {
-    uint32 len;   /* includes header */
+    uint32 len;   /* 含头部 */
     uint8  type;  /* PdMsgType */
 } PdMsgHeader;
 ```
 
-| Type | Direction | Payload |
+| 类型 | 方向 | 负载 |
 |---|---|---|
-| `PD_MSG_TASK_RECORD` | walsender → Worker | top_xid, xid, LSNs, raw XLogRecord bytes |
-| `PD_MSG_TASK_COMMIT` | walsender → Worker | top_xid, commit_lsn, snapshot_version, generation |
-| `PD_MSG_TASK_ABORT` | walsender → Worker | top_xid, abort_lsn |
-| `PD_MSG_EVENT_SNAPSHOT` | walsender → Worker (broadcast) | event_id, version, SerializeSnapshot output |
-| `PD_MSG_EVENT_INVAL` | walsender → Worker (broadcast) | event_id, SharedInvalidationMessage array |
-| `PD_MSG_EVENT_FLUSH_ALL` | walsender → Worker (broadcast) | event_id (triggers InvalidateSystemCaches) |
-| `PD_MSG_RESULT_CHANGES` | Worker → walsender | top_xid, commit_lsn, PdIntermediateChange stream |
-| `PD_MSG_RESULT_FRAMES` | Worker → walsender | top_xid, commit_lsn, protocol frame bytes |
-| `PD_MSG_ERROR` | Worker → walsender | Error text |
-| `PD_MSG_CTRL_HEARTBEAT` | Worker → walsender | consumed_event_id, state |
-| `PD_MSG_CTRL_RELEASE_ACK` | walsender → Worker | top_xid, generation |
+| `PD_MSG_TASK_RECORD` | walsender → Worker | top_xid、xid、LSN、原始 XLogRecord 字节 |
+| `PD_MSG_TASK_COMMIT` | walsender → Worker | top_xid、commit_lsn、snapshot_version、generation |
+| `PD_MSG_TASK_ABORT` | walsender → Worker | top_xid、abort_lsn |
+| `PD_MSG_EVENT_SNAPSHOT` | walsender → Worker（广播） | event_id、version、SerializeSnapshot 输出 |
+| `PD_MSG_EVENT_INVAL` | walsender → Worker（广播） | event_id、SharedInvalidationMessage 数组 |
+| `PD_MSG_EVENT_FLUSH_ALL` | walsender → Worker（广播） | event_id（触发 InvalidateSystemCaches） |
+| `PD_MSG_RESULT_CHANGES` | Worker → walsender | top_xid、commit_lsn、PdIntermediateChange 流 |
+| `PD_MSG_RESULT_FRAMES` | Worker → walsender | top_xid、commit_lsn、协议帧字节 |
+| `PD_MSG_ERROR` | Worker → walsender | 错误文本 |
+| `PD_MSG_CTRL_HEARTBEAT` | Worker → walsender | consumed_event_id、state |
+| `PD_MSG_CTRL_RELEASE_ACK` | walsender → Worker | top_xid、generation |
 
-#### Intermediate Result Format (centralized call)
+#### 中间结果格式（集中调用模式）
 
 ```c
 typedef struct PdIntermediateChange {
     uint8  op;             /* 'I'/'U'/'D'/'T' */
     Oid    relid;
-    uint32 newtuple_len;   /* 0 = absent */
-    uint32 oldtuple_len;   /* 0 = absent */
-    /* followed by tuple bytes (TOAST-reassembled by Worker) */
+    uint32 newtuple_len;   /* 0 = 无 */
+    uint32 oldtuple_len;   /* 0 = 无 */
+    /* 后跟元组字节（Worker 侧已完成 TOAST 重组） */
 } PdIntermediateChange;
 ```
 
-#### Worker Startup Sequence
+#### Worker 启动序列
 
-1. `BackgroundWorkerInitializeConnectionByOid(dboid, useroid, 0)` — establishes `MyDatabaseId`, relcache, syscache
-2. `dsm_attach(dsm_handle)` — attach to DSM segment
-3. `shm_toc_attach(PARALLEL_DECODE_TOC_MAGIC, ...)` — attach to TOC
-4. Validate `startup_generation` and `worker_id`
-5. Attach six message queues with complementary sender/receiver roles
-6. Allocate private `XLogReaderState` (plan A)
-7. `ReorderBufferAllocate()` with intermediate result callbacks
-8. Create minimal `LogicalDecodingContext` (no slot, no plugin)
-9. Set state to `PD_WORKER_IDLE`, send first heartbeat
-10. Enter main loop
+1. `BackgroundWorkerInitializeConnectionByOid(dboid, useroid, 0)`——建立 `MyDatabaseId`、relcache、syscache
+2. `dsm_attach(dsm_handle)`——附加 DSM 段
+3. `shm_toc_attach(PARALLEL_DECODE_TOC_MAGIC, ...)`——附加 TOC
+4. 校验 `startup_generation` 与 `worker_id`
+5. 以互补的 sender/receiver 角色附加六条消息队列
+6. 分配私有 `XLogReaderState`（方案 A）
+7. `ReorderBufferAllocate()` 并注册中间结果回调
+8. 创建最小 `LogicalDecodingContext`（无槽、无插件）
+9. 置状态为 `PD_WORKER_IDLE`，发送首个心跳
+10. 进入主循环
 
-#### Worker Main Loop
+#### Worker 主循环
 
 ```
 while (!shutting_down):
-    poll cmd_h (non-blocking) → handle SHUTDOWN/CANCEL/RELEASE_ACK
-    poll event_h (non-blocking) → handle SNAPSHOT/INVAL/FLUSH_ALL
-    poll task_h (non-blocking) → dispatch to decode/commit/abort handler
-    if heartbeat interval elapsed → send HEARTBEAT
+    轮询 cmd_h（非阻塞）→ 处理 SHUTDOWN/CANCEL/RELEASE_ACK
+    轮询 event_h（非阻塞）→ 处理 SNAPSHOT/INVAL/FLUSH_ALL
+    轮询 task_h（非阻塞）→ 分发给 decode/commit/abort 处理器
+    若心跳间隔到达 → 发送 HEARTBEAT
     WaitLatch(timeout=PD_HEARTBEAT_INTERVAL_MS)
 ```
 
-#### Worker Decode Pipeline (Plan A)
+#### Worker 解码管线（方案 A）
 
 ```
 XLogReaderSetDecodeBuffer(reader, msg->rec, msg->rec_len)
 XLogBeginRead(reader, msg->orig_lsn)
 record = XLogReadRecord(reader)
-if top_xid != xid:
+若 top_xid != xid:
     ReorderBufferAssignChild(rb, top_xid, xid, orig_lsn)
 rmgr = GetRmgr(XLogRecGetRmid(reader))
 rmgr.rm_decode(decode_ctx, &buf)  /* → ReorderBufferQueueChange */
 ```
 
-#### Worker Commit Processing
+#### Worker 提交处理
 
 ```
 snap = lookup_snapshot(snapshot_version)
 ReorderBufferSetBaseSnapshot(rb, top_xid, commit_lsn, snap)
 ReorderBufferCommit(rb, top_xid, commit_lsn, ...)
   → ProcessTXN → SetupHistoricSnapshot → ToastReplace
-  → apply_change callback → pdw_append_intermediate
-result → Result Queue
+  → apply_change 回调 → pdw_append_intermediate
+结果 → Result Queue
 ```
 
-#### Leader Result Replay (centralized call)
+#### Leader 结果回放（集中调用模式）
 
 ```
-entry = output_queue_head (sorted by commit_lsn)
+entry = output_queue_head（按 commit_lsn 排序）
 snap = RestoreSnapshot(snapshot_registry[entry->snapshot_version])
 SetupHistoricSnapshot(snap, NULL)
 ctx->reorder->begin(ctx->reorder, NULL)
-for each PdIntermediateChange in entry->result_data:
+对 entry->result_data 中的每个 PdIntermediateChange:
     rel = RelationIdGetRelation(ic->relid)
     change = palloc0(sizeof(ReorderBufferChange))
     change->action = ic->op → REORDER_BUFFER_CHANGE_*
-    change->data.tp.newtuple = reconstruct HeapTuple
+    change->data.tp.newtuple = 重建 HeapTuple
     ctx->reorder->apply_change(ctx->reorder, NULL, rel, change)
     RelationClose(rel)
 ctx->reorder->commit(ctx->reorder, NULL, entry->commit_lsn)
 TeardownHistoricSnapshot(false)
 ```
 
-#### Concurrency Rules
+#### 并发规则
 
-| Field | Writer | Mechanism |
+| 字段 | 写者 | 机制 |
 |---|---|---|
 | `state` | Worker | `pg_atomic_write_u32` |
-| `consumed_event_id` | Worker | `pg_atomic_write_u64` (relaxed) |
-| `top_xid`, `task_generation` | walsender | `SpinLockAcquire(&pd_mutex)` |
+| `consumed_event_id` | Worker | `pg_atomic_write_u64`（relaxed） |
+| `top_xid`、`task_generation` | walsender | `SpinLockAcquire(&pd_mutex)` |
 | `last_heartbeat` | Worker | `SpinLockAcquire(&pd_mutex)` |
-| Compound reads (state + consumed) | walsender | Hold `pd_mutex` |
+| 复合读取（state + consumed） | walsender | 持有 `pd_mutex` |
 
-#### Timeout Constants
+#### 超时常量
 
-| Parameter | Value |
+| 参数 | 值 |
 |---|---|
-| Heartbeat interval | 1000 ms |
-| Heartbeat timeout | 30 s |
-| Worker startup timeout | 60 s |
-| Pool shutdown timeout | 60 s |
-| Echo/result timeout | 10 s / 30 s |
+| 心跳间隔 | 1000 ms |
+| 心跳超时 | 30 s |
+| Worker 启动超时 | 60 s |
+| 池关闭超时 | 60 s |
+| Echo/结果超时 | 10 s / 30 s |
 
-### Compatibility
+### 兼容性
 
-**Build**: Three new `.c` files added to `src/backend/replication/logical/` (both Makefile and meson.build). No external dependencies.
+**构建**：三个新 `.c` 文件加入 `src/backend/replication/logical/`（Makefile 与 meson.build 同步）。无外部依赖。
 
-**`parallel_decode = off`**: Zero code path changes. The dispatch hook in `decode.c` checks `ctx->parallel_pool != NULL` before taking any parallel action. When NULL, execution is identical to unmodified PG 18.
+**`parallel_decode = off`**：零代码路径变化。`decode.c` 中的分流钩子在 `ctx->parallel_pool != NULL` 时才生效。为 NULL 时执行路径与未修改的 PG 18 完全一致。
 
-**Worker registration**: `ParallelDecodeWorkerMain` is added to `InternalBGWorkers` in `bgworker.c`, following the pattern of `ApplyWorkerMain`/`ParallelApplyWorkerMain`.
+**Worker 注册**：`ParallelDecodeWorkerMain` 加入 `bgworker.c` 的 `InternalBGWorkers` 数组，与 `ApplyWorkerMain`/`ParallelApplyWorkerMain` 同一模式。
 
-**Test module**: `src/test/modules/test_parallel_decode/` provides SQL functions for pool lifecycle testing without requiring a replication connection.
+**测试模块**：`src/test/modules/test_parallel_decode/` 提供不依赖复制连接即可测试池生命周期的 SQL 函数。
 
-### Performance
+### 性能
 
-**Statistics collected** via `ParallelDecodePoolMetrics`:
-- Worker states (idle/busy/failed counts)
-- Pending transaction count
-- Task/result queue bytes
-- Result spill bytes
-- Transaction total and latency average
-- Output lag (minimum consumed event ID)
-- Plugin timing
-- Fallback and restart counts
+**统计指标**（`ParallelDecodePoolMetrics` 结构体）：
+- Worker 状态（idle/busy/failed 计数）
+- pending 事务数
+- 任务/结果队列字节数
+- 结果 spill 字节数
+- 事务总数与延迟均值
+- 输出 lag（最小已消费事件 ID）
+- 插件耗时
+- 回退与重启计数
 
-**`pg_stat_parallel_decode` view**: SQL view (schema defined) backed by C function calling `ParallelDecodePoolGetMetrics`. Returns per-slot metrics.
+**`pg_stat_parallel_decode` 视图**：SQL 视图（schema 已定义），后端由调用 `ParallelDecodePoolGetMetrics` 的 C 函数支撑。返回按槽维度的指标。
 
-------------------------------------------------------------------------
+---
 
-## Alternatives Considered
+## 已考虑的备选方案
 
-### Worker launch: WORKERTYPE extension vs. dynamic bgworker
+### Worker 启动：WORKERTYPE 扩展 vs. 动态后台 Worker
 
-Preferred: extend `LogicalRepWorkerType` with `WORKERTYPE_PARALLEL_DECODE`. However, `LogicalRepWorker` array is globally fixed-size with subscription-based indexing. The initial implementation uses `RegisterDynamicBackgroundWorker` directly (detailed design §2.3 fallback path). The `bgw_extra` layout is identical, so switching to WORKERTYPE stays local to one function.
+优先扩展 `LogicalRepWorkerType` 增加 `WORKERTYPE_PARALLEL_DECODE`。但 `LogicalRepWorker` 数组全局定长、按订阅索引。初始实现直接使用 `RegisterDynamicBackgroundWorker`（详设 §2.3 回退路径）。`bgw_extra` 布局相同，后续切换 WORKERTYPE 只需修改一个函数。
 
-### Record transport: decoded vs. raw bytes
+### 记录传送：解码后数据 vs. 原始字节
 
-Initial approach sent decoded record content. Corrected to send raw `XLogRecord` bytes (`XLogRecGetTotalLen` range): Worker uses `XLogReaderSetDecodeBuffer` + `XLogReadRecord` to parse, which is the API designed for this purpose.
+最初方案发送解码后的记录内容。修正为发送**原始 XLogRecord 字节**（`XLogRecGetTotalLen` 覆盖范围）：Worker 用 `XLogReaderSetDecodeBuffer` + `XLogReadRecord` 解析——这正是该 API 的设计用途。
 
-### Result replay: shadow transaction vs. direct callback invocation
+### 结果回放：影子事务 vs. 直接回调调用
 
-Considered creating a shadow `ReorderBufferTXN` and calling `ReorderBufferCommit`. Simplified to direct callback invocation (`rb->begin`/`apply_change`/`commit`) to avoid the complexity of shadow transaction lifecycle management. The pgoutput wrapper callbacks handle NULL transactions correctly for basic output.
+考虑过创建影子 `ReorderBufferTXN` 并调用 `ReorderBufferCommit`。简化为直接调用回调（`rb->begin`/`apply_change`/`commit`），避免影子事务生命周期管理的复杂度。pgoutput 的包装回调对 NULL 事务在基本输出场景下工作正常。
 
-------------------------------------------------------------------------
+---
 
-## Open Questions
+## 开放问题
 
-1. **Subxact mapping via ASSIGNMENT records**: Worker handles `top_xid != xid` per record, but `XLOG_XACT_ASSIGNMENT` records containing batched subxid lists are not dispatched to Workers. Full solution: extend `PD_MSG_TASK_RECORD` with subxid arrays.
+1. **子事务 ASSIGNMENT 记录的映射传递**：Worker 按 `top_xid != xid` 逐条处理，但包含批量 subxid 列表的 `XLOG_XACT_ASSIGNMENT` 记录未分发给 Worker。完整方案：在 `PD_MSG_TASK_RECORD` 中扩展 subxid 数组。
 
-2. **Result Store disk spill**: Layout defined (per-transaction files, `ReorderBufferSerialize` pattern) but not implemented. Deferred until memory-only proves insufficient under real workloads.
+2. **Result Store 磁盘 spill**：布局已定义（按事务文件、`ReorderBufferSerialize` 模式）但未实现。推迟到内存-only 在实际负载下被证明不足时。
 
-3. **Plan B (LSN range authorization)**: Requires Worker-side `XLogReaderState` with page-read callback for authorized ranges only. Not implemented in first pass.
+3. **方案 B（LSN 区间授权）**：需要 Worker 侧 `XLogReaderState` 配置只读授权区间的页面回调。首版未实现。
 
-4. **Worker call mode (stage 4)**: Private plugin instance loading, `OutputPluginPrepareWrite`/`Write` writer redirection to Result Queue frames, startup parameter serialization. Not implemented.
+4. **Worker 调用模式（阶段 4）**：私有插件实例加载、`OutputPluginPrepareWrite`/`Write` writer 重定向到 Result Queue 帧、启动参数序列化。未实现。
 
-5. **`pg_stat_parallel_decode` C backing function**: SQL view schema defined; C function returning metrics not yet written.
+5. **`pg_stat_parallel_decode` C 后端函数**：SQL 视图 schema 已定义；返回指标的 C 函数未编写。
 
-6. **Non-transactional message ordering**: Flush mechanism implemented (`CollectResults` + `OutputPending` before message emission), but exact ordering guarantee under concurrent DDL needs verification.
+6. **非事务消息排序**：冲刷机制已实现（消息输出前先 `CollectResults` + `OutputPending`），但在并发 DDL 下的精确顺序保证需验证。
 
-7. **Error serialization format**: Stage 1 uses simple text. Stage 2 should upgrade to `pq_parse_errornotice` protocol format (matching `parallel.c:1166`).
+7. **错误序列化格式**：阶段 1 使用简单文本。阶段 2 应升级为 `pq_parse_errornotice` 协议格式（对齐 `parallel.c:1166`）。
 
-8. **macOS ARM64 shm_mq direction**: Leader-to-Worker `shm_mq` communication times out on macOS ARM64 (Worker-to-Leader direction works). Likely platform-specific shared memory visibility issue. Linux expected to work correctly.
+8. **macOS ARM64 shm_mq 方向**：Leader→Worker 方向的 `shm_mq` 通信在 macOS ARM64 上超时（Worker→Leader 方向正常）。可能是平台相关的共享内存可见性问题。Linux 上预期正常。

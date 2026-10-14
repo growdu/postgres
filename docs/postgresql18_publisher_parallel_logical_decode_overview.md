@@ -1,235 +1,229 @@
-# [RFC] Publisher-Side Parallel Logical Decoding for PostgreSQL 18
+# [RFC] PostgreSQL 18 发布端并行逻辑解码
 
-## Summary
+## 概述
 
-Add transaction-level parallel logical decoding to the publisher side of PostgreSQL logical replication. A fixed pool of background Decode Worker processes performs WAL record decoding in parallel, while the walsender retains exclusive control over WAL reading, transaction identification, snapshot management, and protocol output. The output byte stream is identical to serial decoding.
+在 PostgreSQL 逻辑复制的发布端增加事务级并行逻辑解码能力。由固定容量的后台 Decode Worker 进程池并行执行 WAL 记录解码，walsender 独占 WAL 读取、事务识别、快照管理和协议输出。输出字节流与串行解码完全一致。
 
-## Motivation
+## 动机
 
-The publisher side of logical replication is single-threaded: one `walsender` process reads WAL sequentially, decodes records, invokes output plugin callbacks, and sends protocol messages in a single execution loop. When logical decoding itself becomes the bottleneck (high write volume, wide tables, many TOAST columns), this single thread cannot utilize multi-core CPUs.
+逻辑复制的发布端是单线程的：一个 `walsender` 进程顺序读取 WAL、解码记录、调用输出插件回调、发送协议消息，全部在单个执行循环里完成。当逻辑解码本身成为瓶颈时（高写入量、宽表、大量 TOAST 列），该单线程无法利用多核 CPU。
 
-PG 18's existing `streaming = parallel` option parallelizes the *subscriber* side (applying streamed transactions in parallel). It does not parallelize the *publisher* side (decoding multiple transactions concurrently). These are complementary features.
+PG 18 已有的 `streaming = parallel` 选项解决的是**订阅端**的并行（并行应用流式事务），不是**发布端**的并行（并行解码多个事务）。两者互补，不是同一件事。
 
-The performance bottleneck decomposes into five segments:
+解码瓶颈按 CPU 消耗分解为五段：
 
-| Segment | Description |
+| 段 | 描述 |
 |---|---|
-| (a) Record parsing | `DecodeInsert`/`Update`/`Delete` + `ReorderBufferQueueChange` |
-| (b) Catalog lookup | relcache/syscache access under historic snapshot |
-| (c) TOAST reassembly | `ReorderBufferToastReplace` |
-| (d) Plugin callback | `pgoutput` tuple-to-protocol serialization |
-| (e) Protocol write | `WalSndWriteData` network send |
+| (a) 记录解析 | `DecodeInsert`/`Update`/`Delete` + `ReorderBufferQueueChange` |
+| (b) 目录查找 | 历史快照下的 relcache/syscache 访问 |
+| (c) TOAST 重组 | `ReorderBufferToastReplace` |
+| (d) 插件回调 | `pgoutput` 的 tuple→协议消息序列化 |
+| (e) 协议写出 | `WalSndWriteData` 网络发送 |
 
-Segments (a)-(c) are parallelizable per-transaction. Segment (d) is parallelizable if the output plugin supports per-transaction instances. Segment (e) remains serial (single protocol output stream). With N workers, the theoretical speedup is bounded by segments (a)-(d) as a fraction of total time.
+段 (a)-(c) 可以按事务并行。段 (d) 在输出插件支持每事务独立实例的前提下可以并行。段 (e) 保持串行（单一协议输出流）。N 个 Worker 的理论加速比受段 (a)-(d) 占总时间比例的约束。
 
-## Detailed Design
+## 详细设计
 
-### API
+### 接口
 
-**GUC Parameters** (all SIGHUP, superuser-only, read at connection establishment):
+**GUC 参数**（全部 SIGHUP、仅超级用户、连接建立时读取）：
 
-| Parameter | Type | Default | Description |
+| 参数 | 类型 | 默认值 | 语义 |
 |---|---|---|---|
-| `parallel_decode` | bool | `off` | Master switch |
-| `max_parallel_decode_workers_per_walsender` | int | `2` | Worker pool size; bounded by `max_worker_processes` |
-| `parallel_decode_input_queue_size` | int (kB) | `65536` | Pending input buffer limit; overflow triggers WAL read backpressure |
-| `parallel_decode_result_queue_size` | int (kB) | `16384` | Result Store memory limit; overflow spills to disk |
-| `parallel_decode_fallback` | enum (`serial`/`wait`) | `serial` | Fallback strategy when safety cannot be proven |
+| `parallel_decode` | bool | `off` | 总开关 |
+| `max_parallel_decode_workers_per_walsender` | int | `2` | Worker 池容量；受 `max_worker_processes` 约束 |
+| `parallel_decode_input_queue_size` | int (kB) | `65536` | pending 输入缓存上限，超限触发 WAL 读取流控 |
+| `parallel_decode_result_queue_size` | int (kB) | `16384` | Result Store 内存上限，超限按事务 spill 到磁盘 |
+| `parallel_decode_fallback` | enum (`serial`/`wait`) | `serial` | 安全性无法证明时的回退策略 |
 
-**Statistics View**: `pg_stat_parallel_decode` — one row per replication slot/session with worker states, pending transaction count, queue/spill bytes, invalidation catch-up wait, output lag, fallback/restart counts, plugin timing.
+**统计视图**：`pg_stat_parallel_decode`——按复制槽/会话一行，包含 Worker 状态数、pending 事务数、队列与 spill 字节、失效追平等待、输出 lag、回退/重建计数、插件耗时。
 
-**Replication Protocol**: No new messages or capability bits. Output byte stream is identical to serial decoding, ordered by commit LSN.
+**复制协议**：不新增消息或能力位。输出字节流与串行解码按提交序一致。
 
-**Output Plugin Interface**: In the baseline mode (centralized call), plugin API is unchanged. In the extended mode (Worker call), plugins must declare parallel support; undeclared plugins automatically use centralized call.
+**输出插件接口**：基线模式（集中调用）下插件 API 不变。扩展模式（Worker 调用）需要插件声明并行支持；未声明的插件自动使用集中调用。
 
-**Client Impact**: None. Subscribers of any version connect without negotiation changes.
+**客户端影响**：无。任意版本的订阅端无需协商即可连接。
 
-### Implementation
+### 实现
 
-#### Process Architecture
+#### 进程架构
 
 ```
 postmaster
-├── walsender (per replication connection)
-│   ├── WAL reading + transaction identification + global SnapBuild
-│   ├── Scheduler (pending queue, worker assignment)
-│   ├── Result collection + output ordering (Result Store)
-│   └── Protocol output (sole writer)
-└── Decode Worker 1..N (per session, dynamic background workers)
-    ├── Private ReorderBuffer (per-transaction scoped)
-    ├── Local relcache/syscache (with invalidation tracking)
-    └── Decode computation (centralized: intermediate results / Worker: private plugin)
+├── walsender（每个复制连接一个）
+│   ├── WAL 读取 + 事务识别 + 全局 SnapBuild
+│   ├── 调度（pending queue、Worker 分配）
+│   ├── 结果收集与输出排序（Result Store）
+│   └── 协议输出（唯一写者）
+└── Decode Worker 1..N（每会话，动态后台 Worker）
+    ├── 私有 ReorderBuffer（仅含被授权事务）
+    ├── 本地 relcache/syscache（含失效跟踪）
+    └── 解码计算（集中调用：产出中间结果 / Worker 调用：持有私有插件实例）
 ```
 
-#### Key Mechanism: ReorderBuffer Split
+#### 关键机制：ReorderBuffer 职责拆分
 
-The serial `ReorderBuffer` is decomposed by transaction scope:
+串行 `ReorderBuffer` 按事务作用域拆分：
 
-| Responsibility | Owner |
+| 职责 | 归属 |
 |---|---|
-| XID classification, subxact→top-level mapping | walsender |
-| Transaction boundary detection (COMMIT/ABORT) | walsender |
-| Per-transaction change buffering + disk spill | Worker |
-| TOAST reassembly | Worker |
-| Commit-time catalog invalidation + decode | Worker |
-| Commit-order output | walsender |
+| XID 分类、子事务→顶层映射 | walsender |
+| 事务边界识别（COMMIT/ABORT） | walsender |
+| 每事务变更缓冲 + 磁盘 spill | Worker |
+| TOAST 重组 | Worker |
+| 提交时目录失效应用与解码 | Worker |
+| 提交序输出 | walsender |
 
-#### Key Mechanism: Snapshot Versioning
+#### 关键机制：快照版本化
 
-- walsender generates snapshot versions at `RUNNING_XACTS` boundaries using `SnapBuildGetOrBuildSnapshot`
-- Each version is serialized via `SerializeSnapshot` and broadcast to all Workers
-- Workers cache versions in a 16-entry table and use `ReorderBufferSetBaseSnapshot` to attach the correct version per transaction
-- Invariant: transaction T must use the snapshot corresponding to T's commit record LSN
+- walsender 在 RUNNING_XACTS 边界调用 `SnapBuildGetOrBuildSnapshot` 生成快照版本
+- 每个版本经 `SerializeSnapshot` 序列化后广播到全部 Worker
+- Worker 在 16 条版本表中缓存，解码时用 `ReorderBufferSetBaseSnapshot` 挂接正确版本
+- 不变量：事务 T 必须使用 T 提交记录 LSN 对应的快照版本
 
-#### Key Mechanism: Catalog Invalidation Catch-up
+#### 关键机制：目录失效追平
 
-- walsender extracts `xl_xact_invals` from commit records and broadcasts as INVAL events
-- Workers execute `LocalExecuteInvalidationMessage` locally, advancing `consumed_event_id`
-- Over-execution of invalidations is safe (only clears caches; visibility determined by snapshot)
-- Under-execution is unsafe (stale cache entries reused across versions)
-- Slot position candidates (`restart_lsn`/`catalog_xmin`) are gated by the minimum `consumed_event_id` across all in-flight Workers
+- walsender 从提交记录提取 `xl_xact_invals`，作为 INVAL 事件广播
+- Worker 本地执行 `LocalExecuteInvalidationMessage`，推进 `consumed_event_id`
+- 失效**提前执行安全**（只清缓存，可见性由快照决定）；**欠执行不安全**（过期缓存条目被跨版本复用）
+- 槽位置候选（`restart_lsn`/`catalog_xmin`）受全部在途 Worker 的最小 `consumed_event_id` 门控
 
-#### Dispatch Points in decode.c
+#### decode.c 分流点
 
-| Record type | Parallel mode behavior |
+| 记录类型 | 并行模式行为 |
 |---|---|
-| HEAP/HEAP2 (DML) | `ParallelDecodeDispatchRecord` → Worker task queue |
-| COMMIT | Publish invalidations → `ParallelDecodeDispatchCommit` |
+| HEAP/HEAP2（DML） | `ParallelDecodeDispatchRecord` → Worker task 队列 |
+| COMMIT | 先发布失效事件 → `ParallelDecodeDispatchCommit` |
 | ABORT | `ParallelDecodeDispatchAbort` |
 | RUNNING_XACTS | `SnapBuildProcessRunningXacts` → `ParallelDecodePublishSnapshot` |
-| Non-transactional logical message | Flush output queue to this LSN, then emit |
+| 非事务逻辑消息 | 先冲刷输出队列到当前 LSN，再输出消息 |
 
-#### Worker Input Transport (two options)
+#### Worker 输入获取方式（两个候选）
 
-| Aspect | Option A: per-record | Option B: LSN range |
+| 维度 | 方案 A：逐条记录下发 | 方案 B：LSN 区间授权 |
 |---|---|---|
-| Worker input | Record bytes via task queue | LSN range + subxact map; Worker reads WAL |
-| IPC volume | Proportional to change count | Control messages only |
-| walsender CPU | Parse + copy per record | Parse record header only |
-| Implementation | Simple; validated first | Complex; requires Worker-side WAL reader |
+| Worker 输入 | 记录字节经 task 队列发送 | 只发 LSN 区间；Worker 自行读 WAL |
+| IPC 流量 | 与变更数成正比 | 只有控制消息 |
+| walsender CPU | 解析 + 拷贝，每条记录一次 | 只读记录头，负担最低 |
+| 实现复杂度 | 低，先验证正确性 | 高，需要 Worker 侧 WAL reader 生命周期管理 |
 
-Baseline: Option A. Switch to B if benchmarks show walsender as bottleneck.
+基线：方案 A。若基准显示 walsender 为瓶颈，切换方案 B。
 
-#### Output Plugin Call Position (two modes)
+#### 插件调用位置（两个候选）
 
-| Mode | Description | Plugin compatibility | Benefit |
+| 模式 | 描述 | 插件兼容性 | 收益 |
 |---|---|---|---|
-| Centralized call (baseline) | Worker produces intermediate results; walsender calls plugin serially | All existing plugins unchanged | Correctness-first |
-| Worker call (extension) | Worker loads private plugin instance, outputs protocol frames directly | Requires capability declaration | Parallelizes segment (d) |
+| 集中调用（基线） | Worker 产出中间结果；walsender 单一后端按序调用插件 | 所有现有插件不变 | 正确性优先 |
+| Worker 调用（扩展） | Worker 加载私有插件实例，直接产出协议帧 | 需要插件声明并行支持 | 并行化段 (d) |
 
-Decision: Start with centralized call. Switch to Worker call if segment (d) > 30% of CPU time (measured in stage 1 benchmark).
+决策：先做集中调用。阶段 1 基准中段 (d) 占比超过 30%（阈值暂定）时推进 Worker 调用。
 
-### Compatibility
+### 兼容性
 
-| Client | Behavior |
+| 使用方 | 行为 |
 |---|---|
-| PG subscriber, any version, `streaming = off` | Unaffected (output identical to serial) |
-| PG subscriber, `streaming = on/parallel` | Entire slot falls back to serial |
-| `pg_recvlogical`, Debezium, pglogical | Unaffected |
-| `pgoutput` protocol v3/v4/v6 | Unchanged |
-| `parallel_decode = off` | Original serial path |
+| PG 订阅端，任意版本，`streaming = off` | 不受影响（输出与串行一致） |
+| PG 订阅端，`streaming = on/parallel` | 整槽回退串行 |
+| `pg_recvlogical`、Debezium、pglogical | 不受影响 |
+| `pgoutput` 协议 v3/v4/v6 | 不变 |
+| `parallel_decode = off` | 恢复原串行路径 |
 
-**Plugin compatibility**: Centralized call mode: zero API changes. Worker call mode: requires `OutputPluginCallbacks` parallel support flag; undeclared plugins use centralized call.
+**插件兼容性**：集中调用模式零 API 变化。Worker 调用模式需要 `OutputPluginCallbacks` 的并行支持标志；未声明的插件自动使用集中调用。
 
-**Upgrade/downgrade**: GUC default `off`; behavior unchanged after pg_upgrade. Rollback = disable GUC.
+**升级/降级**：GUC 默认 `off`，升级后行为不变。回退 = 关闭 GUC。
 
-**Resource**: Workers consume `max_worker_processes` quota. Insufficient quota → fewer workers or full serial, with WARNING; connections never rejected.
+**资源约束**：Worker 占用 `max_worker_processes` 配额。不足时降级为更少 Worker 或完全串行，记 WARNING，不拒绝连接。
 
-### Performance
+### 性能
 
-**Metrics** (per-slot via `pg_stat_parallel_decode`): worker states, pending transactions, queue/spill bytes, invalidation wait time, output lag, plugin timing, fallback count, restart count.
+**指标**（按槽维度，`pg_stat_parallel_decode`）：Worker 状态、pending 事务数、队列/spill 字节、失效追平等待、输出 lag、插件耗时、回退/重建计数。
 
-**Benchmark plan** (minimum):
-1. Many independent small transactions
-2. Few large transactions
-3. Interleaved multi-transaction writes
-4. High catalog access / system table changes
-5. DDL interleaved with DML (triggering catalog invalidation)
-6. Worker pool saturation + queue backpressure
-7. Worker failure + cancel + reconnect
-8. Slow plugin / slow network (observing head-of-line blocking)
-9. Non-transactional logical messages interleaved
-10. `two_phase` slots (serial fallback verification)
-11. Serial vs parallel comparison
+**基准计划**（最少覆盖）：
+1. 大量互不相关的小事务
+2. 少量大事务
+3. 多事务交错写入
+4. 高目录访问与系统表变化
+5. DDL 与 DML 交错（触发目录失效追平）
+6. Worker 池饱和 + 队列流控
+7. Worker 故障 + 取消 + 重连
+8. 慢插件/慢网络（观察 head-of-line 阻塞）
+9. 非事务逻辑消息交错
+10. `two_phase` 槽（验证串行回退）
+11. 串行 vs 并行对照
 
-**Performance targets** (provisional, calibrated by benchmark):
+**性能目标**（暂定，基准校准后确认）：
 
-| Metric | Target |
+| 指标 | 目标 |
 |---|---|
-| Small transaction throughput | ≥1.5× (2 workers), ≥2× (4 workers) |
-| Large transaction | ≥0.9× of serial |
-| Latency P99 | ≤1.2× of serial |
-| Serial path regression (`off`) | <3% deviation from unmodified PG18 |
+| 小事务吞吐 | ≥1.5×（2 Worker）、≥2×（4 Worker） |
+| 大事务 | ≥串行的 0.9× |
+| 延迟 P99 | ≤串行的 1.2× |
+| 串行路径回归（`off`） | 与不含本特性的 PG18 偏差 <3% |
 
-------------------------------------------------------------------------
+---
 
-## Alternatives Considered
+## 已考虑的备选方案
 
-### 1. openGauss parallel decoding
+### 1. openGauss 并行解码
 
-openGauss 3.0.0+ implements publisher-side parallel logical decoding using a thread-based architecture (reader thread + N decoder threads + sender thread in one process, communicating via lock-free ring queues).
+openGauss 3.0.0+ 在发布端实现了并行逻辑解码，使用线程架构（同一进程内的 reader 线程 + N 个 decoder 线程 + sender 线程，经无锁环形队列通信）。
 
-**Why not adopted**: openGauss's three premises relax PostgreSQL's hardest constraints:
-- Thread model eliminates cross-process serialization cost (pointer passing suffices)
-- Custom output protocol (text/json/binary) bypasses plugin ecosystem and byte-level equivalence
-- No DDL decoding avoids catalog consistency entirely
+**不采纳的原因**：openGauss 的三个前提放宽了 PostgreSQL 最难约束——线程模型消除了跨进程序列化成本（传指针即可）；自有输出协议（text/json/二进制）绕开了插件生态与字节级等价；不支持 DDL 解码回避了目录一致性问题。PostgreSQL 的进程模型、插件生态和协议兼容要求不可放宽，必须正面解决跨进程序列化、插件调用位置和目录一致性这三件 openGauss 绕开的事。
 
-PostgreSQL's process model, plugin ecosystem, and protocol compatibility cannot be relaxed. The design must solve cross-process serialization (§5.2), plugin call position (§5.3), and catalog consistency (§4.5) that openGauss avoids.
+**借鉴点**：reader/decoder/sender 三级流水线验证了总体结构；事务固定线程 + LSN 序输出印证了调度模型。
 
-**What is borrowed**: The reader/decoder/sender three-stage pipeline validates the overall structure. Transaction-per-thread + LSN-ordered output confirms the scheduling model.
+### 2. PolarDB（开源）
 
-### 2. PolarDB (open source)
+已核实：开源 PolarDB-PG **没有**发布端并行逻辑解码实现。其"并行回放"特性是备库物理 WAL 回放（LogIndex + 页级分发），属于不同问题域。
 
-Verified: open source PolarDB-PG has **no publisher-side parallel logical decoding implementation**. Its "parallel replay" feature is standby physical WAL replay (LogIndex + page-tag dispatch), which is a different problem domain.
+### 3. 订阅端并行 Apply（PG 18 已有）
 
-### 3. Subscriber-side parallel apply (existing PG 18)
+PG 18 的 `applyparallelworker.c` 有完全相同的**机制**（leader + worker 池、DSM/shm_mq、一事务一 Worker、serialize_changes 回退），但解决的是**不同问题**（向表应用 DML vs 解码 WAL 记录）。目录一致性模型根本不同：apply Worker 用当前快照 + sinval；decode Worker 需要历史快照 + 显式失效事件。
 
-PG 18's `applyparallelworker.c` has identical *mechanism* (leader + worker pool, DSM/shm_mq, one-txn-one-worker, serialize_changes fallback) but solves a *different problem* (applying DML to tables vs decoding WAL records). The catalog consistency model differs fundamentally: apply workers use current snapshots + sinval; decode workers need historic snapshots + explicit invalidation events.
+### 4. 给 relcache/syscache 做快照版本化
 
-### 4. Cache versioning for relcache/syscache
+否决：relcache/syscache 是全局单版本结构。版本化等于重写缓存子系统。
 
-Rejected: relcache/syscache are globally single-version structures. Versioning them equals rewriting the cache subsystem.
+### 5. Worker 绕过缓存直接读堆表
 
-### 5. Worker bypasses cache, reads heap directly
+否决：正确但目录查找是解码热点，性能不可接受。
 
-Rejected: Correct but catalog lookup is a decode hotspot; performance unacceptable.
+### 6. Worker 内重放 DDL
 
-### 6. Worker replays DDL
+否决：不可行且无必要——失效语义（清条目）已足够。
 
-Rejected: Infeasible and unnecessary — invalidation semantics (clear entries) suffice.
+---
 
-------------------------------------------------------------------------
+## 开放问题
 
-## Open Questions
+1. **Worker 调用模式阈值**：段 (d) 占比多少才值得实现 Worker 调用？（暂定 30%。需基准校准。）
 
-1. **Worker call mode threshold**: What percentage of segment (d) justifies implementing Worker call? (Provisional: 30%. Needs benchmark calibration.)
+2. **快照版本表淘汰**：16 条 LRU + refcount 淘汰正确但可能需要针对跨多个 RUNNING_XACTS 边界的并发事务做调优。
 
-2. **Snapshot version table eviction**: The 16-entry LRU with refcount-based eviction is correct but may need tuning for workloads with many concurrent transactions spanning multiple RUNNING_XACTS boundaries.
+3. **子事务映射传递**：当前按 `top_xid != xid` 逐条发送，处理直接父子关系，但不处理 ASSIGNMENT 记录中累积的映射。完整方案需要在任务消息中扩展 subxid 列表。
 
-3. **Subtransaction mapping transfer**: Current approach sends `top_xid != xid` per record, which handles direct parent-child but not accumulated ASSIGNMENT record mappings. Full solution requires extending the task message with subxid lists.
+4. **Result Store 磁盘 spill**：布局已定义（按事务文件、`ReorderBufferSerialize` 模式），实现推迟到内存-only 被证明不足时。
 
-4. **Result Store disk spill**: The current design describes the layout (per-transaction files, `ReorderBufferSerialize` pattern) but implementation is deferred until memory-only proves insufficient.
+5. **方案 B（LSN 区间授权）**：推迟到阶段 3。需要 Worker 侧 WAL reader 的生命周期管理和区间边界错误恢复。
 
-5. **Plan B (LSN range authorization)**: Deferred to stage 3. Requires Worker-side WAL reader lifecycle management and error recovery at range boundaries.
+6. **运行时模式切换**：参数在连接建立时固定。会话中切换（活跃事务处理、是否需重连）推迟。
 
-6. **Runtime mode switching**: Currently, parameters are fixed at connection establishment. Mid-session switching (active transaction handling, reconnection requirement) is deferred.
+7. **SQL 接口（`pg_logical_slot_get_changes`）**：首版范围外。可后续用同一池基础设施添加。
 
-7. **SQL interface (`pg_logical_slot_get_changes`)**: Out of scope for the first version. Can be added later using the same pool infrastructure.
+8. **交错输出协议**：若复制协议扩展为允许跨事务交错，需更新协议版本协商和订阅端状态机设计。
 
-8. **Interleaved output protocol**: If the replication protocol is extended to allow cross-transaction interleaving, the design must be updated with protocol version negotiation and subscriber-side state machine changes.
+---
 
-------------------------------------------------------------------------
+## 附录 A：术语表
 
-## Appendix A: Terminology
-
-| Term | Definition |
+| 术语 | 定义 |
 |---|---|
-| Decode Worker | Background worker process responsible for one top-level transaction's decode task |
-| Worker Pool | Fixed-capacity set of Decode Workers |
-| Pending Queue | Queue for transactions waiting for an idle Worker |
-| Event Stream | walsender-ordered channel for snapshot versions and catalog invalidations |
-| Catalog Invalidation Catch-up | Synchronization mechanism: walsender waits for Workers to consume invalidation events to a required position before advancing slot positions; semantically equivalent to Linux RCU quiescent state |
-| Result Store | walsender-side result buffer: memory-first, per-transaction disk spill on overflow |
-| Historic Snapshot | Historical snapshot used for transaction decoding; must correspond to the transaction's commit record LSN |
-| Centralized Call / Worker Call | Two output plugin execution positions: centralized in walsender single backend (baseline) / moved to Worker private plugin instance (extension, requires plugin declaration) |
-| Snapshot Version | Numbered instance of a historic snapshot generated by walsender; reused within a RUNNING_XACTS window |
+| Decode Worker | 后台 Worker 进程，负责一个顶层事务的解码任务 |
+| Worker Pool | 固定容量的 Decode Worker 集合 |
+| Pending Queue | 等待空闲 Worker 的事务队列 |
+| 事件流 | walsender 按序发布快照版本和目录失效的通道 |
+| 目录失效追平 | 同步机制：walsender 等待 Worker 将失效事件消费到指定位点后才推进槽位置；语义对应 Linux RCU 静默点 |
+| Result Store | walsender 侧结果缓冲：内存为主，超限按事务 spill 到磁盘 |
+| 历史快照 | 事务解码使用的快照；必须对应事务提交记录的 LSN |
+| 集中调用 / Worker 调用 | 插件回调的两种执行位置：集中在 walsender 单一后端（基线）/ 移入 Worker 私有插件实例（扩展） |
+| 快照版本 | walsender 生成的历史快照编号实例；RUNNING_XACTS 窗口内复用同一版本 |
