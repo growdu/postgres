@@ -24,7 +24,12 @@
 - [4. 关键设计决策](#4-关键设计决策)
   - [4.1 决策一：解码切分点——worker 负责到哪一层](#41-决策一解码切分点worker-负责到哪一层)
   - [4.2 决策二：提交顺序保证——commit barrier 与 FIFO 队列对比](#42-决策二提交顺序保证commit-barrier-与-fifo-队列对比)
-  - [4.3 决策三：worker 与事务的绑定关系](#43-决策三worker-与事务的绑定关系)
+  - [4.3 决策三：事务与 worker 的绑定关系](#43-决策三事务与-worker-的绑定关系)
+  - [4.4 事务亲和性与事务内顺序保证](#44-事务亲和性与事务内顺序保证)
+    - [4.4.1 绑定规则](#441-绑定规则)
+    - [4.4.2 事务内顺序的三重保证](#442-事务内顺序的三重保证)
+    - [4.4.3 与流式切分的交互](#443-与流式切分的交互)
+    - [4.4.4 多事务并发下的相互影响](#444-多事务并发下的相互影响)
 - [5. 进程间通信](#5-进程间通信)
   - [5.1 共享内存布局](#51-共享内存布局)
   - [5.2 消息定义](#52-消息定义)
@@ -172,10 +177,11 @@
 **decode worker 进程**
 
 1. 从与自己的共享内存队列取出 WAL 记录批次与事务上下文；
-2. 调用现有的 `heap_decode` / `heap2_decode` / `logicalmsg_decode` 完成解码，复用同一套解析函数，不改动解析语义；
-3. 在本地 reorder buffer 中按事务累积变更，达到阈值即切分流式分片；
-4. 通过 output plugin 生成协议字节，写入共享内存的结果区；
-5. 事务结束时（收到 commit/abort/cancel）执行该事务累积的目录失效消息，释放事务资源。
+2. 同时承载多个在途事务，每个事务的全部 WAL 记录都由本 worker 按 WAL 顺序处理（见 4.4）；
+3. 调用现有的 `heap_decode` / `heap2_decode` / `logicalmsg_decode` 完成解码，复用同一套解析函数，不改动解析语义；
+4. 在本地 reorder buffer 中按事务累积变更，达到阈值即切分流式分片；
+5. 通过 output plugin 生成协议字节，写入共享内存的结果区；
+6. 事务结束时（收到 commit/abort/cancel）执行该事务累积的目录失效消息，释放事务资源。
 
 **walsender 进程（主进程 / 发送进程）**
 
@@ -317,10 +323,16 @@ walreader            worker#0            walsender           订阅端
 
 因此最终设计为：**主路径 commit barrier；非流式订阅方走“整事务缓冲”退化路径。** 两种路径共用同一套 cseq 分配与水位管理，只是数据写出时机不同。
 
-### 4.3 决策三：worker 与事务的绑定关系
+### 4.3 决策三：事务与 worker 的绑定关系
+
+绑定关系有两个方向，必须分清：
+
+- **事务 → worker 是多对一**：一个 worker 可以同时承载多个并发事务；不存在“一个 worker 只服务一个事务”的限制，也不需要这样的限制。
+- **事务在 worker 之间不可迁移**：一个顶层事务从第一条 WAL 记录到最后一条，全程只由同一个 worker 处理。
 
 | 对比项 | 方案一：worker 生命周期 = 事务生命周期 | 方案二：一个 worker 同时处理多个并发事务 |
 | --- | --- | --- |
+| 绑定基数 | 一对一：一个 worker 同时只服务一个事务 | 多对一：一个 worker 承载多个在途事务 |
 | worker 状态 | 事务结束即释放，worker 空闲 | 长期持有多个在途事务 |
 | 负载均衡 | 事务粒度，天然均衡 | 需显式分配算法与再平衡 |
 | 关系缓存 | 每事务重建，RELATION 消息重复率高 | 跨事务复用，重复率低 |
@@ -333,9 +345,60 @@ walreader            worker#0            walsender           订阅端
 
 方案二带来的设计要求：
 
-- 事务分配策略：walreader 维护“事务→worker”绑定表与各 worker 的在途事务数，分配时选择在途事务最少的 worker（最小负载优先），并保证**同一顶层事务的全部 WAL 记录始终发往同一 worker**（事务内顺序不变）；
+- **事务分配策略**：walreader 维护“事务→worker”绑定表与各 worker 的在途事务数，分配时选择在途事务最少的 worker（最小负载优先）；
+- **绑定一旦建立即不可变**：同一顶层事务的全部 WAL 记录始终发往同一 worker，事务内顺序由此不变（详见 4.4）；
 - worker 的 reorder buffer 需支持多个并发在途事务，`rb->size` 的内存阈值需要按 worker 数量切分（`logical_decoding_work_mem` 语义从“每解码上下文”变为“每 worker”或总量均摊，见 12.2）；
 - 快照：每个事务有自己的 base snapshot（事实 2），worker 需为每个在途事务保存一份快照，事务结束时释放。
+
+### 4.4 事务亲和性与事务内顺序保证
+
+本节回答两个问题：**事务内的顺序靠什么保证？** 一个 worker 上并发多个事务会不会互相干扰？
+
+#### 4.4.1 绑定规则
+
+| 规则 | 说明 |
+| --- | --- |
+| 绑定时机 | 事务的**第一条** WAL 记录到达时分配 worker；此后不再变更 |
+| 绑定粒度 | 顶层事务 xid。子事务、事务型 logical message 跟随其顶层事务 |
+| 绑定唯一性 | 一个顶层事务在整个生命周期内只属于一个 worker |
+| 解绑时机 | 事务收到 commit / abort / cancel 后解绑，worker 回到空闲池 |
+| 禁止迁移 | 事务一旦绑定，后续 WAL 记录不因负载变化而改投其他 worker |
+
+禁止迁移的理由：事务的插件状态（`txn->output_plugin_private`）、tuplecid 哈希表、累积的变更、待执行的目录失效消息都保存在 worker 进程内。迁移需要把这些状态跨进程搬迁，代价高于短暂失衡本身。
+
+#### 4.4.2 事务内顺序的三重保证
+
+事务内顺序由三个环节串联保证，**不需要任何额外的序号机制**：
+
+1. **walreader 侧：单一来源 + 顺序追加。** walreader 是 WAL 的唯一读取者，它按 WAL 顺序读到的记录，依次追加到目标 worker 的 SPSC 队列尾部。SPSC 队列本身保序，因此队列中的记录序 = WAL 序。
+2. **worker 侧：单线程顺序消费。** worker 从自己的队列按到达顺序取批次，不并发处理同一条队列。不同事务的记录即使在队列中交错，每个事务的变更仍按其自身的到达顺序进入各自的 reorder buffer。
+3. **事务内状态单线程。** 一个事务在 worker 内只有一份 reorder buffer 状态（`ReorderBufferTXN`），其变更链表、命令 ID、目录失效消息都追加在这一个结构上。
+
+由此得到：**同一事务的 WAL 顺序 == 该事务在 worker 中的变更产出顺序 == 发往订阅端的字节顺序。**
+
+顺序由“绑定 + 顺序追加 + 单线程消费”共同成立；commit barrier（4.2）解决的是**事务之间**的顺序，两者作用在不同层面，互不替代。
+
+#### 4.4.3 与流式切分的交互
+
+一个 worker 上并发多个事务，它们共享同一个 reorder buffer，因此 `rb->size` 统计的是该 worker 上**所有在途事务**的聚合大小（事实 4、事实 5）。这带来两点：
+
+- 流式触发阈值变成“每 worker 聚合”，而非“每事务”。单个 worker 上的内存压力是其上事务大小之和；
+- 触发流式后，`ReorderBufferLargestStreamableTopTXN()`（`reorderbuffer.c:3592-3621`）在该 worker 的在途事务中挑选总字节数最大的顶层事务输出。被选中的事务仍然是“该 worker 上的某个事务”，其分片顺序仍由该事务自身的到达顺序决定。
+
+因此事务内顺序在流式路径上同样成立：分片是该事务变更序列的一段段连续切片，不会出现同一事务的分片乱序或交错。
+
+#### 4.4.4 多事务并发下的相互影响
+
+| 影响面 | 说明 | 是否影响事务内顺序 |
+| --- | --- | --- |
+| reorder buffer 内存 | `rb->size` 聚合统计，阈值按 worker 切分（12.2） | 否 |
+| 关系缓存 | 多个事务共用一个 `RelationSyncCache`，RELATION 消息的重复粒度是每 top-xid（事实 6） | 否 |
+| 目录失效 | 每个事务各自累积自己的失效消息，事务结束时各自执行（事实 3） | 否 |
+| 快照 | 每个事务各自持有一份拷贝后的快照（事实 2、6.3） | 否 |
+| 插件状态 | 每个事务一份 `output_plugin_private`，事务之间互不影响（4.1） | 否 |
+| 流式切分 | 事务级分片边界由 worker 聚合内存决定（4.4.3） | 否 |
+
+结论：**并发只发生在事务之间，事务内始终是单线程顺序执行。** 这正是把解码切分点选在事务级（4.1 方案 A）的原因——若切分点在变更级（方案 B），事务内的顺序就会被多个 worker 的并发写入打散。
 
 ## 5. 进程间通信
 
@@ -345,7 +408,7 @@ walreader            worker#0            walsender           订阅端
 
 | 区域 | 生产者 | 消费者 | 类型 | 说明 |
 | --- | --- | --- | --- | --- |
-| WAL 分发队列 × N | walreader | worker #i | SPSC 无锁环形队列 | 每 worker 一条，避免竞争 |
+| WAL 分发队列 × N | walreader | worker #i | SPSC 无锁环形队列 | 每 worker 一条，避免竞争；同一事务的记录按 WAL 顺序追加到同一条队列（4.4.2） |
 | 事务控制队列 | walreader | walsender | SPSC | cseq 分配结果、xmin 推进请求、keepalive 应答 |
 | 快照/失效区 | walreader | worker | 每 worker 一块环形区 | 事务级快照与目录失效消息 |
 | 解码结果区 | worker | walsender | 每 worker 一块环形区 | 协议字节块 + 事务结束/错误通知 |
@@ -536,7 +599,7 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 | --- | --- | --- |
 | commit / abort / cancel | **是**，严格按 cseq | 订阅端按到达顺序 apply 提交 |
 | prepare / commit prepared | **是**，与 commit 同一序列 | 两阶段提交的状态机要求 |
-| 事务内的变更顺序 | **是**，由 WAL 顺序与单 worker 保证 | 变更间的语义依赖 |
+| 事务内的变更顺序 | **是**，由事务与 worker 的绑定 + 顺序追加 + 单 worker 单线程消费保证（4.4.2） | 变更间的语义依赖 |
 | 不同事务的变更顺序 | **否** | 事实 4：PG 现状已允许乱序下发 |
 | 流式分片与提交消息的相对位置 | 分片可先于提交，提交不可先于本事务的全部分片 | 协议要求 |
 
@@ -615,7 +678,7 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 ### 11.2 程序内部接口
 
 - `ParallelDecodeCreate()` / `ParallelDecodeDestroy()`：共享内存与子进程管理；
-- `ParallelDecodeAssignTxn()`：事务→worker 绑定；
+- `ParallelDecodeAssignTxn()`：事务→worker 绑定（多对一，绑定后不可迁移，见 4.4）；
 - `ParallelDecodeAllocCommitSeq()`：提交序号分配；
 - `ParallelDecodePublishSnapshot()` / `ParallelDecodePublishInvalidations()`：快照与失效分发；
 - `ParallelDecodeSubmitBytes()`：worker 产出协议字节。
@@ -639,6 +702,7 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 ### 12.2 资源与内存
 
 - **解码内存**：现状 `logical_decoding_work_mem` 是单个解码上下文的阈值。改为多 worker 后，若每个 worker 都按该值分配，总内存上限为 N 倍。两种选择：(a) 保持 `logical_decoding_work_mem` 语义不变、总量为 N 倍，并在文档中明确；(b) 新增总量级 GUC，worker 均摊。**倾向 (b)**，避免用户无意中放大内存占用。
+- **阈值的作用域**：一个 worker 承载多个在途事务（4.3），`rb->size` 是该 worker 上所有在途事务的聚合大小，因此内存阈值实际约束的是“每 worker 总量”，而不是“每事务大小”。这与现状（单进程、单解码上下文、聚合语义）一致，只是聚合的边界从“进程”变成了“worker”。
 - **共享内存**：WAL 批次区 + 结果区，大小随并发事务数与在途字节量增长，需设定上限并纳入 `max_worker_processes` 与 `shared_buffers` 之外的独立核算。
 - **进程数**：walreader 1 + decode worker N，均为动态后台进程，占用 `max_worker_processes` 名额；与并行查询、并行 apply 的名额竞争需在文档中提示。
 
@@ -683,7 +747,7 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 | --- | --- | --- | --- |
 | Q1 | 提交顺序方案 | commit barrier / FIFO | commit barrier（4.2） |
 | Q2 | 解码切分点 | 事务级 A / 变更级 B / A+关系表 C | A 为主，C 为后续优化（4.1） |
-| Q3 | worker 与事务绑定 | 事务生命周期 / 多事务并发 | 多事务并发（4.3） |
+| Q3 | 事务→worker 绑定基数 | 一对一 / 多对一 | 多对一：一个 worker 承载多个事务，绑定后不可迁移（4.3、4.4） |
 | Q4 | 关系消息重复 | 容忍 / 共享关系表 | 首版容忍（4.1） |
 | Q5 | 解码内存语义 | 每 worker 独立 / 总量均摊 | 总量均摊（12.2） |
 | Q6 | 流式切分默认档 | buffered / immediate | 默认 buffered，`immediate` 按需开启（8.1） |
@@ -737,3 +801,4 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 | --- | --- | --- |
 | v0.1 | 2026-11-17 | 初稿：完成 `need.md` 需求说明书 |
 | v0.2 | 2026-11-18 | 重构为 walreader / decode worker / walsender 三进程模型；补充 commit barrier 与 FIFO 的对比与选型；补充快照事件流、tuplecid 传递与 xmin 跨进程聚合；补充低拷贝策略与可消除拷贝的分析；统一为标准 Markdown 格式并补充目录与术语表；新增第 16 章实现计划 |
+| v0.3 | 2026-11-18 | 明确事务与 worker 的绑定方向为多对一：新增 4.4 节，说明事务亲和性规则、事务内顺序的三重保证、与流式切分的交互及多事务并发的相互影响；同步更新 3.1、5.1、7.4、11.2、12.2、15 章与 `need.md` 的 FR/约束/验收 |
