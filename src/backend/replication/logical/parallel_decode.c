@@ -582,6 +582,16 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 			return true;
 
 		/*
+		 * The session may be winding down: the walsender that started it may
+		 * be gone, or it may have asked the participants to stop.  In both
+		 * cases there is nothing left to wait for.
+		 */
+		if (ctl == NULL || ctl->shutdown)
+			return false;
+		if (!ParallelDecodeProcessAlive(ctl->walsender_pid))
+			return false;
+
+		/*
 		 * Clear the latch before looking at the queues.  A frame that arrives
 		 * after this point sets the latch again, so the wait below returns
 		 * immediately; a frame that arrived before is found by the receive.
@@ -608,27 +618,59 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 			{
 				/*
 				 * The worker is gone, so the frames it was going to produce
-				 * will never arrive.  The session cannot continue.
+				 * will never arrive.  When the session is winding down, that
+				 * is what happens; otherwise the session cannot continue.
 				 */
-				if (!ParallelDecodeProcessAlive(ctl->workers[worker].pid))
-					return false;
+				if (!ParallelDecodeProcessAlive(parallel_decode_worker_pids[worker]))
+				{
+					if (ctl->shutdown)
+						return false;
+
+					ereport(ERROR,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("the parallel decode worker died unexpectedly"),
+							 errdetail("Decode worker %d is gone.", worker)));
+				}
 			}
 		}
 
 		if (got_message)
 			continue;
 
-		/* No frame yet.  Check whether the session is still alive. */
-		if (ctl == NULL || ctl->shutdown)
-			return false;
-		if (!ParallelDecodeProcessAlive(ctl->walsender_pid))
-			return false;
+		/*
+		 * No frame yet.  Check that the participants of the session are still
+		 * there: without them no new frame can arrive.
+		 *
+		 * The walreader is the only reader of the WAL, so without it no new
+		 * record can arrive and the session cannot continue.
+		 */
+		if (!ParallelDecodeProcessAlive(ctl->walreader_pid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("the parallel decode walreader died unexpectedly")));
+
 		for (worker = 0; worker < parallel_decode_num_workers; worker++)
 		{
-			if (!ParallelDecodeProcessAlive(ctl->workers[worker].pid))
+			/*
+			 * A worker that has not claimed its slot yet is still starting
+			 * up.  It is not dead, so the session has to wait for it.
+			 */
+			if (ctl->workers[worker].status == PD_WORKER_STATUS_UNUSED)
+			{
+				if (!ParallelDecodeProcessAlive(parallel_decode_worker_pids[worker]))
+					ereport(ERROR,
+							(errcode(ERRCODE_INTERNAL_ERROR),
+							 errmsg("the parallel decode worker died unexpectedly"),
+							 errdetail("Decode worker %d died before it joined the session.",
+									   worker)));
+				continue;
+			}
+
+			if (!ParallelDecodeProcessAlive(parallel_decode_worker_pids[worker]))
 				ereport(ERROR,
 						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("the parallel decode worker died unexpectedly")));
+						 errmsg("the parallel decode worker died unexpectedly"),
+						 errdetail("Decode worker %d is gone.", worker)));
 		}
 
 		/*
