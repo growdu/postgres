@@ -43,10 +43,13 @@
 
 | 类别 | 内容 | 特性 |
 | --- | --- | --- |
-| 控制信息 | `standby`（RUNNING_XACTS）、`xlog`、`xact`（COMMIT/ABORT/PREPARE/ASSIGNMENT/INVALIDATIONS）、`heap2` 的 `XLOG_HEAP2_NEW_CID` | 数量少、需全局顺序、必须由单一进程维护 |
+| walreader 独占处理 | `standby`（RUNNING_XACTS）、`xlog`、`xact` 的 COMMIT/ABORT/PREPARE | 数量少、需全局顺序、必须由单一进程维护 |
+| 门控后转发给 worker | `xact` 的 ASSIGNMENT / INVALIDATIONS、`heap2` 的 `XLOG_HEAP2_NEW_CID`、全部 `heap` / `heap2` 数据记录、事务型 `message` | 携带**事务内部状态**（子事务归属、tuplecid、命令 ID、失效消息），只有持有该事务的 worker 才能消费 |
 | 数据信息 | `heap`（INSERT/UPDATE/DELETE/TRUNCATE/CONFIRM）、`heap2` 的 `XLOG_HEAP2_MULTI_INSERT`、事务型 `message` | 数量大、CPU 密集、可按事务独立并行 |
 
 数据信息占解码开销的绝大部分，且天然可按顶层事务切分——这是本特性的并行切分依据。
+
+**下发给 worker 的是原始 WAL 记录，而不是翻译后的语义事件。** 命令 ID、失效消息、tuplecid 映射都能从记录本身重建；翻译成语义消息就要额外维护三套重复状态，且每一套都要与 WAL 位置严格对齐——这正是并行化最容易出错的地方。
 
 ### 2.4 目标架构
 
@@ -54,9 +57,9 @@
 
 | 进程 | 职责 |
 | --- | --- |
-| **walsender（主进程 / 发送进程）** | 启动并监控 walreader 与 decode worker；持有复制槽与 CopyBoth 连接；负责全部网络收发；按提交序号输出 commit/abort/cancel；推进 `confirmed_flush`；代 walreader 执行复制槽的 xmin 推进 |
-| **walreader** | 唯一的 WAL 读取者；驱动 snapbuild 前进至 consistent；按顶层事务把数据类 WAL 路由到对应 worker；解析控制类 WAL；为每个事务结束事件分配提交序号并上报 walsender；向 worker 分发快照与目录失效通知 |
-| **decode worker** | 从共享内存队列取 WAL 批次与事务上下文；**同时承载多个在途事务**，每个事务的全部 WAL 记录由本 worker 按 WAL 顺序处理；复用现有解析函数完成解码；在本地 reorder buffer 中累积变更并切分流式分片；通过 output plugin 生成协议字节写入共享内存；解码完成即通知 walsender 可以发送 |
+| **walsender（主进程 / 发送进程）** | 启动并监控 walreader 与 decode worker；持有复制槽与 CopyBoth 连接；负责全部网络收发；按提交序号输出 commit/abort/cancel；推进 `confirmed_flush`；代 walreader 执行复制槽的 **xmin 与 restart_lsn** 推进 |
+| **walreader** | 唯一的 WAL 读取者；驱动 snapbuild 前进至 consistent；按顶层事务把 WAL 记录路由到对应 worker；分配 base snapshot 并通过快照版本池下发；广播无 xid 的目录失效；为每个事务结束事件分配提交序号并上报 walsender；维护事务→worker 绑定表与在途字节水位 |
+| **decode worker** | 从共享内存队列取 WAL 批次与事务上下文；**同时承载多个在途事务**，每个事务的全部 WAL 记录由本 worker 按 WAL 顺序处理；复用现有解析函数完成解码；在本地 reorder buffer 中累积变更并切分流式分片；通过 output plugin 生成协议字节写入共享内存；事务结束事件处理完毕后向 walsender 回执 |
 
 三者通过共享内存队列通信。**改动只落在发布端，订阅端机制与代码零改动。**
 
@@ -64,8 +67,8 @@
 
 | 编号 | 目标 | 度量方式 |
 | --- | --- | --- |
-| G1 | 提升发布端解码吞吐 | tpcc 100 万 tpm 场景下，逻辑复制 WAL 同步速率达到 **70MB/s**（以 `confirm_flush_lsn` 速率为准） |
-| G2 | 解码结果与原串行实现等价 | 开启/关闭并行解码，同一套负载产生的逻辑变更内容与顺序完全一致 |
+| G1 | 提升发布端解码吞吐 | tpcc 100 万 tpm 场景下，逻辑复制 WAL 同步速率达到 **70MB/s**（以**发布端实际发出的协议字节速率**为准；不能用 `confirm_flush_lsn` 速率——并行模型下事务数据可乱序下发，该指标会虚高，理由见 `design.md` 7.4） |
+| G2 | 解码结果与原串行实现**语义等价** | 开启/关闭并行解码，同一套负载下：每个事务内部的变更内容与顺序与 WAL 顺序**逐条一致**；事务结束事件（commit/abort/cancel）的顺序一致；订阅端最终 apply 的结果一致。**允许**的差异：RELATION 消息冗余（每 worker 一份关系缓存）、事务之间的数据下发顺序不同、流式分片的切点不同 |
 | G3 | 保证提交顺序 | 订阅端收到的 commit/abort/cancel 顺序与 WAL 中的提交顺序完全一致；事务数据本身允许乱序（与现有串行语义一致） |
 | G4 | 事务完整 | 子事务与顶层事务合并为一个完整事务，不拆分、不丢变更 |
 | G5 | 流式尽早发送 | 大事务边解码边发送，不等整个事务解码完成才开始传输 |
@@ -79,8 +82,10 @@
 - 发布端拆分为 walreader、decode worker、walsender 三进程，walsender 作为主进程；
 - walreader 与 worker 之间、worker 与 walsender 之间的共享内存通信与调度；
 - 按顶层事务分配 worker、维护事务→worker 绑定（一个事务只交给一个 worker，一个 worker 可承载多个事务）；
-- 提交序号（cseq）的分配与基于 cseq 的 commit/abort/cancel 顺序输出；
-- 一致性快照在 worker 间的分发，以及目录失效消息随 WAL 变化及时送达 worker；
+- 提交序号（cseq）的分配与基于 cseq 的 commit/abort/cancel 顺序输出，**barrier 靠 worker 的结束事件确认推进（含空事件）**；
+- **wire 上的分帧顺序保证**：同一时刻只允许一个打开的流段，同一事务的字节整块连续（FR-18）；
+- **复制槽两个水位（xmin 与 `restart_lsn`）的跨进程聚合**（FR-12）；
+- 一致性快照在 worker 间的分发（base snapshot 由 walreader 分配并下发），以及目录失效消息随 WAL 变化及时送达 worker；
 - 并行模式下的错误传播、worker 异常退出处理；
 - 故障恢复：worker / walreader / walsender 崩溃与数据库重启后的会话重建；
 - 相关 GUC、监控指标与文档。
@@ -88,32 +93,44 @@
 ### 4.2 范围外
 
 - **订阅端**：并行 apply 已由 PG16+ 的流复制协议提供，本特性不改动订阅端任何代码与机制。
-- **非流复制协议场景**：未开启 streaming 的订阅方，其事务仍走原有串行解码路径。发布端可以同时支持两类订阅方，但只有流复制订阅方能受益于并行解码。
 - **物理复制**、逻辑复制插件（output plugin）自身的接口与行为。
-- **快照构建（snapbuild）本身的并行化**：快照仍由 walreader 独占维护，worker 只持有快照副本与事件流。
+- **快照构建（snapbuild）本身的并行化**：快照仍由 walreader 独占维护，worker 只持有 base snapshot 的副本，并从原始 WAL 记录自行重建命令 ID、失效消息与 tuplecid。
 - **WAL 读取的并行化**：WAL 只能有一个读取者（walreader），不引入 WAL 读取的多进程拆分。
+
+### 4.3 非流式订阅方（退化路径）
+
+未开启 streaming 的订阅方**仍走并行路径**，但输出形态退化为"整事务缓冲"：worker 不切分分片，整个事务的协议字节构成一个完整的块，在该事务的提交序号轮到时整块写出。
+
+与串行路径的差别有两处，都必须显式处理：
+
+- **不再落盘**：现状非流式路径用 `ReorderBufferSerializeTXN()` 写临时文件、提交时回放。但落盘路径在多 worker 下会**互删文件**（所有 worker 共享 `pg_replslot/<slot>/` 目录，`ReorderBufferCleanupSerializedTXNs()` 会删掉该目录下所有 `xid*` 文件，而它在每个 worker 的启动与退出时都会被调用），且依赖进程全局的 `MyReplicationSlot`（worker 进程里为 NULL）。因此并行模式下禁用落盘，改为**内存整事务缓冲**，代价是内存占用与事务大小成正比。
+- **待提交区必须与结果区分离**：整事务字节要整块挂在待提交区等自己的提交序号，若待提交区与 worker 的结果区共享容量，会形成死锁（worker 想写自己的事务字节但空间被挂起区占满；挂起区等提交序号，提交序号又等那个 worker 写出字节）。因此待提交区与结果区分离，或让提交序号队头事务的字节直通 socket。
+
+只有流式订阅方能真正受益于并行解码；非流式订阅方的收益仅限"解码算力并行"，而其 wire 占用时间反而变长。
 
 ## 5. 功能需求
 
 | 编号 | 需求 |
 | --- | --- |
-| FR-1 | walsender 作为主进程，负责启动、监控与重启 walreader 和 decode worker，持有复制槽与订阅端 CopyBoth 连接，负责全部网络收发与 `confirmed_flush` 的推进。 |
-| FR-2 | walreader 是唯一的 WAL 读取者，负责驱动 snapbuild 前进至 consistent 状态，并解析全部控制类 WAL（`xact`、`standby`、`xlog`、`XLOG_HEAP2_NEW_CID`）。 |
-| FR-3 | walreader 按顶层事务 ID 把数据类 WAL 路由到绑定的 decode worker，并维护事务→worker 绑定表与各 worker 的在途事务数；新事务分配给在途事务最少的 worker。 |
-| FR-4 | **事务与 worker 的绑定是多对一的**：一个顶层事务的全部 WAL 必须由同一个 worker 处理，事务内 WAL 顺序不得改变；一个 worker 可以同时承载多个并发事务。绑定在事务的第一条 WAL 记录到达时建立，直到事务 COMMIT/ABORT/CANCEL 才解除，期间不得迁移到其他 worker。 |
-| FR-5 | walreader 为每个事务结束事件（commit/abort/cancel）按 WAL 提交顺序分配提交序号 cseq，并上报 walsender。 |
+| FR-1 | walsender 作为主进程，负责启动、监控 walreader 和 decode worker，持有复制槽与订阅端 CopyBoth 连接，负责全部网络收发与 `confirmed_flush` 的推进。**子进程异常一律终止本次复制会话并按第 17 章重建会话，不做进程级重启**——worker 注册为 `bgw_restart_time = BGW_NEVER_RESTART` 的后台进程，自动重启会让同一事务被拆到两个 worker。 |
+| FR-2 | walreader 是唯一的 WAL 读取者，负责驱动 snapbuild 前进至 consistent 状态，并解析全部控制类 WAL（`xact`、`standby`、`xlog`）。 |
+| FR-3 | walreader 按顶层事务 ID 把数据类 WAL 路由到绑定的 decode worker，并维护事务→worker 绑定表与各 worker 的**在途字节数**；新事务分配给在途字节最少的 worker（按事务数分配会被大事务误导，见 `design.md` 4.5.1）。 |
+| FR-4 | **事务与 worker 的绑定是多对一的**：一个顶层事务的全部 WAL 必须由同一个 worker 处理，事务内 WAL 顺序不得改变；一个 worker 可以同时承载多个并发事务。绑定在事务的第一条 WAL 记录到达时建立，直到事务 COMMIT/ABORT/CANCEL 才解除，期间不得迁移到其他 worker。**例外：prepared 事务在 PREPARE 之后仍保持绑定与事务上下文（含 gid），直到 COMMIT PREPARED / ROLLBACK PREPARED**。 |
+| FR-5 | walreader 为每个事务结束事件（commit/abort/cancel/prepare）按 WAL 提交顺序分配提交序号 cseq，并上报 walsender。 |
 | FR-6 | decode worker 复用现有 `heap_decode` / `heap2_decode` / `logicalmsg_decode` 完成解码，经 output plugin 生成协议字节写入共享内存，完成后通知 walsender 可以发送。 |
-| FR-7 | walsender 按 cseq 顺序输出 commit/abort/cancel；事务数据允许乱序发送，与现有串行实现的语义一致（现有实现中事务数据本就不保证按提交顺序输出）。 |
-| FR-8 | 每个 worker 在解码事务前获得该事务对应的基础快照；解码过程中遇到目录失效、命令 ID 等事件时，walreader 须按 WAL 顺序及时通知 worker；无 xid 的失效消息由 walreader 本地执行。 |
-| FR-9 | 事务在 worker 内部累积到阈值即切分流式分片，边解码边发送，不等待整个事务解码完成。 |
-| FR-10 | `XLOG_RUNNING_XACTS` 清理的游离事务（无 COMMIT/ABORT）须通知对应 worker 取消该事务的解码并回收资源（对应 `PMSG_TXN_FINISH` 的结束类型 `cancel`）。 |
-| FR-11 | worker 内部报错须上报 walsender（对应 `PMSG_ERROR`），由 walsender 按现有逻辑复制错误语义终止本次复制会话；walsender 不得因单个 worker 故障而静默丢弃变更。 |
-| FR-12 | 复制槽的 xmin 推进由 walsender 代 walreader 执行，保证复制槽状态由单一进程维护。 |
-| FR-13 | 提供 GUC 控制并行解码的启停与 worker 数量，并提供相关监控项（至少含 worker 数量、事务平均解码耗时、队列积压深度、cseq 等待深度）。 |
+| FR-7 | walsender 按 cseq 顺序输出 commit/abort/cancel；**提交序号的推进依据是"结束事件被 worker 确认"而不是"提交消息到达"**——非流式事务的 abort 与游离事务的 cancel 在 wire 上不产生任何消息，若只在收到消息时推进，水位会永久空洞。事务数据允许乱序发送，与现有串行实现的语义一致（现有实现中事务数据本就不保证按提交顺序输出）。 |
+| FR-8 | 每个 worker 在解码事务前获得该事务对应的 **base snapshot**（由 walreader 分配并下发，worker 在回放时刻自行补齐子事务集合）；**无 xid 的失效消息必须广播给所有 worker**——每个 worker 有自己的 catcache/syscache/relcache，walreader 本地执行只能清掉自己的缓存，worker 会继续使用已失效的元数据。命令 ID、失效消息与 tuplecid 映射由 worker 从原始 WAL 记录自行重建。 |
+| FR-9 | 事务在 worker 内部累积到阈值即切分流式分片，边解码边发送，不等待整个事务解码完成。**单个流段必须有字节上限**——wire 上同一时刻只允许一个打开的流段，没有上限时段的独占时间无上界，并行解码的产出会被堵死。 |
+| FR-10 | `XLOG_RUNNING_XACTS` 清理的游离事务（无 COMMIT/ABORT）须通知对应 worker 取消该事务的解码并回收资源（对应 `PD_ENT_TXN_END` 的结束类型 `cancel`）。 |
+| FR-11 | worker 内部报错须上报 walsender（对应 `PD_ENT_ERROR`），由 walsender 按现有逻辑复制错误语义终止本次复制会话；walsender 不得因单个 worker 故障而静默丢弃变更。 |
+| FR-12 | 复制槽的水位推进由 walsender 代 walreader 执行，保证复制槽状态由单一进程维护。**两个水位都要跨进程聚合**：`xmin`（各 worker 上报的最小快照 xmin）与 `restart_lsn`（全局最老在途事务的 `restart_decoding_lsn`）——后者若不聚合，槽会周期性地跳过仍在 worker 中在途的事务，发布端重启后丢变更。 |
+| FR-13 | 提供 GUC 控制并行解码的启停与 worker 数量，并提供相关监控项（至少含 worker 数量、在途字节数、事务平均解码耗时、队列积压深度、cseq 等待深度、**最长挂起提交年龄**、walsender 输出帧率与 socket 写次数、跨进程唤醒速率）。 |
 | FR-14 | **worker 处理到一半崩溃时，walsender 必须终止本次复制会话，不得静默丢弃或续跑该 worker 上的在途事务**；恢复只能以整个会话重建的方式进行，从复制槽的 `restart_lsn` 重新解码。 |
 | FR-15 | worker 死亡必须被**确定且及时**地检测到，不得让复制静默停滞：共享内存记录 worker 状态、worker 退出时通知 walsender、barrier 等待带超时，三者至少其一生效即可判定会话失效。 |
 | FR-16 | 提交序号 cseq 与共享内存状态**不持久化**，与 walreader 同生命周期；walreader 死亡即作废本会话的全部 cseq，walsender 必须立即失败而非等待超时。 |
 | FR-17 | 数据库重启后，复制槽由既有机制恢复，新会话按既有流程从 `restart_lsn` 重新读 WAL 并重建快照；并行化不得改变该恢复语义。 |
+| FR-18 | **wire 上的分帧顺序必须保证**：同一时刻只允许一个打开的流段（`STREAM_START` … `STREAM_STOP` 必须成对且不交错），非流式事务的 `BEGIN` … `COMMIT` 字节必须整块连续。订阅端用进程级单值跟踪当前流，第二个 `STREAM START` 会触发 `ereport(ERROR, "duplicate STREAM START message")`；流段打开期间插入其它事务的字节则会被静默归错事务，造成数据损坏。 |
+| FR-19 | **复制槽的 `confirmed_flush` 语义必须守住**：流复制协议每条逻辑消息都带一个 `'w'` 帧头，其 LSN 被订阅端用来推进 `last_received` 并回报 flush LSN。事务数据若完全自由乱序，会让 `confirmed_flush` 被后发事务抬高，而前面事务的数据其实还没发出。**`'w'` 帧携带的 LSN 在 wire 上不得倒退。** |
 
 ## 6. 非功能需求
 
@@ -121,7 +138,7 @@
 | --- | --- |
 | NFR-1 | **性能**：达到 G1 的 70MB/s 目标；并行度提升应带来可观测的吞吐提升，单核场景下不显著劣化。 |
 | NFR-2 | **兼容性**：订阅端零改动；不新增 output plugin 的必选接口；现有插件（pgoutput 等）在并行模式下行为不变。 |
-| NFR-3 | **资源占用**：worker 为常驻进程，同时承载多个在途事务，内存占用以单个 worker 上全部在途事务解码所需为上限；空闲时不应常驻占用 `max_worker_processes` 名额之外的资源。 |
+| NFR-3 | **资源占用**：worker 为常驻进程，同时承载多个在途事务，内存占用以**单个 worker** 上全部在途事务解码所需为上限（`parallel_decode_work_mem` 是每 worker 的上限，总量 = worker 数 × 该值；首版不做跨进程总量配额）。**prepared 事务的驻留时间无上界**（PREPARE 之后直到 COMMIT PREPARED / ROLLBACK PREPARED），必须单列计入预算。空闲时不应常驻占用 `max_worker_processes` 名额之外的资源。 |
 | NFR-4 | **稳定性**：并行路径需覆盖 crash recovery、worker 异常退出、事务回滚、catalog 变更等既有回归用例，不引入新的 crash 或数据不一致。 |
 | NFR-5 | **可维护性**：并行解码逻辑与既有串行解码逻辑共用同一套解析函数（`heap_decode`、`heap2_decode` 等），差异集中在“谁来调用”而非“怎么解析”。 |
 | NFR-6 | **调度开销**：进程间通信以共享内存队列为主，调度本身不得成为新的性能瓶颈；串行发送路径上的内存拷贝应保持最少。 |
@@ -132,12 +149,12 @@
 2. **WAL 单读者**：WAL 读取、snapbuild 推进、提交序号分配集中于 walreader。
 3. **插件状态单进程闭环**：output plugin 的私有状态（`txn->output_plugin_private`）不可跨进程共享，begin → changes → commit 必须在同一个 worker 内走完。
 4. **快照一致性是前提**：解码必须基于一致性快照读取系统表元数据。快照由 walreader 独占维护，worker 持有快照副本并接收事件流。
-5. **顺序保证只针对事务结束事件**：commit/abort/cancel 的顺序必须严格保证；事务数据本身的乱序容忍度与现有串行实现保持一致。
+5. **顺序保证有两层**：**事务结束事件**（commit/abort/cancel）的顺序必须严格保证；事务数据本身的乱序容忍度与现有串行实现保持一致。此外还有**分帧顺序**这一层——wire 上同一时刻只允许一个打开的流段，同一事务的字节必须整块连续（FR-18），这是订阅端的状态机要求，不是本特性引入的。
 6. **子事务归属先于并行**：WAL 中出现 `XACT_ASSIGNMENT` 时，子事务已归属于某个顶层事务；数据类 WAL 到达时其顶层事务 ID 已可确定。
-7. **流复制协议为并行前提**：并行解码依赖 streaming 协议分片发送，非流复制订阅方保持原路径。
-8. **快照副本可序列化**：worker 所需的快照状态必须能在进程间传递，必要时复用 `ReorderBufferCopySnap` 的子事务集拷贝机制。
+7. **流复制协议为并行前提**：并行解码依赖 streaming 协议分片发送。非流复制订阅方走"整事务缓冲"退化路径（见 4.3），收益有限。
+8. **快照的传递方向**：walreader 下发的是 **base snapshot 的内容**（`xmin`/`xmax`/`xip`/`curcid`）；**含子事务集合的最终快照由 worker 自行生成**——`ReorderBufferCopySnap()` 需要事务的子事务链表，那只有持有事务的 worker 才有，且子事务在事务的第一条记录到达时还不知道。它是 `static` 函数，未导出到头文件，因此 walreader 想调也调不到。
 9. **事务与 worker 多对一绑定**：一个顶层事务只交给一个 worker，期间不迁移；一个 worker 可同时承载多个事务。事务内顺序由“绑定 + 顺序追加 + 单 worker 单线程消费”保证（FR-4）。
-10. **并发只发生在事务之间**：事务内的解码与插件调用始终单线程顺序执行；这是把切分点选在事务级的前提。
+10. **并发只发生在事务之间**：事务内的解码与插件调用始终单线程顺序执行；这是把切分点选在事务级的前提。worker 承载多个事务时，各事务的解码**不得交错**——历史快照与 tuplecid 映射是进程级单例，交错会导致旧版本可见性判定出错。
 11. **恢复以会话为单位**：复制槽是唯一的持久化恢复锚点，进程内状态（reorder buffer、插件私有状态、快照副本、cseq、共享内存）全部不参与恢复；worker 的重建只能以整个会话重建的形式进行。
 12. **worker 不得自动重启**：worker 注册为 `bgw_restart_time = BGW_NEVER_RESTART` 的后台进程，且退出码只能是 0 或 1——其他退出码或死于信号会触发集群级 crash recovery。
 
@@ -146,7 +163,7 @@
 | 编号 | 验收项 | 通过条件 |
 | --- | --- | --- |
 | AC-1 | 吞吐 | tpcc 100 万 tpm 场景下 `confirm_flush_lsn` 速率 ≥ 70MB/s。 |
-| AC-2 | 功能等价 | 同一负载在并行开关 ON/OFF 两种状态下，订阅端收到的逻辑变更内容与顺序完全一致；其中**每个事务内部的变更顺序必须与 WAL 顺序逐条一致**（FR-4）。 |
+| AC-2 | 语义等价 | 同一负载在并行开关 ON/OFF 两种状态下，**每个事务内部的变更内容与顺序与 WAL 顺序逐条一致**（FR-4）；**事务结束事件的顺序一致**；**订阅端最终 apply 的结果一致**。允许的差异：RELATION 消息冗余（每 worker 一份关系缓存）、事务之间的数据下发顺序不同、流式分片的切点不同（FR-19、G2）。 |
 | AC-3 | 提交顺序 | 大并发 + 频繁提交/回滚 + 系统表变更（DDL）混合负载下，commit/abort/cancel 的输出顺序与 WAL 提交顺序逐条一致，无乱序、无事务拆分、无丢变更。 |
 | AC-4 | 流式及时性 | 大事务在解码未完成时即可向订阅端输出分片，订阅端提前收到首片数据。 |
 | AC-5 | 快照正确性 | 并发 DDL 场景下，worker 读到的元数据与串行实现一致，无“元数据已失效却仍被使用”导致的变更内容错误。 |
@@ -161,17 +178,23 @@
 
 | 风险 | 影响 | 应对 |
 | --- | --- | --- |
-| 系统表变更导致快照失效，worker 读到错误元数据 | 变更内容错误 | 快照与目录失效信息随 WAL 变化及时通知 worker（FR-8），并以 AC-5 重点验证。 |
+| 系统表变更导致快照失效，worker 读到错误元数据 | 变更内容错误 | base snapshot 由 walreader 分配并下发；无 xid 的失效**广播给所有 worker**（每个 worker 有自己的目录缓存，walreader 本地执行不够）；命令 ID / 失效 / tuplecid 由 worker 从原始 WAL 记录自行重建（FR-8），并以 AC-5 重点验证。 |
 | 并行完成顺序与提交顺序不一致 | 订阅端 apply 乱序 | 提交顺序由 walreader 分配 cseq、walsender 单点按序输出（FR-5、FR-7）。 |
+| **wire 上出现两个打开的流段** | 订阅端 `ereport(ERROR, "duplicate STREAM START message")`；流段打开期间插入其它事务的字节则被静默归错事务，数据损坏 | walsender 一次只取一整块，块未取完不得取其它 worker 的字节（FR-18）。 |
+| **`'w'` 帧 LSN 倒退** | `confirmed_flush` 被后发事务抬高，槽水位失真；与 `restart_lsn` 漏洞复合后发布端重启丢变更 | 事务数据（非流式整事务块）跟随 cseq 放行，`'w'` 帧 LSN 不倒退（FR-19）。 |
+| **`restart_lsn` 越过仍在途的事务** | 发布端重启后，在途事务的前半段变更永久丢失 | walreader 侧维护事务绑定表并汇总全局最老在途事务的 `restart_decoding_lsn`，两个水位都由 walsender 单点推进（FR-12）。 |
 | worker 崩溃导致变更丢失 | 数据不一致 | worker 错误与退出必须上报，walsender 终止会话而非静默继续（FR-11）。 |
 | 事务在 worker 之间迁移导致事务内乱序 | 变更顺序错误、数据不一致 | 绑定建立后禁止迁移；事务内顺序由“绑定 + 顺序追加 + 单 worker 单线程消费”保证（FR-4、约束 9） |
+| **分配准则只看事务数** | 大事务独占的 worker 被判为“最空闲”，有效并行度退化为 1；早提交的大事务把其后所有提交一起卡住 | 分配代价函数改为**在途字节数**，并设单 worker 在途事务数上限（FR-3）。 |
 | 共享内存队列成为新瓶颈 | 吞吐不升反降 | 队列深度与吞吐纳入监控（NFR-1、NFR-6），必要时按实测调整队列与批量策略。 |
-| 进程间通信引入额外延迟 | 小事务场景劣化 | 需实测小事务延迟，与串行路径做对比（AC-8）。 |
+| **协议帧率 / 系统调用率** | 每条协议消息一次 `write()` 系统调用，30–70 万次/秒量级，串行卡在 walsender | 并行模式改为按块 / 按 8KB 缓冲刷出（帧不能合并）；帧率纳入监控。 |
+| **目录缓存 N 倍** | 每个 worker 各自做发布关系判定与 DDL 后的全量重扫，DDL 密集时是 N 倍目录扫描 CPU | 把“关系 → 发布列表 / schema”做成只读共享内存表（walreader 维护、worker 只读）。 |
+| 进程间通信引入额外延迟 | 小事务场景劣化 | 需实测小事务延迟，与串行路径做对比（AC-8）；批次按字节阈值而非按事务切。 |
 | 插件状态按 worker 复制，RELATION 消息重复 | 冗余带宽 | 首版容忍该冗余（重复 RELATION 语义正确），把共享关系表列为后续优化。 |
-| 复制槽 xmin 推进跨进程归属不清 | 槽保留 xmin 漂移或过旧 | 由 walsender 代 walreader 执行槽相关操作（FR-12）。 |
+| 复制槽水位推进跨进程归属不清 | 槽保留 xmin 漂移或过旧；`restart_lsn` 推进过早 | 由 walsender 代 walreader 执行槽相关操作，两个水位都需跨进程聚合（FR-12）。 |
 | worker 崩溃未被检测，复制静默停滞 | 复制链路悄悄挂死 | 三级检测机制：共享内存状态字 + worker 退出通知 + walreader 归因；barrier 等待带超时兜底（FR-15）。 |
-| cseq 分配者与消费者不同步 | barrier 永久卡死 | cseq 与 walreader 同生命周期，walreader 死亡即作废全部 cseq 并立即失败（FR-16）。 |
-| worker 被 postmaster 自动重启 | 同一事务被拆到两个 worker，事务内乱序 | `bgw_restart_time = BGW_NEVER_RESTART`，worker 只随会话重建（约束 11、12）。 |
+| cseq 分配者与消费者不同步 | barrier 永久卡死 | cseq 与 walreader 同生命周期，walreader 死亡即作废全部 cseq 并立即失败（FR-16）。**并且 barrier 靠 worker 的结束事件确认推进（含空事件）**，否则非流式 abort / cancel 会造成永久空洞（FR-7）。 |
+| worker 被 postmaster 自动重启 | 同一事务被拆到两个 worker，事务内乱序 | `bgw_restart_time = BGW_NEVER_RESTART`，worker 只随会话重建（约束 11、12、FR-1）。 |
 
 ## 10. 参考
 
