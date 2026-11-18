@@ -65,6 +65,15 @@
 - [14. 风险与对策](#14-风险与对策)
 - [15. 待决问题](#15-待决问题)
 - [16. 实现计划](#16-实现计划)
+- [17. 故障恢复](#17-故障恢复)
+  - [17.1 恢复的唯一持久化锚点是复制槽](#171-恢复的唯一持久化锚点是复制槽)
+  - [17.2 故障分类与处置](#172-故障分类与处置)
+  - [17.3 worker 处理到一半崩溃](#173-worker-处理到一半崩溃)
+  - [17.4 walreader 崩溃](#174-walreader-崩溃)
+  - [17.5 walsender 崩溃与会话断开](#175-walsender-崩溃与会话断开)
+  - [17.6 数据库重启后的恢复](#176-数据库重启后的恢复)
+  - [17.7 恢复语义与不变量](#177-恢复语义与不变量)
+  - [17.8 实现约束清单](#178-实现约束清单)
 - [附录 A 术语表](#附录-a-术语表)
 - [附录 B 修订记录](#附录-b-修订记录)
 
@@ -751,7 +760,7 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 | Q4 | 关系消息重复 | 容忍 / 共享关系表 | 首版容忍（4.1） |
 | Q5 | 解码内存语义 | 每 worker 独立 / 总量均摊 | 总量均摊（12.2） |
 | Q6 | 流式切分默认档 | buffered / immediate | 默认 buffered，`immediate` 按需开启（8.1） |
-| Q7 | worker 崩溃是否降级为串行 | 终止会话 / 降级 | 终止会话（9） |
+| Q7 | worker 崩溃是否降级为串行 | 终止会话 / 降级 | 终止会话（9、17.3） |
 | Q8 | 子进程形态 | 动态后台进程 / walsender 直接 fork | 动态后台进程，参照 `launcher.c:503`（3.3） |
 
 ## 16. 实现计划
@@ -767,12 +776,145 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 | P4 多 worker 并行 | worker 池与事务分配 | 事务→worker 绑定表、最小负载优先分配、队列水位反馈 | 吞吐随 worker 数上升（AC-1、AC-6） |
 | P5 快照与失效 | 事件流分发与 tuplecid 传递 | 快照切换 / 命令 ID / 失效消息与 WAL 变更同序传递；`ReorderBufferCopySnap()` 结果与 tuplecid 哈希跨进程传递 | DDL 混合负载下元数据与现状一致（AC-5） |
 | P6 尽早流式 | 分片切分与提前下发 | 流式模式 GUC、批次粒度切分、结果区提前发送 | 大事务在解码完成前即可到达订阅端（AC-4） |
+| P7 故障恢复 | 进程生命周期与故障处置 | worker 状态字、`bgw_notify_pid` 通知、barrier 超时、退出码与 `bgw_restart_time` 约束、cseq 作废路径 | kill worker 后会话及时终止而非静默停滞；重启后可从 `restart_lsn` 续传（AC-10、AC-11） |
 
 推进顺序上的三条约束：
 
 1. **P1 之前不改解码路径。** 先把 WAL 读取搬走、解码仍留在 walsender，用现有路径验证进程拆分本身没有引入行为差异。
 2. **P2 之前不引入多 worker。** 单 worker 打通后，多 worker 只是分配策略的变化；否则进程拆分、解码改造、并行调度三个变量同时出错，难以定位。
 3. **P3 可以在 P1 之后独立推进。** cseq 的分配只依赖 walreader 的 WAL 顺序，与 worker 是否解码无关，可以与 P2 并行实现。
+
+## 17. 故障恢复
+
+### 17.1 恢复的唯一持久化锚点是复制槽
+
+进程内的任何状态都不参与恢复：worker 的 reorder buffer、output plugin 私有状态、tuplecid 哈希、快照副本、共享内存队列、cseq 水位与提交水位，全部随进程消失而丢失。
+
+**唯一跨故障存活的状态是复制槽**：
+
+| 槽内字段 | 作用 | 写盘时机 |
+| --- | --- | --- |
+| `restart_lsn` | 解码的起点。它之前及之上的 WAL 被槽保留，不会被回收 | `ReplicationSlotSave()`（`slot.c:992`）、`ReplicationSlotPersist()`（`slot.c:1027`） |
+| `confirmed_flush` | 订阅端已确认接收的位置。它只随订阅端反馈前进 | 同上 |
+| `xmin` / `catalog_xmin` | 槽保留的事务视野，决定能回收多老的事务 | 同上 |
+| `persistency` | 槽是持久化还是临时 | `ReplicationSlotPersist()` 把临时槽转为持久化槽 |
+
+槽状态写在 `pg_replslot/<name>/state`，由 `StartupReplicationSlots()`（`slot.c:1896`）在**崩溃恢复之前**读回内存；带 CRC 校验，读回失败直接 PANIC。临时槽（`RS_EPHEMERAL` / `RS_TEMPORARY`）在崩溃后被删除而不是恢复。
+
+由此得出恢复模型：
+
+> **恢复 = 终止旧会话 + 重建会话 + 从槽的 `restart_lsn` 重新解码。**
+> 不存在“把崩溃进程的状态捞回来”的路径，也不需要这样的路径——槽的重放语义天然覆盖了崩溃瞬间的全部未确认变更。
+
+这条模型与现有单进程实现**完全一致**：现有实现中 walsender 崩溃后的恢复路径同样是“重建会话、从 `restart_lsn` 重放”。并行化不改变恢复语义，只增加了需要被终止的进程数量。
+
+### 17.2 故障分类与处置
+
+| 故障 | 退出方式 | postmaster 行为 | 本设计的处置 | 恢复路径 |
+| --- | --- | --- | --- | --- |
+| worker 内部错误 | `proc_exit(1)`（`bgworker.c:815`；`elog.c:590` 的 FATAL 路径同此） | 记 `rw_crashed_at`，**不触发集群重启**（`postmaster.c:2733-2736`：只有 0/1 以外的退出码才触发系统级重启） | worker 上报 `PMSG_ERROR`；walsender 终止会话 | 订阅端重连 → 新会话从 `restart_lsn` 重放 |
+| worker 崩溃（信号） | 被信号杀死 | **触发集群级 crash recovery**（`postmaster.c:3040` 置 `FatalError`） | 集群整体恢复，槽从磁盘恢复 | 数据库重启 → 同上 |
+| worker 正常退出 | `proc_exit(0)` | 记 `rw_terminate`，不重启该 worker | 视为会话终止 | 同上 |
+| walreader 崩溃 | 同 worker | 同上 | 终止会话 | 同上 |
+| walsender 崩溃 / 会话断开 | 正常或异常 | 异常退出触发集群级 crash recovery | `ReplicationSlotRelease()`（`walsender.c:341`）释放槽；槽状态已落盘 | 订阅端重连 → 新会话从 `restart_lsn` 重放 |
+| 数据库重启 | — | `StartupReplicationSlots()` 恢复槽；所有动态后台进程消失 | 无需额外动作 | 客户端重连 → 新会话 → 重新构建快照 |
+
+关键差别在于**谁死了**：
+
+- **worker / walreader 死亡**（以退出码 1 结束）：这是**局部故障**。集群继续运行，复制会话终止，订阅端自动重连即可恢复，数据库本身不需要重启。
+- **walsender 死亡**（异常退出）：这是**全局故障**。按 PostgreSQL 的既有语义，普通后端的异常退出会让 postmaster 终止所有其他后端并进入崩溃恢复（`postmaster.c:3040`）。这一点与现状相同，不是并行化引入的问题。
+
+### 17.3 worker 处理到一半崩溃
+
+这是并行化引入的唯一一个新故障点，需要单独设计。
+
+**丢失了什么**：该 worker 上全部在途事务的解码状态——已解码但未发出的字节、reorder buffer 中累积的变更、插件私有状态、tuplecid 哈希、待执行的目录失效消息。
+
+**为什么不尝试“部分恢复”**：
+
+1. **流式分片可能只发了一半。** 一个事务的字节可能已经部分写入 socket，订阅端手里是一个不完整的事务。无法判断哪些字节可以保留。
+2. **重发粒度是事务，不是字节。** 复制槽的重放单位是 WAL 记录，重发的最小单位是事务。要恢复一个事务，必须从它的第一条 WAL 记录重新解码——这正是“从 `restart_lsn` 重放”所做的事。
+3. **迁移到其他 worker 会破坏事务亲和性**（4.4）。worker 之间的状态搬迁代价高于整个会话重建。
+4. **已发出的字节可能已被订阅端 apply。** 重发会产生重复，这与逻辑复制的既有语义一致（见 17.7），不构成本设计特有的问题。
+
+结论：**worker 崩溃一律终止会话，不做进程级或事务级的抢救。** 这与第 9 章“任何可能造成变更丢失或乱序的故障，一律以终止会话的方式暴露”的原则一致。
+
+**故障检测**。worker 死亡后，walsender 若继续等待它持有的 cseq，barrier 会出现空洞并永久卡死——复制会静默停滞而不是失败。因此检测必须做到“确定、快速”：
+
+| 机制 | 做法 | 覆盖的场景 |
+| --- | --- | --- |
+| 共享内存状态字 | 每个 worker 在共享内存中有一个状态字段（RUNNING / EXITED / FAILED）；退出前由 worker 写入 FAILED 并附错误码 | worker 主动退出或捕获到错误后正常退出 |
+| postmaster 通知 | 注册 worker 时设置 `bgw_notify_pid = MyProcPid`；worker 启动（`bgworker.c:467-478`）与退出（`bgworker.c:486-515`）时 postmaster 都向该 pid 发送 SIGUSR1，walsender 被立即唤醒 | worker 异常死亡、信号杀死 |
+| walreader 监控 | walreader 持有事务→worker 绑定表，能判断“某个 cseq 的持有者已经不在了”，据此判定 barrier 空洞不可恢复 | cseq 空洞的直接归因 |
+
+三者结合：状态字给出**原因**，SIGUSR1 给出**即时唤醒**，walreader 给出**归因**。任一机制单独失效都不会造成静默停滞——最坏情况下 walsender 的 barrier 等待超时（见下）。
+
+**barrier 等待超时**。walsender 在等待 `next_commit_seq` 时必须带超时：正常情况下 cseq 的分配不依赖任何 worker（4.2），提交消息的延迟只可能是 worker 尚未解码完成；超过阈值即判定会话失效并终止，而不是无限等待。这条兜底保证了“检测机制全部失效”时退化为“复制停滞并报错”，而不是“永久挂起”。
+
+**不自动重启 worker**。`bgw_restart_time` 必须设为 `BGW_NEVER_RESTART`：postmaster 在该设置下会移除该 worker 并向 `bgw_notify_pid` 发送 SIGUSR1（`postmaster.c:4459-4470`）。若设置了自动重启，postmaster 会在 `bgw_restart_time` 之后拉起一个新 worker，但新 worker 没有任何前一个 worker 的在途事务状态，只会让事务在两个 worker 之间分裂，破坏 4.4 的亲和性。**worker 的重建必须以会话重建的形式进行，由 walsender 统一发起。**
+
+### 17.4 walreader 崩溃
+
+walreader 持有 WAL 读取位置、snapbuild 状态与事务→worker 绑定表。这些全部是进程内状态，崩溃即丢失。
+
+处置与 worker 崩溃相同：**终止会话**。区别在于 walreader 的死亡同时意味着 WAL 读取位置丢失，会话必须从槽的 `restart_lsn` 重新开始，而不是从崩溃点继续——这同样由复制槽的重放语义保证。
+
+一个必须避免的误判：walreader 崩溃后，walsender 仍在按 cseq 等待提交消息，而 cseq 的分配者已经死了。**cseq 的分配者与 cseq 的消费者必须同生共死**——walreader 死亡即意味着本会话的所有 cseq 作废，barrier 等待必须立即失败，不能等到超时。
+
+### 17.5 walsender 崩溃与会话断开
+
+walsender 持有复制槽与 CopyBoth 连接。异常退出时：
+
+- 槽被释放（`ReplicationSlotRelease()`，`walsender.c:341`），但**槽的状态已经落盘**，`restart_lsn` / `confirmed_flush` / `xmin` 保留；
+- 按 PostgreSQL 的既有语义，walsender 的异常退出会触发集群级崩溃恢复，所有其他后端被终止，共享内存被重建，槽在重启时由 `StartupReplicationSlots()` 读回；
+- 订阅端的 walreceiver 检测到连接断开后按既有逻辑重连，重新发起 `START_REPLICATION`，新会话从 `restart_lsn` 开始解码。
+
+与现状一致，无需额外机制。
+
+### 17.6 数据库重启后的恢复
+
+数据库重启（正常重启或崩溃恢复）后的完整过程：
+
+| 步骤 | 发生什么 | 数据来源 |
+| --- | --- | --- |
+| 1. 槽恢复 | `StartupReplicationSlots()` 在崩溃恢复之前把 `pg_replslot/<name>/state` 读回内存，`restart_lsn` / `confirmed_flush` / `xmin` / `catalog_xmin` 全部还原 | 磁盘 |
+| 2. 子进程清空 | walreader 与全部 decode worker 随 postmaster 一起消失；共享内存的 dsa 区域一并释放 | — |
+| 3. 客户端重连 | 订阅端重连并重新发起 `START_REPLICATION`，触发一个新的 walsender 会话 | 客户端 |
+| 4. 快照重建 | 新会话按既有流程 `DecodingContextFindStartpoint()`：从 `slot->data.restart_lsn` 重新读 WAL（`logical.c:655`），推进 snapbuild 直到 consistent。**并行化不改变这一步**——快照仍由单一进程构建，只是该进程从 walsender 换成了 walreader | WAL |
+| 5. 重新解码 | 从 `restart_lsn`（推进到 `confirmed_flush` 之后的起点）重新解码并重发给订阅端 | WAL |
+| 6. cseq 重置 | cseq 分配与 `next_commit_seq` 水位都从 1 重新开始 | 内存 |
+
+**第 6 步是本设计特有的约束**，必须写进实现：cseq 是会话内序号，不是持久化序号。walreader 与 walsender 必须同时重建、同时重置。若 walsender 存活而 walreader 重启（理论上不应发生，因为 walreader 死亡必然终止会话），旧 cseq 与新 cseq 会冲突，导致 barrier 永久卡死。因此实现上必须保证：**walreader 的重启总是伴随整个会话的重启**。
+
+**两阶段提交**。发布端的 prepared transaction 是真正的 prepared xact，持久化在 `pg_prepared_xacts` 中，数据库重启后依然存在。重启后重放时会再次输出 `BEGIN_PREPARE` / `PREPARE`，订阅端按 gid 处理，与现有行为一致。
+
+**关系缓存**。worker 的 `RelationSyncCache` 随进程丢失，重建会话后 RELATION 消息会重新发送，订阅端覆盖缓存，语义正确。
+
+**槽的 xmin 视野**。重启后 `MyReplicationSlot` 由新的 walsender 重新绑定，xmin 推进路径与现状一致（FR-12）。
+
+### 17.7 恢复语义与不变量
+
+| 不变量 | 说明 |
+| --- | --- |
+| `restart_lsn` 单调前进 | 只在收到订阅端反馈后前进；槽保留该 LSN 之前的 WAL，因此重放所需的 WAL 一定还在 |
+| `confirmed_flush` 单调前进 | 只反映订阅端已确认的位置 |
+| 重放范围 = 未确认区间 | 重发的内容由 `restart_lsn` 与 `confirmed_flush` 共同界定，即“订阅端尚未确认”的区间 |
+| 至少一次语义 | 订阅端可能收到已 apply 但未确认的事务而重复 apply。这是逻辑复制的既有语义，本设计不改变它 |
+| 绝不静默丢数据 | 任何不确定状态一律以终止会话暴露（第 9 章），不做静默降级 |
+| 会话内自洽 | cseq 分配者、cseq 消费者、共享内存区域三者同生共死 |
+
+### 17.8 实现约束清单
+
+以下每一条都直接对应上面某一节的结论，实现时必须逐条满足：
+
+1. **worker 不得以 0 / 1 以外的退出码退出，也不得死于信号。** 只有 0 与 1 不会触发集群级 crash recovery（`postmaster.c:2733-2736`）。worker 必须在事务边界用 `PG_TRY` / `PG_CATCH` 捕获错误，上报 `PMSG_ERROR` 后以 0 或 1 退出。
+2. **`bgw_restart_time` 必须为 `BGW_NEVER_RESTART`。** worker 的重建只能以会话重建的形式进行（17.3）。
+3. **`bgw_notify_pid` 必须设置为 walsender 的 pid。** 这是 worker 异常死亡时唯一的即时通知通道。
+4. **cseq 与共享内存不持久化，且与 walreader 同生命周期。** 禁止跨会话复用 cseq（17.6）。
+5. **barrier 等待必须带超时。** 防止检测机制全部失效时复制静默停滞（17.3）。
+6. **worker 状态字必须放在共享内存中。** 使“谁持有哪个 cseq”在故障后仍可判定（17.3）。
+7. **walreader 死亡必须立即使本会话的 cseq 作废。** 不等超时（17.4）。
+8. **槽相关的操作仍只由 walsender 执行**（FR-12）。walreader 与 worker 都不得直接操作复制槽。
 
 ## 附录 A 术语表
 
@@ -802,3 +944,4 @@ pending_commits[]   /* 按 cseq 排序的挂起提交表 */
 | v0.1 | 2026-11-17 | 初稿：完成 `need.md` 需求说明书 |
 | v0.2 | 2026-11-18 | 重构为 walreader / decode worker / walsender 三进程模型；补充 commit barrier 与 FIFO 的对比与选型；补充快照事件流、tuplecid 传递与 xmin 跨进程聚合；补充低拷贝策略与可消除拷贝的分析；统一为标准 Markdown 格式并补充目录与术语表；新增第 16 章实现计划 |
 | v0.3 | 2026-11-18 | 明确事务与 worker 的绑定方向为多对一：新增 4.4 节，说明事务亲和性规则、事务内顺序的三重保证、与流式切分的交互及多事务并发的相互影响；同步更新 3.1、5.1、7.4、11.2、12.2、15 章与 `need.md` 的 FR/约束/验收 |
+| v0.4 | 2026-11-18 | 新增第 17 章故障恢复：明确复制槽是唯一的持久化恢复锚点；给出故障分类与处置、worker 处理中途崩溃的处置与三级检测机制、walreader 与 walsender 崩溃的处置、数据库重启后的完整恢复流程、恢复语义不变量与实现约束清单；同步更新 `need.md` 的 FR/约束/验收/风险 |

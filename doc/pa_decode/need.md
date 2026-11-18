@@ -82,6 +82,7 @@
 - 提交序号（cseq）的分配与基于 cseq 的 commit/abort/cancel 顺序输出；
 - 一致性快照在 worker 间的分发，以及目录失效消息随 WAL 变化及时送达 worker；
 - 并行模式下的错误传播、worker 异常退出处理；
+- 故障恢复：worker / walreader / walsender 崩溃与数据库重启后的会话重建；
 - 相关 GUC、监控指标与文档。
 
 ### 4.2 范围外
@@ -109,6 +110,10 @@
 | FR-11 | worker 内部报错须上报 walsender（对应 `PMSG_ERROR`），由 walsender 按现有逻辑复制错误语义终止本次复制会话；walsender 不得因单个 worker 故障而静默丢弃变更。 |
 | FR-12 | 复制槽的 xmin 推进由 walsender 代 walreader 执行，保证复制槽状态由单一进程维护。 |
 | FR-13 | 提供 GUC 控制并行解码的启停与 worker 数量，并提供相关监控项（至少含 worker 数量、事务平均解码耗时、队列积压深度、cseq 等待深度）。 |
+| FR-14 | **worker 处理到一半崩溃时，walsender 必须终止本次复制会话，不得静默丢弃或续跑该 worker 上的在途事务**；恢复只能以整个会话重建的方式进行，从复制槽的 `restart_lsn` 重新解码。 |
+| FR-15 | worker 死亡必须被**确定且及时**地检测到，不得让复制静默停滞：共享内存记录 worker 状态、worker 退出时通知 walsender、barrier 等待带超时，三者至少其一生效即可判定会话失效。 |
+| FR-16 | 提交序号 cseq 与共享内存状态**不持久化**，与 walreader 同生命周期；walreader 死亡即作废本会话的全部 cseq，walsender 必须立即失败而非等待超时。 |
+| FR-17 | 数据库重启后，复制槽由既有机制恢复，新会话按既有流程从 `restart_lsn` 重新读 WAL 并重建快照；并行化不得改变该恢复语义。 |
 
 ## 6. 非功能需求
 
@@ -133,6 +138,8 @@
 8. **快照副本可序列化**：worker 所需的快照状态必须能在进程间传递，必要时复用 `ReorderBufferCopySnap` 的子事务集拷贝机制。
 9. **事务与 worker 多对一绑定**：一个顶层事务只交给一个 worker，期间不迁移；一个 worker 可同时承载多个事务。事务内顺序由“绑定 + 顺序追加 + 单 worker 单线程消费”保证（FR-4）。
 10. **并发只发生在事务之间**：事务内的解码与插件调用始终单线程顺序执行；这是把切分点选在事务级的前提。
+11. **恢复以会话为单位**：复制槽是唯一的持久化恢复锚点，进程内状态（reorder buffer、插件私有状态、快照副本、cseq、共享内存）全部不参与恢复；worker 的重建只能以整个会话重建的形式进行。
+12. **worker 不得自动重启**：worker 注册为 `bgw_restart_time = BGW_NEVER_RESTART` 的后台进程，且退出码只能是 0 或 1——其他退出码或死于信号会触发集群级 crash recovery。
 
 ## 8. 验收标准
 
@@ -147,6 +154,8 @@
 | AC-7 | 回归 | 现有逻辑复制回归用例（`logical_replication`、`publication`、DDL 复制等）全部通过。 |
 | AC-8 | 可回退 | 关闭开关后行为与当前主线实现完全一致，性能无显著劣化。 |
 | AC-9 | 订阅端零改动 | 特性开启期间订阅端不需要升级、不需要改配置，行为与升级前一致。 |
+| AC-10 | worker 崩溃恢复 | 在 worker 处理事务中途 kill 掉该进程，walsender 能及时发现并终止会话（不静默停滞、不静默丢数据）；订阅端重连后从复制槽 `restart_lsn` 重放，变更内容与顺序与崩溃前一致。 |
+| AC-11 | 数据库重启恢复 | 数据库正常重启与崩溃恢复后，复制槽正确恢复，订阅端重连后能继续同步，无丢变更、无重复的事务内乱序。 |
 
 ## 9. 风险
 
@@ -160,8 +169,11 @@
 | 进程间通信引入额外延迟 | 小事务场景劣化 | 需实测小事务延迟，与串行路径做对比（AC-8）。 |
 | 插件状态按 worker 复制，RELATION 消息重复 | 冗余带宽 | 首版容忍该冗余（重复 RELATION 语义正确），把共享关系表列为后续优化。 |
 | 复制槽 xmin 推进跨进程归属不清 | 槽保留 xmin 漂移或过旧 | 由 walsender 代 walreader 执行槽相关操作（FR-12）。 |
+| worker 崩溃未被检测，复制静默停滞 | 复制链路悄悄挂死 | 三级检测机制：共享内存状态字 + worker 退出通知 + walreader 归因；barrier 等待带超时兜底（FR-15）。 |
+| cseq 分配者与消费者不同步 | barrier 永久卡死 | cseq 与 walreader 同生命周期，walreader 死亡即作废全部 cseq 并立即失败（FR-16）。 |
+| worker 被 postmaster 自动重启 | 同一事务被拆到两个 worker，事务内乱序 | `bgw_restart_time = BGW_NEVER_RESTART`，worker 只随会话重建（约束 11、12）。 |
 
 ## 10. 参考
 
-- `design.md`：概要设计说明书（三进程模型、消息协议、顺序保证方案、快照与失效分发）。
+- `design.md`：概要设计说明书（三进程模型、消息协议、顺序保证方案、快照与失效分发、故障恢复）。
 - PostgreSQL 源码：`src/backend/replication/logical/logical.c`、`src/backend/replication/logical/decode.c`、`src/backend/replication/logical/reorderbuffer.c`、`src/backend/replication/logical/snapbuild.c`、`src/backend/replication/logical/worker.c`、`src/backend/replication/walsender.c`。
