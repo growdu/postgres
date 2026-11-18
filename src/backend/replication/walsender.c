@@ -1467,6 +1467,7 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	QueryCompletion qc;
 	char		pd_plugin_options[PD_MAX_PLUGIN_OPTIONS];
 	uint32		pd_plugin_options_len = 0;
+	int			pd_streaming_mode = PD_STREAMING_OFF;
 
 	/* make sure that our requirements are still fulfilled */
 	CheckLogicalDecodingRequirements();
@@ -1503,9 +1504,23 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	 * the context exists.
 	 */
 	if (ParallelDecodeEnabled())
+	{
 		PDSerializePluginOptions(cmd->options, pd_plugin_options,
 								  sizeof(pd_plugin_options),
 								  &pd_plugin_options_len);
+
+		/*
+		 * How eagerly the changes of a transaction are streamed depends on
+		 * what the subscriber asked for: a subscriber that applies the
+		 * transactions in parallel needs the changes to arrive early, while a
+		 * subscriber that applies them on its own does not.
+		 *
+		 * The mode is resolved before the decoding context is created,
+		 * because the startup callback of the output plugin may modify the
+		 * option values in place.
+		 */
+		pd_streaming_mode = ParallelDecodeResolveStreamingMode(cmd->options);
+	}
 
 	/*
 	 * Create our decoding context, making it start at the previously ack'ed
@@ -1544,7 +1559,8 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 			start_lsn = MyReplicationSlot->data.confirmed_flush;
 
 		ParallelDecodeSessionStart(MyReplicationSlot, pd_plugin_options,
-									pd_plugin_options_len, start_lsn);
+									pd_plugin_options_len, pd_streaming_mode,
+									start_lsn);
 
 		/*
 		 * While the session waits for the decode worker to hand over the
@@ -3545,6 +3561,16 @@ pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
 	memcpy(&frame->data[1 + sizeof(int64) + sizeof(int64)],
 		   tmpbuf.data, sizeof(int64));
 
+	/*
+	 * The frames of a stream segment may carry a position that is beyond the
+	 * release frontier, because the segment is sent before the transaction it
+	 * belongs to is complete.  The subscriber uses the position of the frames
+	 * it receives to advance the flush position of the slot, so a position
+	 * beyond the frontier would make it skip a transaction that has not been
+	 * delivered yet.
+	 */
+	ParallelDecodeClampFrame(frame);
+
 	/* output previously gathered data in a CopyData packet */
 	PDTraceWrite(frame->data, frame->len);
 	pq_putmessage_noblock('d', frame->data, frame->len);
@@ -4261,12 +4287,26 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 static void
 WalSndKeepalive(bool requestReply, XLogRecPtr writePtr)
 {
+	XLogRecPtr	pos;
+
 	elog(DEBUG2, "sending replication keepalive");
+
+	pos = XLogRecPtrIsInvalid(writePtr) ? sentPtr : writePtr;
+
+	/*
+	 * The subscriber takes the position of the keepalive into account when it
+	 * decides how far it has received, so it may not be beyond the release
+	 * frontier: the parallel decoding path sends the frames of a transaction
+	 * before the transaction is complete, so the position of the session can
+	 * be ahead of the transactions that have not been delivered yet.
+	 */
+	if (ParallelDecodeEnabled())
+		pos = ParallelDecodeClampLSN(pos);
 
 	/* construct the message... */
 	resetStringInfo(&output_message);
 	pq_sendbyte(&output_message, 'k');
-	pq_sendint64(&output_message, XLogRecPtrIsInvalid(writePtr) ? sentPtr : writePtr);
+	pq_sendint64(&output_message, pos);
 	pq_sendint64(&output_message, GetCurrentTimestamp());
 	pq_sendbyte(&output_message, requestReply ? 1 : 0);
 

@@ -97,6 +97,23 @@ PDRecordSerialize(DecodedXLogRecord *record, StringInfo buf)
 		bh.flags = blk->flags;
 		bh.rlocator = blk->rlocator;
 		bh.blkno = blk->blkno;
+
+		/*
+		 * A block reference the record does not use carries no data.  The
+		 * reader reuses the space of the decode buffer for the records, so
+		 * the fields of an unused block are whatever the record that used
+		 * that space before left there.  Only the reader knows which blocks
+		 * a record really uses, and it marks the others as not in use.
+		 */
+		if (!blk->in_use)
+		{
+			bh.data_len = 0;
+
+			appendBinaryStringInfo(buf, (const char *) &bh, sizeof(bh));
+
+			continue;
+		}
+
 		bh.data_len = blk->has_data ? (uint32) blk->data_len : 0;
 
 		appendBinaryStringInfo(buf, (const char *) &bh, sizeof(bh));

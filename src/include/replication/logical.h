@@ -129,6 +129,27 @@ typedef struct LogicalDecodingContext
 	 */
 	int			txn_owner;
 	int			worker_index;
+
+	/*
+	 * The publisher-side parallel decoding path streams the changes of a
+	 * transaction before the transaction is complete, so that they reach the
+	 * subscriber early.  These two fields say how eagerly that happens.
+	 *
+	 * stream_segment_size is the number of bytes a transaction has to have
+	 * accumulated before its changes are streamed.  Zero means that the
+	 * changes are only streamed when the decoding path runs out of memory,
+	 * which is the behavior of the serial decoding path.
+	 *
+	 * stream_min_size is the number of bytes a transaction has to have
+	 * accumulated before it may be streamed at all.  A threshold larger than
+	 * the size of the typical transaction keeps the subscriber from
+	 * receiving any stream segment.
+	 *
+	 * Both are zero in the serial decoding path, so its behavior is
+	 * unchanged.
+	 */
+	Size		stream_segment_size;
+	Size		stream_min_size;
 } LogicalDecodingContext;
 
 

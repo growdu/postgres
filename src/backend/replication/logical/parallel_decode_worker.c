@@ -91,6 +91,27 @@ static uint64 pd_current_cseq = 0;
 /* The position the walsender has been told about. */
 static XLogRecPtr pd_reported_lsn = InvalidXLogRecPtr;
 
+/*
+ * The frames of the stream segment that is being built.
+ *
+ * The subscriber accepts only one stream segment at a time, so the frames of
+ * a segment have to reach it without the frames of another transaction in
+ * between.  The worker collects them here and hands the whole segment over
+ * to the walsender as a single message.
+ */
+static StringInfo pd_segment = NULL;
+static int	pd_segment_frames = 0;
+static bool pd_segment_active = false;
+
+/*
+ * The streaming callbacks of the output plugin.
+ *
+ * The worker wraps them, so that it knows which frames belong to a stream
+ * segment.
+ */
+static LogicalDecodeStreamStartCB pd_plugin_stream_start = NULL;
+static LogicalDecodeStreamStopCB pd_plugin_stream_stop = NULL;
+
 /* The wait event the worker reports while it waits for the walreader. */
 static uint32 pd_wait_event = PG_WAIT_EXTENSION;
 
@@ -156,13 +177,89 @@ pd_worker_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
  *
  * The frame is complete at this point, so it is handed over to the walsender,
  * which writes it to the network.
+ *
+ * The frames of a stream segment are an exception: they are collected, so
+ * that the segment reaches the subscriber as a whole.  The subscriber accepts
+ * only one stream segment at a time.
  */
 static void
 pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 				bool last_write)
 {
+	uint32		len;
+
+	if (pd_segment_active)
+	{
+		/*
+		 * The frames of the segment are stored with their length in front of
+		 * them, so that the walsender can find the boundaries of the frames.
+		 */
+		len = (uint32) ctx->out->len;
+		appendBinaryStringInfo(pd_segment, (char *) &len, sizeof(len));
+		appendBinaryStringInfo(pd_segment, ctx->out->data, ctx->out->len);
+		pd_segment_frames++;
+
+		return;
+	}
+
 	PDQueueSendFrame(pd_out_mqh, (uint64) pd_end_lsn, pd_current_cseq,
 					 ctx->out->data, ctx->out->len);
+}
+
+/*
+ * Hand the stream segment over to the walsender.
+ *
+ * The whole segment goes into a single message, so that the walsender can put
+ * its frames on the wire one after the other.
+ */
+static void
+pd_worker_send_segment(void)
+{
+	StringInfoData msg;
+
+	if (pd_segment_frames == 0)
+	{
+		resetStringInfo(pd_segment);
+		pd_segment_frames = 0;
+		return;
+	}
+
+	resetStringInfo(&msg);
+	PDQueueSendSegment(pd_out_mqh, (uint64) pd_end_lsn, pd_segment_frames,
+					   pd_segment->data, pd_segment->len);
+
+	resetStringInfo(pd_segment);
+	pd_segment_frames = 0;
+}
+
+/*
+ * The 'stream_start' callback of the output plugin.
+ *
+ * The frames the plugin writes from here on belong to the stream segment, so
+ * they are collected instead of being sent one by one.
+ */
+static void
+pd_worker_stream_start(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
+{
+	resetStringInfo(pd_segment);
+	pd_segment_frames = 0;
+	pd_segment_active = true;
+
+	pd_plugin_stream_start(ctx, txn);
+}
+
+/*
+ * The 'stream_stop' callback of the output plugin.
+ *
+ * The segment is complete now, so it is handed over to the walsender.
+ */
+static void
+pd_worker_stream_stop(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
+{
+	pd_plugin_stream_stop(ctx, txn);
+
+	pd_segment_active = false;
+	pd_worker_send_segment();
 }
 
 /*
@@ -498,6 +595,40 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	 */
 	pd_worker_index = slot_index;
 	pd_ctx->worker_index = slot_index;
+
+	/*
+	 * The amount of memory the reorder buffer of this worker may use.  The
+	 * walsender decided on it, so that the workers do not use more memory
+	 * than the session is allowed to use.
+	 */
+	if (ctl->work_mem_kb > 0)
+		SetConfigOption("logical_decoding_work_mem",
+						psprintf("%d", ctl->work_mem_kb),
+						PGC_USERSET, PGC_S_SESSION);
+
+	/*
+	 * How eagerly the changes of a transaction are streamed.  A session that
+	 * does not stream leaves the sizes at zero, which keeps the behavior of
+	 * the serial path: the changes are streamed only when the decoding path
+	 * runs out of memory.
+	 */
+	pd_ctx->stream_segment_size = (Size) ctl->stream_segment_size;
+	pd_ctx->stream_min_size = (Size) ctl->stream_min_size;
+
+	/*
+	 * The frames of a stream segment have to reach the subscriber without the
+	 * frames of another transaction in between, so the worker collects them
+	 * and hands the whole segment over at once.
+	 */
+	pd_segment = makeStringInfo();
+	if (pd_ctx->callbacks.stream_start_cb != NULL &&
+		pd_ctx->callbacks.stream_stop_cb != NULL)
+	{
+		pd_plugin_stream_start = pd_ctx->callbacks.stream_start_cb;
+		pd_plugin_stream_stop = pd_ctx->callbacks.stream_stop_cb;
+		pd_ctx->callbacks.stream_start_cb = pd_worker_stream_start;
+		pd_ctx->callbacks.stream_stop_cb = pd_worker_stream_stop;
+	}
 
 	ereport(LOG,
 			(errmsg("parallel decode worker %d started", slot_index)));

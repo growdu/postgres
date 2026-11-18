@@ -393,6 +393,30 @@ PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
 }
 
 /*
+ * Send a stream segment to the walsender.
+ *
+ * The segment is preceded by a PDSegmentHeader, which tells the walsender how
+ * far the decoding has come and how many frames the segment holds.  The
+ * frames follow the header, each of them preceded by its length.
+ *
+ * The whole segment goes into a single message, so that the walsender can put
+ * the frames on the wire one after the other: the subscriber accepts only one
+ * stream segment at a time.
+ */
+void
+PDQueueSendSegment(shm_mq_handle *mqh, uint64 end_lsn, uint32 nframes,
+				   const char *payload, size_t len)
+{
+	PDSegmentHeader sh;
+
+	sh.end_lsn = end_lsn;
+	sh.nframes = nframes;
+
+	pd_queue_send_chunked(mqh, PD_ENT_SEGMENT, &sh, sizeof(sh), payload, len,
+						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+}
+
+/*
  * Report an event to the walsender.
  *
  * The message uses the chunked framing, because the receiver of the queue

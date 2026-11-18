@@ -53,6 +53,19 @@ typedef enum ParallelDecodeStreamingMode
 } ParallelDecodeStreamingMode;
 
 /*
+ * The streaming mode of a session, after the GUC and the mode the subscriber
+ * asked for have been combined.
+ *
+ * A subscriber that did not ask for streaming never gets a stream segment,
+ * no matter what the GUC says: the output plugin of the publisher decides
+ * whether it streams at all, and it does so based on the mode the subscriber
+ * asked for.
+ */
+#define PD_STREAMING_OFF			0
+#define PD_STREAMING_BUFFERED		1
+#define PD_STREAMING_IMMEDIATE		2
+
+/*
  * The largest size of the serialized output plugin options in the control
  * block.  The options of the output plugin are a handful of short strings,
  * so this is generous.
@@ -70,6 +83,18 @@ extern PGDLLIMPORT char *parallel_decode_trace_file;
 
 /* True when the publisher-side parallel path is requested. */
 extern bool ParallelDecodeEnabled(void);
+
+/*
+ * Resolve the streaming mode of a session.
+ *
+ * The mode is the combination of the GUC with the mode the subscriber asked
+ * for with the "streaming" option of the output plugin.  A subscriber that
+ * did not ask for streaming never gets a stream segment, so the result is
+ * PD_STREAMING_OFF for it, whatever the GUC says.
+ *
+ * plugin_options are the options the client gave for the output plugin.
+ */
+extern int ParallelDecodeResolveStreamingMode(List *plugin_options);
 
 /*
  * Wire trace facility.
@@ -110,6 +135,7 @@ extern void PDTraceShutdown(void);
 extern void ParallelDecodeSessionStart(ReplicationSlot *slot,
 									   const char *plugin_options,
 									   uint32 plugin_options_len,
+									   int streaming_mode,
 									   XLogRecPtr start_lsn);
 extern void ParallelDecodeSessionStop(void);
 
@@ -157,6 +183,24 @@ typedef struct ParallelDecodeControl
 	int			streaming_mode;	/* ParallelDecodeStreamingMode */
 	int			proto_version;
 	char		plugin_name[NAMEDATALEN];
+
+	/*
+	 * The size of the stream segments the decode workers produce, and the
+	 * smallest size a transaction may have before it is streamed at all.
+	 *
+	 * Both are zero when the session does not stream: the changes of a
+	 * transaction are then only streamed when the decoding path runs out of
+	 * memory, which is the behavior of the serial path.
+	 */
+	uint64		stream_segment_size;
+	uint64		stream_min_size;
+
+	/*
+	 * The amount of memory each decode worker may use for the changes it has
+	 * accumulated, in kilobytes.  Zero means the default of the decoding
+	 * path.
+	 */
+	int			work_mem_kb;
 
 	/*
 	 * The parameters of the session, as the decode workers need them.
@@ -260,8 +304,53 @@ typedef enum ParallelDecodeEntryType
 	PD_ENT_ERROR = 9,			/* worker -> walsender */
 	PD_ENT_READY = 10,			/* walreader -> walsender */
 	PD_ENT_FRAME = 11,			/* worker -> walsender */
-	PD_ENT_POSITION = 12		/* worker -> walsender */
+	PD_ENT_POSITION = 12,		/* worker -> walsender */
+	PD_ENT_CSEQ = 13,			/* walreader -> walsender */
+	PD_ENT_SEGMENT = 14			/* worker -> walsender */
 } ParallelDecodeEntryType;
+
+/*
+ * The information about a transaction that has ended.
+ *
+ * The walreader is the only reader of the WAL, so it is the one that knows
+ * where the record that ended the transaction is.  The walsender needs that
+ * position to compute the release frontier, which is the limit the LSNs of
+ * the frames it writes to the subscriber may not exceed (see the design
+ * document, 7.4).
+ *
+ * end_lsn is the *start* of the record that ended the transaction, which is
+ * the position the decoding path compares against the flush position of the
+ * slot when it decides whether a transaction has to be skipped.  Using the
+ * end of the record instead would let the flush position land inside the
+ * record, which would make the subscriber skip the transaction.
+ */
+typedef struct PDCseqInfo
+{
+	uint64		cseq;				/* the commit sequence number */
+	uint64		end_lsn;			/* the start of the record that ended the
+									 * transaction */
+	uint64		read_lsn;			/* the position the walreader has read up
+									 * to */
+} PDCseqInfo;
+
+/*
+ * The header of a stream segment.
+ *
+ * A stream segment is the sequence of the frames of one part of a
+ * transaction that is streamed before the transaction is complete: a STREAM
+ * START message, the changes and a STREAM STOP message.
+ *
+ * The frames of a segment have to reach the subscriber without the bytes of
+ * another transaction in between, because the subscriber accepts only one
+ * open stream segment at a time.  The worker therefore hands the frames of a
+ * segment over as one message, and the walsender writes them out one after
+ * the other.
+ */
+typedef struct PDSegmentHeader
+{
+	uint64		end_lsn;			/* the decoding position after the segment */
+	uint32		nframes;			/* the number of frames in the segment */
+} PDSegmentHeader;
 
 /*
  * The header that precedes every WAL record on the channel between the
@@ -419,6 +508,15 @@ extern void PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
 							  const char *frame, size_t len);
 
 /*
+ * Send a stream segment to the walsender.
+ *
+ * The frames of the segment follow each other, each of them preceded by its
+ * length, so that the walsender can find the boundaries of the frames.
+ */
+extern void PDQueueSendSegment(shm_mq_handle *mqh, uint64 end_lsn,
+							   uint32 nframes, const char *payload, size_t len);
+
+/*
  * Report an event to the walsender.
  *
  * The message uses the chunked framing, because the receiver of a queue uses
@@ -504,6 +602,38 @@ extern XLogRecPtr ParallelDecodePosition(void);
  * walreader has not reported one yet.
  */
 extern XLogRecPtr ParallelDecodeWalreaderPosition(void);
+
+/*
+ * The release frontier of the session.
+ *
+ * The frontier is the position of the record that ended the first transaction
+ * that has not been released to the subscriber yet.  No frame the walsender
+ * writes may carry a position that is beyond the frontier: the subscriber
+ * uses the position of the frames it receives to advance the flush position
+ * of the slot, and a position that is beyond the frontier would make the
+ * subscriber skip the transactions that have not been delivered yet.
+ *
+ * The frontier is InvalidXLogRecPtr when the session does not know it yet.
+ */
+extern XLogRecPtr ParallelDecodeFrontier(void);
+
+/*
+ * Limit a position to the release frontier.
+ *
+ * This is used for the position of the keepalive frames, which the subscriber
+ * folds into its flush position just like the position of a data frame.
+ */
+extern XLogRecPtr ParallelDecodeClampLSN(XLogRecPtr lsn);
+
+/*
+ * Limit the positions of a frame to the release frontier.
+ *
+ * The frame is the 'w' frame of the replication protocol, whose header holds
+ * two positions.  The positions of the frames of a transaction that has been
+ * released are always within the frontier, so this only ever changes the
+ * frames of a stream segment.
+ */
+extern void ParallelDecodeClampFrame(StringInfo frame);
 
 /*
  * The 'prepare_write' callback of the logical decoding context.

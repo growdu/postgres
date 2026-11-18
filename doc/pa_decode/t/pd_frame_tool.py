@@ -357,17 +357,21 @@ def _parse_message(buf, tag, streaming):
     raise ValueError("unknown message tag %r" % tag)
 
 
-def parse_messages(payload):
+def parse_messages(payload, streaming=False):
     """Split the body of a 'w' frame into pgoutput messages.
 
-    Returns a list of (tag, bytes, description) triples.  A message that
-    cannot be parsed is returned as a single opaque blob, so that the
-    comparison never loses bytes.
+    Returns a list of (tag, bytes, description) triples and the streaming
+    state the frame leaves behind.  A message that cannot be parsed is
+    returned as a single opaque blob, so that the comparison never loses
+    bytes.
+
+    The streaming state is a part of the result, because a stream segment is
+    spread over many frames: the changes of a segment carry the transaction
+    id in band, and the parser has to know that it is inside a segment.
     """
     body = payload[FRAME_HEADER_LEN["w"]:]
     buf = _Buf(body)
     messages = []
-    streaming = False
 
     while buf.pos < len(body):
         start = buf.pos
@@ -388,16 +392,18 @@ def parse_messages(payload):
         elif tag == MSG_STREAM_STOP:
             streaming = False
 
-    return messages
+    return messages, streaming
 
 
 def message_stream(frames):
     """The ordered list of pgoutput messages across all data frames."""
     stream = []
+    streaming = False
     for frame in frames:
         if frame.type != "w":
             continue
-        for tag, raw, desc in parse_messages(frame.payload):
+        messages, streaming = parse_messages(frame.payload, streaming)
+        for tag, raw, desc in messages:
             stream.append((tag, hashlib.sha256(raw).hexdigest()[:16], len(raw)))
     return stream
 
@@ -405,10 +411,12 @@ def message_stream(frames):
 def message_multiset(frames):
     """The multiset of pgoutput messages across all data frames."""
     counter = Counter()
+    streaming = False
     for frame in frames:
         if frame.type != "w":
             continue
-        for tag, raw, desc in parse_messages(frame.payload):
+        messages, streaming = parse_messages(frame.payload, streaming)
+        for tag, raw, desc in messages:
             counter[(tag, hashlib.sha256(raw).hexdigest()[:16], len(raw))] += 1
     return counter
 
@@ -440,10 +448,12 @@ def message_lsn_map(frames):
     LSNs can only be compared per message, not per frame.
     """
     result = defaultdict(list)
+    streaming = False
     for frame in frames:
         if frame.type != "w":
             continue
-        for tag, raw, desc in parse_messages(frame.payload):
+        messages, streaming = parse_messages(frame.payload, streaming)
+        for tag, raw, desc in messages:
             key = (tag, hashlib.sha256(raw).hexdigest()[:16], len(raw))
             result[key].append((frame.lsn1, frame.lsn2))
     for key in result:
@@ -454,10 +464,12 @@ def message_lsn_map(frames):
 def transaction_order(frames):
     """The ordered list of the transaction delimiters."""
     order = []
+    streaming = False
     for frame in frames:
         if frame.type != "w":
             continue
-        for tag, raw, desc in parse_messages(frame.payload):
+        messages, streaming = parse_messages(frame.payload, streaming)
+        for tag, raw, desc in messages:
             if tag in TXN_BOUNDARY:
                 order.append(tag)
     return order
@@ -466,10 +478,12 @@ def transaction_order(frames):
 def cmd_dump(args):
     frames = read_trace(args.tracefile)
     print("%d frame(s) in %s" % (len(frames), args.tracefile))
+    streaming = False
     for frame in frames:
         print(frame)
         if args.messages and frame.type == "w":
-            for tag, raw, desc in parse_messages(frame.payload):
+            messages, streaming = parse_messages(frame.payload, streaming)
+            for tag, raw, desc in messages:
                 print("    %s %d bytes %s" % (tag, len(raw), desc))
     return 0
 

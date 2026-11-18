@@ -57,6 +57,15 @@ static ParallelDecodeControl *pd_ctl = NULL;
 static shm_mq_handle *pd_wal_mqh[MAX_PARALLEL_DECODE_WORKERS];
 static int	pd_num_workers = 0;
 
+/*
+ * The control channel the walreader reports on.
+ *
+ * The walreader is the only reader of the WAL, so it is the only one that
+ * knows where the records that end the transactions are.  The walsender needs
+ * that information to compute the release frontier.
+ */
+static shm_mq_handle *pd_control_mqh = NULL;
+
 /* The wait event the walreader reports while it waits for new WAL. */
 static uint32 pd_wait_event = PG_WAIT_EXTENSION;
 
@@ -543,6 +552,46 @@ pd_walreader_classify(XLogReaderState *reader)
 }
 
 /*
+ * Tell the walsender where the record that ended a transaction is.
+ *
+ * The walsender needs the position of that record to compute the release
+ * frontier: the frames it writes may not carry a position beyond it, or the
+ * subscriber would advance the flush position of the slot beyond a
+ * transaction that has not been delivered yet.
+ *
+ * The message is sent before the record itself is handed over to the decode
+ * workers, so the walsender always knows the position of a transaction before
+ * it sees the report that the transaction has been decoded.
+ */
+static void
+pd_walreader_send_cseq(uint64 cseq, XLogRecPtr end_lsn, XLogRecPtr read_lsn)
+{
+	PDCseqInfo	info;
+
+	info.cseq = cseq;
+
+	/*
+	 * The frontier is built from the start of the record that ended the
+	 * transaction, because that is the position the skip test of the decoding
+	 * path compares with the flush position of the slot.
+	 */
+	info.end_lsn = (uint64) end_lsn;
+
+	/*
+	 * The position the walreader has read up to.  It is the position of the
+	 * record itself, so it covers every transaction that ended before it.
+	 */
+	info.read_lsn = (uint64) read_lsn;
+
+	if (!PDQueueSend(pd_control_mqh, PD_ENT_CSEQ, &info, sizeof(info),
+					 false, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("could not hand a commit sequence number to the parallel "
+						"decoding session")));
+}
+
+/*
  * Read the WAL and hand the records over to the decoding side.
  */
 static void
@@ -621,6 +670,15 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		recdesc = pd_walreader_classify(reader);
 		info = recdesc.txn;
 		cseq = recdesc.cseq;
+
+		/*
+		 * The record that ends a transaction gets a commit sequence number.
+		 * Tell the walsender where the record is, so that it can limit the
+		 * positions it reports to the release frontier.
+		 */
+		if (cseq != 0)
+			pd_walreader_send_cseq(cseq, reader->record->lsn,
+								   reader->record->next_lsn);
 
 		/*
 		 * Hand the record over.  The record points into the reader's decode
@@ -760,6 +818,7 @@ ParallelWalreaderMain(Datum main_arg)
 				 errmsg("could not find the parallel decoding control channel")));
 	shm_mq_set_sender(control_mq, MyProc);
 	control_mqh = shm_mq_attach(control_mq, seg, NULL);
+	pd_control_mqh = control_mqh;
 
 	ready_payload[0] = (int64) MyProcPid;
 	ready_payload[1] = 0;

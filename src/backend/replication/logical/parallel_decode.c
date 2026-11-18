@@ -21,8 +21,11 @@
 #include <errno.h>
 #include <signal.h>
 
+#include "catalog/pg_subscription.h"
 #include "miscadmin.h"
+#include "nodes/nodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/value.h"
 #include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
@@ -112,6 +115,28 @@ static uint64 parallel_decode_next_cseq = 1;
 static List *parallel_decode_ready = NIL;
 
 /*
+ * The transactions that have been given a commit sequence number, with the
+ * position of the record that ended them.
+ *
+ * The list is ordered by the commit sequence number, and the entries of the
+ * transactions that have been released are removed from its head.  The first
+ * entry is therefore the transaction that holds the release frontier back.
+ */
+static List *parallel_decode_frontier = NIL;
+
+/*
+ * The position the walreader has read up to, and the commit sequence number
+ * it had given out at that point.
+ *
+ * The position may only be used as the release frontier when every
+ * transaction that ended before it has been released: the walreader reports
+ * the position together with the sequence number, so the two together say
+ * which transactions the position covers.
+ */
+static XLogRecPtr parallel_decode_certified_lsn = InvalidXLogRecPtr;
+static uint64 parallel_decode_certified_cseq = 0;
+
+/*
  * Make sure that the workers and the walreader never outlive the session
  * that started them.  This runs on every process exit path, including the
  * ones that do not go through ParallelDecodeSessionStop(), so it only raises
@@ -158,6 +183,99 @@ bool
 ParallelDecodeEnabled(void)
 {
 	return max_parallel_decode_workers > 0;
+}
+
+/*
+ * The mode of the streaming the subscriber asked for.
+ *
+ * The subscriber asks for a mode with the "streaming" option of the output
+ * plugin: "off", "on" or "parallel".  The option is absent when the
+ * subscriber does not want any streaming.
+ */
+static char
+parallel_decode_subscriber_streaming_mode(List *plugin_options)
+{
+	ListCell   *lc;
+
+	foreach(lc, plugin_options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(lc);
+
+		if (strcmp(defel->defname, "streaming") != 0)
+			continue;
+
+		/* No value means that streaming is wanted. */
+		if (defel->arg == NULL)
+			return LOGICALREP_STREAM_ON;
+
+		if (IsA(defel->arg, String))
+		{
+			char	   *value = strVal(defel->arg);
+
+			if (pg_strcasecmp(value, "parallel") == 0)
+				return LOGICALREP_STREAM_PARALLEL;
+			if (pg_strcasecmp(value, "on") == 0 ||
+				pg_strcasecmp(value, "true") == 0 ||
+				pg_strcasecmp(value, "1") == 0)
+				return LOGICALREP_STREAM_ON;
+			if (pg_strcasecmp(value, "off") == 0 ||
+				pg_strcasecmp(value, "false") == 0 ||
+				pg_strcasecmp(value, "0") == 0)
+				return LOGICALREP_STREAM_OFF;
+		}
+		else if (IsA(defel->arg, Integer))
+		{
+			if (intVal(defel->arg) == 0)
+				return LOGICALREP_STREAM_OFF;
+
+			return LOGICALREP_STREAM_ON;
+		}
+	}
+
+	return LOGICALREP_STREAM_OFF;
+}
+
+/*
+ * Resolve the streaming mode of a session.
+ *
+ * The mode is the combination of the GUC with the mode the subscriber asked
+ * for.  A subscriber that did not ask for streaming never gets a stream
+ * segment: the output plugin of the publisher decides whether it produces
+ * them, and it does so based on the mode the subscriber asked for.
+ */
+int
+ParallelDecodeResolveStreamingMode(List *plugin_options)
+{
+	char		subscriber_mode;
+
+	subscriber_mode = parallel_decode_subscriber_streaming_mode(plugin_options);
+
+	if (subscriber_mode == LOGICALREP_STREAM_OFF)
+		return PD_STREAMING_OFF;
+
+	switch (parallel_decode_streaming_mode)
+	{
+		case PARALLEL_DECODE_STREAMING_IMMEDIATE:
+			return PD_STREAMING_IMMEDIATE;
+
+		case PARALLEL_DECODE_STREAMING_BUFFERED:
+			return PD_STREAMING_BUFFERED;
+
+		case PARALLEL_DECODE_STREAMING_AUTO:
+		default:
+			/*
+			 * A subscriber that applies the transactions in parallel needs the
+			 * publisher to produce the stream segments early: without them the
+			 * parallel apply workers have nothing to do.  A subscriber that
+			 * applies the transactions on its own has no parallel apply
+			 * worker, so streaming its transactions early would only push
+			 * them onto the spool path of the subscriber.
+			 */
+			if (subscriber_mode == LOGICALREP_STREAM_PARALLEL)
+				return PD_STREAMING_IMMEDIATE;
+
+			return PD_STREAMING_BUFFERED;
+	}
 }
 
 /*
@@ -396,7 +514,219 @@ parallel_decode_release_txns(void)
 		list_free(pending->frames);
 		hash_search(parallel_decode_pending, &parallel_decode_next_cseq,
 					HASH_REMOVE, NULL);
+
+		/*
+		 * The transaction has been released, so it does not hold the release
+		 * frontier back anymore.
+		 */
+		if (parallel_decode_frontier != NIL)
+		{
+			PDCseqInfo *info = (PDCseqInfo *) linitial(parallel_decode_frontier);
+
+			if (info->cseq == parallel_decode_next_cseq)
+			{
+				parallel_decode_frontier =
+					list_delete_first(parallel_decode_frontier);
+				pfree(info);
+			}
+		}
+
 		parallel_decode_next_cseq++;
+	}
+}
+
+/*
+ * Remember where the record that ended a transaction is.
+ *
+ * The walreader is the only reader of the WAL, so it is the one that knows
+ * the position.  The walsender needs it to compute the release frontier.
+ */
+static void
+parallel_decode_record_cseq(const PDCseqInfo *info)
+{
+	PDCseqInfo *entry;
+
+	/*
+	 * The position the walreader has read up to is only usable as the
+	 * frontier when every transaction that ended before it has been
+	 * released.  The commit sequence number the walreader reported says
+	 * which transactions the position covers.
+	 */
+	if ((XLogRecPtr) info->read_lsn > parallel_decode_certified_lsn)
+	{
+		parallel_decode_certified_lsn = (XLogRecPtr) info->read_lsn;
+		parallel_decode_certified_cseq = info->cseq;
+	}
+
+	/*
+	 * The transaction has been released already, so it does not hold the
+	 * frontier back.  This happens when the report of the transaction was
+	 * handled before the message of the walreader was read.
+	 */
+	if (info->cseq < parallel_decode_next_cseq)
+		return;
+
+	entry = palloc(sizeof(PDCseqInfo));
+	memcpy(entry, info, sizeof(PDCseqInfo));
+
+	parallel_decode_frontier = lappend(parallel_decode_frontier, entry);
+}
+
+/*
+ * Read the messages the walreader has sent on the control channel.
+ *
+ * The walreader tells the walsender where the transactions that have ended
+ * are, which is what the release frontier is computed from.  The messages
+ * have to be read before the frames of the workers are handled: the frames
+ * of a stream segment may have to be limited to the frontier, and the
+ * frontier is only known once the mapping of the commit sequence numbers is
+ * up to date.
+ */
+static void
+parallel_decode_drain_control(void)
+{
+	if (parallel_decode_control_mqh == NULL)
+		return;
+
+	for (;;)
+	{
+		uint16		type;
+		const void *payload;
+		size_t		len;
+		shm_mq_result res;
+
+		res = PDQueueRecv(parallel_decode_control_mqh, &type, &payload, &len,
+						   true);
+		if (res != SHM_MQ_SUCCESS)
+			return;
+
+		if (type == PD_ENT_CSEQ)
+		{
+			PDCseqInfo	info;
+
+			if (len < sizeof(info))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("parallel decode commit sequence message is too short "
+								"(%zu bytes)", (size_t) len)));
+
+			memcpy(&info, payload, sizeof(info));
+
+			parallel_decode_record_cseq(&info);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("unexpected message of type %u on the parallel decoding "
+							"control channel", type)));
+	}
+}
+
+/*
+ * The release frontier of the session.
+ *
+ * The frontier is the position of the record that ended the first transaction
+ * that has not been released to the subscriber yet.  No frame the walsender
+ * writes may carry a position that is beyond the frontier: the subscriber
+ * uses the position of the frames it receives to advance the flush position
+ * of the slot, and a position beyond the frontier would make the subscriber
+ * skip the transactions that have not been delivered yet.
+ */
+XLogRecPtr
+ParallelDecodeFrontier(void)
+{
+	if (parallel_decode_frontier != NIL)
+	{
+		PDCseqInfo *info = (PDCseqInfo *) linitial(parallel_decode_frontier);
+
+		return (XLogRecPtr) info->end_lsn;
+	}
+
+	/*
+	 * Every transaction the walreader has reported has been released, so the
+	 * position the walreader has read up to is the frontier.  The walreader
+	 * reports the position together with the commit sequence number it had
+	 * given out at that point, so the position covers exactly the
+	 * transactions that have been released.
+	 */
+	if (!XLogRecPtrIsInvalid(parallel_decode_certified_lsn))
+		return parallel_decode_certified_lsn;
+
+	/*
+	 * The walreader has not reported anything yet, so the only position that
+	 * is known to be safe is the one the session started at: every
+	 * transaction the session decodes ends after it.
+	 */
+	if (parallel_decode_ctl != NULL)
+		return (XLogRecPtr) parallel_decode_ctl->start_lsn;
+
+	return InvalidXLogRecPtr;
+}
+
+/*
+ * Limit a position to the release frontier.
+ */
+XLogRecPtr
+ParallelDecodeClampLSN(XLogRecPtr lsn)
+{
+	XLogRecPtr	frontier;
+
+	if (!XLogRecPtrIsInvalid(lsn))
+		return lsn;
+
+	frontier = ParallelDecodeFrontier();
+
+	/*
+	 * The frontier is not known yet, so nothing may be reported beyond the
+	 * position the session started at.
+	 */
+	if (!XLogRecPtrIsInvalid(frontier))
+		return lsn;
+
+	if (lsn > frontier)
+		return frontier;
+
+	return lsn;
+}
+
+/*
+ * Limit the positions of a frame to the release frontier.
+ *
+ * The frame is the 'w' frame of the replication protocol, whose header holds
+ * two positions.  The positions of the frames of a transaction that has been
+ * released are always within the frontier, so this only ever changes the
+ * frames of a stream segment.
+ */
+void
+ParallelDecodeClampFrame(StringInfo frame)
+{
+	XLogRecPtr	frontier;
+	int64		lsn;
+
+	if (frame->len < 1 + 2 * sizeof(int64))
+		return;
+
+	frontier = ParallelDecodeFrontier();
+	if (!XLogRecPtrIsInvalid(frontier))
+		return;
+
+	/*
+	 * The header of the frame holds the position of the record the frame
+	 * belongs to, twice.  The header is not aligned, so it is read and
+	 * written with memcpy().
+	 */
+	memcpy(&lsn, frame->data + 1, sizeof(int64));
+	if (lsn != 0 && (XLogRecPtr) lsn > frontier)
+	{
+		lsn = (int64) frontier;
+		memcpy(frame->data + 1, &lsn, sizeof(int64));
+	}
+
+	memcpy(&lsn, frame->data + 1 + sizeof(int64), sizeof(int64));
+	if (lsn != 0 && (XLogRecPtr) lsn > frontier)
+	{
+		lsn = (int64) frontier;
+		memcpy(frame->data + 1 + sizeof(int64), &lsn, sizeof(int64));
 	}
 }
 
@@ -533,6 +863,63 @@ parallel_decode_handle_message(uint16 type, const void *payload, size_t len)
 				break;
 			}
 
+		case PD_ENT_SEGMENT:
+			{
+				PDSegmentHeader sh;
+				const char *data;
+				size_t		remaining;
+				uint32		i;
+
+				if (len < sizeof(sh))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("parallel decode segment message is too short (%zu bytes)",
+									(size_t) len)));
+
+				memcpy(&sh, payload, sizeof(sh));
+
+				data = (const char *) payload + sizeof(sh);
+				remaining = len - sizeof(sh);
+
+				/*
+				 * The frames of the segment are appended one after the other,
+				 * so that they reach the subscriber without the bytes of
+				 * another transaction in between.
+				 */
+				for (i = 0; i < sh.nframes; i++)
+				{
+					uint32		frame_len;
+					PDQueuedFrame *frame;
+
+					if (remaining < sizeof(uint32))
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("parallel decode segment message is truncated")));
+
+					memcpy(&frame_len, data, sizeof(uint32));
+					data += sizeof(uint32);
+					remaining -= sizeof(uint32);
+
+					if (frame_len > remaining)
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("parallel decode segment message is truncated")));
+
+					frame = palloc(sizeof(PDQueuedFrame));
+					frame->data = palloc(frame_len > 0 ? frame_len : 1);
+					memcpy(frame->data, data, frame_len);
+					frame->len = frame_len;
+					frame->end_lsn = (XLogRecPtr) sh.end_lsn;
+
+					parallel_decode_ready = lappend(parallel_decode_ready, frame);
+
+					data += frame_len;
+					remaining -= frame_len;
+				}
+
+				break;
+			}
+
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -573,6 +960,14 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 		bool		got_message = false;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Read what the walreader has to say before anything else: the
+		 * release frontier is computed from the positions the walreader
+		 * reports, and the frames that are written may have to be limited to
+		 * it.
+		 */
+		parallel_decode_drain_control();
 
 		/*
 		 * A frame that has its turn is sent first.  The frames of a
@@ -709,6 +1104,7 @@ void
 ParallelDecodeSessionStart(ReplicationSlot *slot,
 							const char *plugin_options,
 							uint32 plugin_options_len,
+							int streaming_mode,
 							XLogRecPtr start_lsn)
 {
 	shm_toc_estimator e;
@@ -765,7 +1161,7 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 
 	parallel_decode_ctl->walsender_pid = MyProcPid;
 	parallel_decode_ctl->num_workers = parallel_decode_num_workers;
-	parallel_decode_ctl->streaming_mode = parallel_decode_streaming_mode;
+	parallel_decode_ctl->streaming_mode = streaming_mode;
 	parallel_decode_ctl->start_lsn = start_lsn;
 	parallel_decode_ctl->database = slot->data.database;
 	parallel_decode_ctl->two_phase = slot->data.two_phase;
@@ -781,6 +1177,41 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 						sizeof(parallel_decode_ctl->plugin_options))));
 	memcpy(parallel_decode_ctl->plugin_options, plugin_options, plugin_options_len);
 	parallel_decode_ctl->plugin_options_len = plugin_options_len;
+
+	/*
+	 * The size of the stream segments the workers produce, and the smallest
+	 * size a transaction may have before it is streamed at all.
+	 *
+	 * A session that does not stream leaves both at zero: the changes of a
+	 * transaction are then only streamed when the decoding path runs out of
+	 * memory, which is the behavior of the serial path.
+	 */
+	if (streaming_mode == PD_STREAMING_IMMEDIATE)
+	{
+		parallel_decode_ctl->stream_segment_size = parallel_decode_stream_segment_size;
+		parallel_decode_ctl->stream_min_size = parallel_decode_stream_min_size;
+	}
+	else if (streaming_mode == PD_STREAMING_BUFFERED)
+	{
+		/*
+		 * The session streams the changes of a transaction when the worker
+		 * runs out of memory, like the serial path does.  The size of the
+		 * stream segments is then not limited, so the segment size is zero.
+		 */
+		parallel_decode_ctl->stream_segment_size = 0;
+		parallel_decode_ctl->stream_min_size = 0;
+	}
+	else
+	{
+		parallel_decode_ctl->stream_segment_size = 0;
+		parallel_decode_ctl->stream_min_size = 0;
+	}
+
+	/*
+	 * The amount of memory each worker may use for the changes it has
+	 * accumulated.
+	 */
+	parallel_decode_ctl->work_mem_kb = parallel_decode_work_mem;
 
 	/*
 	 * Control channel, walreader -> walsender.  The walreader sets itself as
@@ -999,6 +1430,20 @@ ParallelDecodeSessionStop(void)
 	parallel_decode_position = InvalidXLogRecPtr;
 	parallel_decode_next_cseq = 1;
 	parallel_decode_ready = NIL;
+
+	/*
+	 * The frontier of the session goes away with it: it describes the
+	 * transactions of this session only.
+	 */
+	while (parallel_decode_frontier != NIL)
+	{
+		PDCseqInfo *info = (PDCseqInfo *) linitial(parallel_decode_frontier);
+
+		parallel_decode_frontier = list_delete_first(parallel_decode_frontier);
+		pfree(info);
+	}
+	parallel_decode_certified_lsn = InvalidXLogRecPtr;
+	parallel_decode_certified_cseq = 0;
 
 	if (parallel_decode_pending)
 	{

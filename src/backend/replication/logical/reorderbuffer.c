@@ -3621,12 +3621,43 @@ ReorderBufferLargestStreamableTopTXN(ReorderBuffer *rb)
 }
 
 /*
+ * Has a transaction accumulated enough changes to be streamed?
+ *
+ * The publisher-side parallel decoding path asks for the changes of a
+ * transaction to be streamed once they reach a certain size, so that a large
+ * transaction reaches the subscriber before it is complete.  The size of the
+ * whole reorder buffer is checked by the caller first, because it is the sum
+ * of the sizes of the transactions the buffer holds: if it is below the
+ * threshold, no transaction in it can be above it.
+ */
+static bool
+ReorderBufferStreamableTxnReached(ReorderBuffer *rb, Size segment_size)
+{
+	ReorderBufferTXN *txn;
+
+	if (!ReorderBufferCanStartStreaming(rb))
+		return false;
+
+	txn = ReorderBufferLargestStreamableTopTXN(rb);
+	if (txn == NULL)
+		return false;
+
+	return txn->total_size >= segment_size;
+}
+
+/*
  * Check whether the logical_decoding_work_mem limit was reached, and if yes
  * pick the largest (sub)transaction at-a-time to evict and spill its changes to
  * disk or send to the output plugin until we reach under the memory limit.
  *
  * If debug_logical_replication_streaming is set to "immediate", stream or
  * serialize the changes immediately.
+ *
+ * The publisher-side parallel decoding path asks for the changes of a
+ * transaction to be streamed once they reach the size it wants a stream
+ * segment to have, so that a large transaction reaches the subscriber before
+ * it is complete.  That is a separate trigger: it does not depend on the
+ * memory the reorder buffer holds.
  *
  * XXX At this point we select the transactions until we reach under the memory
  * limit, but we might also adapt a more elaborate eviction strategy - for example
@@ -3637,13 +3668,35 @@ static void
 ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 {
 	ReorderBufferTXN *txn;
+	LogicalDecodingContext *ctx = rb->private_data;
+	Size		segment_size = 0;
+	Size		min_size = 0;
+
+	/*
+	 * The parallel decoding path decides on its own how eagerly the changes
+	 * of a transaction are streamed.  The serial path leaves these at zero,
+	 * which keeps its behavior unchanged.
+	 */
+	if (ctx != NULL)
+	{
+		segment_size = ctx->stream_segment_size;
+		min_size = ctx->stream_min_size;
+	}
+
+	/*
+	 * A transaction may only be streamed once it has reached the minimum
+	 * size, so the threshold is the larger of the two.
+	 */
+	if (min_size > segment_size)
+		segment_size = min_size;
 
 	/*
 	 * Bail out if debug_logical_replication_streaming is buffered and we
 	 * haven't exceeded the memory limit.
 	 */
 	if (debug_logical_replication_streaming == DEBUG_LOGICAL_REP_STREAMING_BUFFERED &&
-		rb->size < logical_decoding_work_mem * 1024L)
+		rb->size < logical_decoding_work_mem * 1024L &&
+		segment_size == 0)
 		return;
 
 	/*
@@ -3658,7 +3711,10 @@ ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 	 */
 	while (rb->size >= logical_decoding_work_mem * 1024L ||
 		   (debug_logical_replication_streaming == DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE &&
-			rb->size > 0))
+			rb->size > 0) ||
+		   (segment_size > 0 &&
+			rb->size >= segment_size &&
+			ReorderBufferStreamableTxnReached(rb, segment_size)))
 	{
 		/*
 		 * Pick the largest transaction and evict it from memory by streaming,
@@ -3698,8 +3754,13 @@ ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 		Assert(txn->nentries_mem == 0);
 	}
 
-	/* We must be under the memory limit now. */
-	Assert(rb->size < logical_decoding_work_mem * 1024L);
+	/*
+	 * We must be under the memory limit now.  The parallel decoding path
+	 * streams the changes of a transaction for its own sake, so it may stop
+	 * while the reorder buffer still holds more than the memory limit.
+	 */
+	if (segment_size == 0)
+		Assert(rb->size < logical_decoding_work_mem * 1024L);
 
 }
 
