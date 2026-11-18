@@ -111,6 +111,14 @@ static int64 pd_worker_bytes[MAX_PARALLEL_DECODE_WORKERS] = {0};
 static uint64 pd_next_cseq = 1;
 
 /*
+ * The WAL position the walreader has read up to.
+ *
+ * It is reported with an error, so that the walsender can tell where the
+ * failure happened.
+ */
+static XLogRecPtr pd_read_lsn = InvalidXLogRecPtr;
+
+/*
  * SIGTERM handler: ask the walreader to exit at the next opportunity.
  */
 static void
@@ -511,8 +519,10 @@ pd_walreader_record_prepares_xact(XLogReaderState *reader)
 typedef struct PDRecordInfo
 {
 	PDTxnInfo   *txn;		/* the top level transaction, NULL if there is none */
+	int			worker;		/* the worker that owns the transaction */
 	uint64		cseq;		/* the commit sequence number, zero if the record
 							 * does not end a transaction */
+	bool		ended;		/* the transaction is over, its entry is gone */
 } PDRecordInfo;
 
 /*
@@ -525,7 +535,9 @@ pd_walreader_classify(XLogReaderState *reader)
 	PDRecordInfo result;
 
 	result.txn = NULL;
+	result.worker = -1;
 	result.cseq = 0;
+	result.ended = false;
 
 	if (!TransactionIdIsValid(pd_walreader_record_xid(reader)))
 		return result;
@@ -538,15 +550,29 @@ pd_walreader_classify(XLogReaderState *reader)
 	 * the transactions, no matter which worker decoded them.
 	 */
 	if (!pd_walreader_record_ends_xact(reader, result.txn))
+	{
+		if (result.txn != NULL)
+			result.worker = result.txn->worker;
 		return result;
+	}
 
 	result.cseq = pd_next_cseq++;
+
+	/*
+	 * Remember the owner of the transaction before the entry is removed: the
+	 * entry is freed when the transaction ends, so it may not be looked at
+	 * afterwards.
+	 */
+	result.worker = result.txn->worker;
 
 	/*
 	 * The transaction is over, unless it is only prepared.
 	 */
 	if (!pd_walreader_record_prepares_xact(reader))
+	{
 		pd_walreader_forget_txn(result.txn);
+		result.ended = true;
+	}
 
 	return result;
 }
@@ -564,7 +590,8 @@ pd_walreader_classify(XLogReaderState *reader)
  * it sees the report that the transaction has been decoded.
  */
 static void
-pd_walreader_send_cseq(uint64 cseq, XLogRecPtr end_lsn, XLogRecPtr read_lsn)
+pd_walreader_send_cseq(uint64 cseq, XLogRecPtr end_lsn, XLogRecPtr read_lsn,
+					   int worker)
 {
 	PDCseqInfo	info;
 
@@ -583,12 +610,59 @@ pd_walreader_send_cseq(uint64 cseq, XLogRecPtr end_lsn, XLogRecPtr read_lsn)
 	 */
 	info.read_lsn = (uint64) read_lsn;
 
+	/*
+	 * The worker that decoded the transaction.  The walsender uses it to find
+	 * out which worker it has to wait for when the transaction is next in line.
+	 */
+	info.owner = worker;
+
 	if (!PDQueueSend(pd_control_mqh, PD_ENT_CSEQ, &info, sizeof(info),
 					 false, true))
 		ereport(ERROR,
 				(errcode(ERRCODE_IO_ERROR),
 				 errmsg("could not hand a commit sequence number to the parallel "
 						"decoding session")));
+}
+
+/*
+ * Report an error to the walsender.
+ *
+ * The walsender has to end the session anyway: the walreader is the only
+ * reader of the WAL, so without it no new record can be decoded.  The report
+ * tells it what went wrong, so that the session ends with a message that says
+ * what happened instead of the generic "the walreader died unexpectedly".
+ *
+ * The text of the error is put into the control block, because the walreader
+ * is gone by the time the walsender reads the report.
+ */
+static void
+pd_walreader_report_error(const char *message)
+{
+	PDErrorHeader eh;
+
+	if (pd_ctl != NULL)
+	{
+		/*
+		 * The message is written before the status, so that a reader that sees
+		 * the status also sees the message.  The barrier makes sure that the
+		 * write is not reordered past the status.
+		 */
+		pd_ctl->walreader_error_lsn = (uint64) pd_read_lsn;
+		strlcpy(pd_ctl->walreader_errmsg, message, PD_MAX_ERROR_MESSAGE);
+		pg_memory_barrier();
+		pd_ctl->walreader_status = PD_WORKER_STATUS_FAILED;
+	}
+
+	eh.worker = -1;
+	eh.lsn = (uint64) pd_read_lsn;
+
+	/*
+	 * The control channel is not chunked: every message of it is a plain
+	 * message with a fixed size header.
+	 */
+	if (!PDQueueSend(pd_control_mqh, PD_ENT_ERROR, &eh, sizeof(eh),
+					 false, true))
+		return;
 }
 
 /*
@@ -603,6 +677,7 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 	PDRecordInfo	recdesc;
 	PDTxnInfo   *info;
 	uint64		cseq;
+	int			worker;
 	int			i;
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -619,6 +694,16 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 	XLogBeginRead(reader, start_lsn);
 
 	buf = makeStringInfo();
+
+	/*
+	 * The fault injection is a debugging facility: it makes the walreader fail,
+	 * so that the way the session reports and recovers from a failure can be
+	 * verified.
+	 */
+	if (parallel_decode_fault_inject == PD_FAULT_WALREADER)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("parallel decode walreader failed on purpose")));
 
 	for (;;)
 	{
@@ -669,6 +754,7 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		 */
 		recdesc = pd_walreader_classify(reader);
 		info = recdesc.txn;
+		worker = recdesc.worker;
 		cseq = recdesc.cseq;
 
 		/*
@@ -678,7 +764,7 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		 */
 		if (cseq != 0)
 			pd_walreader_send_cseq(cseq, reader->record->lsn,
-								   reader->record->next_lsn);
+								   reader->record->next_lsn, worker);
 
 		/*
 		 * Hand the record over.  The record points into the reader's decode
@@ -693,7 +779,7 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		 * accumulate its changes.
 		 */
 		resetStringInfo(buf);
-		wal_header.owner = (info != NULL) ? info->worker : -1;
+		wal_header.owner = worker;
 		wal_header.cseq = cseq;
 		appendBinaryStringInfo(buf, (const char *) &wal_header,
 								sizeof(wal_header));
@@ -712,15 +798,21 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		/*
 		 * Account for the bytes the transaction has produced, so that the
 		 * next transaction goes to the worker that has the least work.
+		 *
+		 * The transaction of a record that ends it is over, and its entry is
+		 * gone: the bytes of such a record do not have to be accounted for,
+		 * because the in-flight bytes of the transaction have been released
+		 * already.
 		 */
-		if (info != NULL)
+		if (info != NULL && !recdesc.ended)
 		{
 			info->bytes += buf->len;
-			pd_worker_bytes[info->worker] += buf->len;
+			pd_worker_bytes[worker] += buf->len;
 		}
 
 		/* Tell the walsender how far we have come. */
 		pd_ctl->walreader_end_lsn = (uint64) reader->record->next_lsn;
+		pd_read_lsn = reader->record->next_lsn;
 	}
 
 	XLogReaderFree(reader);
@@ -832,8 +924,51 @@ ParallelWalreaderMain(Datum main_arg)
 	ereport(LOG,
 			(errmsg("parallel decode walreader started")));
 
-	/* Read the WAL and hand the records over to the walsender. */
-	pd_walreader_read_loop(arg.start_lsn);
+	/*
+	 * Read the WAL and hand the records over to the walsender.
+	 *
+	 * An error that happens here ends the session: the walreader is the only
+	 * reader of the WAL, and the state it holds cannot be handed over to
+	 * another process.  The error is reported to the walsender first, so that
+	 * the session ends with a message that says what went wrong.
+	 */
+	PG_TRY();
+	{
+		pd_walreader_read_loop(arg.start_lsn);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		/*
+		 * Copy the error data before anything else: the error context is gone
+		 * as soon as the error is rethrown.
+		 */
+		edata = CopyErrorData();
+
+		/*
+		 * The report is best effort: if it cannot be sent, the walsender
+		 * notices that the walreader is gone anyway.
+		 */
+		PG_TRY(report);
+		{
+			pd_walreader_report_error(edata->message);
+		}
+		PG_CATCH(report);
+		{
+			/* The error could not be reported. */
+		}
+		PG_END_TRY(report);
+
+		FreeErrorData(edata);
+
+		/*
+		 * Rethrow the error, so that it is logged and the walreader exits with
+		 * a code that does not make the postmaster restart the cluster.
+		 */
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	ctl->walreader_status = PD_WORKER_STATUS_EXITED;
 

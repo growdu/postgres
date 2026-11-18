@@ -1500,6 +1500,8 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | `parallel_decode_stream_segment_size` | 建议 1MB | **单个流段的字节上限**。O2 把 wire 的交错粒度钉死为"一个流段"，没有上限时段的独占时间无上界，并行解码的产出会被堵死（见 8.1） |
 | `parallel_decode_work_mem` | 建议 `logical_decoding_work_mem` | **每 worker** 的解码内存上限（总量 = worker 数 × 该值）。它是 `logical_decoding_work_mem` 的覆盖值——后者语义不变，但首版不做跨进程总量配额（12.2） |
 | `parallel_decode_batch_size` | 建议 64KB | WAL 批次与流式分片的切分粒度；同时是**跨进程唤醒的速率上限**（批次满即 force_flush，5.4） |
+| `parallel_decode_barrier_timeout` | 60（秒，默认）/ 0 表示禁用 | **停滞检测的超时**：barrier 生效（有待放行的事务）且某个 worker 的解码位置落后于 walreader 的读取位置、且该 worker 在这段时间内没有送来任何消息时，判定该 worker 卡死并结束会话（17.8）。0 表示关闭该检测 |
+| `parallel_decode_fault_inject` | 0（默认，即不注入） | **故障注入开关**，仅用于验证故障路径：`1` = decode worker 启动后立刻失败，`2` = walreader 启动后立刻失败（17.8）。生产环境必须保持 0 |
 
 所有 GUC 均需提供 `sighup` 或 `user` 级可调性，并保证关闭时行为与现状完全一致（AC-8）。
 
@@ -1747,9 +1749,9 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 2. **P2 之前不引入多 worker。** 单 worker 打通后，多 worker 只是分配策略的变化；否则进程拆分、解码改造、并行调度三个变量同时出错，难以定位。
 3. **P3 可以在 P1 之后独立推进。** cseq 的分配只依赖 walreader 的 WAL 顺序，与 worker 是否解码无关，可以与 P2 并行实现。
 
-### 16.1 实现状态（P0–P6）
+### 16.1 实现状态（P0–P7）
 
-P0–P6 已在 `pa_decode` 分支实现。P0–P4 的验证手段是**帧级比对**：同一个发布端、同一批 WAL、两个在同一条事务里创建的复制槽，分别用串行路径（`max_parallel_decode_workers = 0`）与并行路径（`max_parallel_decode_workers = N`）各解一遍，把两侧的 wire 字节全部记录下来逐消息比对（`doc/pa_decode/t/frame_diff_smoke.sh`、`concurrent_diff_smoke.sh`）。P6 的验证手段是**订阅端实测**（`streaming_smoke.sh`）：订阅端用 `streaming = 'parallel'` 建立订阅，检查大事务的变更在解码完成前就到达订阅端，且发布端硬重启后不丢数据。
+P0–P7 已在 `pa_decode` 分支实现。P0–P4 的验证手段是**帧级比对**：同一个发布端、同一批 WAL、两个在同一条事务里创建的复制槽，分别用串行路径（`max_parallel_decode_workers = 0`）与并行路径（`max_parallel_decode_workers = N`）各解一遍，把两侧的 wire 字节全部记录下来逐消息比对（`doc/pa_decode/t/frame_diff_smoke.sh`、`concurrent_diff_smoke.sh`）。P6 的验证手段是**订阅端实测**（`streaming_smoke.sh`）：订阅端用 `streaming = 'parallel'` 建立订阅，检查大事务的变更在解码完成前就到达订阅端，且发布端硬重启后不丢数据。P7 的验证手段是**故障注入实测**（`failure_smoke.sh`）：分别让 decode worker 与 walreader 失败，检查发布端报出的是**带原因的错误**而不是笼统的"参与者意外死亡"，且会话**及时结束**而不是静默停滞；随后恢复正常配置，订阅端重连并把数据补齐。
 
 覆盖的负载形态（每种都有一个独立的冒烟脚本）：
 
@@ -1762,6 +1764,7 @@ P0–P6 已在 `pa_decode` 分支实现。P0–P4 的验证手段是**帧级比�
 | `keepalive_smoke.sh` | 会话空闲 20 秒 | 空闲期 keepalive 的产出 |
 | `worker_death_repro.sh` | 订阅在流式中途被删除 | 参与者生命周期与关停次序 |
 | `streaming_smoke.sh` | 单个 4000 行（每行约 200 字节）的大事务，订阅端 `streaming = 'parallel'` | 尽早流式：分片提前到达订阅端、分片帧不交错、发布端硬重启后不丢数据（不变式 S1） |
+| `failure_smoke.sh` | decode worker / walreader 分别被注入故障，其后恢复正常 | 故障恢复：报错带**原因**、会话及时终止而非静默停滞、订阅端重连后补齐数据 |
 
 实现过程中确定的规则与实测到的事实：
 
@@ -1781,8 +1784,14 @@ P0–P6 已在 `pa_decode` 分支实现。P0–P4 的验证手段是**帧级比�
 | 流式化的粒度 | 触发点在 `ReorderBufferCheckMemoryLimit()`：除了 `logical_decoding_work_mem` 阈值外，`rb->size` 达到 `parallel_decode_stream_segment_size` 且**当前事务可以流式**（快照已一致、`SnapBuildXactNeedsSkip()` 为假）时立即切一个分片。分片在 worker 侧收集（`STREAM START` → 若干变更 → `STREAM STOP`），整块通过 `PD_ENT_SEGMENT` 交给 walsender 发送，因此**一个分片的帧在 wire 上必然连续**——订阅端同时只接受一个流段（`worker.c` 的协议约束），分片交错会被拒绝 |
 | 分片帧的 LSN 必须钳制 | 提前送达的分片帧与 keepalive 都携带 LSN，订阅端把它并入 `last_received` → 发布端据此抬高 `confirmed_flush`。若不钳制，`confirmed_flush` 会越过尚未放行的事务的提交记录，重启后整个事务被跳过（不变式 S1 被破坏）。因此 `'w'` 帧头的两个 int64 与 `'k'` keepalive 的 `end_lsn` 都要钳到**放行前沿 F**（`ParallelDecodeClampFrame()` / `ParallelDecodeClampLSN()`）；COMMIT **载荷**里的 `end_lsn` 不钳 |
 | 放行前沿 F 的取值 | F = min{ 每个已分配但未放行的 cseq 的结束记录**起点** LSN }；集合为空时唯一合法取值是 **walreader 认证过的读取位置**（`PDCseqInfo.read_lsn`）。用终点会落在（起点, 终点] 区间内 → 重启后整个事务被跳过 |
+| 故障必须由**状态字**定性，不能只靠"进程没了" | worker 在捕获错误后先把原因写进共享内存的状态字（先写 `errmsg` / `error_lsn`，再 `pg_memory_barrier()`，最后写 `PD_WORKER_STATUS_FAILED`），再把错误通过 `PD_ENT_ERROR` 送给 walsender。walsender 侧 `parallel_decode_report_worker_failure()` **先看状态字**：状态已是 FAILED 就报出**带原因**的错（"the parallel decode worker failed: …"），否则报"参与者意外死亡"。只靠消息传递会有竞态——DETACHED 路径可能在错误消息被读出之前就判定进程已死，于是原因丢失，退化成笼统的"意外死亡" |
+| 故障注入必须放在**循环体内** | 最初的故障注入点在 `pd_worker_decode_loop()` / `pd_walreader_read_loop()` 的**顶部**，即在 `PG_TRY` 之外 → 错误直接终止进程，`PG_CATCH` 里的错误上报根本没机会执行。注入点移进循环体、位于 `PG_TRY` 之内，错误才会走"捕获 → 上报 → 会话结束"这条路径 |
+| bgworker 退出码不会触发崩溃恢复 | `bgworker.c` 的顶层处理器捕获错误后 `EmitErrorReport()` 并 `proc_exit(1)`。退出码 1 **不是**崩溃退出码，postmaster 不会做崩溃恢复。因此 worker 失败必须由 walsender 主动感知并结束会话，不能指望 postmaster 来善后 |
+| 通知 walsender 的通道 | worker 侧的 `bgw_notify_pid` 指向 walsender。postmaster 收到 worker 的退出通知后向该 pid 发 SIGUSR1，walsender 的 `procsignal_sigusr1_handler` 末尾 `SetLatch(MyLatch)` → 唤醒 `ParallelDecodeNextFrame()` 里的 `WaitLatch(MyLatch, …)`。注意本树的 latch 通知用的是 **SIGURG**（`storage/ipc/latch.c` 的 `kill(owner_pid, SIGURG)`），与 SIGUSR1 是两条不同的信号，不要混淆 |
+| 停滞检测的三个必要条件 | 只在**同时满足**下列三条时才判定卡死，避免误报：(a) barrier 生效——有待放行的事务；(b) 某个 worker 的解码位置**落后于** walreader 的读取位置；(c) 该 worker 在 `parallel_decode_barrier_timeout` 秒内没有送来任何消息。worker 每 256 条记录上报一次位置心跳，作为 (c) 的活性信号。空闲的发布端不满足 (a)，因此不会误触发 |
+| 故障后数据不丢 | 会话失败时数据仍在 WAL 里；订阅端重连后从复制槽的 `confirmed_flush` 续传。不变式 S1 保证 `confirmed_flush` 不会越过未放行事务，因此重连后这些事务会被重新解码并送达。实测：两次故障注入之后恢复正常配置，订阅端收到全部 100 行且内容正确 |
 
-尚未实现：P5（快照与失效共享、共享关系表）、P7（故障恢复）。
+尚未实现：P5（快照与失效共享、共享关系表）。
 
 ## 17. 故障恢复
 
@@ -1933,6 +1942,8 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 11. **子事务 abort 必须即时下发**：不占 cseq、不受 barrier 门控、独占一块，且必须早于其后子事务的变更到达订阅端（5.2.2、5.2.3）。
 12. **worker 必须拿到原始插件选项列表**（`PD_ENT_SESSION_INIT`），并据此实例化自己的 output plugin——模式值在 `PGOutputData.streaming` 里，`ctx->streaming` 只是 bool（事实 8c、6.1）。
 
+P7 已落实其中的 1、2、3、5、6、7 条：worker 的错误在循环内的 `PG_TRY` / `PG_CATCH` 中被捕获，经 `PD_ENT_ERROR` 上报并写入共享内存的状态字；`bgw_restart_time = BGW_NEVER_RESTART`、`bgw_notify_pid` 指向 walsender；barrier 等待带 `parallel_decode_barrier_timeout` 超时，worker 另以每 256 条记录一次的位置心跳作为活性信号；walreader 死亡立即使本会话的 cseq 作废。第 4 条（cseq 不持久化）与第 8–12 条在 P1–P6 中已满足。
+
 ## 附录 A 术语表
 
 | 术语 | 说明 |
@@ -1970,3 +1981,4 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 | v0.8 | 2026-11-18 | **修正本特性自身的正确性与性能分析漏洞**。(1) **新增事实 8c**：`STREAM ABORT` 的载荷随订阅端流式模式而变（`pgoutput.c:1842`、`proto.c:1166-1184`：v2/v3 为 8 字节、v4 为 24 字节），worker 必须按**模式值**而非布尔值初始化 `ctx->streaming`——新增下行条目 `PD_ENT_SESSION_INIT`（5.2.2）并在 6.1 的插件实例化处点名。(2) **补上 keepalive 这条数据丢失路径**：`'k'` 消息的 end_lsn 取 `sentPtr` = 发布端的 WAL 读取位置（`walsender.c:3443`、`:4071`），订阅端照样并入 `last_received`（`worker.c:3608-3612`）→ `confirmed_flush` 被抬到未放行事务之上 → 重启后丢事务。因此 C9 与 §7.4 的钳制**必须同时覆盖 `'w'` 帧头与 `'k'` keepalive**。(3) **放行前沿口径唯一化**：恒等于 cseq = 放行水位 + 1 的事务的提交记录 LSN；未知时唯一合法取值是会话开始时的槽 `confirmed_flush`，**禁止**用当前 WAL 读取位置（原表述「前沿取当前 WAL 读取位置」易被误实现而破坏 S1）。(4) **修正流式门槛的默认值**：`parallel_decode_stream_min_size` 由 64KB 改为 **0**——15.1 的测算里 tpcc 每事务仅约 3KB，64KB 门槛会使**所有事务都不流式化**，订阅端永远收不到 STREAM START、并行 apply 根本不启动，70MB/s 目标与整个前提同时落空。同时**推翻了「过度流式化」的两项代价核算**：流式化不改变「每条变更一帧」，只多出每事务 2 帧（约 5%–10%）；订阅端每事务一个 apply worker 是**并行的机制本身**而非开销。(5) **流式激进程度按订阅端模式区分**：`parallel_decode_streaming_mode` 新增 `auto` 档并作为默认值——`streaming='parallel'` → `immediate`，`streaming='on'` → `buffered`（后者没有 apply worker，流式化会把它推到 `TRANS_LEADER_SERIALIZE` 的 spool 慢路径，对存量用户是性能回归）。(6) **apply worker 数不能只写「> 0」**：订阅端能并行回放的事务数 = `max_parallel_apply_workers_per_subscription`（默认 2，`launcher.c:412` 超限即拒绝启动），超出部分退化为 spool 慢路径；§3.5、§12.1、§12.3、§13、§14 同步为「按目标速率反推下限」。`need.md` 同步 || v0.11 | 2026-11-18 | **P0–P4 实现完成，§16 新增 16.1 实现状态**。记录实现过程中确定的规则（cseq 由 walreader 分配、事务与 worker 多对一绑定、END_ACK 只由事务拥有者上报）与实测事实（并行路径与串行路径的帧头 LSN 逐消息相同；关系消息按 worker 重复，实测 1 条 vs 4 条，证实事实 6；帧分组可不同但提交顺序必须一致；`AllocateFile()` 的文件在每次事务结束时被关闭且 `fflush()` 返回值未检查，追踪设施必须改用裸 fd）。帧级比对工具按 PG18 的 wire 格式重写（cstring 字符串、`'R'` 消息无长度前缀）。 |
 | v0.12 | 2026-11-18 | **修复一个会话启动竞态，并澄清两条复制语义**。(1) **启动竞态**：walsender 在会话建立后立刻进入取帧循环，用控制块里的 `workers[i].pid` 判断 worker 存活；但 worker 要到 `BackgroundWorkerInitializeConnectionByOid()` 之后才写这个字段，未认领槽位时它是 0，`ParallelDecodeProcessAlive(0)` 返回 false → 误报"the parallel decode worker died unexpectedly"并打断会话。改为用 walsender 自己从 `WaitForBackgroundWorkerStartup()` 拿到的 pid 判断存活，并把状态位仍为 `PD_WORKER_STATUS_UNUSED` 解释为"仍在启动"；同时补上 walreader 的存活检查（此前 walreader 死亡会让会话静默停滞）。实测：16 个 worker 时旧代码 5 次运行里 4 次触发，修复后 8 次全部通过。(2) **DDL 不被复制**（`pg_publication.c:137` 排除系统表），订阅端的表必须事先存在。(3) **订阅端的表清单在 `CREATE SUBSCRIPTION` 时固定**，发布端之后新建的表不在 `pg_subscription_rel` 里，订阅端会静默丢弃其变更；纳入订阅的官方手段是 `ALTER SUBSCRIPTION ... REFRESH PUBLICATION`。§16.1 补入这两条事实与负载形态表；新增 `live_diff_smoke.sh`、`ddl_diff_smoke.sh`、`worker_death_repro.sh` 三个冒烟脚本 |
 | v0.13 | 2026-11-18 | **P6（尽早流式与帧头钳制）实现完成，并修复一个 P1–P4 就存在的记录序列化缺陷**。(1) **尽早流式**：新增 `parallel_decode_streaming_mode`（`auto` / `immediate` / `buffered`）、`parallel_decode_stream_segment_size`、`parallel_decode_stream_min_size` 三个 GUC；流式模式在 `CreateDecodingContext()` 之前按订阅端的插件选项解析（`ParallelDecodeResolveStreamingMode()`，`auto` 按 `streaming='parallel'` → `immediate`、`streaming='on'` → `buffered`）；切分触发点放在 `ReorderBufferCheckMemoryLimit()`——`rb->size` 达到分片大小且当前事务可流式时立即切一个分片；分片在 worker 侧收集并整块通过新增的 `PD_ENT_SEGMENT` 条目交给 walsender，保证一个分片的帧在 wire 上连续（订阅端同时只接受一个流段）。(2) **帧头钳制（FR-20 / C9）**：walsender 发送 `'w'` 帧前调用 `ParallelDecodeClampFrame()`，把帧头的两个 int64 钳到放行前沿 F；`WalSndKeepalive()` 的 `end_lsn` 同样经 `ParallelDecodeClampLSN()` 钳制；COMMIT 载荷的 `end_lsn` 不钳。F = min{ 已分配未放行 cseq 的结束记录起点 LSN }，集合为空时取 walreader 认证过的读取位置（`PDCseqInfo.read_lsn`）。(3) **修复未使用块引用的序列化缺陷**：`XLogReaderState` 的解码缓冲是环形复用的，`DecodedXLogRecord.blocks[]` 中未使用槽位的 `data` / `data_len` 保留着上一条记录的残留值，`PDRecordSerialize()` 把这些槽位一并序列化后，walreader 会用野指针（实测 `data = 0x7878787878787878`）在 `appendBinaryStringInfo()` 里崩溃。改为 `!blk->in_use` 的槽位置 `data_len = 0` 且不复制数据；该缺陷在 P1–P4 就存在，用 P6 的负载复现并定位。(4) **新增 `streaming_smoke.sh`**：订阅端 `streaming = 'parallel'`，单个 4000 行大事务，检查分片真的产生（STREAM START / STREAM STOP 数量相等）、行数与内容正确、发布端硬重启（`-m immediate`）后不丢数据。(5) §16.1 实现状态扩到 P0–P6，补入上述规则与事实。**尚未实现：P5（快照与失效共享、共享关系表）、P7（故障恢复）** |
+| v0.14 | 2026-11-18 | **P7（故障恢复）实现完成**。(1) **故障上报**：decode worker 与 walreader 的主循环都包在 `PG_TRY` / `PG_CATCH` 中，捕获错误后把原因写入共享内存的状态字（先写 `errmsg` 与 `error_lsn`，再 `pg_memory_barrier()`，最后写 `PD_WORKER_STATUS_FAILED`），并通过 `PD_ENT_ERROR` 条目把错误送给 walsender；walsender 侧的 `parallel_decode_report_worker_failure()` 先看状态字——状态是 FAILED 就报出**带原因**的错误（"the parallel decode worker failed: …"），否则才报"参与者意外死亡"。(2) **停滞检测**：barrier 生效（有待放行事务）+ 该 worker 的解码位置落后于 walreader 的读取位置 + 该 worker 在 `parallel_decode_barrier_timeout`（默认 60 秒）内无任何消息——三者同时成立才判定卡死并结束会话；worker 每 256 条记录上报一次位置心跳作为活性信号，空闲的发布端不满足第一个条件，因此不会误触发。(3) **通知通道**：`bgw_notify_pid` 指向 walsender，postmaster 向该 pid 发 SIGUSR1，walsender 的 `procsignal_sigusr1_handler` 末尾 `SetLatch(MyLatch)` 唤醒取帧循环（注意本树的 latch 通知用的是 SIGURG，与 SIGUSR1 是两条不同信号）。(4) **退出码约束**：`bgworker.c` 的顶层处理器捕获错误后 `EmitErrorReport()` 并 `proc_exit(1)`，退出码 1 不触发集群崩溃恢复，因此 worker 失败必须由 walsender 主动感知并结束会话；`bgw_restart_time = BGW_NEVER_RESTART`。(5) **修复一个 P1–P6 就存在的 use-after-free**：`pd_walreader_classify()` 在 `hash_search(HASH_REMOVE)` 释放 `PDTxnInfo` 之后仍解引用 `info->worker` / `info->bytes`；改为在释放前取出 worker 索引与 `ended` 标志。(6) **故障注入开关** `parallel_decode_fault_inject`（0 / 1 = worker 失败 / 2 = walreader 失败），注入点置于循环体内、`PG_TRY` 之内——最初放在循环外，错误直接终止进程，`PG_CATCH` 的上报根本没机会执行。(7) **新增 `failure_smoke.sh`**：分别注入 worker 与 walreader 故障，检查发布端报出带原因的失败、会话及时终止，随后恢复正常配置验证订阅端重连并补齐数据（100 行）。§16.1 实现状态扩到 P0–P7，§11.1 补入两个新 GUC，§17.8 补入 P7 的落实情况。**尚未实现：P5（快照与失效共享、共享关系表）** |

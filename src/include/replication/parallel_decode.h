@@ -79,7 +79,20 @@ extern PGDLLIMPORT int	parallel_decode_stream_min_size;
 extern PGDLLIMPORT int	parallel_decode_stream_segment_size;
 extern PGDLLIMPORT int	parallel_decode_work_mem;
 extern PGDLLIMPORT int	parallel_decode_batch_size;
+extern PGDLLIMPORT int	parallel_decode_barrier_timeout;
+extern PGDLLIMPORT int	parallel_decode_fault_inject;
 extern PGDLLIMPORT char *parallel_decode_trace_file;
+
+/*
+ * The failures the fault injection knob can produce.
+ *
+ * The knob exists to verify the failure paths of the session: the way a
+ * participant reports an error, the way the walsender turns it into the end
+ * of the session, and the way the subscriber recovers from it.
+ */
+#define PD_FAULT_NONE			0
+#define PD_FAULT_WORKER			1	/* the decode workers fail when they start */
+#define PD_FAULT_WALREADER		2	/* the walreader fails when it starts */
 
 /* True when the publisher-side parallel path is requested. */
 extern bool ParallelDecodeEnabled(void);
@@ -155,13 +168,21 @@ extern void ParallelWalreaderMain(Datum main_arg);
 #define PD_WORKER_STATUS_FAILED		3
 #define PD_WORKER_STATUS_EXITED		4
 
+/*
+ * The largest error text the participants of a session report.  The text is
+ * kept in the control block, so that it survives the death of the process that
+ * produced it.
+ */
+#define PD_MAX_ERROR_MESSAGE		512
+
 typedef struct ParallelDecodeWorkerSlot
 {
 	pid_t		pid;			/* 0 until the worker has reported its pid */
 	int			status;		/* PD_WORKER_STATUS_* */
 	int			slot_index;	/* index of this worker within the session */
 	uint64		error_lsn;		/* WAL position the failure was detected at */
-	char		errmsg[512];	/* error text reported by the worker */
+	char		errmsg[PD_MAX_ERROR_MESSAGE];	/* error text reported by the
+												 * worker */
 } ParallelDecodeWorkerSlot;
 
 typedef struct ParallelDecodeControl
@@ -170,6 +191,14 @@ typedef struct ParallelDecodeControl
 	pid_t		walreader_pid;
 	int			num_workers;
 	int			walreader_status;	/* PD_WORKER_STATUS_* */
+
+	/*
+	 * The error the walreader reported, if it reported one.  The text is kept
+	 * here, because the walreader is gone by the time the walsender reads the
+	 * report.
+	 */
+	uint64		walreader_error_lsn;
+	char		walreader_errmsg[PD_MAX_ERROR_MESSAGE];
 
 	/*
 	 * The WAL position the walreader has reached.  The walsender uses it to
@@ -301,13 +330,28 @@ typedef enum ParallelDecodeEntryType
 	PD_ENT_SUBXACT_ABORT = 6,	/* walreader -> worker */
 	PD_ENT_BLOCK = 7,			/* worker -> walsender */
 	PD_ENT_EVENT = 8,			/* worker -> walsender */
-	PD_ENT_ERROR = 9,			/* worker -> walsender */
+	PD_ENT_ERROR = 9,			/* worker or walreader -> walsender */
 	PD_ENT_READY = 10,			/* walreader -> walsender */
 	PD_ENT_FRAME = 11,			/* worker -> walsender */
 	PD_ENT_POSITION = 12,		/* worker -> walsender */
 	PD_ENT_CSEQ = 13,			/* walreader -> walsender */
 	PD_ENT_SEGMENT = 14			/* worker -> walsender */
 } ParallelDecodeEntryType;
+
+/*
+ * The header of an error report.
+ *
+ * A participant that fails reports the error to the walsender, so that the
+ * session ends with a message that says what went wrong instead of the
+ * generic "the participant died unexpectedly".  The text of the error is in
+ * the control block, so that it is still there when the participant is gone;
+ * the message itself only says who failed.
+ */
+typedef struct PDErrorHeader
+{
+	int32		worker;			/* the worker that failed, -1 for the walreader */
+	uint64		lsn;			/* the decoding position when the error happened */
+} PDErrorHeader;
 
 /*
  * The information about a transaction that has ended.
@@ -331,6 +375,7 @@ typedef struct PDCseqInfo
 									 * transaction */
 	uint64		read_lsn;			/* the position the walreader has read up
 									 * to */
+	int32		owner;				/* the worker that decoded the transaction */
 } PDCseqInfo;
 
 /*

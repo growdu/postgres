@@ -50,6 +50,8 @@ int			parallel_decode_stream_min_size = 0;
 int			parallel_decode_stream_segment_size = 1024 * 1024;
 int			parallel_decode_work_mem = 0;	/* 0 means: use the PG default */
 int			parallel_decode_batch_size = 64 * 1024;
+int			parallel_decode_barrier_timeout = 60;	/* seconds, 0 disables it */
+int			parallel_decode_fault_inject = PD_FAULT_NONE;
 
 /* Session state, only touched by the walsender. */
 static dsm_segment *parallel_decode_seg = NULL;
@@ -135,6 +137,18 @@ static List *parallel_decode_frontier = NIL;
  */
 static XLogRecPtr parallel_decode_certified_lsn = InvalidXLogRecPtr;
 static uint64 parallel_decode_certified_cseq = 0;
+
+/*
+ * The decoding position of every worker, and the time of the last message of
+ * every worker.
+ *
+ * The positions tell the walsender whether a worker still has records to
+ * decode, and the times tell it whether a worker that still has work is making
+ * any progress.  A worker that stops making progress while it still has work
+ * to do is stuck, and the session that waits for it has to end.
+ */
+static XLogRecPtr parallel_decode_worker_position[MAX_PARALLEL_DECODE_WORKERS];
+static instr_time parallel_decode_worker_progress[MAX_PARALLEL_DECODE_WORKERS];
 
 /*
  * Make sure that the workers and the walreader never outlive the session
@@ -368,6 +382,15 @@ parallel_decode_wait_for_walreader(void)
 						   true);
 		if (res == SHM_MQ_SUCCESS)
 		{
+			if (type == PD_ENT_ERROR)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("the parallel decode walreader failed: %s",
+								parallel_decode_ctl ?
+								parallel_decode_ctl->walreader_errmsg : "")));
+			}
+
 			if (type != PD_ENT_READY || len < sizeof(int64))
 			{
 				ereport(ERROR,
@@ -614,6 +637,26 @@ parallel_decode_drain_control(void)
 
 			parallel_decode_record_cseq(&info);
 		}
+		else if (type == PD_ENT_ERROR)
+		{
+			PDErrorHeader eh;
+
+			if (len < sizeof(eh))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("parallel decode error message is too short (%zu bytes)",
+								(size_t) len)));
+
+			memcpy(&eh, payload, sizeof(eh));
+
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("the parallel decode walreader failed: %s",
+							parallel_decode_ctl ?
+							parallel_decode_ctl->walreader_errmsg : ""),
+					 errdetail("The walreader failed at WAL position %X/%X.",
+							   LSN_FORMAT_ARGS((XLogRecPtr) eh.lsn))));
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -762,12 +805,32 @@ parallel_decode_take_ready_frame(StringInfo buf, XLogRecPtr *end_lsn)
 }
 
 /*
+ * Note that a worker has made progress.
+ *
+ * The position is the position the worker has decoded up to.  It tells the
+ * walsender whether the worker still has records to decode, and the time of
+ * the message tells it whether the worker is still working on them.
+ */
+static void
+parallel_decode_note_worker_progress(int worker, XLogRecPtr position)
+{
+	if (worker < 0 || worker >= parallel_decode_num_workers)
+		return;
+
+	if (position > parallel_decode_worker_position[worker])
+		parallel_decode_worker_position[worker] = position;
+
+	INSTR_TIME_SET_CURRENT(parallel_decode_worker_progress[worker]);
+}
+
+/*
  * Handle a message of one of the decode workers.
  *
  * The payload belongs to the caller.
  */
 static void
-parallel_decode_handle_message(uint16 type, const void *payload, size_t len)
+parallel_decode_handle_message(int worker, uint16 type, const void *payload,
+								size_t len)
 {
 	switch (type)
 	{
@@ -785,6 +848,9 @@ parallel_decode_handle_message(uint16 type, const void *payload, size_t len)
 
 				if ((XLogRecPtr) position > parallel_decode_position)
 					parallel_decode_position = (XLogRecPtr) position;
+
+				parallel_decode_note_worker_progress(worker,
+														(XLogRecPtr) position);
 
 				break;
 			}
@@ -835,6 +901,9 @@ parallel_decode_handle_message(uint16 type, const void *payload, size_t len)
 									"(%u declared, %zu received)",
 									fh.length, (size_t) len - sizeof(fh))));
 
+				parallel_decode_note_worker_progress(worker,
+														(XLogRecPtr) fh.end_lsn);
+
 				if (fh.cseq == 0)
 				{
 					/*
@@ -878,6 +947,9 @@ parallel_decode_handle_message(uint16 type, const void *payload, size_t len)
 
 				memcpy(&sh, payload, sizeof(sh));
 
+				parallel_decode_note_worker_progress(worker,
+														(XLogRecPtr) sh.end_lsn);
+
 				data = (const char *) payload + sizeof(sh);
 				remaining = len - sizeof(sh);
 
@@ -920,11 +992,146 @@ parallel_decode_handle_message(uint16 type, const void *payload, size_t len)
 				break;
 			}
 
+		case PD_ENT_ERROR:
+			{
+				PDErrorHeader eh;
+				const char *message;
+
+				if (len < sizeof(eh))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("parallel decode error message is too short (%zu bytes)",
+									(size_t) len)));
+
+				memcpy(&eh, payload, sizeof(eh));
+
+				/*
+				 * The text of the error is in the control block: the worker is
+				 * gone by the time the report is read, so it cannot be taken
+				 * from the message itself.
+				 */
+				if (eh.worker >= 0 && eh.worker < parallel_decode_num_workers)
+					message = parallel_decode_ctl->workers[eh.worker].errmsg;
+				else
+					message = "";
+
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("the parallel decode worker failed: %s",
+								message),
+						 errdetail("Decode worker %d failed at WAL position %X/%X.",
+								   eh.worker,
+								   LSN_FORMAT_ARGS((XLogRecPtr) eh.lsn))));
+			}
+
+			break;
+
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("unexpected message of type %u on the parallel decode "
 							"output channel", type)));
+	}
+}
+
+/*
+ * Report the failure of a decode worker.
+ *
+ * A worker that fails puts the reason of the failure into the control block
+ * before it exits, so that the reason is still there when the walsender
+ * notices that the worker is gone.  A worker that dies without saying anything
+ * leaves the status word alone, and the session ends with the generic
+ * message.
+ */
+static void
+parallel_decode_report_worker_failure(int worker)
+{
+	const char *message;
+
+	/*
+	 * The worker wrote the message before it published the status, so the
+	 * message is there when the status says that the worker failed.  The
+	 * barrier makes sure that the write is visible before the status is read.
+	 */
+	pg_memory_barrier();
+
+	if (parallel_decode_ctl->workers[worker].status != PD_WORKER_STATUS_FAILED)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("the parallel decode worker died unexpectedly"),
+				 errdetail("Decode worker %d is gone.", worker)));
+	}
+
+	message = parallel_decode_ctl->workers[worker].errmsg;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("the parallel decode worker failed: %s", message),
+			 errdetail("Decode worker %d failed at WAL position %X/%X.",
+					   worker,
+					   LSN_FORMAT_ARGS((XLogRecPtr)
+										parallel_decode_ctl->workers[worker].error_lsn))));
+}
+
+/*
+ * Check that the session is still making progress.
+ *
+ * The walsender holds the frames of a transaction back until the transaction
+ * has its turn, so it waits for the worker that owns the transaction.  A
+ * worker that dies is noticed by the liveness check, but a worker that is
+ * stuck is not: the session would wait for it forever, and the replication
+ * would look like it had simply caught up.
+ *
+ * The timeout is the backstop for that case.  It only applies to a worker
+ * that still has records to decode: a worker that has decoded everything the
+ * walreader has read is waiting for new WAL, which is not a stall.
+ */
+static void
+parallel_decode_check_stall(void)
+{
+	instr_time	now;
+	XLogRecPtr	walreader_pos;
+	int			worker;
+
+	if (parallel_decode_barrier_timeout <= 0)
+		return;
+
+	/*
+	 * The session is not waiting for a transaction to be released, so there is
+	 * nothing that could be stuck.
+	 */
+	if (parallel_decode_pending == NULL)
+		return;
+
+	walreader_pos = (XLogRecPtr) parallel_decode_ctl->walreader_end_lsn;
+
+	INSTR_TIME_SET_CURRENT(now);
+
+	for (worker = 0; worker < parallel_decode_num_workers; worker++)
+	{
+		double		idle;
+
+		/*
+		 * The worker has decoded everything the walreader has read, so it is
+		 * waiting for new WAL rather than working on something.
+		 */
+		if (parallel_decode_worker_position[worker] >= walreader_pos)
+			continue;
+
+		idle = INSTR_TIME_GET_DOUBLE(now) -
+			INSTR_TIME_GET_DOUBLE(parallel_decode_worker_progress[worker]);
+
+		if (idle < parallel_decode_barrier_timeout)
+			continue;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("the parallel decode session stalled"),
+				 errdetail("Decode worker %d made no progress for %.0f seconds.",
+						   worker, idle),
+				 errhint("The session was waiting for a transaction to be released "
+						 "to the subscriber.")));
 	}
 }
 
@@ -1004,7 +1211,7 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 									   &payload, &len, true);
 			if (res == SHM_MQ_SUCCESS)
 			{
-				parallel_decode_handle_message(type, payload, len);
+				parallel_decode_handle_message(worker, type, payload, len);
 				pfree((void *) payload);
 				got_message = true;
 				break;
@@ -1021,10 +1228,7 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 					if (ctl->shutdown)
 						return false;
 
-					ereport(ERROR,
-							(errcode(ERRCODE_INTERNAL_ERROR),
-							 errmsg("the parallel decode worker died unexpectedly"),
-							 errdetail("Decode worker %d is gone.", worker)));
+					parallel_decode_report_worker_failure(worker);
 				}
 			}
 		}
@@ -1062,11 +1266,15 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 			}
 
 			if (!ParallelDecodeProcessAlive(parallel_decode_worker_pids[worker]))
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("the parallel decode worker died unexpectedly"),
-						 errdetail("Decode worker %d is gone.", worker)));
+				parallel_decode_report_worker_failure(worker);
 		}
+
+		/*
+		 * All the participants are alive, but one of them may be stuck.  The
+		 * check is the backstop for that case: without it the session would wait
+		 * for a transaction that is never going to be released.
+		 */
+		parallel_decode_check_stall();
 
 		/*
 		 * There is nothing to do but wait for the decode workers.  The callback
@@ -1249,6 +1457,17 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 	for (i = 0; i < parallel_decode_num_workers; i++)
 		PDChunkReceiverInit(&parallel_decode_chunk_rcv[i]);
 	parallel_decode_position = start_lsn;
+
+	/*
+	 * The workers start out at the position the session starts at, and they
+	 * have made no progress yet.  The stall detection uses both values, so
+	 * they have to be initialized before the first check.
+	 */
+	for (i = 0; i < parallel_decode_num_workers; i++)
+	{
+		parallel_decode_worker_position[i] = start_lsn;
+		INSTR_TIME_SET_CURRENT(parallel_decode_worker_progress[i]);
+	}
 
 	/*
 	 * Create the table of the transactions whose frames are waiting for their

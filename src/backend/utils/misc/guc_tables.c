@@ -3041,6 +3041,39 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"parallel_decode_barrier_timeout", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the number of seconds the publisher waits for a "
+						 "parallel decode worker to make progress."),
+			gettext_noop("The frames of a transaction are held back until the "
+						 "transaction has its turn, so the publisher waits for the "
+						 "worker that decodes it.  A worker that stops making progress "
+						 "while it still has records to decode ends the session with "
+						 "an error, so that the replication does not stall silently. "
+						 "Zero disables the check.  The change takes effect in the next "
+						 "replication session.")
+		},
+		&parallel_decode_barrier_timeout,
+		60, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_fault_inject", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the failure the parallel decoding session produces on "
+						 "purpose."),
+			gettext_noop("This is a debugging facility: 1 makes the decode workers "
+						 "fail when they start, 2 makes the walreader fail when it "
+						 "starts.  It is used to verify the way a participant reports "
+						 "an error and the way the session recovers from it.  Zero "
+						 "disables it.  The change takes effect in the next "
+						 "replication session.")
+		},
+		&parallel_decode_fault_inject,
+		PD_FAULT_NONE, 0, PD_FAULT_WALREADER,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"commit_delay", PGC_SUSET, WAL_SETTINGS,
 			gettext_noop("Sets the delay in microseconds between transaction commit and "
 						 "flushing WAL to disk."),

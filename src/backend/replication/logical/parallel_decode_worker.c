@@ -92,6 +92,16 @@ static uint64 pd_current_cseq = 0;
 static XLogRecPtr pd_reported_lsn = InvalidXLogRecPtr;
 
 /*
+ * The number of records between two reports of the decoding position.
+ *
+ * The reports tell the walsender that the worker is still working: a worker
+ * that stops reporting while it still has records to decode is stuck, and the
+ * session that waits for it has to end.  The interval is a compromise between
+ * the overhead of the reports and the time it takes to notice a stuck worker.
+ */
+#define PD_POSITION_REPORT_INTERVAL	256
+
+/*
  * The frames of the stream segment that is being built.
  *
  * The subscriber accepts only one stream segment at a time, so the frames of
@@ -293,6 +303,48 @@ pd_worker_send_position(void)
 }
 
 /*
+ * Report an error to the walsender.
+ *
+ * The walsender has to end the session anyway: the worker cannot continue
+ * with the transaction it was working on.  The report tells it what went
+ * wrong, so that the session ends with a message that says what happened
+ * instead of the generic "the worker died unexpectedly".
+ *
+ * The text of the error is put into the control block, because the worker is
+ * gone by the time the walsender reads the report.
+ */
+static void
+pd_worker_report_error(const char *message)
+{
+	PDErrorHeader eh;
+
+	if (pd_ctl != NULL && pd_worker_index >= 0 &&
+		pd_worker_index < pd_ctl->num_workers)
+	{
+		/*
+		 * The message is written before the status, so that a reader that sees
+		 * the status also sees the message.  The barrier makes sure that the
+		 * write is not reordered past the status.
+		 */
+		pd_ctl->workers[pd_worker_index].error_lsn = (uint64) pd_end_lsn;
+		strlcpy(pd_ctl->workers[pd_worker_index].errmsg, message,
+				PD_MAX_ERROR_MESSAGE);
+		pg_memory_barrier();
+		pd_ctl->workers[pd_worker_index].status = PD_WORKER_STATUS_FAILED;
+	}
+
+	eh.worker = pd_worker_index;
+	eh.lsn = (uint64) pd_end_lsn;
+
+	/*
+	 * The message is sent with the chunked framing, because the walsender
+	 * reads every message of this queue with a single chunk receiver.
+	 */
+	PDQueueSendChunked(pd_out_mqh, PD_ENT_ERROR, &eh, sizeof(eh),
+						PARALLEL_DECODE_CHUNK_SIZE, false, true);
+}
+
+/*
  * Get the next WAL record the walreader has read.
  *
  * On PD_RECV_RECORD the record belongs to the caller, which frees it with
@@ -377,6 +429,19 @@ pd_worker_recv_record(DecodedXLogRecord **record, bool nowait)
 static void
 pd_worker_decode_loop(void)
 {
+	uint32		since_report = 0;
+
+	/*
+	 * The fault injection is a debugging facility: it makes the worker fail, so
+	 * that the way the session reports and recovers from a failure can be
+	 * verified.
+	 */
+	if (parallel_decode_fault_inject == PD_FAULT_WORKER)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("parallel decode worker %d failed on purpose",
+						pd_worker_index)));
+
 	for (;;)
 	{
 		DecodedXLogRecord *record = NULL;
@@ -418,6 +483,17 @@ pd_worker_decode_loop(void)
 		pd_end_lsn = record->next_lsn;
 
 		LogicalDecodingProcessRecord(pd_ctx, pd_ctx->reader);
+
+		/*
+		 * Tell the walsender now and then that the worker is still working.
+		 * The report tells it that the worker is alive and how far it has come,
+		 * and it is what the stall detection is based on.
+		 */
+		if (++since_report >= PD_POSITION_REPORT_INTERVAL)
+		{
+			since_report = 0;
+			pd_worker_send_position();
+		}
 
 		/*
 		 * The transaction the record ended is decoded now, so the walsender
@@ -633,8 +709,53 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	ereport(LOG,
 			(errmsg("parallel decode worker %d started", slot_index)));
 
-	/* Decode the records the walreader hands over. */
-	pd_worker_decode_loop();
+	/*
+	 * Decode the records the walreader hands over.
+	 *
+	 * An error that happens while decoding ends the session: the worker cannot
+	 * continue with the transaction it was working on, and the state of that
+	 * transaction cannot be handed over to another worker without breaking the
+	 * affinity of the transactions to their worker.  The error is reported to
+	 * the walsender first, so that the session ends with a message that says
+	 * what went wrong.
+	 */
+	PG_TRY();
+	{
+		pd_worker_decode_loop();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		/*
+		 * Copy the error data before anything else: the error context is gone
+		 * as soon as the error is rethrown.
+		 */
+		edata = CopyErrorData();
+
+		/*
+		 * The report is best effort: if it cannot be sent, the walsender
+		 * notices that the worker is gone anyway.
+		 */
+		PG_TRY(report);
+		{
+			pd_worker_report_error(edata->message);
+		}
+		PG_CATCH(report);
+		{
+			/* The error could not be reported. */
+		}
+		PG_END_TRY(report);
+
+		FreeErrorData(edata);
+
+		/*
+		 * Rethrow the error, so that it is logged and the worker exits with a
+		 * code that does not make the postmaster restart the cluster.
+		 */
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	ctl->workers[slot_index].status = PD_WORKER_STATUS_EXITED;
 
