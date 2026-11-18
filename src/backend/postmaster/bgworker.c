@@ -21,6 +21,7 @@
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
+#include "replication/parallel_decode.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -132,6 +133,12 @@ static const struct
 	},
 	{
 		"TablesyncWorkerMain", TablesyncWorkerMain
+	},
+	{
+		"ParallelDecodeWorkerMain", ParallelDecodeWorkerMain
+	},
+	{
+		"ParallelWalreaderMain", ParallelWalreaderMain
 	}
 };
 

@@ -72,6 +72,7 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/slotsync.h"
+#include "replication/parallel_decode.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"
 #include "replication/syncrep.h"
@@ -1484,6 +1485,16 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	 * Do this before sending a CopyBothResponse message, so that any errors
 	 * are reported early.
 	 */
+	/*
+	 * Publisher-side parallel logical decoding.  Until the decoding path has
+	 * been moved out of this process, starting the session only exercises the
+	 * process plumbing: the walreader and the decode workers are started, they
+	 * attach to the shared segment, and they stay alive for the duration of
+	 * the replication session.  The data path below is unchanged.
+	 */
+	if (ParallelDecodeEnabled())
+		ParallelDecodeSessionStart();
+
 	logical_decoding_ctx =
 		CreateDecodingContext(cmd->startpoint, cmd->options, false,
 							  XL_ROUTINE(.page_read = logical_read_xlog_page,
@@ -1522,7 +1533,20 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	SyncRepInitConfig();
 
 	/* Main loop of walsender */
-	WalSndLoop(XLogSendLogical);
+	PG_TRY();
+	{
+		WalSndLoop(XLogSendLogical);
+	}
+	PG_FINALLY();
+	{
+		/*
+		 * Tear the parallel decoding session down on every exit path, so
+		 * that the workers and the walreader never outlive the session that
+		 * created them.
+		 */
+		ParallelDecodeSessionStop();
+	}
+	PG_END_TRY();
 
 	FreeDecodingContext(logical_decoding_ctx);
 	ReplicationSlotRelease();

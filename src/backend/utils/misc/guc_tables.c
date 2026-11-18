@@ -67,6 +67,7 @@
 #include "postmaster/walsummarizer.h"
 #include "postmaster/walwriter.h"
 #include "replication/logicallauncher.h"
+#include "replication/parallel_decode.h"
 #include "replication/slot.h"
 #include "replication/slotsync.h"
 #include "replication/syncrep.h"
@@ -429,6 +430,13 @@ static const struct config_enum_entry ssl_protocol_versions_info[] = {
 static const struct config_enum_entry debug_logical_replication_streaming_options[] = {
 	{"buffered", DEBUG_LOGICAL_REP_STREAMING_BUFFERED, false},
 	{"immediate", DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry parallel_decode_streaming_mode_options[] = {
+	{"auto", PARALLEL_DECODE_STREAMING_AUTO, false},
+	{"immediate", PARALLEL_DECODE_STREAMING_IMMEDIATE, false},
+	{"buffered", PARALLEL_DECODE_STREAMING_BUFFERED, false},
 	{NULL, 0, false}
 };
 
@@ -2968,6 +2976,71 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"max_parallel_decode_workers", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the maximum number of parallel decode worker processes "
+						 "used by a publisher-side logical decoding session."),
+			gettext_noop("Zero disables parallel logical decoding and keeps the "
+						 "existing in-process decoding path. The change takes effect "
+						 "in the next replication session.")
+		},
+		&max_parallel_decode_workers,
+		0, 0, MAX_PARALLEL_DECODE_WORKERS,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_stream_min_size", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the minimum size in bytes of a transaction that is "
+						 "streamed by the publisher."),
+			gettext_noop("Zero means that every transaction is streamed. A threshold "
+						 "larger than the typical transaction size stops the "
+						 "subscriber from receiving STREAM START messages, which "
+						 "prevents parallel apply from starting at all. The change "
+						 "takes effect in the next replication session.")
+		},
+		&parallel_decode_stream_min_size,
+		0, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_stream_segment_size", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the maximum size in bytes of a single stream segment "
+						 "produced by the publisher."),
+			gettext_noop("Only one stream segment may be open on the wire at a time, "
+						 "so this bounds the time a segment can block the others. "
+						 "The change takes effect in the next replication session.")
+		},
+		&parallel_decode_stream_segment_size,
+		1024 * 1024, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_work_mem", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the maximum amount of memory used by each parallel "
+						 "decode worker."),
+			gettext_noop("Minus one means to use logical_decoding_work_mem. The total "
+						 "memory used is the number of workers times this value. "
+						 "The change takes effect in the next replication session.")
+		},
+		&parallel_decode_work_mem,
+		-1, -1, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_batch_size", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the granularity in bytes of the WAL batches and stream "
+						 "segments handled by the parallel decode workers."),
+			gettext_noop("The change takes effect in the next replication session.")
+		},
+		&parallel_decode_batch_size,
+		64 * 1024, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"commit_delay", PGC_SUSET, WAL_SETTINGS,
 			gettext_noop("Sets the delay in microseconds between transaction commit and "
 						 "flushing WAL to disk."),
@@ -4731,6 +4804,19 @@ struct config_string ConfigureNamesString[] =
 
 struct config_enum ConfigureNamesEnum[] =
 {
+	{
+		{"parallel_decode_streaming_mode", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets how aggressively the publisher streams transactions."),
+			gettext_noop("In auto mode the actual setting is derived from the "
+						 "subscriber: immediate for streaming='parallel' subscribers, "
+						 "buffered otherwise. The change takes effect in the next "
+						 "replication session.")
+		},
+		&parallel_decode_streaming_mode,
+		PARALLEL_DECODE_STREAMING_AUTO, parallel_decode_streaming_mode_options,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"backslash_quote", PGC_USERSET, COMPAT_OPTIONS_PREVIOUS,
 			gettext_noop("Sets whether \"\\'\" is allowed in string literals."),
