@@ -77,6 +77,8 @@
 - [13. 兼容性与约束](#13-兼容性与约束)
 - [14. 风险与对策](#14-风险与对策)
 - [15. 待决问题](#15-待决问题)
+  - [15.1 收益测算：并行度并不需要很大](#151-收益测算并行度并不需要很大)
+  - [15.2 待实测确认清单](#152-待实测确认清单)
 - [16. 实现计划](#16-实现计划)
 - [17. 故障恢复](#17-故障恢复)
   - [17.1 恢复的唯一持久化锚点是复制槽](#171-恢复的唯一持久化锚点是复制槽)
@@ -118,7 +120,7 @@
 
 发布端的解码与发送全部在 walsender 进程内串行完成，代码路径如下：
 
-1. `walsender.c:XLogSendLogical()` 循环调用 `logical.c:LogicalDecodingProcessRecord()`；
+1. `walsender.c:XLogSendLogical()` 循环调用 `decode.c:88` 的 `LogicalDecodingProcessRecord()`；
 2. `decode.c:LogicalDecodingProcessRecord()` 取出记录头中的顶层事务 ID（`XLogRecGetTopXid`），调用 `ReorderBufferAssignChild()` 归属子事务，再按 rmgr 分派到同文件的 `xlog_decode` / `xact_decode` / `standby_decode` / `heap_decode` / `heap2_decode` / `logicalmsg_decode`（本分支已把上游 PG 的记录分发入口从 `reorderbuffer.c` 重构进 `decode.c`，树中不存在 `ReorderBufferProcessRecord()`）；
 3. `reorderbuffer.c` 维护事务表（按 LSN 排序的 `toplevel_by_lsn` 与 `txns_by_base_snapshot_lsn` 两条链表），在 `ReorderBufferQueueChange()` 之后由 `ReorderBufferCheckMemoryLimit()` 按 `logical_decoding_work_mem` 阈值决定流式输出还是落盘；
 4. `logical.c` 的 `OutputPluginWrite()` 把插件生成的字节交给 `walsender.c:WalSndWriteData()` 写入 socket。
@@ -138,7 +140,11 @@
 | `xact` INVALIDATIONS | 目录失效消息 | **walreader 门控后转发给 worker**（xid 有效时）；xid 无效时**广播给所有 worker**（6.5） | 失效要落到持有该事务的 worker 上 |
 | `heap2` `XLOG_HEAP2_NEW_CID` | 命令 ID + tuplecid | **walreader 门控后转发给 worker** | worker 用它重建命令 ID、tuplecid 哈希与 `rbtxn_has_catalog_changes` 标志（6.3） |
 | `heap` | INSERT / UPDATE / HOT UPDATE / DELETE / TRUNCATE / CONFIRM | decode worker | 数据变更，解码主体 |
+| `heap` `XLOG_HEAP_INPLACE` | 目录行的就地更新 | **walreader 门控后转发给 worker** | 不解码任何数据（`decode.c:509-513`：目录元组不参与解码），但要置位 `rbtxn_has_catalog_changes`（`decode.c:527` 的 `ReorderBufferXidSetCatalogChanges()`）——tuplecid 哈希表建表的必要条件（6.3）。该标志落在 worker 的 reorder buffer 上，因此这条记录必须到 worker |
+| `heap` `XLOG_HEAP_LOCK` | 行级锁 | walreader | `decode.c:535`：不关心行锁 |
 | `heap2` `XLOG_HEAP2_MULTI_INSERT` | 批量插入 | decode worker | 数据变更，解码主体 |
+| `heap2` `XLOG_HEAP2_REWRITE` | 仅供崩溃/归档恢复 | walreader | `decode.c:435-441`：注释明确"所有工作都在恢复时完成，这里什么都不用做" |
+| `heap2` `XLOG_HEAP2_VISIBLE` / `PRUNE_*` / `LOCK_UPDATED` | 可见性位、清理、锁 | walreader | `decode.c:448-453`：纯物理操作，逻辑解码不关心 |
 | `message` | 逻辑复制消息 | decode worker（事务型）/ 任意 worker（非事务型） | 事务型消息随事务分发 |
 
 **分类的要点是"归属"不是"处理"。** `ASSIGNMENT` / `INVALIDATIONS` / `NEW_CID` 三类记录虽然数量少、看起来像控制信息，但它们携带的是**事务内部状态**，只有持有该事务的 worker 才能消费。因此 walreader 对它们只做**门控与路由**，语义解释仍在 worker 侧完成（5.2.1）。这是"下行载荷必须是原始 WAL 记录"这一结论的直接推论。
@@ -147,11 +153,11 @@
 
 以下事实直接来自本仓库代码，是本设计的约束前提，方案必须成立而非重新论证。
 
-**事实 1：顶层事务 ID 可独立获取。** `logical.c:LogicalDecodingProcessRecord()` 通过 `XLogRecGetTopXid(record)` 从 WAL 记录头直接得到顶层事务 ID，无需查询 reorder buffer。因此 walreader 可以仅凭 WAL 记录自身决定分发目标，这是并行分发的前提。
+**事实 1：顶层事务 ID 可独立获取。** `decode.c:88` 的 `LogicalDecodingProcessRecord()` 通过 `XLogRecGetTopXid(record)` 从 WAL 记录头直接得到顶层事务 ID，无需查询 reorder buffer。因此 walreader 可以仅凭 WAL 记录自身决定分发目标，这是并行分发的前提。
 
-**事实 2：快照按事务分配。** `snapbuild.c:800-817` 在事务的首条记录处构建快照并调用 `ReorderBufferSetBaseSnapshot()` 绑定到该事务；`reorderbuffer.c:3162` 的 `ReorderBufferSetBaseSnapshot()` 保存 `txn->base_snapshot`。快照是**事务级**而非全局单例，因此可以随事务一起分发给 worker。
+**事实 2：快照按事务分配。** `snapbuild.c:778-820` 的 `SnapBuildProcessChange()` 在事务的**首条可解码变更**处构建快照并调用 `ReorderBufferSetBaseSnapshot()` 绑定到该事务；`reorderbuffer.c:3162` 的 `ReorderBufferSetBaseSnapshot()` 保存 `txn->base_snapshot`。快照是**事务级**而非全局单例，因此可以随事务一起分发给 worker。
 
-**事实 3：目录失效消息按事务累积、在事务提交时执行。** `decode.c:281-308` 处理 `XLOG_XACT_INVALIDATIONS`，调用 `ReorderBufferAddInvalidations()` 挂到事务上；`reorderbuffer.c:2577/2623/2913` 在事务结束（提交/回滚/准备）时调用 `ReorderBufferExecuteInvalidations()` 执行。带 xid 的失效天然属于事务，随该事务分发即可；**xid 无效的失效是例外**——它影响全局目录状态，而每个 worker 有自己的目录缓存，因此必须广播（见 6.5）。
+**事实 3：目录失效消息按事务累积、在事务结束时执行。** `decode.c:281-308` 处理 `XLOG_XACT_INVALIDATIONS`，调用 `ReorderBufferAddInvalidations()` 挂到事务上；提交路径在 `reorderbuffer.c:2577/2623/2913` 调用 `ReorderBufferExecuteInvalidations()` 执行，**回滚路径走的是 `ReorderBufferImmediateInvalidation()`**（`reorderbuffer.c:2957`，在 abort 时立即执行）。带 xid 的失效天然属于事务，随该事务分发即可；**xid 无效的失效是例外**——它影响全局目录状态，而每个 worker 有自己的目录缓存，因此必须广播（见 6.5）。
 
 **事实 4：流式模式下事务数据本身可以是乱序的，只有 commit 需要保序。** `reorderbuffer.c:3659-3676` 的 `ReorderBufferCheckMemoryLimit()` 在 `rb->size`（reorder buffer 中所有在途变更的总字节数）超过 `logical_decoding_work_mem * 1024` 时触发流式，并通过 `ReorderBufferLargestStreamableTopTXN()` **挑选总字节数最大的事务**优先输出——可见 PG 已允许事务数据乱序下发。而 commit/abort 始终在对应的 WAL 提交记录处按 WAL 顺序发出：`decode.c:216-243` 解析 `XLOG_XACT_COMMIT` → `DecodeCommit()`（`decode.c:733` 调用 `ReorderBufferCommit()`）→ `ReorderBufferReplay()`（`reorderbuffer.c:2679`）立即输出该事务。**这意味着并行解码必须保证的只有 commit/abort/cancel 的相对顺序，事务数据不必保序。** 本设计的顺序方案全部建立在这一事实上。
 
@@ -161,7 +167,7 @@
 
 **事实 7：非流式订阅方的大事务走落盘而非流式。** `reorderbuffer.c:3677-3691` 在无法流式时调用 `ReorderBufferSerializeTXN()` 把事务写入 `pg_logical/reorderbuffer` 下的临时文件，提交时再整体回放输出。因此“整事务字节连续”是现状既有行为。但**落盘路径在多 worker 下不可用**：它依赖进程全局的 `MyReplicationSlot`（worker 进程里为 NULL），且所有 worker 共享同一个 `pg_replslot/<slot>/` 目录，`ReorderBufferCleanupSerializedTXNs()`（`reorderbuffer.c:4598-4629`）会删掉该目录下所有 `xid*` 文件——它在每个 worker 的启动与退出时都会被调用，因此 worker 之间会互删文件。并行模式改为**内存整事务缓冲**（见 8.2）。
 
-**事实 8：协议 v4 是订阅端的并行 apply，不是发布端的并行流式。** `logicalproto.h:26-45` 的四个版本号分别是：v1 基础协议、v2 流式（PG14）、v3 两阶段提交（PG15）、**v4 “applying large streaming transactions in parallel”（PG16）**。v4 的语义全部落在**订阅端**：`CREATE SUBSCRIPTION ... WITH (streaming = parallel)`（`subscriptioncmds.c:255-261`、`pg_subscription.h:162-176` 定义 `LOGICALREP_STREAM_PARALLEL 'p'`）要求订阅端用 parallel apply worker 回放流式事务（`applyparallelworker.c`）。**发布端在这一模式下没有获得任何新能力**——它仍然是单进程串行解码、单流段顺序下发。发布端并行流式（publisher-side parallel streaming）是 PG18 的特性，本分支不具备。
+**事实 8：协议 v4 是订阅端的并行 apply，不是发布端的并行流式。** `logicalproto.h:26-45` 的四个版本号分别是：v1 基础协议、v2 流式（PG14）、v3 两阶段提交（PG15）、**v4 “applying large streaming transactions in parallel”（PG16）**。v4 的语义全部落在**订阅端**：`CREATE SUBSCRIPTION ... WITH (streaming = parallel)`（`subscriptioncmds.c:254-260` 解析该选项，`defGetStreamingMode()` 在 `:2389`；`pg_subscription.h:162-176` 定义 `LOGICALREP_STREAM_PARALLEL 'p'`）要求订阅端用 parallel apply worker 回放流式事务（`applyparallelworker.c`）。**发布端在这一模式下没有获得任何新能力**——它仍然是单进程串行解码、单流段顺序下发。发布端并行流式（publisher-side parallel streaming）是 PG18 的特性，本分支不具备。
 
 **事实 9：复制槽绑定在 walsender 进程。** `logical.c:1693-1699` 的 `LogicalIncreaseXminForSlot()` 使用 `MyReplicationSlot`（进程局部变量），`snapbuild.c:1316` 在 `SnapBuildProcessRunningXacts()` 中调用它推进槽的 catalog_xmin。**拆分进程后，walreader 持有 snapbuild 却无法推进槽的 xmin**，必须由 walsender 代劳（见 5.2 的 `PMSG_WATERMARK_ADVANCE` / `PMSG_WATERMARK_ACK` 与 6.6）。
 
@@ -169,7 +175,7 @@
 
 **事实 11：是否流式由发布方决定，判据是订阅方传来的选项。** `libpqwalreceiver.c:588-590` 订阅方在 `START_REPLICATION` 中带 `streaming` 选项；发布方在 `pgoutput.c:488-510` 依据该选项与协议版本（`logicalproto.h:26-45`：v1 基础、v2 流式、v3 两阶段提交、v4 订阅端并行 apply）决定 `ctx->streaming`。发布方因此**知道**当前订阅方是否接受分片下发，但**不知道**订阅端是否启用 parallel apply worker——这不影响发布端的输出格式，两者正交。
 
-**事实 12：output plugin 不是在读 WAL 时调用的，而是在事务回放时调用的。** 读 WAL 阶段只把变更**入队**（`decode.c:893` `DecodeInsert` → `reorderbuffer.c:788` `ReorderBufferQueueChange`）；插件回调发生在变更从 reorder buffer **回放**时——提交时（`ReorderBufferCommit()` → `ReorderBufferProcessTXN()`，`reorderbuffer.c:2109`）或流式时（`ReorderBufferStreamTXN()`，`reorderbuffer.c:4054`）。由此得到两条对本设计至关重要的推论：
+**事实 12：output plugin 不是在读 WAL 时调用的，而是在事务回放时调用的。** 读 WAL 阶段只把变更**入队**（`decode.c:893` `DecodeInsert` → `reorderbuffer.c:788` `ReorderBufferQueueChange`）；插件回调发生在变更从 reorder buffer **回放**时——提交时（`ReorderBufferCommit()` → `ReorderBufferProcessTXN()`，`reorderbuffer.c:2109`）或流式时（`ReorderBufferStreamTXN()`，`reorderbuffer.c:4055`）。由此得到两条对本设计至关重要的推论：
 
 - **CPU 热点不在拷贝，而在插件格式化。** 每次变更的每列都要做一次 syscache 查类型 + 一次类型输出函数调用 + 一次分配（`logical/proto.c:828-858`），每条变更还要做一次 relmapper 查表 + 一次 relcache 打开（`reorderbuffer.c:2230-2255`）。相对而言 memcpy 是 GB/s 级的廉价操作。**只把“WAL→tuple”搬到 worker 省下的是拷贝，不是热点。**
 - **一个事务的插件调用不能跨进程拆分。** `txn->output_plugin_private`（pgoutput 的 `PGOutputTxnData`，`pgoutput.c:574` 创建、`pgoutput.c:610` 销毁）必须在同一个进程内走完 begin→changes→commit，且 `ReorderBufferProcessTXN()` 在调用插件前会安装历史快照并开启内部事务（`reorderbuffer.c:2127/2145-2149`）。
@@ -264,6 +270,17 @@
 - **运行**：三进程并行推进，walsender 周期性发送 keepalive 并处理订阅端 feedback。
 - **退出**：walsender 退出时通知 walreader 与 worker 收尾；复制槽释放仍由 walsender 负责。
 
+**子进程句柄的持有方式**。`RegisterDynamicBackgroundWorker()`（`bgworker.h:118-119`）返回 `BackgroundWorkerHandle *`，walsender 必须持有它，用于：
+
+| 用途 | 接口 |
+| --- | --- |
+| 等待 worker 完成启动（拿到 pid，用于 `SetLatch()` 定向唤醒） | `WaitForBackgroundWorkerStartup(handle, &pid)`（`bgworker.h:122-124`） |
+| 查询 worker 是否已退出 | `GetBackgroundWorkerPid(handle, &pid)`（`bgworker.h:122-124`），返回 `BgwHandleStatus` |
+| 主动终止 worker（会话收尾时） | `TerminateBackgroundWorker(handle)`（`bgworker.h:130`） |
+
+**句柄只用于生命周期管理，不用于状态传递。** worker 的运行状态（RUNNING / EXITED / FAILED）放在共享内存状态字里（§5.1 的错误通道），walsender 读共享内存判定，不查句柄——因为 `GetBackgroundWorkerPid()` 只能回答"进程还在不在"，回答不了"它为什么死"。两者的分工是：句柄回答"是否还在"，状态字回答"是否健康"。§17.3 的三重检测机制中，postmaster 的 SIGUSR1 通知负责"立刻醒来"，状态字负责"为什么"。
+
+
 ### 3.4 端到端时序
 
 以事务 T1（顶层事务，绑定 worker#0）为例：
@@ -354,7 +371,33 @@ walreader            worker#0            walsender           订阅端
 
 **这一层在并行化前后等价**，因为现状实现本来就是“数据可乱序、结束事件有序”（事实 4）。这是本设计与现状语义等价的关键一环。
 
-**但"数据可乱序"有一条边界，必须写进契约。** 流复制协议每条逻辑消息都带一个 `'w'` 帧头，其 LSN 会被订阅端用来推进 `last_received` 并回报 flush LSN，发布端据此推进 `confirmed_flush`。事务数据若完全自由乱序，会让 `confirmed_flush` 被后发事务抬高，而前面事务的数据其实还没发出——槽水位失真，并与 6.6.2 的 `restart_lsn` 漏洞复合成"发布端重启后丢变更"。因此 O3 的实现必须附带一条约束：**`'w'` 帧携带的 LSN 在 wire 上不得倒退**，其代价是非流式事务的整事务字节跟随 cseq 一起放行（详见 7.4）。
+**但"数据可乱序"有一条边界，必须写进契约，而且这条边界的正确形式与直觉不同。** 协议帧的 LSN 如何影响槽水位，链路是这样的（全部可在源码中核对）：
+
+| 环节 | 源码 | 行为 |
+| --- | --- | --- |
+| 帧头写 LSN | `walsender.c:1549-1560` `WalSndPrepareWrite()` | **只有 `last_write` 为真时才写入 `ctx->write_location`，否则写 0**。pgoutput 中 `last_write=true` 的只有：BEGIN、每条变更、COMMIT、PREPARE、COMMIT/ROLLBACK PREPARED、STREAM COMMIT；STREAM START / STREAM STOP 与 origin 消息写 0 |
+| 订阅端跟踪 | `worker.c:3588-3594` | `last_received = max(last_received, start_lsn, end_lsn)`——**取最大值，不会倒退** |
+| 订阅端回报 | `worker.c:3778-3785` `get_flush_position()` | 无待 apply 事务时 `flushpos = writepos = recvpos`，即回报 `last_received` |
+| 发布端落槽 | `logical.c:1836-1850`、`:1915` `LogicalConfirmReceivedLocation()` | **无条件**把 `confirmed_flush` 设为回报值，没有"不得超过已发送位置"的上限 |
+| 重启跳过判据 | `logical.c:568-591` → `snapbuild.c:358` → `decode.c:1302` → `snapbuild.c:443-446` | `start_decoding_at = confirmed_flush`；**在事务的提交/回滚记录处**用 `ptr < start_decoding_at` 判断是否整体跳过该事务 |
+
+**由此得到真正的安全不变式**（不是"'w' 帧 LSN 不得倒退"）：
+
+> **S1**：任何**提交记录 LSN 小于 `confirmed_flush`** 的事务，必须已经**完整送达**订阅端。
+> 因为重启后 `start_decoding_at = confirmed_flush`，提交记录 LSN 更小的事务会被 `DecodeTXNNeedSkip()` **整体跳过**——它的 BEGIN 与全部变更都不会重发。（重读本身是从 `restart_lsn` 开始的，`walsender.c:1506`，所以只要事务被重发，它就是完整的；危险的不是"重发得不完整"，而是"根本不重发"。）
+
+**现状（串行）为什么自动满足 S1**：reorder buffer 按 WAL 顺序处理记录，事务按提交顺序送达。设已完整送达的事务集合为 `D`（送达序 = 提交序），`M` = 已送达帧的最大 LSN。`M` 只可能来自某个已送达事务的变更帧，其 LSN ≤ 该事务的提交记录 LSN ≤ `D` 中最后一个事务的提交记录 LSN；而任何尚未送达的事务，其提交记录必然位于 WAL 中 `M` 之后（否则它早已被 reorder buffer 处理并输出）→ 提交记录 LSN > M → 重启时不会被跳过。
+
+**并行模型下 S1 在哪里被破坏**：本设计让**提交消息**按 cseq 放行（= 提交序），这一半与现状等价 ✔；但**流式分片提前送达**是新的破坏源——分片里变更帧的 LSN 可以大于某个"已提交但因 barrier 尚未放行"的事务的提交记录 LSN。于是 `M` 被抬高，越过那个事务的提交记录 → 重启后该事务被跳过 → **丢变更**。
+
+例：T1 的提交记录 LSN = 200（cseq=1，worker 慢，提交消息尚未放行）；T2（cseq=2）已提前输出一个分片，其中变更帧 LSN = 250。则 `M = 250 > 200`，重启后 `start_decoding_at = 250`，**T1 被整体跳过**。
+
+因此 O3 的实现必须附带一条约束：
+
+> **C9（改写）**：wire 上任何一条携带 LSN 的帧，其 LSN **不得超过"下一个待放行事务（cseq = 放行水位 + 1）的提交记录 LSN"**。
+> 非流式事务的整事务字节因此必须跟随 cseq 一起放行；**流式分片必须被钳制**——walsender 在转发分片帧时把帧头两个 int64 改写为 `min(帧内 LSN, 放行前沿 LSN)`（详见 7.4）。
+
+注意这**不是**"'w' 帧 LSN 不得倒退"：现状串行实现本身就产生倒退的帧 LSN（后提交事务的 BEGIN 帧 LSN 可能小于先提交事务的 COMMIT 帧 LSN），订阅端用取最大值的方式正是为此设计的。真正的判据是 S1。
 
 **必须注意的一条**：不是每个事务结束事件都会产生 wire 消息。`ReorderBufferAbort()`（`reorderbuffer.c:2946`）只在 `rbtxn_is_streamed(txn)` 为真时才调用 `rb->stream_abort()`；非流式事务的 abort / cancel **不产生任何 wire 消息**。因此 cseq 水位不能靠“等待 cseq=k 的消息”来推进，必须靠“收到 cseq=k 的结束事件回执（含空消息）”来推进，否则 barrier 会在常规路径上死锁（见 7.2）。
 
@@ -379,8 +422,10 @@ walreader            worker#0            walsender           订阅端
 | C6 | 快照事件必须与 WAL 记录同序到达 worker | O1（快照状态属于事务内状态） |
 | C7 | xid 无效的失效消息必须广播到所有 worker | O1（各 worker 各自持有目录缓存） |
 | C8 | walreader 只做门控与路由，不下发 snapbuild 之外的语义翻译结果 | O1（避免重复状态） |
-| C9 | `'w'` 帧携带的 LSN 在 wire 上不得倒退；因此非流式事务的整事务字节跟随 cseq 一起放行（流式分片不受此限） | O3 + 7.4 |
+| C9 | 已送达帧的 LSN 不得超过"下一个待放行事务的提交记录 LSN"（不变式 **S1**，见 4.1.3）；因此非流式事务的整事务字节跟随 cseq 放行，**流式分片的帧 LSN 由 walsender 钳制到放行前沿** | O3 + 7.4 |
 | C10 | 复制槽的**两个水位**（xmin 与 `restart_lsn`）都必须跨进程聚合，且由 walsender 单点推进 | 6.6 |
+| C11 | **受 cseq 门控的输出条目必须自带 cseq**（非流式整事务块、流式事务的 STREAM COMMIT 事件）；否则 walsender 无法把它们挂到 barrier 的正确位置 | O3 + 7.2 |
+| C12 | 事务结束事件必须携带**结束记录的 LSN 与载荷**（提交时间戳、prepare 的 gid）；worker 不看提交记录本身，这些字段只能由 walreader 传下去 | O1 + 5.2.2 |
 
 ### 4.2 决策一：解码切分点——worker 负责到哪一层
 
@@ -400,7 +445,7 @@ walreader            worker#0            walsender           订阅端
 
 理由：
 
-1. **CPU 热点在插件格式化，不在拷贝。** 事实 12：output plugin 的回调不是在读 WAL 时发生，而是在变更从 reorder buffer **回放**时发生（提交路径 `reorderbuffer.c:2109`、流式路径 `reorderbuffer.c:4054`），热点是插件对每列的 syscache 查类型与类型输出函数调用（`logical/proto.c:828-858`）。方案 B 只把 tuple 解码搬到 worker，**这段热点仍完整地留在单线程的 walsender 上**，无法达成 70MB/s 目标；方案 A 把“解码 + 插件格式化”整体并行化，walsender 只剩**按帧转发**（每帧一次 `write()` 系统调用，见 12.3），CPU 分布最均衡。
+1. **CPU 热点在插件格式化，不在拷贝。** 事实 12：output plugin 的回调不是在读 WAL 时发生，而是在变更从 reorder buffer **回放**时发生（提交路径 `reorderbuffer.c:2109`、流式路径 `reorderbuffer.c:4055`），热点是插件对每列的 syscache 查类型与类型输出函数调用（`logical/proto.c:828-858`）。方案 B 只把 tuple 解码搬到 worker，**这段热点仍完整地留在单线程的 walsender 上**，无法达成 70MB/s 目标；方案 A 把“解码 + 插件格式化”整体并行化，walsender 只剩**按帧转发**（每帧一次 `write()` 系统调用，见 12.3），CPU 分布最均衡。
 2. **插件状态必须在同一进程内闭环。** `txn->output_plugin_private` 是 output plugin 的私有状态，跨进程无法共享。方案 A 让 begin → changes → commit 全部在同一个 worker 内走完，插件状态天然自洽；方案 B 要么在 worker 与 walsender 之间传递插件私有状态，要么把格式化退回 walsender，两者都不可取。
 3. **方案 A 的串行路径拷贝最少**（共享内存 → socket 一次），符合“调度不成为新瓶颈”的要求；方案 B 多出 reorder buffer 与插件缓冲两次往返。
 4. 方案 B 的优点（改动小）可以通过“把 reorder buffer 与插件实例化到 worker、walsender 只保留发送职责”来达成，而不必保留 reorder buffer 在 walsender。
@@ -562,6 +607,16 @@ walreader            worker#0            walsender           订阅端
 - O1 要求 walreader 不被 worker 的解码速度拖住。否则 WAL 读取位置会被 worker 的背压卡住，`restart_lsn` 的推进随之停滞，复制槽的 WAL 保留窗口被无谓拉长；
 - O2/O3 要求 walsender 不被 worker 的产出顺序拖住。walsender 是唯一的网络出口，它必须能自由地在 N 个 worker 之间选择下一个可下发的块。
 
+**共享内存的尺寸上界必须显式约束。** dsa 区域是按需增长的（`dsa_create_ext()` 的 `init_segment_size` / `max_segment_size`，`dsa.c:421`），若不给出上界，一个失控的 worker（或一条大事务）可以把 dsa 撑到把 postmaster 的动态共享内存吃光。因此首版约定：
+
+| 项 | 上界来源 | 说明 |
+| --- | --- | --- |
+| 单条下行条目 / 单个上行块 | `MaxAllocSize`（`memutils.h:40`，1GB−1） | 单次分配的硬上限，超过即报错终止会话；不是设计目标值，只是"不会把内存吃爆"的兜底 |
+| 每个 `shm_mq` 实例的容量 | `shm_mq_set_max_size()` | 队列满即触发背压（5.5），而不是无限增长 |
+| dsa 区域总容量 | GUC 上限（建议 `parallel_decode_shmem_size`） | 超过即拒绝启动新事务并告警 |
+
+**单条消息的尺寸另有协议约束**：libpq 的 `PQ_LARGE_MESSAGE_LIMIT` 就是 `MaxAllocSize - 1`（`libpq.h:31`），超过该值必须走大消息分片协议——这与本设计的 `PD_BLK_*` 分块语义天然一致（5.2.3 的 FIRST / MORE / LAST 就是分片协议），因此单块字节数上限必须显著低于 `PQ_LARGE_MESSAGE_LIMIT`。
+
 ### 5.2 消息定义
 
 #### 5.2.1 推导：下行载荷为什么必须是原始 WAL 记录
@@ -589,7 +644,19 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | `PD_ENT_WAL` | 一批属于该 worker 的事务的 WAL 记录 | 记录数 + 每条记录（见下） |
 | `PD_ENT_SNAPSHOT` | 事务首条记录之前 / 目录事务提交时 | 快照版本号 + 随附的失效消息 |
 | `PD_ENT_GLOBAL_INVAL` | `XLOG_XACT_INVALIDATIONS` 且 xid 无效 | 失效消息数组（广播到所有 worker，见 6.5） |
-| `PD_ENT_TXN_END` | 读到事务结束记录 / 检测到 cancel | xid、结束类型、**cseq** |
+| `PD_ENT_TXN_END` | 读到事务结束记录 / 检测到 cancel | xid、结束类型、**cseq**、**结束记录的 LSN 与载荷**（见下） |
+
+**`PD_ENT_TXN_END` 必须携带结束记录本身的数据。** 事务结束记录（COMMIT / ABORT / PREPARE / COMMIT PREPARED）按 5.2.2 的筛选规则**不进入 `PD_ENT_WAL`**，worker 永远看不到它们。而 worker 侧的收尾工作需要这些字段：
+
+| 字段 | 用途 | 现状来源 |
+| --- | --- | --- |
+| `commit_lsn`（记录起点） | `txn->final_lsn` | `decode.c` 的 `DecodeCommit()` 传 `buf->origptr` |
+| `commit_end_lsn`（记录终点） | `txn->end_lsn`；**COMMIT 消息的 `'w'` 帧 LSN** | 同上，`buf->endptr` |
+| `commit_time` | `logicalrep_write_commit()` 写进 COMMIT 消息的时间戳 | `xl_xact_commit.xact_time` |
+| `gid` | prepare 的事务名，`logicalrep_write_commit_prepared()` 用它 | `xl_xact_prepare.twophase_gid` |
+| `end_type` | commit / abort / prepare / commit-prepared / rollback-prepared / cancel | — |
+
+现状这些值都在 worker 进程内从 WAL 记录直接解析；拆分后 walreader 读到结束记录，**只能由它解析并随事件下发**。
 
 `PD_ENT_WAL` 中每条记录必须携带 worker 重放该记录所需的**全部**信息：
 
@@ -620,9 +687,19 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 
 因此 worker 侧只需合成一个 `DecodedXLogRecord`（含 `blocks[]` 的柔性数组）并挂在一个最小 `XLogReaderState` 上（`record` 指向它，`ReadRecPtr` 等字段填当前记录的 LSN）。这样 rm_decode 函数拿到的 `XLogReaderState` 与现状同构，`heap_decode` / `heap2_decode` **一行都不用改**。
 
-**记录筛选规则**：walreader 转发的是“现状会喂给 `LogicalDecodingProcessRecord()` 且带有效 top xid 的全部记录”，包括 `XLOG_HEAP*` / `XLOG_HEAP2_MULTI_INSERT` / `XLOG_HEAP2_NEW_CID` / `XLOG_XACT_ASSIGNMENT` / `XLOG_XACT_INVALIDATIONS` / 事务型 `XLOG_LOGICAL_MESSAGE`；**不包括**事务结束记录（COMMIT / ABORT / PREPARE），它们由 `PD_ENT_TXN_END` 取代；**不包括**无 xid 的记录（`standby` / `xlog`），它们由 walreader 自行处理。
+**记录筛选规则**：walreader 转发的是“现状会喂给 `LogicalDecodingProcessRecord()` 且带有效 top xid 的全部记录”，即：
 
-**`XLOG_HEAP2_NEW_CID` 的额外要求**：`SnapBuildProcessNewCid()`（`snapbuild.c:828-861`）除了投递 tuplecid，还调用 `ReorderBufferXidSetCatalogChanges()` 设置 `rbtxn_has_catalog_changes` 标志——该标志是 `ReorderBufferBuildTupleCidHash()` 建表的必要条件（`reorderbuffer.c:1760-1765`）。因此这条记录下发时，worker 必须在本地事务上**同时置位该标志**（见 6.3）。
+- `XLOG_HEAP_INSERT` / `XLOG_HEAP_UPDATE` / `XLOG_HEAP_HOT_UPDATE` / `XLOG_HEAP_DELETE` / `XLOG_HEAP_TRUNCATE` / `XLOG_HEAP_CONFIRM`；
+- `XLOG_HEAP_INPLACE`（只为传递 `rbtxn_has_catalog_changes`，见 2.3）；
+- `XLOG_HEAP2_MULTI_INSERT` / `XLOG_HEAP2_NEW_CID`；
+- `XLOG_XACT_ASSIGNMENT` / `XLOG_XACT_INVALIDATIONS`；
+- 事务型 `XLOG_LOGICAL_MESSAGE`。
+
+**不包括**事务结束记录（COMMIT / ABORT / PREPARE / COMMIT PREPARED），它们由 `PD_ENT_TXN_END` 取代；**不包括**无 xid 的记录（`standby` / `xlog`），它们由 walreader 自行处理；**不包括**逻辑解码不关心的物理记录（`XLOG_HEAP_LOCK` / `XLOG_HEAP2_REWRITE` / `XLOG_HEAP2_VISIBLE` / `XLOG_HEAP2_PRUNE_*` / `XLOG_HEAP2_LOCK_UPDATED`，见 2.3）。
+
+**`XLOG_HEAP2_NEW_CID` 的额外要求**：`SnapBuildProcessNewCid()`（`snapbuild.c:828-861`）除了投递 tuplecid，还调用 `ReorderBufferXidSetCatalogChanges()` 设置 `rbtxn_has_catalog_changes` 标志——该标志是 `ReorderBufferBuildTupleCidHash()` 建表的必要条件（`reorderbuffer.c:1761-1766`）。因此这条记录下发时，worker 必须在本地事务上**同时置位该标志**（见 6.3）。
+
+注意 `SnapBuildProcessNewCid()` 本身是 **snapbuild 的函数**，而它操作的三个目标（`ReorderBufferXidSetCatalogChanges` / `ReorderBufferAddNewTupleCids` / `ReorderBufferAddNewCommandId`）**全在 reorder buffer 上**——拆分后 reorder buffer 在 worker 侧。因此 worker 侧的 snapbuild 替身必须**再提供第三个函数** `SnapBuildProcessNewCid()`（见 6.1）。`XLOG_HEAP_INPLACE` 同理：它的 `ReorderBufferXidSetCatalogChanges()` 也落在 worker 的 reorder buffer 上。
 
 #### 5.2.3 上行条目（worker → walsender）
 
@@ -630,7 +707,7 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 
 | 条目 | 载荷 | 说明 |
 | --- | --- | --- |
-| `PD_ENT_BLOCK` | 块边界标记（FIRST / MORE / LAST）、块类型、xid、字节 | O2 的载体：块内字节在 wire 上必须连续 |
+| `PD_ENT_BLOCK` | 块边界标记（FIRST / MORE / LAST）、块类型、xid、**cseq（仅整事务块有）**、字节 | O2 的载体：块内字节在 wire 上必须连续 |
 | `PD_ENT_EVENT` | cseq、结束类型、字节（**可为空**）、xid | O3 的载体：事务结束事件 |
 | `PD_ENT_ERROR` | 错误信息 | worker 内部错误（FR-11） |
 
@@ -651,10 +728,21 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 
 | 事务形态 | 数据 | 结束事件 |
 | --- | --- | --- |
-| 被流式（分段下发） | 若干 `PD_BLK_SEG`，解码过程中陆续产出 | `PD_ENT_EVENT`，载荷是 `STREAM_COMMIT` / `STREAM_ABORT` 字节 |
-| 未被流式（整事务下发） | 一个 `PD_BLK_TXN`，在 `PD_ENT_TXN_END` 到达时一次性产出 | 无独立事件——`COMMIT` 消息已包含在块内，块整体受该 cseq 门控 |
+| 被流式（分段下发） | 若干 `PD_BLK_SEG`，解码过程中陆续产出，**不带 cseq**——此时事务尚未提交，cseq 还不存在 | `PD_ENT_EVENT`，携带 cseq，载荷是 `STREAM_COMMIT` / `STREAM_ABORT` 字节；另有一条 `END_ACK` |
+| 未被流式（整事务下发） | 一个 `PD_BLK_TXN`，在 `PD_ENT_TXN_END` 到达时一次性产出，**携带该 cseq** | 同样有 `END_ACK`（字节可为空） |
 
-第二种形态下，`PD_BLK_TXN` 整体要等自己的 cseq 被放行才能下发（否则块内的 `COMMIT` 会早于更早的 cseq）。这是 FIFO 语义在非流式事务上的局部体现，代价是这些事务的字节在 wire 上被短暂挂起；由于未被流式的事务本身体量小，代价可控。
+**只有携带 cseq 的条目受 barrier 门控**：
+
+| 条目 | 是否受 cseq 门控 | 说明 |
+| --- | --- | --- |
+| `PD_BLK_SEG` | 否 | 流段内部连续即可，可以随时下发；C9 只约束它携带的帧 LSN（见 7.4） |
+| `PD_BLK_TXN` | **是** | 块内的 `COMMIT` 必须与更早的 cseq 保持相对顺序 |
+| `PD_ENT_EVENT`（STREAM_COMMIT / STREAM_ABORT） | **是** | 同上 |
+| `PD_ENT_EVENT{END_ACK}` | **是** | 它本身就是 barrier 的推进凭据 |
+
+因此 `PD_BLK_TXN` 必须**自带 cseq**（C11）。walsender 不能靠 `PMSG_COMMIT_SEQ` 来关联它——那是 walreader → walsender 的另一条通道，与 worker 的输出队列之间没有先后关系，两条通道的消息到达顺序不可比。
+
+第二种形态下，`PD_BLK_TXN` 整体要等自己的 cseq 被放行才能下发。它自带 cseq，walsender 直接把它挂进按 cseq 排序的挂起表——与 7.2 的 `pending_commits` 是同一张表，不需要额外的关联机制。
 
 #### 5.2.4 控制类消息
 
@@ -760,6 +848,20 @@ WAL 页缓冲 --memcpy--> decode_buffer --memcpy--> shm_mq 环（memcpy）
 6. **块粒度的输出调度（O2 的执行点，C5）**：walsender 一次只取**一整块**（读到该块的 LAST 片段为止），在整块取完之前不得从其它 worker 取字节。这条规则是 O2 在 walsender 侧的唯一执行机制，必须实现为“取块”这一原子动作，而不是“取片段后再判断”。
 7. **预取**：写当前块的同时，可以从另一个 worker 预取下一块到本地缓冲，但**不得提前写出**——提前写出就破坏了块连续性。预取用于掩盖“切换 worker”的空转。
 8. **walsender 的等待模型要覆盖两个事件源**：socket 可写与共享内存有新数据。现有 `WalSndWaitForWal()`（`walsender.c:1054-1069`）用 `WaitLatchOrSocket()` 只等 socket；并行后 worker 的产出必须能唤醒它。注意**跨进程 `SetLatch()` 的实现是发信号**（`latch.c:695`，向 owner_pid 发 SIGURG；本分支的 `Latch` 结构没有信号量/futex 语义，`latch.h:112-121`），不是纯原子操作——每次定向唤醒的实际成本是一次 `kill()` 系统调用 + 一次信号处理（上下文切换），比一次原子操作贵一到两个数量级。因此第 3、4 条的“批量 + 合并唤醒”在这里是硬要求，不是优化项。
+
+   **具体机制取"`WaitEventSet` 同时挂 socket 与 latch"**：`WaitLatchOrSocket()`（`latch.c:565-614`）本身就是 `WaitEventSet` 的包装——它建一个临时 `WaitEventSet`，把 `WL_LATCH_SET` 与 socket 事件一起加进去，等完就 `FreeWaitEventSet()`。但它是**一次性**的（每次调用都新建 + 释放一个 set），在高频循环里开销可观。因此并行模式的 walsender 应持有一个**长生命周期的 `WaitEventSet`**（`CreateWaitEventSet()`），一次性加入：
+
+   | 事件 | 用途 |
+   | --- | --- |
+   | `WL_SOCKET_READABLE` | 订阅端的 feedback / keepalive 应答 |
+   | `WL_SOCKET_WRITABLE` | TCP 窗口打开，可以继续写协议字节 |
+   | `WL_LATCH_SET`（`MyLatch`） | worker 产出就绪、walreader 的控制消息就绪 |
+   | `WL_EXIT_ON_PM_DEATH` | postmaster 死亡时立刻退出 |
+
+   等待用 `WaitEventSetWait(set, timeout, &event, 1, wait_event_info)`，返回后再按 `event.events` 分派。**首版取超时值 100ms**（与 `NAPTIME_PER_CYCLE` 同量级）：正常路径由 latch 唤醒立刻返回；超时只用于"没有待写数据、也没有新产出"的空转轮询，此时必须有代价可接受——100ms 的空转轮询不影响吞吐，只影响复制延迟的下界。**注意 timeout 只是兜底**：只要 worker 侧保证"有产出就 `SetLatch()`"（第 3、4 条），正常延迟不依赖这个超时值。
+
+   备选方案（"socket 超时 + 信号打断"）不取：`WaitLatchOrSocket()` 本来就把 socket 与 latch 放在同一个 `WaitEventSet` 里等，跨进程 `SetLatch()` 的信号会被 `WaitEventSet` 的等待机制正确接收，拆成两套机制只会多一次系统调用与一次竞争窗口。
+
 9. **`shm_mq` 的唤醒门槛必须显式选择。** `shm_mq` 只在 `force_flush` 为真、或累计写入量达到环的 1/4 时才 `SetLatch()` 接收方（`shm_mq.c:536-541`）；反过来，接收方**每读一次就反向唤醒发送方**（`shm_mq.c:1296`）——信号总数是单向的两倍。因此唤醒策略必须显式声明，不能依赖 `shm_mq` 的默认行为：
 
    | 策略 | 做法 | 代价 |
@@ -796,6 +898,16 @@ WAL 页缓冲 --memcpy--> decode_buffer --memcpy--> shm_mq 环（memcpy）
 | `SnapBuildProcessChange(builder, xid, lsn)` | `decode.c:477` | 判定"该事务是否已有 base snapshot"，没有就分配 | walreader 完成分配并下发 `PD_ENT_SNAPSHOT`；worker 只需回答"本事务是否已有快照" |
 | `SnapBuildXactNeedsSkip(builder, lsn)` | `reorderbuffer.c:4037` | `ptr < builder->start_decoding_at`（`snapbuild.c:443-446`），**一个 LSN 比较** | 共享状态块里的 `start_decoding_at` |
 | `ReorderBufferCanStartStreaming()` | `reorderbuffer.c:4028-4047` | 上述状态 + `ctx->streaming` + `ctx->reader->ReadRecPtr` | 状态块 + `ctx->streaming`（worker 侧常量）+ 本地记录 LSN |
+| `SnapBuildProcessNewCid(builder, xid, lsn, xlrec)` | `snapbuild.c:828-861` | 三个 **reorder buffer** 调用：`ReorderBufferXidSetCatalogChanges` / `ReorderBufferAddNewTupleCids` / `ReorderBufferAddNewCommandId` | worker 侧替身直接调这三个 reorder buffer 函数（它们本来就在 worker 侧） |
+| `ReorderBufferSetRestartPoint(rb, ptr)` | `snapbuild.c:1887`、`:2051` | 把 `rb->current_restart_decoding_lsn` 设为 `ptr` | **不跨进程**——由 walreader 维护自己的本地镜像（见下） |
+
+**`ReorderBufferSetRestartPoint()` 是唯一一条"写 reorder buffer"的 snapbuild 依赖，必须单独处理。** 现状下它写的是 `builder->reorder->current_restart_decoding_lsn`（`reorderbuffer.c:688` 读它），而 reorder buffer 在 worker 侧。拆分后：
+
+- walreader **自己持有一份 `current_restart_decoding_lsn` 的本地镜像**，在 snapbuild 推进时同步更新（值完全来自 snapbuild 的调用点，不需要跨进程传递）；
+- walreader 在**创建事务绑定**时把当时的镜像值记为该事务的 `restart_decoding_lsn`（语义与 `reorderbuffer.c:688` 的 `txn->restart_decoding_lsn = rb->current_restart_decoding_lsn` 逐条等价）；
+- worker 侧的本地 reorder buffer 上的 `current_restart_decoding_lsn` **不再被使用**——它只参与 6.6.2 的槽水位聚合，而该聚合完全在 walreader 侧完成。
+
+这样就不需要一条"walreader → worker"的 restart point 消息，也不需要 worker 回传任何状态。
 
 因此 worker 侧的 `ctx->snapshot_builder` 替换为一个**只读替身**：
 
@@ -809,10 +921,11 @@ typedef struct PD_DECODE_STATE
 } PD_DECODE_STATE;
 ```
 
-worker 侧的替身只需提供两个函数：
+worker 侧的替身只需提供三个函数：
 
 - `SnapBuildCurrentState()` —— 直接读状态块；
 - `SnapBuildProcessChange()` —— 等价行为是"本事务已收到 `PD_ENT_SNAPSHOT` 就返回 true，否则返回 false"。**它不再写 reorder buffer、不再构建快照。**
+- `SnapBuildProcessNewCid()` —— 直接转调 worker 侧的 `ReorderBufferXidSetCatalogChanges()` / `ReorderBufferAddNewTupleCids()` / `ReorderBufferAddNewCommandId()`（这三个函数的操作对象全在 worker 的 reorder buffer 上，不需要 snapbuild 的任何状态）。
 
 这样"解析语义零变更"（第 10 章）仍然成立——`heap_decode` / `heap2_decode` 的改动仅限于把 `ctx->snapshot_builder` 指向替身；`SnapBuildProcessChange` 的**判定结果**与现状一致，因为现状的判定本来就等价于"状态够 + 本事务有快照"。
 
@@ -877,9 +990,9 @@ worker 侧的替身只需提供两个函数：
 
 **历史快照是进程级单例，必须按事务切换。** `HistoricSnapshot` 与 `tuplecid_data` 都是 `snapmgr.c:90-91` 的进程级静态变量，不是事务级的。worker 同时承载 K 个在途事务时，同一时刻只能有一份生效。因此 worker 必须以**事务为单位串行解码**：进入事务 A 前 `SetupHistoricSnapshot(A 的快照, A 的 tuplecid_hash)`，离开时 `TeardownHistoricSnapshot()`，再进入事务 B。绝不能两个事务的变更交错解码——否则 `ResolveCminCmaxDuringDecoding()`（`heapam_visibility.c:1703-1704`）会取到错误的 `tuplecid_data`，UPDATE/DELETE 的旧版本判定出错。
 
-**tuplecid 映射不可省略**：事务自身创建目录行时，其可见性由 `cmin < curcid` 判定，依赖 `txn->tuplecid_hash`。该哈希表由 `ReorderBufferBuildTupleCidHash()`（`reorderbuffer.c:1760-1825`）从 `XLOG_HEAP2_NEW_CID` 记录构建，且**不可落盘**（`reorderbuffer.c:3235-3236` 明确跳过 `INTERNAL_TUPLECID` 的落盘记账）。因此这些记录必须以数据形式传给 worker，不能靠 worker 重新读 WAL 获得（见 5.2.1）。
+**tuplecid 映射不可省略**：事务自身创建目录行时，其可见性由 `cmin < curcid` 判定，依赖 `txn->tuplecid_hash`。该哈希表由 `ReorderBufferBuildTupleCidHash()`（`reorderbuffer.c:1761-1826`）从 `XLOG_HEAP2_NEW_CID` 记录构建，而 tuplecid 本身**不随事务落盘**：它们挂在 `txn->tuplecids` 这条独立的链表上（`reorderbuffer.c:3311`），不在 `txn->changes` 里，而 spill 只遍历 `txn->changes`（`reorderbuffer.c:3735`），因此永远不会被序列化；`ReorderBufferChangeMemoryUpdate()` 还刻意不把它们计入内存账（`reorderbuffer.c:3235-3236`），所以它们也不会触发 spill。结论是：**tuplecid 只能以内存态存在于 worker 的事务对象上**，必须以数据形式下发给 worker，不能靠 worker 重新读 WAL 获得（见 5.2.1）。
 
-**`rbtxn_has_catalog_changes` 标志必须一并传递。** `ReorderBufferBuildTupleCidHash()` 的第一道判据是 `if (!rbtxn_has_catalog_changes(txn) || dlist_is_empty(&txn->tuplecids)) return;`（`reorderbuffer.c:1760-1765`）。该标志由 `ReorderBufferXidSetCatalogChanges()` 设置，而设置动作发生在 walreader 侧（`snapbuild.c:836`）。若 worker 侧事务上没有这个标志，哈希表根本不会建立，`SetupHistoricSnapshot()` 传入的 `tuplecid_hash` 就是 NULL，UPDATE/DELETE 的旧版本判定随之出错。因此 `XLOG_HEAP2_NEW_CID` 的下发必须同时携带“本事务有目录变更”的语义，worker 收到后在本地事务上置位（见 5.2.1 的 `PD_ENT_WAL`）。
+**`rbtxn_has_catalog_changes` 标志必须一并传递。** `ReorderBufferBuildTupleCidHash()` 的第一道判据是 `if (!rbtxn_has_catalog_changes(txn) || dlist_is_empty(&txn->tuplecids)) return;`（`reorderbuffer.c:1761-1766`）。该标志由 `ReorderBufferXidSetCatalogChanges()` 设置，而设置动作发生在 walreader 侧（`snapbuild.c:839`，在 `SnapBuildProcessNewCid()` 内）。若 worker 侧事务上没有这个标志，哈希表根本不会建立，`SetupHistoricSnapshot()` 传入的 `tuplecid_hash` 就是 NULL，UPDATE/DELETE 的旧版本判定随之出错。因此 `XLOG_HEAP2_NEW_CID` 的下发必须同时携带“本事务有目录变更”的语义，worker 收到后在本地事务上置位（见 5.2.1 的 `PD_ENT_WAL`）。
 
 ### 6.4 relid 解析
 
@@ -901,7 +1014,18 @@ worker 侧的替身只需提供两个函数：
 | 执行失效消息 | walreader（本地）+ **所有 worker** | `PD_ENT_GLOBAL_INVAL` 广播 |
 | 送达的时点 | 立即，且与该 WAL 记录的位置对应 | walreader 读到记录后立即广播，不等事务结束 |
 
-**广播的正确性依赖 WAL 位置。** 失效消息必须在对应 WAL 记录的位置被应用，否则 worker 可能在失效生效前就用旧元数据解码了后续变更。由于 worker 按 WAL 顺序消费原始记录（O1），把失效消息**插在对应记录的位置**下发即可保证位置正确——这也是 5.2.1 选择“下发原始 WAL 记录、worker 自行重建失效”的理由之一。
+**广播的正确性依赖 WAL 位置，因此”广播”必须实现为”向每条下行队列各追加一个条目”，不能是独立的旁路通道。** 失效消息必须在对应 WAL 记录的位置被应用，否则 worker 可能在失效生效前就用旧元数据解码了后续变更。
+
+具体做法：walreader 在读到该记录时，向 **N 条下行队列各追加一个 `PD_ENT_GLOBAL_INVAL` 条目**。因为 walreader 对每条队列都是**按 WAL 顺序追加**（INV-1.2），而这些追加都发生在同一时刻，所以对任意一个 worker 而言：
+
+- 它队列中已有的条目，其 WAL 位置都在该失效记录**之前** → 先于失效生效；
+- 它队列中后来追加的条目，其 WAL 位置都在该失效记录**之后** → 后于失效生效。
+
+位置正确性因此由队列的 FIFO 追加顺序天然保证，与 5.2.1 选择”下发原始 WAL 记录、worker 自行重建失效”的理由一致——失效的**内容**由 worker 从记录重建，失效的**位置**由队列顺序保证。
+
+代价是每条无 xid 的失效要写 N 份。这是可接受的：无 xid 的失效来自目录修改事务，频率远低于数据变更。
+
+**同一机制也用于快照切换**（6.2）：`PD_ENT_SNAPSHOT` 的”目录修改事务提交时”那一路，同样是向每条下行队列追加一个条目，从而落在正确的 WAL 位置上。
 
 `XLOG_INVALIDATIONS`（standby 记录，`storage/ipc/standby.c:1479`）逻辑解码直接忽略（`decode.c:388-394`），并行设计保持不变。
 
@@ -978,7 +1102,14 @@ walreader 是 WAL 的唯一读取者，因此 WAL 顺序即提交顺序。walrea
 | ABORT | 读到 `XLOG_XACT_ABORT` 时 | 分配 | **取决于是否流式**：流式事务发 `STREAM ABORT`，非流式事务不发任何消息 |
 | PREPARE | 读到 `XLOG_XACT_PREPARE` 时 | 分配 | 是（`PREPARE` 消息） |
 | COMMIT PREPARED / ROLLBACK PREPARED | 读到对应记录时 | 分配 | 是 |
-| CANCEL | 由 `XLOG_RUNNING_XACTS` 清理游离事务时 | 分配 | **否**（现状 `reorderbuffer.c:2946` 只在 `rbtxn_is_streamed(txn)` 时才调 `rb->stream_abort()`） |
+| CANCEL | 由 `XLOG_RUNNING_XACTS` 清理游离事务时 | 分配 | **取决于是否流式**：流式事务发 `STREAM ABORT`，非流式事务不发任何消息（现状 `reorderbuffer.c:2946` 的 `ReorderBufferAbort()` 只在 `rbtxn_is_streamed(txn)` 时才调 `rb->stream_abort()`） |
+
+**CANCEL 的收尾与其它结束事件不同，必须在 worker 侧分叉。** 事务被取消时，worker 侧的本地 `ReorderBufferTXN` 仍在（它从未提交），收尾动作是 `ReorderBufferAbort()`：
+
+- **流式事务**：必须先发 `STREAM ABORT`（`reorderbuffer.c:2946` 的 `rb->stream_abort()`），否则订阅端会一直认为有一个打开的流段；
+- **非流式事务**：不发任何 wire 消息，barrier 靠 `END_ACK` 推进（见 7.2）。
+
+两种情况的 `END_ACK` 都必须发出。
 
 cseq 单调递增且连续分配（每个事务结束事件占一个序号），因此“空洞检测”退化为简单的“水位 + 计数”，无需复杂的乱位图。
 
@@ -1036,20 +1167,32 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | 不同事务的变更顺序 | **否** | 事实 4：PG 现状已允许乱序下发 |
 | 流式分片与提交消息的相对位置 | 分片可先于提交，提交不可先于本事务的全部分片 | 协议要求 |
 
-**"数据可乱序"有一个必须明确的边界：`'w'` 帧的 LSN 不能倒退。**
+**”数据可乱序”有一个必须明确的边界，形式与直觉不同：不是”'w' 帧 LSN 不得倒退”，而是 4.1.3 给出的不变式 S1。**
 
-流复制协议每条逻辑消息都带一个 `'w'` 帧头，其 LSN 取自 `ctx->write_location`（`logical.c:872` 的 BEGIN 用 `txn->first_lsn`、`:904` 的 COMMIT 用 `txn->end_lsn`、每条变更用 `change->lsn`）。订阅端用它推进 `last_received`（`worker.c:3588-3600`），并据此回报 flush LSN；发布端收到后执行 `LogicalConfirmReceivedLocation()`（`logical.c:1836-1847`），**直接把 `confirmed_flush` 设成该值，没有任何“不得超过已发送位置”的上限**。
+要点回顾（推导见 4.1.3 的表）：帧头 LSN 只在 `last_write=true` 时才是真值（BEGIN、每条变更、COMMIT、PREPARE、STREAM COMMIT；STREAM START/STOP 写 0）；订阅端用**取最大值**跟踪 `last_received`；发布端把该值**无条件**写进 `confirmed_flush`；而重启时 `start_decoding_at = confirmed_flush`，**提交记录 LSN 小于它的事务会被整体跳过**。
 
-现状（串行）下这个机制是安全的：事务按提交顺序整体发出，`'w'` 帧的 LSN 单调不减，"已收到 up to LSN" 的语义成立。并行模型下，若允许事务数据完全自由地乱序下发，就会出现 worker B 的事务 T2（变更 LSN 250）先于 worker A 的事务 T1（commit LSN 200）发出——订阅端 `last_received` 被抬到 250，回报 flush = 250，发布端 `confirmed_flush = 250`，**而 T1 的数据其实还没发出去**。后果是槽的 `confirmed_flush` 语义失真，并与 6.6.2 的 `restart_lsn` 推进漏洞复合，导致发布端重启后丢变更。
+于是安全条件是：
 
-因此数据乱序必须受一条约束：**`'w'` 帧携带的 LSN 在 wire 上不得倒退。** 实现上有两条路：
+> **S1**：任何**提交记录 LSN < `confirmed_flush`** 的事务，必须已经**完整送达**。
+
+串行现状自动满足它，因为事务按提交序送达、且 reorder buffer 按 WAL 序处理记录（任何变更帧的 LSN 都不会越过尚未输出的更早提交记录）。
+
+并行模型下破坏 S1 的是**提前送达的流式分片**：分片里变更帧的 LSN 可以大于某个”已提交但因 barrier 尚未放行”的事务的提交记录 LSN，把 `confirmed_flush` 抬到那个提交记录之上，重启后该事务被跳过。
+
+实现上有三条路：
 
 | 方案 | 做法 | 代价 |
 | --- | --- | --- |
-| (a) 按 LSN 序发数据 | walsender 持有一个"下一个可发 LSN"的水位，按 LSN 排序后逐个事务整块发出 | 等价于 FIFO，放弃 4.3 的核心卖点（数据随时可发） |
-| (b) 数据跟随 cseq 放行 | 事务数据与其 commit 一起按 cseq 输出 | 吞吐受最慢事务拖累，但语义最安全 |
+| (a) 按 LSN 序发数据 | walsender 持有一个”下一个可发 LSN”的水位，按 LSN 排序后逐个事务整块发出 | 等价于 FIFO，放弃 4.3 的核心卖点（数据随时可发） |
+| (b) 数据跟随 cseq 放行 | 非流式事务的数据与其提交消息一起按 cseq 输出 | 吞吐受最慢事务拖累，但语义最安全 |
+| (c) 分片帧 LSN 钳制 | 分片照常早发，但 walsender 把分片帧头的两个 int64 改写为 `min(帧内 LSN, 放行前沿 LSN)` | 需要 walsender 改写 worker 产出的帧；订阅端 `last_received` 推进变慢，`confirmed_flush` 推进变慢，WAL 保留窗口变长 |
 
-本设计取 **(b)** 作为正确性基线，并把 (a) 列为可选优化。代价是"数据随时可发"退化为"数据在其 cseq 轮到时发出"——但**流式分片仍然早发**：分片属于事务内部，不受 cseq 约束；只有该事务的**提交消息**（以及非流式事务的整事务字节）等 cseq。这就保住了 G5（流式尽早发送）的核心收益，同时守住 `confirmed_flush` 的语义。
+本设计取 **(b) + (c)**：
+
+- **(b) 覆盖非流式事务**：它们的整事务字节（含 COMMIT）必须等自己的 cseq 被放行，因此其帧 LSN ≤ 自己的提交记录 LSN ≤ 放行前沿 ✔。
+- **(c) 覆盖流式分片**：分片不属于任何已放行事务，必须显式钳制。**放行前沿**定义为”cseq = 放行水位 + 1 的那个事务的提交记录 LSN”——它由 walreader 在分配 cseq 时得知并通过控制通道告知 walsender。在该事务尚未提交（cseq 尚未分配）时，前沿取”当前 WAL 读取位置”，同样安全：此时不存在”已提交但未放行”的事务。
+
+**”放行前沿”还有一个必须注意的边界**：它约束的是**已放行事务的提交记录 LSN**，而不是所有事务。若 walsender 已经放行到 cseq = k，则前沿 = 事务 k+1 的提交记录 LSN；任何已送达帧的 LSN 都不得越过它。这条约束由 walsender 单点执行——它是唯一同时知道”放行水位”与”正在转发的帧”的地方。
 
 对流式事务，事务的最后一个分片与它的 `STREAM COMMIT` 之间隔着一个 cseq 屏障，会略微推迟提交可见性；这是可接受的代价，现状的串行实现本就有同样的提交路径队头阻塞。
 
@@ -1111,7 +1254,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | 故障 | 检测方 | 处理 |
 | --- | --- | --- |
 | worker 内部错误 | worker | `PD_ENT_ERROR` 上报；walsender 按现有逻辑复制语义终止会话并释放复制槽，**不得静默丢弃变更** |
-| worker 进程崩溃 | walsender（`bgw_notify_pid` 失效） | 终止本次复制会话并报错；该会话的变更不完整，不能继续发送 |
+| worker 进程崩溃 | walsender（postmaster 向 `bgw_notify_pid` 发 SIGUSR1 通知 + 共享内存状态字） | 终止本次复制会话并报错；该会话的变更不完整，不能继续发送 |
 | walreader 进程崩溃 | walsender | 同上；WAL 读取位置丢失，会话必须重建 |
 | 复制槽失效 / WAL 被回收 | walreader（读 WAL 失败） | 报错终止，会话重建 |
 | 快照无法达到 consistent | walreader | 报错终止（与现有 `DecodingContextFindStartpoint()` 行为一致） |
@@ -1156,6 +1299,16 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 所有 GUC 均需提供 `sighup` 或 `user` 级可调性，并保证关闭时行为与现状完全一致（AC-8）。
 
+**GUC 变更的生效时机必须区分。** worker 池是**会话级**的（随 walsender 一起建立与销毁），因此：
+
+| GUC | 变更生效时机 | 理由 |
+| --- | --- | --- |
+| `max_parallel_decode_workers` | **下次会话**（新 walsender 会话按新值建池） | worker 数决定了共享内存的队列条数（2N 条 `shm_mq`，§5.1）与绑定表规模，在会话中途增删会改变这些结构；且正在解码的事务不能迁移（4.5） |
+| `parallel_decode_work_mem` / `parallel_decode_batch_size` | `sighup` 后**下次会话** | 同上：`ReorderBufferCheckMemoryLimit()` 只读**本进程**的 GUC 值（12.2），worker 进程必须重启才能看到新值 |
+| `parallel_decode_streaming_mode` / `parallel_decode_stream_segment_size` | `sighup` 后**下次会话** | 分段参数决定 worker 何时切分流段，切分点一旦不同会导致 wire 上的分片边界与现状不一致（§4.2 的"分片切点不一致"），会话中途切换会让同一事务的前后两段用不同参数切分 |
+
+因此这些 GUC 虽然在 `sighup` 级可调，但**变更只在下一次复制会话生效**，不应给出"立即生效"的预期。这一点必须在 GUC 的说明里写清楚，否则运维会在会话中途改值并观察到不一致的行为。首版可只提供 `user` / `session` 级可调，把"会话中途变更"这个问题彻底消掉。
+
 ### 11.2 程序内部接口
 
 - `ParallelDecodeCreate()` / `ParallelDecodeDestroy()`：共享内存与子进程管理；
@@ -1181,6 +1334,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 - 目标：tpcc 100 万 tpm 场景下**实际发出的协议字节速率** ≥ 70MB/s（口径见下）；
 - **度量口径必须修正**：`confirm_flush_lsn` 速率在并行模型下会**虚高**——订阅端用 `'w'` 帧的 LSN 推进 `last_received` 并回报 flush LSN，而事务数据允许乱序下发（7.4），于是 flush LSN 可能被后发的事务抬高，而前面事务的数据其实还在路上。因此 G1 的度量口径应为"发布端实际写出的协议字节速率"或"订阅端**确认的应用速率**"，不能直接用 `confirm_flush_lsn`；
+- **达成条件（"与"关系，缺一不可）**：订阅端 `streaming=parallel` + 多个 parallel apply worker；发布端有段粒度上限（`parallel_decode_stream_segment_size`）；walsender 按块/按 8KB 缓冲批量刷出而非每帧一次 `write()`；发布端开启并行解码。**这三者之外的瓶颈不在解码侧**（15.1 的测算：N = 3~4 个 worker 就够解码 70MB/s）；
 - 需同时测量：单核场景的劣化幅度（应接近 0）、小事务延迟（进程调度不应引入显著抖动）、**walsender 的输出帧率与 socket 写次数**（见 12.3）。
 
 ### 12.2 资源与内存
@@ -1213,7 +1367,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 ## 13. 兼容性与约束
 
-1. **发布端行为变更**：开启并行解码后，发布端的 WAL 读取点、快照推进点发生迁移，需要保证复制槽的 `restart_lsn` / `confirmed_flush` 语义与现状等价。注意这里的"等价"是**有条件的**：并行模型下 `restart_lsn` 由两个跨进程聚合点共同决定（xmin 与 restart_lsn，6.6），`confirmed_flush` 依赖 `'w'` 帧 LSN 不倒退（7.4）。这两条都必须显式实现并验证，不能假设"自然成立"。
+1. **发布端行为变更**：开启并行解码后，发布端的 WAL 读取点、快照推进点发生迁移，需要保证复制槽的 `restart_lsn` / `confirmed_flush` 语义与现状等价。注意这里的"等价"是**有条件的**：并行模型下 `restart_lsn` 由两个跨进程聚合点共同决定（xmin 与 restart_lsn，6.6），`confirmed_flush` 依赖不变式 S1——已送达帧的 LSN 不得超过下一个待放行事务的提交记录 LSN（4.1.3、7.4）。这两条都必须显式实现并验证，不能假设"自然成立"。
 2. **订阅端零改动**：协议格式、消息类型、顺序语义均不改变，订阅端无需升级或改配置；
 3. **非流式订阅方**：走整事务输出路径。**不走现状的落盘回放**——落盘在多 worker 下会互删文件且依赖 `MyReplicationSlot`（8.2）。改为**内存整事务缓冲**：worker 不切分，事务数据是一个完整的 `PD_BLK_TXN` 块，在其 cseq 轮到时整块写出。行为语义与现状一致（整事务字节连续、提交有序），代价是内存占用与事务大小成正比；
 4. **并行流式模式（协议 v4）**：协议 v4 的"并行"指的是**订阅端**用 parallel apply worker 回放（事实 8）。**发布端在 wire 上依然一次只能有一个打开的流段**（事实 13），本特性也不改变这一点。本特性在此模式下的收益在于"解码侧并行 + 分片更早"，不在于"同时打开多个流段"；
@@ -1229,15 +1383,19 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | 风险 | 影响 | 对策 |
 | --- | --- | --- |
 | 目录变更导致 worker 读到错误的元数据 | 变更内容错误 | 失效消息随事务下发并在事务结束时执行（6.2）；xid-less 的失效**广播给所有 worker**（6.5）；以 DDL 混合负载重点验证 |
-| cseq 空洞导致 barrier 卡死 | 复制停滞 | cseq 连续分配；barrier **靠 END_ACK 推进**（含空事件），空��只可能是 worker 崩溃；配合超时与错误上报转为会话失败（7.2） |
+| cseq 空洞导致 barrier 卡死 | 复制停滞 | cseq 连续分配；barrier **靠 END_ACK 推进**（含空事件），空洞只可能是 worker 崩溃；配合超时与错误上报转为会话失败（7.2） |
 | 提交顺序与订阅端 apply 顺序不一致 | 数据不一致 | 以 cseq 严格保序；与现有串行路径做逐事务比对 |
-| `'w'` 帧 LSN 倒退导致 `confirmed_flush` 虚高 | 槽水位失真，重启后丢变更 | 数据（非流式整事务块）跟随 cseq 放行；`'w'` 帧 LSN 不倒退（7.4） |
+| `'w'` 帧 LSN 把 `confirmed_flush` 抬到未送达事务之前 | 重启后该事务被整体跳过 → **静默丢数据** | 维持不变式 S1：已送达帧的 LSN 不得超过下一个待放行事务的提交记录 LSN（4.1.3）；非流式数据跟随 cseq 放行；**流式分片的帧 LSN 由 walsender 按放行前沿钳制**（7.4） |
 | `restart_lsn` 越过仍在途的事务 | 发布端重启后丢变更 | walreader 侧维护事务绑定表并汇总最老在途事务的 `restart_decoding_lsn`（6.6.2） |
 | wire 上出现两个打开的流段 | 订阅端 `ereport(ERROR, "duplicate STREAM START message")` | walsender 一次只取一整块，块未取完不得取其它 worker 的字节（5.4 第 6 条、O2） |
 | 共享内存队列成为瓶颈 | 吞吐不升反降 | 批量提交、定向唤醒；队列深度纳入监控。注意 `shm_mq` 的载荷是 memcpy（`shm_mq.c:1043`），"零拷贝"需要自研固定槽队列，不是 `shm_mq` 的能力 |
 | worker 负载不均 | 部分 worker 空闲 | **按在途字节数**优先分配（4.5.1）；周期性上报校正 |
 | 内存占用放大 | OOM 风险 | 每 worker 上限 × worker 数（12.2）；prepared 事务单列 |
 | 进程数与并行查询/并行 apply 争抢 | 资源不足 | 文档提示；可与 `max_worker_processes` 协调 |
+| **提前流式的分片帧 LSN 抬高 `confirmed_flush`** | 订阅端确认水位越过尚未送达的事务 → 重启后该事务被跳过 → **静默丢数据** | 流式分片虽然可以早发，但其帧 LSN 必须被**放行前沿**钳制（`min(frame LSN, frontier)`，7.4）；放行前沿 = cseq = 放行水位 + 1 的事务的提交记录 LSN。**这是本设计新增的数据丢失路径，必须专门验证**（见 16 的 P6 验收） |
+| walsender 每帧一次 `write()` 系统调用 | 协议帧率高时成为串行天花板 | 批量刷出（`pq_flush` 合并多个 `CopyData`）；帧率纳入监控（11.3 的 `pg_parallel_decode_walsender_frames`） |
+| 段粒度串行下发阻塞整条 wire | 一个慢 worker 拖住全部产出 | `parallel_decode_stream_segment_size` 给段字节上限；预取掩盖切换开销（5.4 第 7 条） |
+| 端到端吞吐上限实为订阅端 apply 速率 | 发布端优化不产生端到端收益 | 文档明确"并行解码的收益前提是订阅端 `streaming=parallel` + 多个 parallel apply worker"；在 12.1 写清达成条件 |
 
 ## 15. 待决问题
 
@@ -1252,6 +1410,42 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | Q9 | 事务数据是否跟随 cseq 放行 | 跟随（安全）/ 按 LSN 序（等价 FIFO） | 跟随 cseq（7.4 的 `'w'` 帧 LSN 约束） |
 | Q7 | worker 崩溃是否降级为串行 | 终止会话 / 降级 | 终止会话（9、17.3） |
 | Q8 | 子进程形态 | 动态后台进程 / walsender 直接 fork | 动态后台进程，参照 `launcher.c:503`（3.3） |
+| Q10 | worker 数量与收益的匹配度 | 按解码算力配 N / 按端到端瓶颈配 N | **待定**——按源码成本结构，单核算力只差 1.5–2 倍，N = 3~4 就够达到 70MB/s 的解码能力（见 15.1）。**瓶颈不在解码**，而在 walsender 的每消息系统调用、O2 的段粒度串行下发、订阅端 apply 速率。因此"整套并行机制"的复杂度投入与解码侧的收益并不匹配，需要在实现前确认收益究竟落在哪一段 |
+
+### 15.1 收益测算：并行度并不需要很大
+
+按源码的真实成本结构估算 tpcc NewOrder（约 25 条行级变更、约 320 列）：
+
+| 成本项 | 源码位置 | 每事务 |
+| --- | --- | --- |
+| 每列：catcache 查类型 + 类型输出函数 + 写协议缓冲 | `proto.c:828/853/854` | 约 42–112 µs |
+| 每变更：relmapper + relcache + tuple 重建 | `reorderbuffer.c:2227/2251`、`decode.c:1253` | 约 8 µs |
+| 每事务：内部事务 + 失效队列排空 + 快照拷贝 | `reorderbuffer.c:2150/2574/1833` | 约 3–5 µs |
+| **合计** | | **约 75–125 µs / 事务** |
+
+→ **单核解码上限约 8k–13k 事务/秒 ≈ 500k–800k tpm**。tpcc 100 万 tpm（16.7k 事务/秒）只需要约 **1.5–2.0 核**的解码算力；按每事务约 3KB WAL 折算，100 万 tpm ≈ 53MB/s WAL，G1 的 70MB/s 大致对应 130 万 tpm 量级，约 **2–2.5 核**。
+
+**结论：N = 3~4 个 worker 就足够达到 70MB/s 的解码能力。** 更多的 worker 收益递减，而共享内存与信号开销线性上升。这一点必须写进设计的自我评估——本设计的复杂度（三进程拆分、共享内存、cseq barrier、顺序契约）远超解码侧的需求。
+
+真正的端到端瓶颈是另外三处：
+
+1. **walsender 的每帧一次 `write()` 系统调用**——这是并行化后最硬的串行天花板（12.3）；
+2. **O2 的段粒度串行下发**——段无字节上限时 wire 的阻塞时间无上界（12.3、8.1）；
+3. **订阅端 apply 速率**——发布端的吞吐上限 = 订阅端的 apply 速率；tpcc 下 42 万行/秒单个 apply worker 做不到，**整个特性的收益完全建立在订阅端已经并行回放（`streaming=parallel` + 多个 parallel apply worker）的前提上**。
+
+因此 70MB/s 的**达成条件**必须写清：订阅端 `streaming=parallel` + 段粒度上限 + walsender 批量刷出 + 发布端并行解码。这三者是"与"的关系，缺一项则端到端达不到目标。
+
+### 15.2 待实测确认清单
+
+以下五项无法从源码静态推断，必须在实现期用实测数据确认。它们都直接影响上文的测算与参数取值：
+
+| # | 事项 | 需要什么证据 | 影响的设计决策 |
+| --- | --- | --- | --- |
+| 1 | 订阅端是否把 `'w'` 帧的 LSN 用于 `confirmed_flush` 之外的用途 | 通读 `worker.c` 中 `last_received` / `send_feedback` 的全部使用点，以及 `pg_stat_replication` 的 `sent_lsn` / `write_lsn` 语义 | 7.4 的钳制方案是否足够（若订阅端另有用途，钳制会引入新的不一致） |
+| 2 | `SnapBuildSerialize` 是否在每个 `XLOG_RUNNING_XACTS` 上真的重写 | 实测 `pg_logical/snapshots` 目录的写入频率，或读其 body 的"是否需要重写"判据 | walreader 的磁盘 I/O 是否会成为新的瓶颈 |
+| 3 | `catalog_xmin` 在多 worker 下实际会被推多旧 | 一个"worker 持有长事务"的实测，看 `pg_replication_slots.catalog_xmin` 的推进行为 | 6.6 的 xmin 聚合策略（保守兜底是否够用） |
+| 4 | 70MB/s 场景下协议帧率的准确值 | 一次真实负载的 `pg_stat_replication` 采样 + 协议字节数统计（帧数需从发布端埋点） | 12.3 的系统调用率估算与批量刷出策略 |
+| 5 | `PQ_SEND_BUFFER_SIZE=8192` 在真实负载下的 `repalloc` 频率（`pqcomm.c:1533`） | 负载中"单条变更 > 8KB"的比例（宽表 / 大 TEXT） | 批量刷出的缓冲大小是否需要提高 |
 
 ## 16. 实现计划
 
@@ -1265,7 +1459,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | P3 顺序保证 | 引入 cseq 与 commit barrier | cseq 分配、`next_commit_seq` 水位与待提交表 | commit/abort/cancel 顺序与 WAL 一致（AC-3） |
 | P4 多 worker 并行 | worker 池与事务分配 | 事务→worker 绑定表、**按在途字节数**优先分配、队列水位反馈 | 吞吐随 worker 数上升（AC-1、AC-6） |
 | P5 快照与失效 | 事件流分发与 tuplecid 传递 | base snapshot 由 walreader 分配并通过**快照版本池**下发；命令 ID / 失效 / tuplecid 由 worker 从原始 WAL 记录**自行重建**；`rbtxn_has_catalog_changes` 标志随 NEW_CID 记录下发 | DDL 混合负载下元数据与现状一致（AC-5） |
-| P6 尽早流式 | 分片切分与提前下发 | 流式模式 GUC、批次粒度切分、结果区提前发送 | 大事务在解码完成前即可到达订阅端（AC-4） |
+| P6 尽早流式 | 分片切分与提前下发 | 流式模式 GUC、批次粒度切分、结果区提前发送；**walsender 按放行前沿钳制分片帧 LSN**（7.4 的方案 c） | 大事务在解码完成前即可到达订阅端（AC-4）；**且提前送达的分片不会把 `confirmed_flush` 抬到未放行事务的提交记录之上**（不变式 S1，用 kill/restart 实验验证无丢数据） |
 | P7 故障恢复 | 进程生命周期与故障处置 | worker 状态字、`bgw_notify_pid` 通知、barrier 超时、退出码与 `bgw_restart_time` 约束、cseq 作废路径 | kill worker 后会话及时终止而非静默停滞；重启后可从 `restart_lsn` 续传（AC-10、AC-11） |
 
 推进顺序上的三条约束：
@@ -1302,7 +1496,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 | 故障 | 退出方式 | postmaster 行为 | 本设计的处置 | 恢复路径 |
 | --- | --- | --- | --- | --- |
-| worker 内部错误 | `proc_exit(1)`（`bgworker.c:815`；`elog.c:590` 的 FATAL 路径同此） | 记 `rw_crashed_at`，**不触发集群重启**（`postmaster.c:2733-2736`：只有 0/1 以外的退出码才触发系统级重启） | worker 上报 `PD_ENT_ERROR`；walsender 终止会话 | 订阅端重连 → 新会话从 `restart_lsn` 重放 |
+| worker 内部错误 | `proc_exit(1)`（`bgworker.c:815`；`elog.c:590` 的 FATAL 路径同此） | 记 `rw_crashed_at`，**不触发集群重启**（`postmaster.c:2737-2739`：只有 0/1 以外的退出码才触发系统级重启） | worker 上报 `PD_ENT_ERROR`；walsender 终止会话 | 订阅端重连 → 新会话从 `restart_lsn` 重放 |
 | worker 崩溃（信号） | 被信号杀死 | **触发集群级 crash recovery**（`postmaster.c:3040` 置 `FatalError`） | 集群整体恢复，槽从磁盘恢复 | 数据库重启 → 同上 |
 | worker 正常退出 | `proc_exit(0)` | 记 `rw_terminate`，不重启该 worker | 视为会话终止 | 同上 |
 | walreader 崩溃 | 同 worker | 同上 | 终止会话 | 同上 |
@@ -1386,18 +1580,30 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 
 | 不变量 | 说明 |
 | --- | --- |
-| `restart_lsn` 单调前进 | 只在收到订阅端反馈后前进；槽保留该 LSN 之前的 WAL，因此重放所需的 WAL 一定还在 |
-| `confirmed_flush` 单调前进 | 只反映订阅端已确认的位置 |
+| `restart_lsn` 单调前进 | 由 walreader 侧的绑定表算出**最老在途事务**的 `restart_decoding_lsn`，再经 `PMSG_WATERMARK_ADVANCE` / `PMSG_WATERMARK_ACK` 交 walsender 单点推进（6.6.2）。**它的推进判据不是"收到订阅端反馈"**，而是"该 LSN 之前的所有事务都已提交并输出完毕"——订阅端反馈只决定 `confirmed_flush`，两者是两条独立的路径（见下） |
+| `confirmed_flush` 单调前进 | 只反映订阅端已确认的位置（`LogicalConfirmReceivedLocation()` 无条件写入，无上界） |
 | 重放范围 = 未确认区间 | 重发的内容由 `restart_lsn` 与 `confirmed_flush` 共同界定，即“订阅端尚未确认”的区间 |
+| **跳过判据受控** | 重启时 `start_decoding_at = confirmed_flush`，**提交记录 LSN 小于它的事务会被整体跳过**（`decode.c:1302` → `snapbuild.c:443-446`）。因此必须保证不变式 S1（4.1.3）：已送达帧的 LSN 不得超过下一个待放行事务的提交记录 LSN |
 | 至少一次语义 | 订阅端可能收到已 apply 但未确认的事务而重复 apply。这是逻辑复制的既有语义，本设计不改变它 |
 | 绝不静默丢数据 | 任何不确定状态一律以终止会话暴露（第 9 章），不做静默降级 |
 | 会话内自洽 | cseq 分配者、cseq 消费者、共享内存区域三者同生共死 |
+
+**`restart_lsn` 与 `confirmed_flush` 的关系必须写清楚，否则实现时一定会混淆。** 两者回答的是不同问题：
+
+| | `confirmed_flush` | `restart_lsn` |
+| --- | --- | --- |
+| 含义 | 订阅端确认已收到的位置 | 槽必须保留 WAL 的起点 |
+| 谁推进 | 订阅端反馈 → `LogicalConfirmReceivedLocation()` | walreader 算出最老在途事务的起点 → walsender 调 `LogicalIncreaseRestartDecodingForSlot()` |
+| 上界 | 无（订阅端报多少就是多少） | 受"最老在途事务"约束 |
+| 对重放的作用 | 决定 `start_decoding_at`（跳过哪些事务） | 决定 WAL 从哪里开始被重读（`walsender.c:1506`） |
+
+因此 §17.1 的表述（"槽水位只由订阅端反馈推进"）只对 `confirmed_flush` 成立；`restart_lsn` 有独立的推进路径（6.6.2），两者不能混为一谈。
 
 ### 17.8 实现约束清单
 
 以下每一条都直接对应上面某一节的结论，实现时必须逐条满足：
 
-1. **worker 不得以 0 / 1 以外的退出码退出，也不得死于信号。** 只有 0 与 1 不会触发集群级 crash recovery（`postmaster.c:2733-2736`）。worker 必须在事务边界用 `PG_TRY` / `PG_CATCH` 捕获错误，上报 `PD_ENT_ERROR` 后以 0 或 1 退出。
+1. **worker 不得以 0 / 1 以外的退出码退出，也不得死于信号。** 只有 0 与 1 不会触发集群级 crash recovery（`postmaster.c:2737-2739`）。worker 必须在事务边界用 `PG_TRY` / `PG_CATCH` 捕获错误，上报 `PD_ENT_ERROR` 后以 0 或 1 退出。
 2. **`bgw_restart_time` 必须为 `BGW_NEVER_RESTART`。** worker 的重建只能以会话重建的形式进行（17.3）。
 3. **`bgw_notify_pid` 必须设置为 walsender 的 pid。** 这是 worker 异常死亡时唯一的即时通知通道。
 4. **cseq 与共享内存不持久化，且与 walreader 同生命周期。** 禁止跨会话复用 cseq（17.6）。
@@ -1436,3 +1642,4 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 | v0.3 | 2026-11-18 | 明确事务与 worker 的绑定方向为多对一：新增 4.4 节，说明事务亲和性规则、事务内顺序的三重保证、与流式切分的交互及多事务并发的相互影响；同步更新 3.1、5.1、7.4、11.2、12.2、15 章与 `need.md` 的 FR/约束/验收 |
 | v0.4 | 2026-11-18 | 新增第 17 章故障恢复：明确复制槽是唯一的持久化恢复锚点；给出故障分类与处置、worker 处理中途崩溃的处置与三级检测机制、walreader 与 walsender 崩溃的处置、数据库重启后的完整恢复流程、恢复语义不变量与实现约束清单；同步更新 `need.md` 的 FR/约束/验收/风险 |
 | v0.5 | 2026-11-18 | **新增第 4.1 节"顺序保证模型：三层契约"**：把顺序要求显式拆成 O1 事务内序 / O2 流段 framing 序 / O3 结束事件序三层，各配不变式与派生约束 C1–C10。**第 5 章按三层契约重写**：下行载荷必须是原始 WAL 记录（含推导）、下行/上行条目与块类型、控制类消息、低拷贝链（含 `shm_mq` 的 memcpy）、唤醒与 `force_flush` 策略、流控。**第 6 章重写**：base snapshot 的分配权归 walreader（worker 侧用只读替身）、快照版本池、xid-less 失效广播、复制槽的 xmin 与 restart_lsn 两个跨进程聚合点。**第 7 章**：barrier 靠结束事件确认（可为空）推进，PREPARE 不解绑事务，`'w'` 帧 LSN 不倒退。**第 8 章**：修正"协议 v4 允许同时流式多个事务"的事实错误、段的字节上限、并行模式禁用落盘。**同步修订** 2.3 记录分类、3.1 职责表、4.2–4.5 选型、10 章改造范围、11 章 GUC 与监控、12 章性能风险、13/14 章兼容与风险；`need.md` 同步修订 G2/AC-2 为语义等价、FR-1/4/7/8/9/12/13、新增 FR-18/FR-19、约束 5/8/10、NFR-3、风险表 |
+| v0.6 | 2026-11-18 | **修正 C9 与新增不变式 S1**：`'w'` 帧 LSN 链（`WalSndPrepareWrite()` 只在 `last_write` 时写帧 LSN → 订阅端取最大值 → 发布端无条件写 `confirmed_flush` → 重启时 `start_decoding_at = confirmed_flush` → 提交记录 LSN 小于它的事务被整体跳过）经源码逐环验证后，原 C9"'w' 帧 LSN 不得倒退"被证明**表述错误**（串行现状本身允许倒退，订阅端的取最大值跟踪正是为此设计）。改为不变式 **S1**："提交记录 LSN 小于 `confirmed_flush` 的事务必须已完整送达"，并据此把 C9 改写为"已送达帧的 LSN 不得超过下一个待放行事务的提交记录 LSN（放行前沿）"。**7.4 重写为三方案对比，取 (b) 数据跟随 cseq + (c) 分片帧 LSN 按放行前沿钳制**——后者堵住本设计引入的唯一一条新数据丢失路径。**新增约束 C11（受 cseq 门控的条目必须自带 cseq）与 C12（事务结束事件必须携带结束记录的 LSN 与载荷）**，并补齐 5.2.2 / 5.2.3 的载荷与门控表、6.1 的第三个 snapbuild 替身函数（`SnapBuildProcessNewCid()`）、6.5 的"广播=逐队列追加"语义。**第 3、5、9、11、12、14、15 章补齐**：子进程句柄（`BackgroundWorkerHandle`）的用途分工、共享内存尺寸上界（`MaxAllocSize` / `shm_mq_set_max_size()` / dsa 总容量）、walsender 的等待模型（长生命周期 `WaitEventSet` 同时挂 socket 与 latch，100ms 超时兜底）、GUC 变更只在下次会话生效、`bgw_notify_pid` 的 SIGUSR1 语义、风险表新增"提前流式抬高 `confirmed_flush`"一行。**15.1 新增收益测算**：单核解码上限约 8k–13k 事务/秒，N = 3~4 个 worker 即够 70MB/s——瓶颈不在解码而在 walsender 的每帧系统调用、段粒度串行下发与订阅端 apply 速率；15.2 列出 5 项待实测确认事项。`need.md` 同步：FR-19 改写、新增 FR-20（分片帧 LSN 钳制）与 AC-12（水位安全）、AC-1 口径与 G1 对齐、约束 5 改为三层、约束 13/14 新增、风险表改写 |
