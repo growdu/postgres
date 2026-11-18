@@ -51,8 +51,13 @@ ParallelWalreaderMain(Datum main_arg)
 {
 	ParallelDecodeWorkerArg arg;
 	ParallelDecodeControl *ctl;
+	dsm_segment *seg = NULL;
+	shm_toc    *toc = NULL;
+	shm_mq	   *control_mq;
+	shm_mq_handle *control_mqh;
 	int			slot_index = -1;
 	uint32		wait_event;
+	int64		ready_payload[2];
 
 	/* Setup signal handling. */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -64,7 +69,7 @@ ParallelWalreaderMain(Datum main_arg)
 
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(ParallelDecodeWorkerArg));
 
-	ctl = ParallelDecodeWorkerAttach(&arg, &slot_index);
+	ctl = ParallelDecodeWorkerAttach(&arg, &slot_index, &seg, &toc);
 	if (ctl == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -72,12 +77,35 @@ ParallelWalreaderMain(Datum main_arg)
 
 	/*
 	 * The walreader owns the snapshot builder, which needs access to the
-	 * system catalogs.
+	 * system catalogs of the database the output plugin works on.
 	 */
-	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+	BackgroundWorkerInitializeConnectionByOid(arg.db_oid, InvalidOid, 0);
 
 	ctl->walreader_pid = MyProcPid;
 	ctl->walreader_status = PD_WORKER_STATUS_RUNNING;
+
+	/*
+	 * Attach to the control channel and tell the walsender that we are up.
+	 * The walsender waits for this message before it starts the replication
+	 * session proper, so a walreader that dies during startup is reported
+	 * as a failure instead of leaving the session without a WAL reader.
+	 */
+	control_mq = ParallelDecodeLookupMq(toc, PARALLEL_DECODE_KEY_CONTROL_MQ);
+	if (control_mq == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("could not find the parallel decoding control channel")));
+	shm_mq_set_sender(control_mq, MyProc);
+	control_mqh = shm_mq_attach(control_mq, seg, NULL);
+
+	ready_payload[0] = (int64) MyProcPid;
+	ready_payload[1] = 0;
+	if (!PDQueueSend(control_mqh, PD_ENT_READY, ready_payload,
+					 sizeof(ready_payload), false, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("could not notify the walsender that the parallel decode "
+						"walreader is ready")));
 
 	wait_event = WaitEventExtensionNew("paralleldecodedewalreader");
 
@@ -94,6 +122,14 @@ ParallelWalreaderMain(Datum main_arg)
 		int			rc;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * The walsender raises the shutdown flag when it goes away in an
+		 * orderly fashion.  If it was killed by a signal, the flag is never
+		 * raised, so check that the walsender is still there.
+		 */
+		if (!ParallelDecodeProcessAlive(ctl->walsender_pid))
+			break;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

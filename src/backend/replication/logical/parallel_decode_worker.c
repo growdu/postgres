@@ -64,7 +64,7 @@ ParallelDecodeWorkerMain(Datum main_arg)
 
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(ParallelDecodeWorkerArg));
 
-	ctl = ParallelDecodeWorkerAttach(&arg, &slot_index);
+	ctl = ParallelDecodeWorkerAttach(&arg, &slot_index, NULL, NULL);
 	if (ctl == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -79,7 +79,7 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	 * The output plugin needs access to the system catalogs, so the worker
 	 * must have a database connection.
 	 */
-	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+	BackgroundWorkerInitializeConnectionByOid(arg.db_oid, InvalidOid, 0);
 
 	/* Claim the slot. */
 	ctl->workers[slot_index].pid = MyProcPid;
@@ -100,6 +100,14 @@ ParallelDecodeWorkerMain(Datum main_arg)
 		int			rc;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * The walsender raises the shutdown flag when it goes away in an
+		 * orderly fashion.  If it was killed by a signal, the flag is never
+		 * raised, so check that the walsender is still there.
+		 */
+		if (!ParallelDecodeProcessAlive(ctl->walsender_pid))
+			break;
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

@@ -18,17 +18,23 @@
  */
 #include "postgres.h"
 
+#include <errno.h>
+#include <signal.h>
+
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "replication/parallel_decode.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/shm_mq.h"
 #include "storage/proc.h"
 #include "storage/shm_toc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/wait_event.h"
 #include "utils/memutils.h"
 
 /* GUCs */
@@ -44,6 +50,7 @@ static dsm_segment *parallel_decode_seg = NULL;
 static shm_toc *parallel_decode_toc = NULL;
 static ParallelDecodeControl *parallel_decode_ctl = NULL;
 static BackgroundWorkerHandle *parallel_decode_walreader_handle = NULL;
+static shm_mq_handle *parallel_decode_control_mqh = NULL;
 static BackgroundWorkerHandle *parallel_decode_worker_handles[MAX_PARALLEL_DECODE_WORKERS];
 static pid_t	parallel_decode_worker_pids[MAX_PARALLEL_DECODE_WORKERS];
 static int	parallel_decode_num_workers = 0;
@@ -54,12 +61,39 @@ static bool parallel_decode_session_active = false;
  * that started them.  This runs on every process exit path, including the
  * ones that do not go through ParallelDecodeSessionStop(), so it only raises
  * the shutdown flag: waiting for the workers here would not be safe.
+ *
+ * The callback has to be a before_shmem_exit one.  proc_exit() runs the
+ * before_shmem_exit callbacks first, then unmaps the dynamic shared memory
+ * segments of this process, and only then runs the on_proc_exit callbacks.
+ * An on_proc_exit callback would therefore touch a segment that is no longer
+ * mapped.
  */
 static void
-parallel_decode_on_proc_exit(int code, Datum arg)
+parallel_decode_before_shmem_exit(int code, Datum arg)
 {
-	if (parallel_decode_session_active && parallel_decode_ctl)
+	if (parallel_decode_ctl)
 		parallel_decode_ctl->shutdown = 1;
+}
+
+/*
+ * Returns true when the given process still exists.
+ *
+ * The workers use this to notice that the walsender died without a chance to
+ * raise the shutdown flag, which happens when the walsender is killed by a
+ * signal.  The walsender is a child of the postmaster, which reaps it as soon
+ * as it is gone, so the process disappears from the process table promptly.
+ */
+bool
+ParallelDecodeProcessAlive(pid_t pid)
+{
+	if (pid <= 0)
+		return false;
+
+	if (kill(pid, 0) == 0)
+		return true;
+
+	/* EPERM means the process exists but belongs to another user. */
+	return errno == EPERM;
 }
 
 /*
@@ -137,6 +171,57 @@ parallel_decode_register_worker(const char *name,
 }
 
 /*
+ * Wait for the walreader's readiness message on the control channel.
+ */
+static bool
+parallel_decode_wait_for_walreader(void)
+{
+	instr_time	deadline;
+	instr_time	now;
+
+	INSTR_TIME_SET_CURRENT(deadline);
+
+	for (;;)
+	{
+		shm_mq_result res;
+		uint16		type;
+		const void *payload;
+		size_t		len;
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+
+		res = PDQueueRecv(parallel_decode_control_mqh, &type, &payload, &len,
+						   true);
+		if (res == SHM_MQ_SUCCESS)
+		{
+			if (type != PD_ENT_READY || len < sizeof(int64))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("unexpected message of type %u on the parallel "
+								"decoding control channel", type)));
+			}
+			return true;
+		}
+		if (res == SHM_MQ_DETACHED)
+			return false;
+
+		/* The queue is empty: wait for the walreader to say something. */
+		INSTR_TIME_SET_CURRENT(now);
+		if (INSTR_TIME_GET_DOUBLE(now) - INSTR_TIME_GET_DOUBLE(deadline) >= 30.0)
+			return false;
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   100L,
+					   PG_WAIT_EXTENSION);
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
+}
+
+/*
  * Create the shared segment, the control block and the message queues, and
  * start the walreader and the decode workers.
  */
@@ -146,6 +231,7 @@ ParallelDecodeSessionStart(void)
 	shm_toc_estimator e;
 	size_t		segsize;
 	ParallelDecodeWorkerArg arg;
+	shm_mq	   *control_mq;
 	pid_t		pid;
 	int			i;
 
@@ -196,9 +282,11 @@ ParallelDecodeSessionStart(void)
 	 * Control channel, walreader -> walsender.  The walreader sets itself as
 	 * the sender once it has attached; the walsender is the receiver.
 	 */
-	shm_mq_set_receiver(parallel_decode_create_mq(parallel_decode_toc,
-													   PARALLEL_DECODE_KEY_CONTROL_MQ),
-						 MyProc);
+	control_mq = parallel_decode_create_mq(parallel_decode_toc,
+										   PARALLEL_DECODE_KEY_CONTROL_MQ);
+	shm_mq_set_receiver(control_mq, MyProc);
+	parallel_decode_control_mqh =
+		shm_mq_attach(control_mq, parallel_decode_seg, NULL);
 
 	/*
 	 * Walreader -> worker queues.  The walreader is the sender, the workers
@@ -222,6 +310,7 @@ ParallelDecodeSessionStart(void)
 	/* Start the walreader. */
 	arg.dsm_handle = (int) dsm_segment_handle(parallel_decode_seg);
 	arg.slot_index = -1;
+	arg.db_oid = MyDatabaseId;
 	parallel_decode_register_worker("parallel decode walreader",
 									"parallel decode walreader",
 									"ParallelWalreaderMain",
@@ -235,6 +324,7 @@ ParallelDecodeSessionStart(void)
 	{
 		arg.dsm_handle = (int) dsm_segment_handle(parallel_decode_seg);
 		arg.slot_index = i;
+		arg.db_oid = MyDatabaseId;
 		parallel_decode_register_worker("parallel decode worker",
 										"parallel decode worker",
 										"ParallelDecodeWorkerMain",
@@ -243,9 +333,19 @@ ParallelDecodeSessionStart(void)
 										&parallel_decode_worker_pids[i]);
 	}
 
+	/*
+	 * Wait for the walreader to report that it is up.  Without this the
+	 * session would start with no WAL reader at all, and the failure would
+	 * only show up as a stalled replication.
+	 */
+	if (!parallel_decode_wait_for_walreader())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the parallel decode walreader did not report readiness")));
+
 	parallel_decode_session_active = true;
 
-	on_proc_exit(parallel_decode_on_proc_exit, (Datum) 0);
+	before_shmem_exit(parallel_decode_before_shmem_exit, (Datum) 0);
 
 	ereport(LOG,
 			(errmsg("parallel logical decoding session started with %d decode worker(s)",
@@ -308,9 +408,12 @@ ParallelDecodeSessionStop(void)
  * control block and register ourselves in it.
  *
  * Returns the control block, or NULL if the segment could not be attached.
+ * The segment and the table of contents are handed back as well, because
+ * the participants need them to attach to the message queues.
  */
 ParallelDecodeControl *
-ParallelDecodeWorkerAttach(ParallelDecodeWorkerArg *arg, int *slot_index)
+ParallelDecodeWorkerAttach(ParallelDecodeWorkerArg *arg, int *slot_index,
+							dsm_segment **seg_out, shm_toc **toc_out)
 {
 	dsm_segment *seg;
 	shm_toc    *toc;
@@ -336,6 +439,11 @@ ParallelDecodeWorkerAttach(ParallelDecodeWorkerArg *arg, int *slot_index)
 
 	if (slot_index)
 		*slot_index = arg->slot_index;
+
+	if (seg_out)
+		*seg_out = seg;
+	if (toc_out)
+		*toc_out = toc;
 
 	return ctl;
 }

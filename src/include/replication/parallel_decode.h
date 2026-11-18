@@ -137,6 +137,7 @@ typedef struct ParallelDecodeWorkerArg
 {
 	int			dsm_handle;
 	int			slot_index;		/* -1 for the walreader */
+	Oid			db_oid;			/* database the output plugin works on */
 } ParallelDecodeWorkerArg;
 
 /*
@@ -154,7 +155,71 @@ typedef struct ParallelDecodeWorkerArg
 
 /* Worker-side helpers, implemented in parallel_decode.c. */
 extern ParallelDecodeControl *ParallelDecodeWorkerAttach(ParallelDecodeWorkerArg *arg,
-														 int *slot_index);
+														 int *slot_index,
+														 dsm_segment **seg,
+														 shm_toc **toc);
 extern shm_mq *ParallelDecodeLookupMq(shm_toc *toc, int key);
+
+/* Returns true when the given process still exists. */
+extern bool ParallelDecodeProcessAlive(pid_t pid);
+
+/*
+ * Message framing over a shared memory queue.
+ *
+ * Every entry on a queue is a header followed by a payload.  The header is
+ * fixed size, so the receiver can find the payload without copying
+ * anything: the payload lives in the ring buffer of the queue and stays
+ * valid until the next receive from the same queue.
+ *
+ * All queues are single sender / single receiver, so a message is never
+ * interleaved with another sender's message.
+ */
+typedef enum ParallelDecodeEntryType
+{
+	PD_ENT_SESSION_INIT = 1,	/* walreader -> worker */
+	PD_ENT_WAL = 2,				/* walreader -> worker */
+	PD_ENT_SNAPSHOT = 3,		/* walreader -> worker */
+	PD_ENT_GLOBAL_INVAL = 4,	/* walreader -> worker */
+	PD_ENT_TXN_END = 5,		/* walreader -> worker */
+	PD_ENT_SUBXACT_ABORT = 6,	/* walreader -> worker */
+	PD_ENT_BLOCK = 7,			/* worker -> walsender */
+	PD_ENT_EVENT = 8,			/* worker -> walsender */
+	PD_ENT_ERROR = 9,			/* worker -> walsender */
+	PD_ENT_READY = 10			/* walreader -> walsender */
+} ParallelDecodeEntryType;
+
+#define PD_MESSAGE_MAGIC			0x50444D31	/* "PDM1" */
+
+/* The largest payload a single entry may carry. */
+#define PD_MESSAGE_MAX_PAYLOAD		(1024 * 1024)
+
+typedef struct ParallelDecodeMessageHeader
+{
+	uint32		magic;
+	uint16		type;
+	uint16		flags;
+	uint32		length;
+} ParallelDecodeMessageHeader;
+
+/*
+ * Send one entry.  Returns false when the queue is full and nowait was
+ * requested, which is the backpressure signal of the design (5.5).
+ *
+ * force_flush makes the entry visible to the receiver right away.  The queue
+ * only publishes what the sender has written when the sender asks for it, so
+ * a sender that never flushes leaves the receiver waiting for data that is
+ * already in the ring buffer.  The control channel always flushes; the data
+ * channels may batch.
+ */
+extern bool PDQueueSend(shm_mq_handle *mqh, uint16 type, const void *payload,
+						size_t len, bool nowait, bool force_flush);
+
+/*
+ * Receive one entry.  The payload points into the ring buffer of the queue
+ * and is valid only until the next receive from the same queue.  Returns
+ * SHM_MQ_WOULD_BLOCK if the queue is empty and nowait was requested.
+ */
+extern shm_mq_result PDQueueRecv(shm_mq_handle *mqh, uint16 *type,
+									 const void **payload, size_t *len, bool nowait);
 
 #endif							/* PARALLEL_DECODE_H */

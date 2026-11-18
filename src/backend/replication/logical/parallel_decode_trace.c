@@ -24,6 +24,7 @@
 
 #include "miscadmin.h"
 #include "replication/parallel_decode.h"
+#include "storage/fd.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 
