@@ -22,6 +22,8 @@
 
 #include "postgres.h"
 
+#include "access/xlogreader.h"
+#include "lib/stringinfo.h"
 #include "storage/shm_mq.h"
 #include "storage/latch.h"
 #include "storage/shm_toc.h"
@@ -81,8 +83,11 @@ extern void PDTraceShutdown(void);
 
 /*
  * Lifecycle, called from the walsender that owns the replication slot.
+ *
+ * start_lsn is the WAL position the walreader has to start reading at, which
+ * is the restart LSN of the replication slot.
  */
-extern void ParallelDecodeSessionStart(void);
+extern void ParallelDecodeSessionStart(XLogRecPtr start_lsn);
 extern void ParallelDecodeSessionStop(void);
 
 /*
@@ -117,6 +122,14 @@ typedef struct ParallelDecodeControl
 	int			num_workers;
 	int			walreader_status;	/* PD_WORKER_STATUS_* */
 
+	/*
+	 * The WAL position the walreader has reached.  The walsender uses it to
+	 * decide whether the session has caught up with the WAL that has been
+	 * flushed, which is the same decision the serial path makes with the
+	 * reader's EndRecPtr.
+	 */
+	volatile uint64 walreader_end_lsn;
+
 	/* Set by the walsender once the slot and the plugin are known. */
 	int			streaming_mode;	/* ParallelDecodeStreamingMode */
 	int			proto_version;
@@ -138,6 +151,13 @@ typedef struct ParallelDecodeWorkerArg
 	int			dsm_handle;
 	int			slot_index;		/* -1 for the walreader */
 	Oid			db_oid;			/* database the output plugin works on */
+
+	/*
+	 * The WAL position the walreader has to start reading at.  Only the
+	 * walreader uses it; the decode workers learn their starting point from
+	 * the records they receive.
+	 */
+	XLogRecPtr	start_lsn;
 } ParallelDecodeWorkerArg;
 
 /*
@@ -150,8 +170,24 @@ typedef struct ParallelDecodeWorkerArg
 #define PARALLEL_DECODE_KEY_WAL_MQ_BASE	10			/* + worker index */
 #define PARALLEL_DECODE_KEY_OUT_MQ_BASE	100			/* + worker index */
 
+/*
+ * The queue the walreader uses to hand WAL records to the walsender.
+ *
+ * In the final architecture the walreader hands the records to the decode
+ * workers over the queues above.  During the P1 milestone the decoding still
+ * happens in the walsender, so the records travel over this queue instead.
+ */
+#define PARALLEL_DECODE_KEY_WALREADER_MQ	20
+
 /* Size of one shared message queue. */
 #define PARALLEL_DECODE_QUEUE_SIZE		(256 * 1024)
+
+/*
+ * The largest payload a single chunk may carry.  A chunk has to fit into a
+ * queue entry together with the message header, and it has to leave room in
+ * the ring for the queue's own bookkeeping.
+ */
+#define PARALLEL_DECODE_CHUNK_SIZE		(64 * 1024)
 
 /* Worker-side helpers, implemented in parallel_decode.c. */
 extern ParallelDecodeControl *ParallelDecodeWorkerAttach(ParallelDecodeWorkerArg *arg,
@@ -221,5 +257,63 @@ extern bool PDQueueSend(shm_mq_handle *mqh, uint16 type, const void *payload,
  */
 extern shm_mq_result PDQueueRecv(shm_mq_handle *mqh, uint16 *type,
 									 const void **payload, size_t *len, bool nowait);
+
+/*
+ * Transfer of a payload that does not fit into a single queue entry.
+ *
+ * The payload is split into chunks of at most chunk_size bytes.  The first
+ * chunk carries the total length of the payload, the following ones carry
+ * plain data.  The receiver keeps the partial payload in a PDChunkReceiver,
+ * so it can pick the transfer up again after it has waited for more data.
+ */
+typedef struct PDChunkReceiver
+{
+	char	   *buffer;		/* the payload accumulated so far */
+	size_t		len;			/* bytes accumulated so far */
+	size_t		expected;		/* total length of the payload */
+	bool		started;		/* a transfer is in progress */
+} PDChunkReceiver;
+
+extern void PDChunkReceiverInit(PDChunkReceiver *rcv);
+extern void PDChunkReceiverReset(PDChunkReceiver *rcv);
+extern shm_mq_result PDChunkReceiverRecv(PDChunkReceiver *rcv,
+										 shm_mq_handle *mqh, uint16 *type,
+										 const void **payload, size_t *len);
+extern bool PDQueueSendChunked(shm_mq_handle *mqh, uint16 type,
+							   const void *payload, size_t len, size_t chunk_size,
+							   bool nowait, bool force_flush);
+
+/*
+ * Serialization of a decoded WAL record.
+ *
+ * The walreader reads the WAL and hands the records to the decoding side as
+ * serialized copies of the decoded record, so that the decoding side does not
+ * have to read the WAL itself.  Only the fields the logical decoding path
+ * looks at are transferred: the record header, the main data and the block
+ * references with their data.
+ */
+#define PD_RECORD_FORMAT_VERSION	1
+
+extern void PDRecordSerialize(DecodedXLogRecord *record, StringInfo buf);
+extern DecodedXLogRecord *PDRecordDeserialize(const char *data, size_t len);
+extern void PDRecordFree(DecodedXLogRecord *record);
+
+/*
+ * Waiting for the next WAL record on the walsender side.
+ *
+ * The walreader is the only reader of the WAL, so the walsender has to wait
+ * for the records to arrive.  While it waits, it still has to service the
+ * replication connection, which is what the idle callback is for.
+ */
+typedef void (*ParallelDecodeIdleCallback) (void);
+
+extern void ParallelDecodeSetIdleCallback(ParallelDecodeIdleCallback callback);
+extern bool ParallelDecodeNextWalRecord(DecodedXLogRecord **record);
+
+/*
+ * The WAL position the walreader has reached, or InvalidXLogRecPtr if the
+ * walreader has not reported one yet.
+ */
+extern XLogRecPtr ParallelDecodeWalreaderPosition(void);
 
 #endif							/* PARALLEL_DECODE_H */

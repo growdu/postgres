@@ -51,6 +51,9 @@ static shm_toc *parallel_decode_toc = NULL;
 static ParallelDecodeControl *parallel_decode_ctl = NULL;
 static BackgroundWorkerHandle *parallel_decode_walreader_handle = NULL;
 static shm_mq_handle *parallel_decode_control_mqh = NULL;
+static shm_mq_handle *parallel_decode_wal_mqh = NULL;
+static PDChunkReceiver parallel_decode_chunk_rcv;
+static ParallelDecodeIdleCallback parallel_decode_idle_cb = NULL;
 static BackgroundWorkerHandle *parallel_decode_worker_handles[MAX_PARALLEL_DECODE_WORKERS];
 static pid_t	parallel_decode_worker_pids[MAX_PARALLEL_DECODE_WORKERS];
 static int	parallel_decode_num_workers = 0;
@@ -222,11 +225,107 @@ parallel_decode_wait_for_walreader(void)
 }
 
 /*
+ * Register the callback the session uses while it waits for the walreader.
+ *
+ * The walreader is the only reader of the WAL, so the walsender has to wait
+ * for the records to arrive.  The replication connection still has to be
+ * serviced while that happens, and only the walsender can do that.
+ */
+void
+ParallelDecodeSetIdleCallback(ParallelDecodeIdleCallback callback)
+{
+	parallel_decode_idle_cb = callback;
+}
+
+/*
+ * The WAL position the walreader has reached.
+ */
+XLogRecPtr
+ParallelDecodeWalreaderPosition(void)
+{
+	if (parallel_decode_ctl == NULL)
+		return InvalidXLogRecPtr;
+
+	return (XLogRecPtr) parallel_decode_ctl->walreader_end_lsn;
+}
+
+/*
+ * Wait for the next WAL record the walreader has read.
+ *
+ * Returns false when the session is winding down.  On success the record
+ * belongs to the caller, which frees it with PDRecordFree().
+ */
+bool
+ParallelDecodeNextWalRecord(DecodedXLogRecord **record)
+{
+	ParallelDecodeControl *ctl = parallel_decode_ctl;
+
+	Assert(parallel_decode_wal_mqh != NULL);
+
+	for (;;)
+	{
+		uint16		type;
+		const void *payload;
+		size_t		len;
+		shm_mq_result res;
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Clear the latch before looking at the queue.  A record that arrives
+		 * after this point sets the latch again, so the wait below returns
+		 * immediately; a record that arrived before is found by the receive.
+		 */
+		ResetLatch(MyLatch);
+
+		res = PDChunkReceiverRecv(&parallel_decode_chunk_rcv,
+								   parallel_decode_wal_mqh, &type, &payload, &len);
+		if (res == SHM_MQ_SUCCESS)
+		{
+			if (type != PD_ENT_WAL)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("unexpected message of type %u on the parallel decode "
+								"WAL channel", type)));
+
+			*record = PDRecordDeserialize(payload, len);
+			pfree((void *) payload);
+
+			return true;
+		}
+		if (res == SHM_MQ_DETACHED)
+			return false;
+
+		/* No record yet.  Check whether the session is still alive. */
+		if (ctl == NULL || ctl->shutdown)
+			return false;
+		if (!ParallelDecodeProcessAlive(ctl->walsender_pid))
+			return false;
+
+		/*
+		 * There is nothing to do but wait for the walreader.  The callback
+		 * takes care of the replication connection, which would otherwise not
+		 * be serviced at all while we wait.
+		 */
+		if (parallel_decode_idle_cb)
+			parallel_decode_idle_cb();
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   100L,
+					   PG_WAIT_EXTENSION);
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
+}
+
+/*
  * Create the shared segment, the control block and the message queues, and
  * start the walreader and the decode workers.
  */
 void
-ParallelDecodeSessionStart(void)
+ParallelDecodeSessionStart(XLogRecPtr start_lsn)
 {
 	shm_toc_estimator e;
 	size_t		segsize;
@@ -253,8 +352,8 @@ ParallelDecodeSessionStart(void)
 	shm_toc_initialize_estimator(&e);
 	shm_toc_estimate_chunk(&e, sizeof(ParallelDecodeControl));
 	shm_toc_estimate_chunk(&e, (size_t) PARALLEL_DECODE_QUEUE_SIZE *
-						   (2 + 2 * parallel_decode_num_workers));
-	shm_toc_estimate_keys(&e, 3 + 2 * parallel_decode_num_workers);
+						   (3 + 2 * parallel_decode_num_workers));
+	shm_toc_estimate_keys(&e, 4 + 2 * parallel_decode_num_workers);
 	segsize = shm_toc_estimate(&e);
 
 	parallel_decode_seg = dsm_create(segsize, 0);
@@ -297,6 +396,17 @@ ParallelDecodeSessionStart(void)
 		parallel_decode_create_mq(parallel_decode_toc,
 								  PARALLEL_DECODE_KEY_WAL_MQ_BASE + i);
 
+	/*
+	 * The queue the walreader uses to hand the WAL records to the walsender.
+	 * The walreader sets itself as the sender once it has attached.
+	 */
+	control_mq = parallel_decode_create_mq(parallel_decode_toc,
+										   PARALLEL_DECODE_KEY_WALREADER_MQ);
+	shm_mq_set_receiver(control_mq, MyProc);
+	parallel_decode_wal_mqh =
+		shm_mq_attach(control_mq, parallel_decode_seg, NULL);
+	PDChunkReceiverInit(&parallel_decode_chunk_rcv);
+
 	/* Worker -> walsender queues.  The walsender is the receiver. */
 	for (i = 0; i < parallel_decode_num_workers; i++)
 	{
@@ -311,6 +421,7 @@ ParallelDecodeSessionStart(void)
 	arg.dsm_handle = (int) dsm_segment_handle(parallel_decode_seg);
 	arg.slot_index = -1;
 	arg.db_oid = MyDatabaseId;
+	arg.start_lsn = start_lsn;
 	parallel_decode_register_worker("parallel decode walreader",
 									"parallel decode walreader",
 									"ParallelWalreaderMain",
@@ -325,6 +436,7 @@ ParallelDecodeSessionStart(void)
 		arg.dsm_handle = (int) dsm_segment_handle(parallel_decode_seg);
 		arg.slot_index = i;
 		arg.db_oid = MyDatabaseId;
+		arg.start_lsn = start_lsn;
 		parallel_decode_register_worker("parallel decode worker",
 										"parallel decode worker",
 										"ParallelDecodeWorkerMain",
@@ -390,6 +502,10 @@ ParallelDecodeSessionStop(void)
 		WaitForBackgroundWorkerShutdown(parallel_decode_walreader_handle);
 		parallel_decode_walreader_handle = NULL;
 	}
+
+	PDChunkReceiverReset(&parallel_decode_chunk_rcv);
+	parallel_decode_wal_mqh = NULL;
+	parallel_decode_idle_cb = NULL;
 
 	if (parallel_decode_seg)
 	{

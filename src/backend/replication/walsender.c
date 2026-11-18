@@ -245,6 +245,7 @@ static void WalSndKill(int code, Datum arg);
 static void WalSndShutdown(void) pg_attribute_noreturn();
 static void XLogSendPhysical(void);
 static void XLogSendLogical(void);
+static void pd_walsender_idle(void);
 static void WalSndDone(WalSndSendDataCallback send_data);
 static void IdentifySystem(void);
 static void UploadManifest(void);
@@ -1500,7 +1501,15 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	 * the replication session.  The data path below is unchanged.
 	 */
 	if (ParallelDecodeEnabled())
-		ParallelDecodeSessionStart();
+	{
+		ParallelDecodeSessionStart(MyReplicationSlot->data.restart_lsn);
+
+		/*
+		 * While the session waits for the walreader to hand over the next
+		 * WAL record, the replication connection still has to be serviced.
+		 */
+		ParallelDecodeSetIdleCallback(pd_walsender_idle);
+	}
 
 	logical_decoding_ctx =
 		CreateDecodingContext(cmd->startpoint, cmd->options, false,
@@ -3434,6 +3443,32 @@ retry:
 }
 
 /*
+ * Called while the walsender waits for the walreader to hand over the next
+ * WAL record.
+ *
+ * The walreader is the only reader of the WAL, so the walsender spends most
+ * of its time waiting for it.  The replication connection has to be serviced
+ * even then, otherwise the subscriber would not see any keepalive and the
+ * session would run into the replication timeout.
+ */
+static void
+pd_walsender_idle(void)
+{
+	/* Check for input from the client */
+	ProcessRepliesIfAny();
+
+	/* Try to flush pending output to the client */
+	if (pq_flush_if_writable() != 0)
+		WalSndShutdown();
+
+	/* die if timeout was reached */
+	WalSndCheckTimeOut();
+
+	/* Send keepalive if the time has come */
+	WalSndKeepaliveIfNecessary();
+}
+
+/*
  * Stream out logically decoded data.
  */
 static void
@@ -3441,6 +3476,7 @@ XLogSendLogical(void)
 {
 	XLogRecord *record;
 	char	   *errm;
+	XLogRecPtr current_lsn;
 
 	/*
 	 * We'll use the current flush point to determine whether we've caught up.
@@ -3451,6 +3487,13 @@ XLogSendLogical(void)
 	static XLogRecPtr flushPtr = InvalidXLogRecPtr;
 
 	/*
+	 * The record that was handed over last.  It is kept alive until the next
+	 * one arrives, because the decoding path may look at it while it produces
+	 * the output of the record.
+	 */
+	static DecodedXLogRecord *current_record = NULL;
+
+	/*
 	 * Don't know whether we've caught up yet. We'll set WalSndCaughtUp to
 	 * true in WalSndWaitForWal, if we're actually waiting. We also set to
 	 * true if XLogReadRecord() had to stop reading but WalSndWaitForWal
@@ -3458,15 +3501,32 @@ XLogSendLogical(void)
 	 */
 	WalSndCaughtUp = false;
 
-	record = XLogReadRecord(logical_decoding_ctx->reader, &errm);
-
-	/* xlog record was invalid */
-	if (errm != NULL)
-		elog(ERROR, "could not find record while sending logically-decoded data: %s",
-			 errm);
-
-	if (record != NULL)
+	if (ParallelDecodeEnabled())
 	{
+		DecodedXLogRecord *decoded = NULL;
+
+		/*
+		 * The walreader is the only reader of the WAL, so the records arrive
+		 * over the shared memory queue instead of being read here.
+		 */
+		if (!ParallelDecodeNextWalRecord(&decoded))
+			return;
+
+		/*
+		 * Hand the record over to the decoding path as if this process had
+		 * read it from the WAL itself.
+		 */
+		if (current_record)
+		{
+			PDRecordFree(current_record);
+			current_record = NULL;
+		}
+
+		current_record = decoded;
+		logical_decoding_ctx->reader->record = decoded;
+		logical_decoding_ctx->reader->ReadRecPtr = decoded->lsn;
+		logical_decoding_ctx->reader->EndRecPtr = decoded->next_lsn;
+
 		/*
 		 * Note the lack of any call to LagTrackerWrite() which is handled by
 		 * WalSndUpdateProgress which is called by output plugin through
@@ -3475,6 +3535,35 @@ XLogSendLogical(void)
 		LogicalDecodingProcessRecord(logical_decoding_ctx, logical_decoding_ctx->reader);
 
 		sentPtr = logical_decoding_ctx->reader->EndRecPtr;
+
+		/*
+		 * How far the session has come is decided by the walreader, because it
+		 * is the one that reads the WAL.
+		 */
+		current_lsn = ParallelDecodeWalreaderPosition();
+	}
+	else
+	{
+		record = XLogReadRecord(logical_decoding_ctx->reader, &errm);
+
+		/* xlog record was invalid */
+		if (errm != NULL)
+			elog(ERROR, "could not find record while sending logically-decoded data: %s",
+				 errm);
+
+		if (record != NULL)
+		{
+			/*
+			 * Note the lack of any call to LagTrackerWrite() which is handled by
+			 * WalSndUpdateProgress which is called by output plugin through
+			 * logical decoding write api.
+			 */
+			LogicalDecodingProcessRecord(logical_decoding_ctx, logical_decoding_ctx->reader);
+
+			sentPtr = logical_decoding_ctx->reader->EndRecPtr;
+		}
+
+		current_lsn = logical_decoding_ctx->reader->EndRecPtr;
 	}
 
 	/*
@@ -3482,7 +3571,7 @@ XLogSendLogical(void)
 	 * we only need to update flushPtr if EndRecPtr is past it.
 	 */
 	if (flushPtr == InvalidXLogRecPtr ||
-		logical_decoding_ctx->reader->EndRecPtr >= flushPtr)
+		current_lsn >= flushPtr)
 	{
 		if (am_cascading_walsender)
 			flushPtr = GetStandbyFlushRecPtr(NULL);
@@ -3491,7 +3580,7 @@ XLogSendLogical(void)
 	}
 
 	/* If EndRecPtr is still past our flushPtr, it means we caught up. */
-	if (logical_decoding_ctx->reader->EndRecPtr >= flushPtr)
+	if (current_lsn >= flushPtr)
 		WalSndCaughtUp = true;
 
 	/*

@@ -24,6 +24,7 @@ OBJS = \
 	origin.o \
 	parallel_decode.o \
 	parallel_decode_msg.o \
+	parallel_decode_record.o \
 	parallel_decode_trace.o \
 	parallel_decode_worker.o \
 	parallel_walreader.o \

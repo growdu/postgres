@@ -10,6 +10,7 @@ backend_sources += files(
   'origin.c',
   'parallel_decode.c',
   'parallel_decode_msg.c',
+  'parallel_decode_record.c',
   'parallel_decode_trace.c',
   'parallel_decode_worker.c',
   'parallel_walreader.c',
