@@ -18,6 +18,8 @@
 
 自 PG16 起订阅端支持流复制协议（streaming protocol），可启动多个 apply parallel worker 并行回放；发布端始终是单进程串行解码。发布端因而成为整条链路的瓶颈：它消耗 CPU 最多，却只能用到一个核。
 
+**本特性针对的正是这一不对称：让发布端的解码与订阅端的回放都并行起来。** 端到端的吞吐上限由两端中较慢的一端决定，只并行一端没有意义。因此本特性的目标部署形态是**发布端并行解码 + 订阅端 `streaming='parallel'` 并行 apply**，二者缺一不可（详见 4.4 与 `design.md` 3.5）。
+
 ## 2. 现状与问题
 
 ### 2.1 现状
@@ -67,7 +69,7 @@
 
 | 编号 | 目标 | 度量方式 |
 | --- | --- | --- |
-| G1 | 提升发布端解码吞吐 | tpcc 100 万 tpm 场景下，逻辑复制 WAL 同步速率达到 **70MB/s**（以**发布端实际发出的协议字节速率**为准；不能用 `confirm_flush_lsn` 速率——并行模型下事务数据可乱序下发，该指标会虚高，理由见 `design.md` 7.4） |
+| G1 | 提升发布端解码吞吐 | tpcc 100 万 tpm 场景下，逻辑复制 WAL 同步速率达到 **70MB/s**（以**发布端实际发出的协议字节速率**为准；不能用 `confirm_flush_lsn` 速率——并行模型下事务数据可乱序下发，该指标会虚高，理由见 `design.md` 7.4）。**达成前提**：目标部署形态（4.4）——订阅端 `streaming='parallel'` + 多个 apply worker，发布端开启并行解码且尽早流式 |
 | G2 | 解码结果与原串行实现**语义等价** | 开启/关闭并行解码，同一套负载下：每个事务内部的变更内容与顺序与 WAL 顺序**逐条一致**；事务结束事件（commit/abort/cancel）的顺序一致；订阅端最终 apply 的结果一致。**允许**的差异：RELATION 消息冗余（每 worker 一份关系缓存）、事务之间的数据下发顺序不同、流式分片的切点不同 |
 | G3 | 保证提交顺序 | 订阅端收到的 commit/abort/cancel 顺序与 WAL 中的提交顺序完全一致；事务数据本身允许乱序（与现有串行语义一致） |
 | G4 | 事务完整 | 子事务与顶层事务合并为一个完整事务，不拆分、不丢变更 |
@@ -89,6 +91,7 @@
 - 一致性快照在 worker 间的分发（base snapshot 由 walreader 分配并下发），以及目录失效消息随 WAL 变化及时送达 worker；
 - 并行模式下的错误传播、worker 异常退出处理；
 - 故障恢复：worker / walreader / walsender 崩溃与数据库重启后的会话重建；
+- **尽早流式**：流式是主路径，整事务块是例外（4.5）；流式激进程度、段字节上限与小事务门槛由 GUC 控制；
 - 相关 GUC、监控指标与文档。
 
 ### 4.2 范围外
@@ -107,7 +110,37 @@
 - **不再落盘**：现状非流式路径用 `ReorderBufferSerializeTXN()` 写临时文件、提交时回放。但落盘路径在多 worker 下会**互删文件**（所有 worker 共享 `pg_replslot/<slot>/` 目录，`ReorderBufferCleanupSerializedTXNs()` 会删掉该目录下所有 `xid*` 文件，而它在每个 worker 的启动与退出时都会被调用），且依赖进程全局的 `MyReplicationSlot`（worker 进程里为 NULL）。因此并行模式下禁用落盘，改为**内存整事务缓冲**，代价是内存占用与事务大小成正比。
 - **待提交区必须与结果区分离**：整事务字节要整块挂在待提交区等自己的提交序号，若待提交区与 worker 的结果区共享容量，会形成死锁（worker 想写自己的事务字节但空间被挂起区占满；挂起区等提交序号，提交序号又等那个 worker 写出字节）。因此待提交区与结果区分离，或让提交序号队头事务的字节直通 socket。
 
-只有流式订阅方能真正受益于并行解码；非流式订阅方的收益仅限"解码算力并行"，而其 wire 占用时间反而变长。
+**这是兼容路径，不承诺性能收益。** 非流式订阅方的收益仅限"解码算力并行"，而其 wire 占用时间反而变长（整事务字节必须连续、必须等到自己的提交序号轮到）。
+
+这个死锁风险面在"尽早流式"（FR-9）下大幅缩小：**一旦事务被流式化，它的字节就不再需要在待提交区里等到提交序号**，待提交区里只剩几十字节的提交消息。这是非流式路径唯一的严重风险点，也是把流式作为主路径的附带收益。
+
+### 4.4 目标部署形态
+
+本特性的**性能承诺**只覆盖下面这一组配置；不满足时并行解码仍可工作（协议与语义不变），但端到端吞吐没有保证：
+
+| 端 | 要求 | 说明 |
+| --- | --- | --- |
+| 订阅端 | `CREATE SUBSCRIPTION ... WITH (streaming = 'parallel')` | 订阅端用 parallel apply worker 回放流式事务 |
+| 订阅端 | `max_parallel_apply_workers_per_subscription > 0`（默认 2） | apply worker 的数量上限 |
+| 发布端 | 支持流复制协议 v4（PG16+） | 订阅端只在发布端版本 ≥ 160000 时才请求 `"parallel"`，否则退化为 `"on"` |
+| 发布端 | 开启本特性，且**尽早流式** | 见 4.5 |
+
+**为什么必须这样组合**：
+
+1. **端到端吞吐由较慢的一端决定。** 只并行发布端而订阅端仍串行 apply，瓶颈只是从解码挪到 apply；
+2. **订阅端的并行 apply 靠发布端产生流式分片才成立。** 订阅端在收到 STREAM START 时才为该事务分配一个 apply worker；发布端不流式，apply worker 就无事可做；
+3. **协议版本是硬约束。** 订阅端请求 `"parallel"` 而发布端不支持 v4 时，发布端直接报错。
+
+这条限制必须写进用户可见的文档，否则会出现"发布端开了并行、订阅端没开 parallel apply、却期待 70MB/s"的落差。
+
+### 4.5 尽早流式是主路径，不是可选项
+
+用户需求明确指出"事务 stream 的时候要尽快发送来提升性能"。在 4.4 确定了目标部署形态之后，这条需求有了更强硬的依据：
+
+- 现状发布端**只在内存超限时才流式**（`reorderbuffer.c:3659` 判断 `rb->size >= logical_decoding_work_mem * 1024`），正常负载下根本不产生流段 → 订阅端即使配了 `streaming='parallel'` 与多个 apply worker，也拿不到可并行的流式事务；
+- 现有调试选项 `debug_logical_replication_streaming = immediate` 已经提供了"每事务立即流式"的语义（`reorderbuffer.c:3659-3661`），本特性沿用这两档，并把 `immediate` 作为默认值；
+- 副作用是好的：事务一旦被流式化，它的字节就不再需要在待提交区里等到自己的提交序号（见 4.3），死锁风险面大幅缩小；
+- 代价由两个门槛控制：小于 `parallel_decode_stream_min_size` 的事务不流式化（省帧数、省订阅端每事务一次的 apply worker 分配），单个流段的字节数不超过 `parallel_decode_stream_segment_size`（限 wire 独占时间）。
 
 ## 5. 功能需求
 
@@ -121,7 +154,7 @@
 | FR-6 | decode worker 复用现有 `heap_decode` / `heap2_decode` / `logicalmsg_decode` 完成解码，经 output plugin 生成协议字节写入共享内存，完成后通知 walsender 可以发送。 |
 | FR-7 | walsender 按 cseq 顺序输出 commit/abort/cancel；**提交序号的推进依据是"结束事件被 worker 确认"而不是"提交消息到达"**——非流式事务的 abort 与游离事务的 cancel 在 wire 上不产生任何消息，若只在收到消息时推进，水位会永久空洞。事务数据允许乱序发送，与现有串行实现的语义一致（现有实现中事务数据本就不保证按提交顺序输出）。 |
 | FR-8 | 每个 worker 在解码事务前获得该事务对应的 **base snapshot**（由 walreader 分配并下发，worker 在回放时刻自行补齐子事务集合）；**无 xid 的失效消息必须广播给所有 worker**——每个 worker 有自己的 catcache/syscache/relcache，walreader 本地执行只能清掉自己的缓存，worker 会继续使用已失效的元数据。命令 ID、失效消息与 tuplecid 映射由 worker 从原始 WAL 记录自行重建。 |
-| FR-9 | 事务在 worker 内部累积到阈值即切分流式分片，边解码边发送，不等待整个事务解码完成。**单个流段必须有字节上限**——wire 上同一时刻只允许一个打开的流段，没有上限时段的独占时间无上界，并行解码的产出会被堵死。 |
+| FR-9 | **流式是主路径**：事务在 worker 内部累积到阈值即切分流式分片，边解码边发送，不等待整个事务解码完成。**并行模式默认"尽早流式"**（语义沿用现有调试选项 `debug_logical_replication_streaming` 的 `immediate` 档）——订阅端的并行 apply 靠发布端产生流式分片才成立，不流式则 apply worker 无事可做（4.4、4.5）。**单个流段必须有字节上限**——wire 上同一时刻只允许一个打开的流段，没有上限时段的独占时间无上界，并行解码的产出会被堵死。**小于 `parallel_decode_stream_min_size` 的事务不流式化**，避免小事务流式化带来的帧数上升与订阅端每事务一次的 apply worker 分配开销。 |
 | FR-10 | `XLOG_RUNNING_XACTS` 清理的游离事务（无 COMMIT/ABORT）须通知对应 worker 取消该事务的解码并回收资源（对应 `PD_ENT_TXN_END` 的结束类型 `cancel`）。 |
 | FR-11 | worker 内部报错须上报 walsender（对应 `PD_ENT_ERROR`），由 walsender 按现有逻辑复制错误语义终止本次复制会话；walsender 不得因单个 worker 故障而静默丢弃变更。 |
 | FR-12 | 复制槽的水位推进由 walsender 代 walreader 执行，保证复制槽状态由单一进程维护。**两个水位都要跨进程聚合**：`xmin`（各 worker 上报的最小快照 xmin）与 `restart_lsn`（全局最老在途事务的 `restart_decoding_lsn`）——后者若不聚合，槽会周期性地跳过仍在 worker 中在途的事务，发布端重启后丢变更。 |
@@ -161,6 +194,8 @@
 12. **worker 不得自动重启**：worker 注册为 `bgw_restart_time = BGW_NEVER_RESTART` 的后台进程，且退出码只能是 0 或 1——其他退出码或死于信号会触发集群级 crash recovery。
 13. **GUC 的变更只在下次会话生效**：`max_parallel_decode_workers` 决定共享内存的队列条数与绑定表规模，正在解码的事务不能迁移；`parallel_decode_work_mem` 由 `ReorderBufferCheckMemoryLimit()` 从**本进程** GUC 读取，worker 必须重启才能看到新值；分段参数中途变更会让同一事务的前后两段用不同参数切分。因此这些 GUC 虽可 `sighup` 级调整，实际生效点是**下一次复制会话**，不得给出"立即生效"的预期。
 14. **共享内存有显式上界**：dsa 区域按需增长，若不设上界，一个失控的 worker 可把动态共享内存吃光。必须有 dsa 总容量上限、单队列容量上限（`shm_mq_set_max_size()`）与单次分配上限（`MaxAllocSize`）；单条消息的字节数还必须显著低于 `PQ_LARGE_MESSAGE_LIMIT`（= `MaxAllocSize - 1`），否则必须走大消息分片协议。
+15. **目标部署形态**：本特性的性能承诺只覆盖"发布端并行解码 + 订阅端 `streaming='parallel'` + 多个 parallel apply worker + 发布端尽早流式"（4.4、4.5）。不满足时功能正常但**不承诺端到端吞吐收益**，必须在用户可见文档与 GUC 说明中写明。
+16. **保提交序与订阅端是否并行无关**：即使订阅端是 parallel apply，发布端仍必须按提交序输出提交消息——订阅端的 flush position 按提交 LSN 追踪在途事务、复制槽的 `confirmed_flush` 语义（FR-19）都是发布端自己的性质，且两个事务改同一行时 apply 顺序不同则最终状态不同（AC-2）。
 
 ## 8. 验收标准
 
@@ -169,7 +204,7 @@
 | AC-1 | 吞吐 | tpcc 100 万 tpm 场景下**发布端实际发出的协议字节速率** ≥ 70MB/s（口径与 G1 一致）。**不能用 `confirm_flush_lsn` 速率**——并行模型下事务数据可乱序下发，该指标会被后发事务抬高而虚高。**达成前提**：订阅端 `streaming=parallel` + 多个 parallel apply worker；发布端有流段字节上限；walsender 按块/按 8KB 缓冲批量刷出。 |
 | AC-2 | 语义等价 | 同一负载在并行开关 ON/OFF 两种状态下，**每个事务内部的变更内容与顺序与 WAL 顺序逐条一致**（FR-4）；**事务结束事件的顺序一致**；**订阅端最终 apply 的结果一致**。允许的差异：RELATION 消息冗余（每 worker 一份关系缓存）、事务之间的数据下发顺序不同、流式分片的切点不同（G2）。 |
 | AC-3 | 提交顺序 | 大并发 + 频繁提交/回滚 + 系统表变更（DDL）混合负载下，commit/abort/cancel 的输出顺序与 WAL 提交顺序逐条一致，无乱序、无事务拆分、无丢变更。 |
-| AC-4 | 流式及时性 | 大事务在解码未完成时即可向订阅端输出分片，订阅端提前收到首片数据。 |
+| AC-4 | 流式及时性 | 大事务在解码未完成时即可向订阅端输出分片，订阅端提前收到首片数据。**且小事务不被过度流式化**：小于 `parallel_decode_stream_min_size` 的事务不产生 STREAM_START / STREAM_STOP 帧。 |
 | AC-5 | 快照正确性 | 并发 DDL 场景下，worker 读到的元数据与串行实现一致，无“元数据已失效却仍被使用”导致的变更内容错误。 |
 | AC-6 | 异常处理 | 人为制造 worker 内部错误、worker 被 kill，walsender 能正确上报错误并终止会话，不产生脏数据。 |
 | AC-7 | 回归 | 现有逻辑复制回归用例（`logical_replication`、`publication`、DDL 复制等）全部通过。 |
@@ -178,6 +213,7 @@
 | AC-10 | worker 崩溃恢复 | 在 worker 处理事务中途 kill 掉该进程，walsender 能及时发现并终止会话（不静默停滞、不静默丢数据）；订阅端重连后从复制槽 `restart_lsn` 重放，变更内容与顺序与崩溃前一致。 |
 | AC-11 | 数据库重启恢复 | 数据库正常重启与崩溃恢复后，复制槽正确恢复，订阅端重连后能继续同步，无丢变更、无重复的事务内乱序。 |
 | AC-12 | **水位安全** | 大事务提前流式下发期间 kill 掉发布端并重启，**已提交但当时尚未放行的事务不得丢失**（FR-19、FR-20）。这是本特性引入的唯一一条新的数据丢失路径，必须专项验证：构造"大事务正在流式下发、其提交消息尚未放行"的时刻，重启后该事务仍能被完整重放。 |
+| AC-13 | **目标部署形态** | 订阅端 `streaming='parallel'` + `max_parallel_apply_workers_per_subscription > 0` + 发布端开启并行解码且尽早流式时，(a) 订阅端**确实有多个 apply worker 在并行工作**（用 `pg_stat_subscription` 的 `parallel_apply_workers` 观察）；(b) 端到端吞吐随发布端 worker 数上升（AC-1）；(c) 关闭发布端并行解码后，订阅端退化为串行 apply，行为与现状一致（AC-8）。 |
 
 ## 9. 风险
 
@@ -193,6 +229,8 @@
 | **分配准则只看事务数** | 大事务独占的 worker 被判为“最空闲”，有效并行度退化为 1；早提交的大事务把其后所有提交一起卡住 | 分配代价函数改为**在途字节数**，并设单 worker 在途事务数上限（FR-3）。 |
 | 共享内存队列成为新瓶颈 | 吞吐不升反降 | 队列深度与吞吐纳入监控（NFR-1、NFR-6），必要时按实测调整队列与批量策略。 |
 | **协议帧率 / 系统调用率** | 每条协议消息一次 `write()` 系统调用，30–70 万次/秒量级，串行卡在 walsender | 并行模式改为按块 / 按 8KB 缓冲刷出（帧不能合并）；帧率纳入监控。 |
+| **小事务被过度流式化** | 每个一行的事务也产生 STREAM_START / STREAM_STOP 帧 → 帧数上升、系统调用上升；且订阅端为每个流式事务分配一个 apply worker（`applyparallelworker.c:470`） | `parallel_decode_stream_min_size` 门槛（FR-9）。 |
+| **订阅端未开 parallel apply** | 期望落空：发布端已并行、订阅端仍串行 apply，端到端无收益 | 目标部署形态写进用户可见文档与 GUC 说明（4.4、约束 15）；监控项暴露订阅端的 streaming 模式与 apply worker 数量。 |
 | **目录缓存 N 倍** | 每个 worker 各自做发布关系判定与 DDL 后的全量重扫，DDL 密集时是 N 倍目录扫描 CPU | 把“关系 → 发布列表 / schema”做成只读共享内存表（walreader 维护、worker 只读）。 |
 | 进程间通信引入额外延迟 | 小事务场景劣化 | 需实测小事务延迟，与串行路径做对比（AC-8）；批次按字节阈值而非按事务切。 |
 | 插件状态按 worker 复制，RELATION 消息重复 | 冗余带宽 | 首版容忍该冗余（重复 RELATION 语义正确），把共享关系表列为后续优化。 |
