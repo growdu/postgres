@@ -1296,6 +1296,117 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 }
 
 /*
+ * The number of messages the non-blocking frame fetch reads at most.
+ *
+ * The fetch reads the messages of the decode workers until it finds a frame
+ * or until the workers have nothing to say.  The limit keeps the fetch from
+ * running for a long time when a worker keeps sending progress messages: the
+ * frames that arrive meanwhile are taken by the next call anyway.
+ */
+#define PD_MAX_NOWAIT_MESSAGES	64
+
+/*
+ * Take the next frame that is ready to be sent, without waiting for one.
+ *
+ * The frame is copied into buf, in the same way ParallelDecodeNextFrame()
+ * does it.  The function returns false when there is no frame at the moment,
+ * which is not an error: the caller simply has nothing to write.
+ *
+ * The function is used to fill a batch of frames.  The first frame of a batch
+ * is waited for, the frames that follow it are taken as they are there, so
+ * that the batch can be written out to the client in one go.
+ */
+bool
+ParallelDecodeNextFrameNoWait(StringInfo buf, XLogRecPtr *end_lsn)
+{
+	ParallelDecodeControl *ctl = parallel_decode_ctl;
+	int			worker;
+	int			messages = 0;
+
+	for (;;)
+	{
+		uint16		type;
+		const void *payload;
+		size_t		len;
+		shm_mq_result res;
+		bool		got_message = false;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Read what the walreader has to say before anything else: the
+		 * release frontier is computed from the positions the walreader
+		 * reports, and the frames that are written may have to be limited
+		 * to it.
+		 */
+		parallel_decode_drain_control();
+
+		/*
+		 * A frame that has its turn is sent first.  The frames of a
+		 * transaction that does not have its turn yet are still waiting.
+		 */
+		if (parallel_decode_take_ready_frame(buf, end_lsn))
+			return true;
+
+		/*
+		 * The session may be winding down: the walsender that started it may
+		 * be gone, or it may have asked the participants to stop.  In both
+		 * cases there is nothing left to wait for.
+		 */
+		if (ctl == NULL || ctl->shutdown)
+			return false;
+
+		/*
+		 * Look at the queues of all the workers.  The receive does not wait,
+		 * so the function returns as soon as the workers have nothing to
+		 * say.
+		 */
+		for (worker = 0; worker < parallel_decode_num_workers; worker++)
+		{
+			res = PDChunkReceiverRecv(&parallel_decode_chunk_rcv[worker],
+									   parallel_decode_out_mqh[worker], &type,
+									   &payload, &len, true);
+			if (res == SHM_MQ_SUCCESS)
+			{
+				parallel_decode_handle_message(worker, type, payload, len);
+				pfree((void *) payload);
+				got_message = true;
+				break;
+			}
+			if (res == SHM_MQ_DETACHED)
+			{
+				/*
+				 * The worker is gone, so the frames it was going to produce
+				 * will never arrive.  When the session is winding down, that
+				 * is what happens; otherwise the session cannot continue.
+				 */
+				if (!ParallelDecodeProcessAlive(parallel_decode_worker_pids[worker]))
+				{
+					if (ctl->shutdown)
+						return false;
+
+					parallel_decode_report_worker_failure(worker);
+				}
+			}
+		}
+
+		/*
+		 * The workers have nothing to say, so there is no frame at the
+		 * moment.
+		 */
+		if (!got_message)
+			return false;
+
+		/*
+		 * Do not read an unbounded number of messages.  The frames the
+		 * messages carry are taken by the next call, so nothing is lost.
+		 */
+		if (++messages >= PD_MAX_NOWAIT_MESSAGES)
+			return false;
+	}
+}
+
+/*
  * The WAL position the decoding has come to.
  */
 XLogRecPtr

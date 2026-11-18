@@ -634,6 +634,19 @@ extern void ParallelDecodeSetIdleCallback(ParallelDecodeIdleCallback callback);
 extern bool ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn);
 
 /*
+ * Take the next frame that is ready to be sent, without waiting for one.
+ *
+ * The frame is copied into buf, in the same way ParallelDecodeNextFrame()
+ * does it.  The function returns false when there is no frame at the moment,
+ * which is not an error: the caller simply has nothing to write.
+ *
+ * The function is used to fill a batch of frames.  The first frame of a batch
+ * is waited for, the frames that follow it are taken as they are there, so
+ * that the batch can be written out to the client in one go.
+ */
+extern bool ParallelDecodeNextFrameNoWait(StringInfo buf, XLogRecPtr *end_lsn);
+
+/*
  * The WAL position the decoding has come to.
  *
  * The position advances with the frames the worker produces and with the

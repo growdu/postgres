@@ -3544,6 +3544,10 @@ pd_walsender_idle(void)
  * The frame is the 'w' frame of the replication protocol.  The serial path
  * builds it in the decoding context and writes it out in WalSndWriteData(),
  * so this does the same for a frame that a decode worker built.
+ *
+ * The frame is not written out to the network here: it is collected in the
+ * output buffer of the connection, and the caller writes out the whole batch
+ * of frames at once.
  */
 static void
 pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
@@ -3577,23 +3581,61 @@ pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
 
 	CHECK_FOR_INTERRUPTS();
 
-	/* Try to flush pending output to the client */
+	/* Track how far the session has come. */
+	LagTrackerWrite(end_lsn, now);
+}
+
+/*
+ * The number of bytes of frames that are written out to the client in one
+ * batch.
+ *
+ * The frames are collected in the output buffer of the connection and are
+ * written out with a single write, so that the number of writes to the
+ * network does not grow with the number of frames.  The frames themselves are
+ * not merged: every frame remains a message of its own, as the replication
+ * protocol requires.
+ */
+#define PD_FRAME_BATCH_SIZE		(8 * 1024)
+
+/*
+ * Write out the frames the decode workers have produced.
+ *
+ * The first frame is waited for, the frames that follow it are taken as they
+ * are there, so that a batch grows to the size of the data that is waiting
+ * anyway.  The batch is written out in one go.
+ */
+static void
+pd_walsender_write_frames(void)
+{
+	XLogRecPtr end_lsn;
+	int64		batch_bytes = 0;
+
+	if (!ParallelDecodeNextFrame(&pd_frame_buf, &end_lsn))
+		return;
+
+	pd_walsender_write_frame(&pd_frame_buf, end_lsn);
+	batch_bytes = pd_frame_buf.len;
+
+	/*
+	 * Take the frames that are ready as well, without waiting for them.
+	 */
+	while (batch_bytes < PD_FRAME_BATCH_SIZE &&
+		   ParallelDecodeNextFrameNoWait(&pd_frame_buf, &end_lsn))
+	{
+		pd_walsender_write_frame(&pd_frame_buf, end_lsn);
+		batch_bytes += pd_frame_buf.len;
+	}
+
+	/* Write the batch out to the client. */
 	if (pq_flush_if_writable() != 0)
 		WalSndShutdown();
 
-	/* Track how far the session has come. */
-	LagTrackerWrite(end_lsn, now);
-
-	/* Try taking fast path unless we get too close to walsender timeout. */
-	if (now < TimestampTzPlusMilliseconds(last_reply_timestamp,
-										  wal_sender_timeout / 2) &&
-		!pq_is_send_pending())
-	{
-		return;
-	}
-
-	/* If we have pending write here, go to slow path */
-	ProcessPendingWrites();
+	/*
+	 * The client is not keeping up with the stream, so wait until the data
+	 * that is still pending has been written out.
+	 */
+	if (pq_is_send_pending())
+		ProcessPendingWrites();
 }
 
 /*
@@ -3624,16 +3666,17 @@ XLogSendLogical(void)
 
 	if (ParallelDecodeEnabled())
 	{
-		XLogRecPtr end_lsn;
-
 		/*
 		 * The decode workers produce the replication frames, so the walsender
 		 * waits for them to arrive and writes them out.  The frames are the
 		 * frames of the replication protocol, byte for byte the ones the
 		 * serial path produces.
+		 *
+		 * The frames that are ready are written out in one batch, so that the
+		 * number of writes to the network does not grow with the number of
+		 * frames.
 		 */
-		if (ParallelDecodeNextFrame(&pd_frame_buf, &end_lsn))
-			pd_walsender_write_frame(&pd_frame_buf, end_lsn);
+		pd_walsender_write_frames();
 
 		/*
 		 * How far the session has come is decided by the decoding, because the
