@@ -32,7 +32,11 @@ export PATH="$PGBIN:$PATH"
 
 TRACE_SERIAL=$ROOT/serial.trace
 TRACE_PARALLEL=$ROOT/parallel.trace
-WORKERS=${WORKERS:-2}
+#
+# The number of decode workers of the parallel run.  More than one worker is
+# the interesting case: the transactions are then decoded by different
+# workers, and the commit barrier has to put them back in order.
+WORKERS=${WORKERS:-4}
 
 pub() { psql -h "$ROOT" -p "$PORT_PUB" -U postgres -v ON_ERROR_STOP=1 -q "$@"; }
 sub() { psql -h "$ROOT" -p "$PORT_SUB" -U postgres -v ON_ERROR_STOP=1 -q "$@"; }

@@ -175,6 +175,13 @@ StartupDecodingContext(List *output_plugin_options,
 	ctx->context = context;
 
 	/*
+	 * The serial decoding path decodes the transactions of every owner, so
+	 * the parallel decoding path is the only one that sets these.
+	 */
+	ctx->txn_owner = -1;
+	ctx->worker_index = -1;
+
+	/*
 	 * (re-)load output plugins, so we detect a bad (removed) output plugin
 	 * now.
 	 */
@@ -626,6 +633,63 @@ CreateDecodingContext(XLogRecPtr start_lsn,
 
 	ereport(LOG,
 			(errmsg("starting logical decoding for slot \"%s\"",
+					NameStr(slot->data.name)),
+			 errdetail("Streaming transactions committing after %X/%X, reading WAL from %X/%X.",
+					   LSN_FORMAT_ARGS(slot->data.confirmed_flush),
+					   LSN_FORMAT_ARGS(slot->data.restart_lsn))));
+
+	return ctx;
+}
+
+/*
+ * Create a decoding context for a decode worker.
+ *
+ * The decode worker does not own the replication slot: the walsender does,
+ * and it hands a copy of the fields the decoding path looks at over to the
+ * worker.  Apart from that the context is the same as the one the walsender
+ * would have created, so the decoding path runs unchanged.
+ */
+LogicalDecodingContext *
+CreateParallelDecodingContext(ReplicationSlot *slot,
+							   List *output_plugin_options,
+							   XLogRecPtr start_lsn,
+							   XLogReaderRoutine *xl_routine,
+							   LogicalOutputPluginWriterPrepareWrite prepare_write,
+							   LogicalOutputPluginWriterWrite do_write,
+							   LogicalOutputPluginWriterUpdateProgress update_progress)
+{
+	LogicalDecodingContext *ctx;
+	MemoryContext old_context;
+
+	/*
+	 * The decoding path reaches for the slot through the global variable, so
+	 * the copy of the slot has to be published there.
+	 */
+	MyReplicationSlot = slot;
+
+	ctx = StartupDecodingContext(output_plugin_options, start_lsn,
+								 InvalidTransactionId, false, false, false,
+								 xl_routine, prepare_write, do_write,
+								 update_progress);
+
+	/* call output plugin initialization callback */
+	old_context = MemoryContextSwitchTo(ctx->context);
+	if (ctx->callbacks.startup_cb != NULL)
+		startup_cb_wrapper(ctx, &ctx->options, false);
+	MemoryContextSwitchTo(old_context);
+
+	/*
+	 * We allow decoding of prepared transactions when the two_phase is
+	 * enabled at the time of slot creation, or when the two_phase option is
+	 * given at the streaming start, provided the plugin supports all the
+	 * callbacks for two-phase.
+	 */
+	ctx->twophase &= (slot->data.two_phase || ctx->twophase_opt_given);
+
+	ctx->reorder->output_rewrites = ctx->options.receive_rewrites;
+
+	ereport(LOG,
+			(errmsg("starting logical decoding for slot \"%s\" in a parallel decode worker",
 					NameStr(slot->data.name)),
 			 errdetail("Streaming transactions committing after %X/%X, reading WAL from %X/%X.",
 					   LSN_FORMAT_ARGS(slot->data.confirmed_flush),

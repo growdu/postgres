@@ -112,6 +112,23 @@ typedef struct LogicalDecodingContext
 
 	/* Do we need to process any change in fast_forward mode? */
 	bool		processing_required;
+
+	/*
+	 * The index of the decode worker that owns the transaction of the record
+	 * that is being processed, and the index of this process among the decode
+	 * workers of the session.
+	 *
+	 * The parallel decoding path assigns every transaction to one of the
+	 * decode workers.  The workers that do not own the transaction see its
+	 * records as well, so that their snapshot builders stay in step with the
+	 * one of the owner, but they must not accumulate the changes: the owner
+	 * is the one that produces the output of the transaction.
+	 *
+	 * txn_owner is -1 when the process decodes the transactions of every
+	 * owner, which is the case of the serial decoding path.
+	 */
+	int			txn_owner;
+	int			worker_index;
 } LogicalDecodingContext;
 
 
@@ -132,6 +149,13 @@ extern LogicalDecodingContext *CreateDecodingContext(XLogRecPtr start_lsn,
 													 LogicalOutputPluginWriterPrepareWrite prepare_write,
 													 LogicalOutputPluginWriterWrite do_write,
 													 LogicalOutputPluginWriterUpdateProgress update_progress);
+extern LogicalDecodingContext *CreateParallelDecodingContext(ReplicationSlot *slot,
+															 List *output_plugin_options,
+															 XLogRecPtr start_lsn,
+															 XLogReaderRoutine *xl_routine,
+															 LogicalOutputPluginWriterPrepareWrite prepare_write,
+															 LogicalOutputPluginWriterWrite do_write,
+															 LogicalOutputPluginWriterUpdateProgress update_progress);
 extern void DecodingContextFindStartpoint(LogicalDecodingContext *ctx);
 extern bool DecodingContextReady(LogicalDecodingContext *ctx);
 extern void FreeDecodingContext(LogicalDecodingContext *ctx);

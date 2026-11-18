@@ -24,6 +24,7 @@
 
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
+#include "replication/logical.h"
 #include "storage/shm_mq.h"
 #include "storage/latch.h"
 #include "storage/shm_toc.h"
@@ -50,6 +51,13 @@ typedef enum ParallelDecodeStreamingMode
 	PARALLEL_DECODE_STREAMING_IMMEDIATE,
 	PARALLEL_DECODE_STREAMING_BUFFERED
 } ParallelDecodeStreamingMode;
+
+/*
+ * The largest size of the serialized output plugin options in the control
+ * block.  The options of the output plugin are a handful of short strings,
+ * so this is generous.
+ */
+#define PD_MAX_PLUGIN_OPTIONS		4096
 
 /* GUCs */
 extern PGDLLIMPORT int	max_parallel_decode_workers;
@@ -84,10 +92,25 @@ extern void PDTraceShutdown(void);
 /*
  * Lifecycle, called from the walsender that owns the replication slot.
  *
- * start_lsn is the WAL position the walreader has to start reading at, which
- * is the restart LSN of the replication slot.
+ * slot is the replication slot of the session.  The workers do not own the
+ * slot, so the fields of it that the decoding path looks at are copied into
+ * the control block.
+ *
+ * plugin_options are the options the client gave for the output plugin, in
+ * the serialized form of PDSerializePluginOptions().  The caller has to
+ * serialize them before it creates its own decoding context: the startup
+ * callback of an output plugin may modify the option values in place, and the
+ * workers need the original values.
+ *
+ * start_lsn is the WAL position the decoding starts at, which is the
+ * confirmed flush position of the slot (or the position the client asked
+ * for, if that is further ahead).  The walreader starts reading at the
+ * restart LSN of the slot.
  */
-extern void ParallelDecodeSessionStart(XLogRecPtr start_lsn);
+extern void ParallelDecodeSessionStart(ReplicationSlot *slot,
+									   const char *plugin_options,
+									   uint32 plugin_options_len,
+									   XLogRecPtr start_lsn);
 extern void ParallelDecodeSessionStop(void);
 
 /*
@@ -135,6 +158,29 @@ typedef struct ParallelDecodeControl
 	int			proto_version;
 	char		plugin_name[NAMEDATALEN];
 
+	/*
+	 * The parameters of the session, as the decode workers need them.
+	 *
+	 * The walsender owns the replication slot, so the workers work on a copy
+	 * of it that carries the fields the decoding path looks at: the name of
+	 * the slot, the name of the output plugin and the database the slot
+	 * belongs to.  The output plugin options are handed over in the
+	 * serialized form of PD_MAX_PLUGIN_OPTIONS bytes.
+	 */
+	char		slot_name[NAMEDATALEN];
+	Oid			database;
+	bool		two_phase;
+	XLogRecPtr	two_phase_at;
+	uint32		plugin_options_len;
+	char		plugin_options[PD_MAX_PLUGIN_OPTIONS];
+
+	/*
+	 * The WAL position the decoding starts at.  The workers use it as the
+	 * start of the decoding window, which is the same value the walsender
+	 * would have used for its own decoding context.
+	 */
+	XLogRecPtr	start_lsn;
+
 	/* Worker status slots. */
 	ParallelDecodeWorkerSlot workers[MAX_PARALLEL_DECODE_WORKERS];
 
@@ -169,15 +215,6 @@ typedef struct ParallelDecodeWorkerArg
 #define PARALLEL_DECODE_KEY_CONTROL_MQ	2	/* walreader -> walsender */
 #define PARALLEL_DECODE_KEY_WAL_MQ_BASE	10			/* + worker index */
 #define PARALLEL_DECODE_KEY_OUT_MQ_BASE	100			/* + worker index */
-
-/*
- * The queue the walreader uses to hand WAL records to the walsender.
- *
- * In the final architecture the walreader hands the records to the decode
- * workers over the queues above.  During the P1 milestone the decoding still
- * happens in the walsender, so the records travel over this queue instead.
- */
-#define PARALLEL_DECODE_KEY_WALREADER_MQ	20
 
 /* Size of one shared message queue. */
 #define PARALLEL_DECODE_QUEUE_SIZE		(256 * 1024)
@@ -221,13 +258,94 @@ typedef enum ParallelDecodeEntryType
 	PD_ENT_BLOCK = 7,			/* worker -> walsender */
 	PD_ENT_EVENT = 8,			/* worker -> walsender */
 	PD_ENT_ERROR = 9,			/* worker -> walsender */
-	PD_ENT_READY = 10			/* walreader -> walsender */
+	PD_ENT_READY = 10,			/* walreader -> walsender */
+	PD_ENT_FRAME = 11,			/* worker -> walsender */
+	PD_ENT_POSITION = 12		/* worker -> walsender */
 } ParallelDecodeEntryType;
+
+/*
+ * The header that precedes every WAL record on the channel between the
+ * walreader and the decode workers.
+ *
+ * The walreader is the only reader of the WAL, so it is the one that knows
+ * which worker owns the transaction a record belongs to, and which commit
+ * sequence number it gave to the record.
+ */
+typedef struct PDWalHeader
+{
+	/*
+	 * The worker that owns the transaction of the record, or -1 when the
+	 * record does not belong to a transaction.
+	 *
+	 * The workers that do not own the transaction see its records as well,
+	 * so that their snapshot builders stay in step with the one of the owner,
+	 * but they do not accumulate the changes: the owner is the one that
+	 * produces the output of the transaction.
+	 */
+	int32		owner;
+
+	/*
+	 * The commit sequence number of the record, or zero when the record does
+	 * not end a transaction.
+	 */
+	uint64		cseq;
+} PDWalHeader;
+
+/*
+ * The header of a frame message.
+ *
+ * The frame is the 'w' frame of the replication protocol, byte for byte the
+ * frame the serial path produces: the frame type, the two LSNs, the send
+ * time and the payload of the output plugin.  The send time is filled in by
+ * the walsender when it writes the frame out, so that it is taken as late as
+ * possible.
+ *
+ * end_lsn is the decoding position after the record the frame belongs to.  It
+ * tells the walsender how far the decoding has come, which is what the
+ * keepalive frames and the caught-up decision are based on.
+ *
+ * cseq is the commit sequence number of the transaction the frame belongs to.
+ * It is zero for the frames that are not part of a transaction, i.e. for the
+ * fragments of a streamed transaction.  The walsender holds the frames of a
+ * transaction back until the commit sequence number of the transaction has
+ * its turn, so that the transactions are applied in the order they were
+ * committed in.
+ */
+typedef struct PDFrameHeader
+{
+	uint64		end_lsn;			/* decoding position after the record */
+	uint64		cseq;				/* commit sequence number of the transaction */
+	uint32		length;			/* length of the frame that follows */
+} PDFrameHeader;
+
+/*
+ * The events a decode worker reports to the walsender.
+ */
+#define PD_EVENT_END_ACK		1	/* the transaction with this cseq is decoded */
+
+/*
+ * The header of an event message.
+ */
+typedef struct PDEventHeader
+{
+	uint64		cseq;				/* the commit sequence number */
+	uint32		event;				/* PD_EVENT_* */
+} PDEventHeader;
 
 #define PD_MESSAGE_MAGIC			0x50444D31	/* "PDM1" */
 
 /* The largest payload a single entry may carry. */
 #define PD_MESSAGE_MAX_PAYLOAD		(1024 * 1024)
+
+/*
+ * The largest total size of a chunked transfer.
+ *
+ * A chunked transfer carries a WAL record or a replication frame, and both
+ * of them are held in memory in the process that produces them anyway, so
+ * the limit is generous.  It only exists to turn a runaway producer into an
+ * error instead of an out-of-memory condition.
+ */
+#define PD_MAX_TRANSFER_SIZE		(512 * 1024 * 1024)
 
 typedef struct ParallelDecodeMessageHeader
 {
@@ -254,6 +372,10 @@ extern bool PDQueueSend(shm_mq_handle *mqh, uint16 type, const void *payload,
  * Receive one entry.  The payload points into the ring buffer of the queue
  * and is valid only until the next receive from the same queue.  Returns
  * SHM_MQ_WOULD_BLOCK if the queue is empty and nowait was requested.
+ *
+ * All messages of a queue use the same framing, because a receiver uses a
+ * single chunk receiver for the whole queue: a message that is sent with
+ * PDQueueSend() would be mistaken for the beginning of a chunked transfer.
  */
 extern shm_mq_result PDQueueRecv(shm_mq_handle *mqh, uint16 *type,
 									 const void **payload, size_t *len, bool nowait);
@@ -278,10 +400,52 @@ extern void PDChunkReceiverInit(PDChunkReceiver *rcv);
 extern void PDChunkReceiverReset(PDChunkReceiver *rcv);
 extern shm_mq_result PDChunkReceiverRecv(PDChunkReceiver *rcv,
 										 shm_mq_handle *mqh, uint16 *type,
-										 const void **payload, size_t *len);
+										 const void **payload, size_t *len,
+										 bool nowait);
 extern bool PDQueueSendChunked(shm_mq_handle *mqh, uint16 type,
 							   const void *payload, size_t len, size_t chunk_size,
 							   bool nowait, bool force_flush);
+
+/*
+ * Send a replication frame to the walsender.
+ *
+ * The frame is preceded by a PDFrameHeader and split into chunks, because a
+ * single transaction can produce more data than fits into one queue entry.
+ *
+ * cseq is the commit sequence number of the transaction the frame belongs to.
+ * It is zero for the frames that are not part of a transaction.
+ */
+extern void PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
+							  const char *frame, size_t len);
+
+/*
+ * Report an event to the walsender.
+ *
+ * The message uses the chunked framing, because the receiver of a queue uses
+ * a single chunk receiver for all of its messages.
+ */
+extern void PDQueueSendEvent(shm_mq_handle *mqh, uint64 cseq, uint32 event);
+
+/*
+ * Report the decoding position to the walsender.
+ *
+ * The position tells the walsender how far the decoding has come, even when
+ * the records that were decoded produced no output at all.  The message uses
+ * the chunked framing, because the receiver of a queue uses a single chunk
+ * receiver for all of its messages.
+ */
+extern void PDQueueSendPosition(shm_mq_handle *mqh, uint64 end_lsn);
+
+/*
+ * The output plugin options, in the serialized form.
+ *
+ * The options are a list of DefElem, and every option of the plugins that
+ * ship with PostgreSQL carries a plain string argument.  The serialized form
+ * is therefore a list of length prefixed names and arguments.
+ */
+extern void PDSerializePluginOptions(List *options, char *buf, size_t buflen,
+									  uint32 *len);
+extern List *PDParsePluginOptions(const char *buf, uint32 len);
 
 /*
  * Serialization of a decoded WAL record.
@@ -299,21 +463,56 @@ extern DecodedXLogRecord *PDRecordDeserialize(const char *data, size_t len);
 extern void PDRecordFree(DecodedXLogRecord *record);
 
 /*
- * Waiting for the next WAL record on the walsender side.
+ * Waiting for the next frame on the walsender side.
  *
- * The walreader is the only reader of the WAL, so the walsender has to wait
- * for the records to arrive.  While it waits, it still has to service the
+ * The decode workers produce the replication frames, so the walsender has to
+ * wait for them to arrive.  While it waits, it still has to service the
  * replication connection, which is what the idle callback is for.
+ *
+ * The callback returns true when the session has to end, which happens when
+ * the client has asked to stop the streaming.  The walsender then returns to
+ * its main loop, which ends the session.
  */
-typedef void (*ParallelDecodeIdleCallback) (void);
+typedef bool (*ParallelDecodeIdleCallback) (void);
 
 extern void ParallelDecodeSetIdleCallback(ParallelDecodeIdleCallback callback);
-extern bool ParallelDecodeNextWalRecord(DecodedXLogRecord **record);
+
+/*
+ * Wait for the next frame the decode worker produced.
+ *
+ * The frame is the 'w' frame of the replication protocol, byte for byte the
+ * frame the serial path produces.  It is copied into buf, which the caller
+ * owns, so that the caller can patch the send time into it and write it out.
+ *
+ * Returns false when no frame has arrived within the wait interval, which
+ * is not an error: the caller is expected to return to its main loop and
+ * come back later.  Returns false as well when the session is winding down.
+ */
+extern bool ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn);
+
+/*
+ * The WAL position the decoding has come to.
+ *
+ * The position advances with the frames the worker produces and with the
+ * position messages it sends when it runs out of work, so that records that
+ * produce no output at all still advance it.
+ */
+extern XLogRecPtr ParallelDecodePosition(void);
 
 /*
  * The WAL position the walreader has reached, or InvalidXLogRecPtr if the
  * walreader has not reported one yet.
  */
 extern XLogRecPtr ParallelDecodeWalreaderPosition(void);
+
+/*
+ * The 'prepare_write' callback of the logical decoding context.
+ *
+ * It builds the header of a replication frame.  The serial path and the
+ * parallel path use the same code, so that the frames they produce are
+ * identical.
+ */
+extern void PDPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn,
+						   TransactionId xid, bool last_write);
 
 #endif							/* PARALLEL_DECODE_H */

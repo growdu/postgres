@@ -14,8 +14,9 @@ are reported separately, because they are intentional:
   * the frame header LSNs may differ, because the parallel path clamps them
     to the release frontier.
 
-Everything else is a defect.  The tool reports the first difference it
-finds, with the frame number, the frame type and both int64 header values.
+Everything else is a defect.  The tool compares the pgoutput messages, not
+just the frames, because the parallel path may group the messages into
+frames differently.
 
 Usage:
     pd_frame_tool.py dump <tracefile> [--messages]
@@ -27,17 +28,14 @@ import difflib
 import hashlib
 import struct
 import sys
+from collections import Counter, defaultdict
 
 # The frame header of a replication frame:
 #   'w' + dataStart(8) + walEnd(8) + sendtime(8) + payload
 #   'k' + walEnd(8) + sendtime(8) + replyRequested(1)
-#   'r' + walEnd(8) + sendtime(8) + replyRequested(1) + data
-#   'c' + walEnd(8) + sendtime(8) + replyRequested(1) + data
 FRAME_HEADER_LEN = {
     "w": 25,
-    "k": 17,
-    "r": 17,
-    "c": 17,
+    "k": 18,
 }
 
 # The replication frame types that carry a transaction's data.
@@ -63,6 +61,21 @@ MSG_STREAM_STOP = "E"
 MSG_STREAM_COMMIT = "c"
 MSG_STREAM_ABORT = "A"
 MSG_STREAM_PREPARE = "p"
+
+# The messages that carry the transaction id in band when the transaction is
+# streamed, see logicalrep_write_insert() and friends.
+XID_IN_BAND = (
+    MSG_INSERT,
+    MSG_UPDATE,
+    MSG_DELETE,
+    MSG_TRUNCATE,
+    MSG_RELATION,
+    MSG_TYPE,
+    MSG_MESSAGE,
+)
+
+# The messages that delimit a transaction.
+TXN_BOUNDARY = (MSG_BEGIN, MSG_COMMIT)
 
 
 class Frame(object):
@@ -148,81 +161,232 @@ def read_trace(path):
     return frames
 
 
-def _need(buf, pos, n):
-    if pos + n > len(buf):
-        raise ValueError("short message")
-    return pos + n
+class _Buf(object):
+    """A cursor over the bytes of one replication frame."""
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def _need(self, n):
+        if self.pos + n > len(self.data):
+            raise ValueError("short message")
+
+    def u8(self):
+        self._need(1)
+        value = self.data[self.pos]
+        self.pos += 1
+        return value
+
+    def u16(self):
+        self._need(2)
+        (value,) = struct.unpack_from(">H", self.data, self.pos)
+        self.pos += 2
+        return value
+
+    def u32(self):
+        self._need(4)
+        (value,) = struct.unpack_from(">I", self.data, self.pos)
+        self.pos += 4
+        return value
+
+    def i64(self):
+        self._need(8)
+        (value,) = struct.unpack_from(">q", self.data, self.pos)
+        self.pos += 8
+        return value
+
+    def cstring(self):
+        """A NUL terminated string, as sent by pq_sendstring()."""
+        end = self.data.find(b"\0", self.pos)
+        if end < 0:
+            raise ValueError("unterminated string")
+        value = self.data[self.pos:end]
+        self.pos = end + 1
+        return value
+
+    def raw(self, n):
+        self._need(n)
+        value = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return value
+
+
+def _parse_tuple(buf):
+    """Parse a tuple, see logicalrep_write_tuple()."""
+    ncols = buf.u16()
+    kinds = []
+    for _ in range(ncols):
+        kind = chr(buf.u8())
+        if kind in ("b", "t"):
+            buf.raw(buf.u32())
+        kinds.append(kind)
+    return kinds
+
+
+def _parse_relation(buf):
+    """Parse a relation message, see logicalrep_write_rel()."""
+    relid = buf.u32()
+    nspname = buf.cstring().decode("utf-8", "replace")
+    relname = buf.cstring().decode("utf-8", "replace")
+    replident = chr(buf.u8())
+    ncols = buf.u16()
+    for _ in range(ncols):
+        buf.u8()                   # flags
+        buf.cstring()              # attribute name
+        buf.u32()                  # attribute type id
+        buf.u32()                  # attribute type modifier
+    return "%s.%s relid=%d replident=%s ncols=%d" % (
+        nspname, relname, relid, replident, ncols)
+
+
+def _parse_message(buf, tag, streaming):
+    """Parse one pgoutput message, return a short description of it."""
+    if tag in XID_IN_BAND and streaming:
+        buf.u32()                  # the in band transaction id
+
+    if tag == MSG_BEGIN:
+        final_lsn = buf.i64()
+        buf.i64()                  # commit time
+        xid = buf.u32()
+        return "xid=%d final_lsn=%d" % (xid, final_lsn)
+    if tag == MSG_COMMIT:
+        buf.u8()                   # flags
+        commit_lsn = buf.i64()
+        buf.i64()                  # end lsn
+        buf.i64()                  # commit time
+        return "commit_lsn=%d" % commit_lsn
+    if tag == MSG_BEGIN_PREPARE:
+        buf.i64()                  # final lsn
+        buf.i64()                  # end lsn
+        buf.i64()                  # prepare time
+        xid = buf.u32()
+        gid = buf.cstring().decode("utf-8", "replace")
+        return "xid=%d gid=%s" % (xid, gid)
+    if tag == MSG_ORIGIN:
+        origin_lsn = buf.i64()
+        origin = buf.cstring().decode("utf-8", "replace")
+        return "origin_lsn=%d origin=%s" % (origin_lsn, origin)
+    if tag == MSG_RELATION:
+        return _parse_relation(buf)
+    if tag == MSG_TYPE:
+        typoid = buf.u32()
+        nspname = buf.cstring().decode("utf-8", "replace")
+        typname = buf.cstring().decode("utf-8", "replace")
+        return "%s.%s typoid=%d" % (nspname, typname, typoid)
+    if tag == MSG_INSERT:
+        relid = buf.u32()
+        action = chr(buf.u8())
+        kinds = _parse_tuple(buf)
+        return "relid=%d action=%s cols=%s" % (relid, action, "".join(kinds))
+    if tag == MSG_UPDATE:
+        relid = buf.u32()
+        action = chr(buf.u8())
+        kinds = _parse_tuple(buf)
+        if action in ("K", "O"):
+            action2 = chr(buf.u8())
+            kinds2 = _parse_tuple(buf)
+            return "relid=%d action=%s,%s cols=%s/%s" % (
+                relid, action, action2, "".join(kinds), "".join(kinds2))
+        return "relid=%d action=%s cols=%s" % (relid, action, "".join(kinds))
+    if tag == MSG_DELETE:
+        relid = buf.u32()
+        action = chr(buf.u8())
+        kinds = _parse_tuple(buf)
+        return "relid=%d action=%s cols=%s" % (relid, action, "".join(kinds))
+    if tag == MSG_TRUNCATE:
+        nrelids = buf.u32()
+        buf.u8()                   # flags
+        relids = [buf.u32() for _ in range(nrelids)]
+        return "relids=%s" % ",".join(str(r) for r in relids)
+    if tag == MSG_MESSAGE:
+        buf.u8()                   # flags
+        lsn = buf.i64()
+        prefix = buf.cstring().decode("utf-8", "replace")
+        size = buf.u32()
+        buf.raw(size)
+        return "lsn=%d prefix=%s size=%d" % (lsn, prefix, size)
+    if tag == MSG_STREAM_START:
+        xid = buf.u32()
+        first = buf.u8()
+        return "xid=%d first_segment=%d" % (xid, first)
+    if tag == MSG_STREAM_STOP:
+        return ""
+    if tag == MSG_STREAM_COMMIT:
+        xid = buf.u32()
+        buf.u8()                   # flags
+        commit_lsn = buf.i64()
+        buf.i64()                  # end lsn
+        buf.i64()                  # commit time
+        return "xid=%d commit_lsn=%d" % (xid, commit_lsn)
+    if tag == MSG_STREAM_ABORT:
+        xid = buf.u32()
+        subxid = buf.u32()
+        # The abort lsn and time are only present in protocol version 2 and
+        # later.
+        if len(buf.data) - buf.pos >= 16:
+            buf.i64()              # abort lsn
+            buf.i64()              # abort time
+        return "xid=%d subxid=%d" % (xid, subxid)
+    if tag in (MSG_PREPARE, MSG_STREAM_PREPARE):
+        buf.u8()                   # flags
+        buf.i64()                  # prepare lsn
+        buf.i64()                  # end lsn
+        buf.i64()                  # prepare time
+        xid = buf.u32()
+        gid = buf.cstring().decode("utf-8", "replace")
+        return "xid=%d gid=%s" % (xid, gid)
+    if tag == MSG_COMMIT_PREPARED:
+        buf.u8()                   # flags
+        buf.i64()                  # commit lsn
+        buf.i64()                  # end lsn
+        buf.i64()                  # commit time
+        xid = buf.u32()
+        gid = buf.cstring().decode("utf-8", "replace")
+        return "xid=%d gid=%s" % (xid, gid)
+    if tag == MSG_ROLLBACK_PREPARED:
+        buf.u8()                   # flags
+        buf.i64()                  # prepare end lsn
+        buf.i64()                  # end lsn
+        buf.i64()                  # prepare time
+        buf.i64()                  # rollback time
+        xid = buf.u32()
+        gid = buf.cstring().decode("utf-8", "replace")
+        return "xid=%d gid=%s" % (xid, gid)
+
+    raise ValueError("unknown message tag %r" % tag)
 
 
 def parse_messages(payload):
     """Split the body of a 'w' frame into pgoutput messages.
 
-    Returns a list of (tag, bytes) pairs.  A message that cannot be parsed
-    is returned as a single opaque blob, so that the comparison never loses
-    bytes.
+    Returns a list of (tag, bytes, description) triples.  A message that
+    cannot be parsed is returned as a single opaque blob, so that the
+    comparison never loses bytes.
     """
     body = payload[FRAME_HEADER_LEN["w"]:]
+    buf = _Buf(body)
     messages = []
-    pos = 0
+    streaming = False
 
-    while pos < len(body):
-        tag = chr(body[pos])
-        start = pos
-        pos += 1
+    while buf.pos < len(body):
+        start = buf.pos
+        tag = chr(body[start])
+        buf.pos += 1				# the tag itself
 
         try:
-            if tag in (MSG_BEGIN,):
-                pos = _need(body, pos, 20)
-            elif tag in (MSG_COMMIT,):
-                pos = _need(body, pos, 24)
-            elif tag in (MSG_BEGIN_PREPARE,):
-                pos = _need(body, pos, 20)
-                pos = _need(body, pos, 1)
-                (glen,) = struct.unpack_from(">I", body, pos)
-                pos = _need(body, pos + 4, glen)
-            elif tag in (MSG_PREPARE, MSG_COMMIT_PREPARED, MSG_ROLLBACK_PREPARED,
-                         MSG_STREAM_PREPARE):
-                pos = _need(body, pos, 4)
-                pos = _need(body, pos, 1)
-                (glen,) = struct.unpack_from(">I", body, pos)
-                pos = _need(body, pos + 4, glen)
-            elif tag == MSG_ORIGIN:
-                pos = _need(body, pos, 8)
-                (nlen,) = struct.unpack_from(">I", body, pos)
-                pos = _need(body, pos + 4, nlen)
-            elif tag in (MSG_RELATION, MSG_TYPE, MSG_INSERT, MSG_UPDATE,
-                         MSG_DELETE):
-                (mlen,) = struct.unpack_from(">I", body, pos)
-                pos = _need(body, pos + 4, mlen)
-            elif tag == MSG_TRUNCATE:
-                (nrelids,) = struct.unpack_from(">I", body, pos)
-                pos = _need(body, pos + 4, 4 * nrelids)
-            elif tag == MSG_MESSAGE:
-                pos = _need(body, pos, 2)
-                pos = _need(body, pos, body[pos - 1])
-                (mlen,) = struct.unpack_from(">I", body, pos)
-                pos = _need(body, pos + 4, mlen)
-            elif tag == MSG_STREAM_START:
-                pos = _need(body, pos, 5)
-            elif tag == MSG_STREAM_STOP:
-                pass
-            elif tag == MSG_STREAM_COMMIT:
-                pos = _need(body, pos, 33)
-            elif tag == MSG_STREAM_ABORT:
-                pos = _need(body, pos, 8)
-                # The abort LSN and time are only present in protocol
-                # version 2 and later; try to read them, and accept the
-                # shorter form as well.
-                if len(body) - pos >= 16:
-                    pos = _need(body, pos, 16)
-            else:
-                raise ValueError("unknown message tag %r" % tag)
-        except (ValueError, struct.error):
+            desc = _parse_message(buf, tag, streaming)
+        except (ValueError, struct.error, IndexError):
             # Fall back to an opaque blob for the rest of the frame.
-            messages.append(("?", body[start:]))
+            messages.append(("?", body[start:], "unparsable"))
             break
 
-        messages.append((tag, body[start:pos]))
+        messages.append((tag, body[start:buf.pos], desc))
+
+        if tag == MSG_STREAM_START:
+            streaming = True
+        elif tag == MSG_STREAM_STOP:
+            streaming = False
 
     return messages
 
@@ -233,9 +397,70 @@ def message_stream(frames):
     for frame in frames:
         if frame.type != "w":
             continue
-        for tag, raw in parse_messages(frame.payload):
+        for tag, raw, desc in parse_messages(frame.payload):
             stream.append((tag, hashlib.sha256(raw).hexdigest()[:16], len(raw)))
     return stream
+
+
+def message_multiset(frames):
+    """The multiset of pgoutput messages across all data frames."""
+    counter = Counter()
+    for frame in frames:
+        if frame.type != "w":
+            continue
+        for tag, raw, desc in parse_messages(frame.payload):
+            counter[(tag, hashlib.sha256(raw).hexdigest()[:16], len(raw))] += 1
+    return counter
+
+
+def split_relation(counter):
+    """Split a message multiset into the relation messages and the rest.
+
+    The relation messages are special: the parallel path gives every decode
+    worker its own relation cache, so it sends one relation message per
+    worker that touched the relation, while the serial path sends one per
+    session.  The repetition is allowed by the protocol, the subscriber
+    simply replaces the relation it knows, but the *definitions* have to be
+    the same.
+    """
+    relation = Counter()
+    other = Counter()
+    for key, count in counter.items():
+        if key[0] == MSG_RELATION:
+            relation[key] = count
+        else:
+            other[key] = count
+    return relation, other
+
+
+def message_lsn_map(frames):
+    """Map every message to the frame header LSNs it was sent with.
+
+    The frames of the two runs may group the messages differently, so the
+    LSNs can only be compared per message, not per frame.
+    """
+    result = defaultdict(list)
+    for frame in frames:
+        if frame.type != "w":
+            continue
+        for tag, raw, desc in parse_messages(frame.payload):
+            key = (tag, hashlib.sha256(raw).hexdigest()[:16], len(raw))
+            result[key].append((frame.lsn1, frame.lsn2))
+    for key in result:
+        result[key].sort()
+    return result
+
+
+def transaction_order(frames):
+    """The ordered list of the transaction delimiters."""
+    order = []
+    for frame in frames:
+        if frame.type != "w":
+            continue
+        for tag, raw, desc in parse_messages(frame.payload):
+            if tag in TXN_BOUNDARY:
+                order.append(tag)
+    return order
 
 
 def cmd_dump(args):
@@ -244,8 +469,8 @@ def cmd_dump(args):
     for frame in frames:
         print(frame)
         if args.messages and frame.type == "w":
-            for tag, raw in parse_messages(frame.payload):
-                print("    %s %d bytes" % (tag, len(raw)))
+            for tag, raw, desc in parse_messages(frame.payload):
+                print("    %s %d bytes %s" % (tag, len(raw), desc))
     return 0
 
 
@@ -256,6 +481,20 @@ def _first_difference(a, b):
         if tag != "equal":
             return tag, i1, i2, j1, j2
     return None
+
+
+def _describe_multiset_diff(counter_a, counter_b):
+    """Describe the difference between two message multisets."""
+    lines = []
+    for key in sorted(set(counter_a) | set(counter_b)):
+        count_a = counter_a.get(key, 0)
+        count_b = counter_b.get(key, 0)
+        if count_a == count_b:
+            continue
+        tag, digest, size = key
+        lines.append("  %s %s (%d bytes): A=%d B=%d" %
+                     (tag, digest, size, count_a, count_b))
+    return lines
 
 
 def cmd_diff(args):
@@ -275,37 +514,83 @@ def cmd_diff(args):
 
     if not data_a and not data_b:
         print("both traces are empty")
-        return 0
+        return 1
 
-    keys_a = [f.key() for f in data_a]
-    keys_b = [f.key() for f in data_b]
-
-    diff = _first_difference(keys_a, keys_b)
     errors = []
 
-    if diff is not None:
-        tag, i1, i2, j1, j2 = diff
-        print("frame sequence differs at %s: A[%d:%d] vs B[%d:%d]" %
-              (tag, i1, i2, j1, j2))
-        for f in data_a[i1:min(i2, i1 + 3)]:
-            print("  A %s" % f)
-        for f in data_b[j1:min(j2, j1 + 3)]:
-            print("  B %s" % f)
-        errors.append("frame sequence differs")
-    else:
-        print("frame sequence matches (%d frame(s))" % len(data_a))
+    # The message multiset must be identical: the parallel path may group the
+    # messages into frames differently, and may interleave the transactions
+    # differently, but it must not change the bytes it produces.
+    multiset_a = message_multiset(data_a)
+    multiset_b = message_multiset(data_b)
 
-    # Compare the header LSNs of the frames that matched.
+    relation_a, other_a = split_relation(multiset_a)
+    relation_b, other_b = split_relation(multiset_b)
+
+    total_a = sum(multiset_a.values())
+    total_b = sum(multiset_b.values())
+
+    if other_a == other_b:
+        print("message multiset matches (%d message(s))" % sum(other_a.values()))
+    else:
+        print("message multiset differs: A=%d message(s), B=%d message(s)" %
+              (total_a, total_b))
+        for line in _describe_multiset_diff(other_a, other_b)[:20]:
+            print(line)
+        errors.append("message multiset differs")
+
+    if set(relation_a) == set(relation_b):
+        if relation_a == relation_b:
+            print("relation messages match (%d message(s))" % sum(relation_a.values()))
+        else:
+            print("note: the parallel path repeats the relation messages "
+                  "(A=%d, B=%d); the relation cache is not shared between "
+                  "the workers yet" %
+                  (sum(relation_a.values()), sum(relation_b.values())))
+    else:
+        print("relation messages differ")
+        for line in _describe_multiset_diff(relation_a, relation_b)[:20]:
+            print(line)
+        errors.append("relation messages differ")
+
+    # The order of the transaction delimiters must be identical: the parallel
+    # path commits the transactions in the order of their commit sequence
+    # numbers, so the subscriber must see the same order as in the serial
+    # path.
+    order_a = transaction_order(data_a)
+    order_b = transaction_order(data_b)
+
+    if order_a == order_b:
+        print("transaction order matches (%d delimiter(s))" % len(order_a))
+    else:
+        print("transaction order differs: A=%s B=%s" % (order_a, order_b))
+        errors.append("transaction order differs")
+
+    # The frame grouping may differ, that is allowed.
+    keys_a = [f.key() for f in data_a]
+    keys_b = [f.key() for f in data_b]
+    if keys_a == keys_b:
+        print("frame grouping matches (%d frame(s))" % len(data_a))
+    else:
+        diff = _first_difference(keys_a, keys_b)
+        print("frame grouping differs (allowed): %s" % (diff,))
+
+    # Compare the header LSNs per message: the frames of the two runs may
+    # group the messages differently, so the frames cannot be compared by
+    # position.  The parallel path clamps the header LSNs to the release
+    # frontier, so a smaller LSN is allowed, a larger one is not.
+    lsns_a = message_lsn_map(data_a)
+    lsns_b = message_lsn_map(data_b)
     clamped = 0
     lsn_errors = []
-    if diff is None:
-        for fa, fb in zip(data_a, data_b):
-            if fa.lsn1 == fb.lsn1 and fa.lsn2 == fb.lsn2:
+    for key in sorted(set(lsns_a) & set(lsns_b)):
+        for lsn_a, lsn_b in zip(lsns_a[key], lsns_b[key]):
+            if lsn_a == lsn_b:
                 continue
-            if fb.lsn1 > fa.lsn1 or fb.lsn2 > fa.lsn2:
+            if lsn_b[0] > lsn_a[0] or lsn_b[1] > lsn_a[1]:
                 lsn_errors.append(
-                    "frame #%d: B header LSN (%d, %d) is ahead of A (%d, %d)"
-                    % (fa.index, fb.lsn1, fb.lsn2, fa.lsn1, fa.lsn2))
+                    "%s: B header LSN (%d, %d) is ahead of A (%d, %d)" %
+                    (key[0], lsn_b[0], lsn_b[1], lsn_a[0], lsn_a[1]))
             else:
                 clamped += 1
     for msg in lsn_errors[:10]:
@@ -315,22 +600,11 @@ def cmd_diff(args):
     if clamped:
         print("%d frame header LSN(s) clamped (allowed)" % clamped)
 
-    # Compare the message streams, which tolerates a different frame
-    # boundary in the parallel path.
-    if args.messages:
-        msgs_a = message_stream(data_a)
-        msgs_b = message_stream(data_b)
-        msg_diff = _first_difference(msgs_a, msgs_b)
-        if msg_diff is None:
-            print("message stream matches (%d message(s))" % len(msgs_a))
-        else:
-            tag, i1, i2, j1, j2 = msg_diff
-            print("message stream differs at %s: A[%d:%d] vs B[%d:%d]" %
-                  (tag, i1, i2, j1, j2))
-            print("  A %s" % (msgs_a[i1:i1 + 3],))
-            print("  B %s" % (msgs_b[j1:j1 + 3],))
-            if not errors:
-                errors.append("message stream differs")
+    # Report the message order difference, if any, for information.
+    msgs_a = message_stream(data_a)
+    msgs_b = message_stream(data_b)
+    if msgs_a != msgs_b and other_a == other_b:
+        print("message order differs (allowed)")
 
     if errors:
         print("FAIL: %s" % "; ".join(errors))

@@ -21,17 +21,25 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <unistd.h>
 
 #include "miscadmin.h"
 #include "replication/parallel_decode.h"
-#include "storage/fd.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 
 /* GUC */
 char	   *parallel_decode_trace_file = NULL;
 
-static FILE *pd_trace_file = NULL;
+/*
+ * The trace file is held open for the whole session, so it must not use
+ * AllocateFile(): AllocateFile() registers the file with the transaction
+ * machinery, which closes it at the end of every transaction.  A walsender
+ * decodes many transactions in a row, so the file would be closed right
+ * after the first one, and the descriptor number could be reused by an
+ * unrelated file.  A raw descriptor avoids both problems.
+ */
+static int	pd_trace_fd = -1;
 static bool pd_trace_broken = false;
 
 /*
@@ -53,6 +61,34 @@ pd_trace_be32(uint32 v)
 }
 
 /*
+ * Write the whole buffer, retrying on partial writes and on EINTR.
+ */
+static bool
+pd_trace_write_all(const void *buf, size_t len)
+{
+	const char *p = (const char *) buf;
+
+	while (len > 0)
+	{
+		ssize_t		written = write(pd_trace_fd, p, len);
+
+		if (written < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (written == 0)
+			return false;
+
+		p += written;
+		len -= written;
+	}
+
+	return true;
+}
+
+/*
  * Open the trace file and write the session marker.
  */
 void
@@ -65,15 +101,16 @@ PDTraceInit(void)
 		parallel_decode_trace_file[0] == '\0')
 		return;
 
-	if (pd_trace_file != NULL)
+	if (pd_trace_fd >= 0)
 		return;					/* already open */
 
 	pd_trace_broken = false;
 
-	pd_trace_file = AllocateFile(parallel_decode_trace_file, "ab");
-	if (pd_trace_file == NULL)
+	pd_trace_fd = open(parallel_decode_trace_file,
+					   O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (pd_trace_fd < 0)
 	{
-		ereport(WARNING,
+		ereport(LOG,
 				(errmsg("could not open parallel decode trace file \"%s\": %m",
 						parallel_decode_trace_file)));
 		return;
@@ -99,11 +136,15 @@ PDTraceInit(void)
 	}
 
 	netlen = pd_trace_be32((uint32) sizeof(marker));
-	if (fwrite(&netlen, 1, sizeof(netlen), pd_trace_file) != sizeof(netlen) ||
-		fwrite(marker, 1, sizeof(marker), pd_trace_file) != sizeof(marker))
+	if (!pd_trace_write_all(&netlen, sizeof(netlen)) ||
+		!pd_trace_write_all(marker, sizeof(marker)))
+	{
+		ereport(LOG,
+				(errmsg("could not write to parallel decode trace file "
+						"\"%s\": %m",
+						parallel_decode_trace_file)));
 		pd_trace_broken = true;
-	else
-		fflush(pd_trace_file);
+	}
 }
 
 /*
@@ -114,27 +155,22 @@ PDTraceWrite(const char *data, size_t len)
 {
 	uint32		netlen;
 
-	if (pd_trace_file == NULL || pd_trace_broken)
+	if (pd_trace_fd < 0)
+		return;
+	if (pd_trace_broken)
 		return;
 
 	netlen = pd_trace_be32((uint32) len);
 
-	if (fwrite(&netlen, 1, sizeof(netlen), pd_trace_file) != sizeof(netlen) ||
-		fwrite(data, 1, len, pd_trace_file) != len)
+	if (!pd_trace_write_all(&netlen, sizeof(netlen)) ||
+		!pd_trace_write_all(data, len))
 	{
-		ereport(WARNING,
-				(errmsg("could not write to parallel decode trace file \"%s\": %m",
+		ereport(LOG,
+				(errmsg("could not write to parallel decode trace file "
+						"\"%s\": %m",
 						parallel_decode_trace_file)));
 		pd_trace_broken = true;
-		return;
 	}
-
-	/*
-	 * Flush every record: the interesting traces are written by sessions that
-	 * are killed on purpose, and a partially written record would make the
-	 * trace file unparsable.
-	 */
-	fflush(pd_trace_file);
 }
 
 /*
@@ -143,11 +179,10 @@ PDTraceWrite(const char *data, size_t len)
 void
 PDTraceShutdown(void)
 {
-	if (pd_trace_file == NULL)
+	if (pd_trace_fd < 0)
 		return;
 
-	fflush(pd_trace_file);
-	FreeFile(pd_trace_file);
-	pd_trace_file = NULL;
+	close(pd_trace_fd);
+	pd_trace_fd = -1;
 	pd_trace_broken = false;
 }

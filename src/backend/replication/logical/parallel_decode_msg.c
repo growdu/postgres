@@ -25,6 +25,9 @@
  */
 #include "postgres.h"
 
+#include "nodes/makefuncs.h"
+#include "nodes/parsenodes.h"
+#include "nodes/value.h"
 #include "replication/parallel_decode.h"
 #include "storage/shm_mq.h"
 #include "utils/memutils.h"
@@ -176,7 +179,7 @@ PDChunkReceiverReset(PDChunkReceiver *rcv)
  */
 shm_mq_result
 PDChunkReceiverRecv(PDChunkReceiver *rcv, shm_mq_handle *mqh, uint16 *type,
-					const void **payload, size_t *len)
+					const void **payload, size_t *len, bool nowait)
 {
 	for (;;)
 	{
@@ -185,7 +188,7 @@ PDChunkReceiverRecv(PDChunkReceiver *rcv, shm_mq_handle *mqh, uint16 *type,
 		size_t		datalen;
 		shm_mq_result res;
 
-		res = PDQueueRecv(mqh, &msgtype, &data, &datalen, true);
+		res = PDQueueRecv(mqh, &msgtype, &data, &datalen, nowait);
 		if (res != SHM_MQ_SUCCESS)
 			return res;
 
@@ -201,11 +204,11 @@ PDChunkReceiverRecv(PDChunkReceiver *rcv, shm_mq_handle *mqh, uint16 *type,
 
 			memcpy(&total, data, sizeof(total));
 
-			if (total > PD_MESSAGE_MAX_PAYLOAD)
+			if (total > PD_MAX_TRANSFER_SIZE)
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						 errmsg("parallel decode payload of %u bytes exceeds the limit of %d bytes",
-								total, PD_MESSAGE_MAX_PAYLOAD)));
+								total, PD_MAX_TRANSFER_SIZE)));
 
 			rcv->expected = total;
 			rcv->len = 0;
@@ -261,9 +264,11 @@ PDChunkReceiverRecv(PDChunkReceiver *rcv, shm_mq_handle *mqh, uint16 *type,
  * the queue, so that a partially written payload can never be mistaken for a
  * complete one.
  */
-bool
-PDQueueSendChunked(shm_mq_handle *mqh, uint16 type, const void *payload,
-				   size_t len, size_t chunk_size, bool nowait, bool force_flush)
+static bool
+pd_queue_send_chunked(shm_mq_handle *mqh, uint16 type,
+					   const void *prefix, size_t prefixlen,
+					   const void *payload, size_t len,
+					   size_t chunk_size, bool nowait, bool force_flush)
 {
 	const char *data = payload;
 	size_t		remaining = len;
@@ -274,21 +279,21 @@ PDQueueSendChunked(shm_mq_handle *mqh, uint16 type, const void *payload,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a chunked parallel decode payload cannot be sent without waiting")));
 
-	if (chunk_size <= sizeof(uint32))
+	if (chunk_size <= sizeof(uint32) + prefixlen)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("the chunk size of a parallel decode payload is too small")));
 
-	if (len > PD_MESSAGE_MAX_PAYLOAD)
+	if (len + prefixlen > PD_MAX_TRANSFER_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("parallel decode payload of %zu bytes exceeds the limit of %d bytes",
-						len, PD_MESSAGE_MAX_PAYLOAD)));
+						len + prefixlen, PD_MAX_TRANSFER_SIZE)));
 
 	do
 	{
 		ParallelDecodeMessageHeader header;
-		shm_mq_iovec iov[3];
+		shm_mq_iovec iov[4];
 		size_t		msglen = 0;
 		size_t		this_chunk;
 		int			iovcnt;
@@ -306,13 +311,20 @@ PDQueueSendChunked(shm_mq_handle *mqh, uint16 type, const void *payload,
 
 		if (first)
 		{
-			uint32		total = (uint32) len;
+			uint32		total = (uint32) (prefixlen + len);
 
 			iov[1].data = (const char *) &total;
 			iov[1].len = sizeof(total);
 			iovcnt = 2;
 
-			this_chunk = Min(remaining, chunk_size - sizeof(uint32));
+			if (prefixlen > 0)
+			{
+				iov[iovcnt].data = (const char *) prefix;
+				iov[iovcnt].len = prefixlen;
+				iovcnt++;
+			}
+
+			this_chunk = Min(remaining, chunk_size - sizeof(uint32) - prefixlen);
 		}
 		else
 			this_chunk = Min(remaining, chunk_size);
@@ -346,4 +358,211 @@ PDQueueSendChunked(shm_mq_handle *mqh, uint16 type, const void *payload,
 	} while (remaining > 0);
 
 	return true;
+}
+
+/*
+ * Send a payload that may be larger than one queue entry.
+ */
+bool
+PDQueueSendChunked(shm_mq_handle *mqh, uint16 type, const void *payload,
+				   size_t len, size_t chunk_size, bool nowait, bool force_flush)
+{
+	return pd_queue_send_chunked(mqh, type, NULL, 0, payload, len, chunk_size,
+								  nowait, force_flush);
+}
+
+/*
+ * Send a replication frame to the walsender.
+ *
+ * The frame is preceded by a PDFrameHeader, which tells the walsender how far
+ * the decoding has come and which transaction the frame belongs to.  A frame
+ * can be larger than one queue entry, so the transfer is chunked.
+ */
+void
+PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
+				 const char *frame, size_t len)
+{
+	PDFrameHeader fh;
+
+	fh.end_lsn = end_lsn;
+	fh.cseq = cseq;
+	fh.length = (uint32) len;
+
+	pd_queue_send_chunked(mqh, PD_ENT_FRAME, &fh, sizeof(fh), frame, len,
+						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+}
+
+/*
+ * Report an event to the walsender.
+ *
+ * The message uses the chunked framing, because the receiver of the queue
+ * uses a single chunk receiver for all of its messages.
+ */
+void
+PDQueueSendEvent(shm_mq_handle *mqh, uint64 cseq, uint32 event)
+{
+	PDEventHeader eh;
+
+	eh.cseq = cseq;
+	eh.event = event;
+
+	pd_queue_send_chunked(mqh, PD_ENT_EVENT, NULL, 0, &eh, sizeof(eh),
+						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+}
+
+/*
+ * Report the decoding position to the walsender.
+ *
+ * The message uses the chunked framing, because the receiver of the queue
+ * uses a single chunk receiver for all of its messages.
+ */
+void
+PDQueueSendPosition(shm_mq_handle *mqh, uint64 end_lsn)
+{
+	pd_queue_send_chunked(mqh, PD_ENT_POSITION, NULL, 0, &end_lsn,
+						  sizeof(end_lsn), PARALLEL_DECODE_CHUNK_SIZE, false,
+						  true);
+}
+
+/*
+ * Serialize the options of the output plugin.
+ *
+ * Every option of the plugins that ship with PostgreSQL carries a plain
+ * string argument, so the serialized form is a list of length prefixed names
+ * and arguments.  The options that have no argument are stored with an
+ * argument length of zero.
+ */
+void
+PDSerializePluginOptions(List *options, char *buf, size_t buflen, uint32 *len)
+{
+	ListCell   *lc;
+	size_t		pos;
+	uint32		count = 0;
+
+	/* The number of options comes first. */
+	if (buflen < sizeof(uint32))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("the buffer for the output plugin options is too small")));
+
+	pos = sizeof(uint32);
+
+	for (lc = list_head(options); lc != NULL; lc = lnext(options, lc))
+	{
+		DefElem    *defel = (DefElem *) lfirst(lc);
+		const char *name = defel->defname;
+		const char *arg = NULL;
+		uint16		namelen;
+		uint16		arglen = 0;
+
+		if (defel->arg != NULL)
+		{
+			if (!IsA(defel->arg, String))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the parallel decoding path cannot use the output plugin option \"%s\"",
+								name),
+						 errdetail("The argument of the option is not a plain string.")));
+			arg = strVal(defel->arg);
+			arglen = (uint16) strlen(arg);
+		}
+
+		namelen = (uint16) strlen(name);
+
+		if (pos + sizeof(uint16) + namelen + sizeof(uint16) + arglen > buflen)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("the output plugin options do not fit into %zu bytes",
+							buflen)));
+
+		memcpy(buf + pos, &namelen, sizeof(uint16));
+		pos += sizeof(uint16);
+		memcpy(buf + pos, name, namelen);
+		pos += namelen;
+		memcpy(buf + pos, &arglen, sizeof(uint16));
+		pos += sizeof(uint16);
+		if (arglen > 0)
+		{
+			memcpy(buf + pos, arg, arglen);
+			pos += arglen;
+		}
+
+		count++;
+	}
+
+	memcpy(buf, &count, sizeof(uint32));
+
+	*len = (uint32) pos;
+}
+
+/*
+ * Parse the options of the output plugin.
+ *
+ * The result is a list of DefElem, exactly like the one the walsender got
+ * from the replication command.
+ */
+List *
+PDParsePluginOptions(const char *buf, uint32 len)
+{
+	List	   *options = NIL;
+	const char *pos = buf;
+	const char *end = buf + len;
+	uint32		count;
+	uint32		i;
+
+	if (len < sizeof(uint32))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the serialized output plugin options are too short")));
+
+	memcpy(&count, pos, sizeof(count));
+	pos += sizeof(count);
+
+	for (i = 0; i < count; i++)
+	{
+		DefElem    *defel;
+		uint16		namelen;
+		uint16		arglen;
+		char	   *name;
+		char	   *arg = NULL;
+
+		if (pos + sizeof(uint16) > end)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the serialized output plugin options are truncated")));
+
+		memcpy(&namelen, pos, sizeof(namelen));
+		pos += sizeof(namelen);
+
+		if (pos + namelen + sizeof(uint16) > end)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the serialized output plugin options are truncated")));
+
+		name = palloc(namelen + 1);
+		memcpy(name, pos, namelen);
+		name[namelen] = '\0';
+		pos += namelen;
+
+		memcpy(&arglen, pos, sizeof(arglen));
+		pos += sizeof(arglen);
+
+		if (pos + arglen > end)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the serialized output plugin options are truncated")));
+
+		if (arglen > 0)
+		{
+			arg = palloc(arglen + 1);
+			memcpy(arg, pos, arglen);
+			arg[arglen] = '\0';
+			pos += arglen;
+		}
+
+		defel = makeDefElem(name, arg ? (Node *) makeString(arg) : NULL, -1);
+		options = lappend(options, defel);
+	}
+
+	return options;
 }

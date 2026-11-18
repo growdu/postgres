@@ -770,6 +770,33 @@ SnapBuildResetExportedSnapshotState(void)
 }
 
 /*
+ * Does this process decode the changes of the given transaction?
+ *
+ * The parallel decoding path assigns every transaction to one of the decode
+ * workers.  The workers that do not own the transaction see its records as
+ * well, so that their snapshot builders stay in step with the one of the
+ * owner, but they must not accumulate the changes: the owner is the one that
+ * produces the output of the transaction.
+ *
+ * The bookkeeping that the snapshot builder does for a transaction still
+ * happens in every worker, so that the invalidations a transaction carries
+ * are executed at the same point of the WAL in all of them.
+ */
+static inline bool
+SnapBuildOwnsTransaction(SnapBuild *builder)
+{
+	LogicalDecodingContext *ctx;
+
+	ctx = (LogicalDecodingContext *) builder->reorder->private_data;
+
+	/* The serial decoding path decodes the transactions of every owner. */
+	if (ctx == NULL || ctx->txn_owner < 0)
+		return true;
+
+	return ctx->txn_owner == ctx->worker_index;
+}
+
+/*
  * Handle the effects of a single heap change, appropriate to the current state
  * of the snapshot builder and returns whether changes made at (xid, lsn) can
  * be decoded.
@@ -815,6 +842,15 @@ SnapBuildProcessChange(SnapBuild *builder, TransactionId xid, XLogRecPtr lsn)
 		ReorderBufferSetBaseSnapshot(builder->reorder, xid, lsn,
 									 builder->snapshot);
 	}
+
+	/*
+	 * The changes of a transaction that belongs to another worker are not
+	 * decoded here.  The bookkeeping above still has to happen, though: the
+	 * transaction has to be known to the reorder buffer, so that the
+	 * invalidations it carries are executed when it ends.
+	 */
+	if (!SnapBuildOwnsTransaction(builder))
+		return false;
 
 	return true;
 }

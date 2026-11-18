@@ -174,6 +174,12 @@ static StringInfoData output_message;
 static StringInfoData reply_message;
 static StringInfoData tmpbuf;
 
+/*
+ * The buffer the frames of the decode workers are received into.  It is only
+ * used by the parallel decoding path.
+ */
+static StringInfoData pd_frame_buf;
+
 /* Timestamp of last ProcessRepliesIfAny(). */
 static TimestampTz last_processing = 0;
 
@@ -245,7 +251,7 @@ static void WalSndKill(int code, Datum arg);
 static void WalSndShutdown(void) pg_attribute_noreturn();
 static void XLogSendPhysical(void);
 static void XLogSendLogical(void);
-static void pd_walsender_idle(void);
+static bool pd_walsender_idle(void);
 static void WalSndDone(WalSndSendDataCallback send_data);
 static void IdentifySystem(void);
 static void UploadManifest(void);
@@ -1459,6 +1465,8 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 {
 	StringInfoData buf;
 	QueryCompletion qc;
+	char		pd_plugin_options[PD_MAX_PLUGIN_OPTIONS];
+	uint32		pd_plugin_options_len = 0;
 
 	/* make sure that our requirements are still fulfilled */
 	CheckLogicalDecodingRequirements();
@@ -1487,30 +1495,25 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	}
 
 	/*
+	 * Serialize the options of the output plugin before the decoding context is
+	 * created.  The startup callback of an output plugin may modify the option
+	 * values in place: pgoutput splits the list of publication names with
+	 * SplitIdentifierString(), which overwrites the value it is given.  The
+	 * decode workers need the original values, so they are serialized before
+	 * the context exists.
+	 */
+	if (ParallelDecodeEnabled())
+		PDSerializePluginOptions(cmd->options, pd_plugin_options,
+								  sizeof(pd_plugin_options),
+								  &pd_plugin_options_len);
+
+	/*
 	 * Create our decoding context, making it start at the previously ack'ed
 	 * position.
 	 *
 	 * Do this before sending a CopyBothResponse message, so that any errors
 	 * are reported early.
 	 */
-	/*
-	 * Publisher-side parallel logical decoding.  Until the decoding path has
-	 * been moved out of this process, starting the session only exercises the
-	 * process plumbing: the walreader and the decode workers are started, they
-	 * attach to the shared segment, and they stay alive for the duration of
-	 * the replication session.  The data path below is unchanged.
-	 */
-	if (ParallelDecodeEnabled())
-	{
-		ParallelDecodeSessionStart(MyReplicationSlot->data.restart_lsn);
-
-		/*
-		 * While the session waits for the walreader to hand over the next
-		 * WAL record, the replication connection still has to be serviced.
-		 */
-		ParallelDecodeSetIdleCallback(pd_walsender_idle);
-	}
-
 	logical_decoding_ctx =
 		CreateDecodingContext(cmd->startpoint, cmd->options, false,
 							  XL_ROUTINE(.page_read = logical_read_xlog_page,
@@ -1519,6 +1522,36 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 							  WalSndPrepareWrite, WalSndWriteData,
 							  WalSndUpdateProgress);
 	xlogreader = logical_decoding_ctx->reader;
+
+	/*
+	 * Publisher-side parallel logical decoding.  The decoding itself happens
+	 * in the decode workers, so the walsender only forwards the frames they
+	 * produce.  The decoding context above is still created here, because it
+	 * is what sets the slot up for the session: it loads the output plugin,
+	 * which tells us whether two-phase decoding is possible, and it marks the
+	 * slot accordingly.
+	 */
+	if (ParallelDecodeEnabled())
+	{
+		XLogRecPtr start_lsn = cmd->startpoint;
+
+		/*
+		 * The decoding starts at the position CreateDecodingContext() would
+		 * have used, so that the two paths decode the same transactions.
+		 */
+		if (start_lsn == InvalidXLogRecPtr ||
+			start_lsn < MyReplicationSlot->data.confirmed_flush)
+			start_lsn = MyReplicationSlot->data.confirmed_flush;
+
+		ParallelDecodeSessionStart(MyReplicationSlot, pd_plugin_options,
+									pd_plugin_options_len, start_lsn);
+
+		/*
+		 * While the session waits for the decode worker to hand over the
+		 * next frame, the replication connection still has to be serviced.
+		 */
+		ParallelDecodeSetIdleCallback(pd_walsender_idle);
+	}
 
 	WalSndSetState(WALSNDSTATE_CATCHUP);
 
@@ -1580,15 +1613,13 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 }
 
 /*
- * LogicalDecodingContext 'prepare_write' callback.
+ * Build the header of a replication frame.
  *
- * Prepare a write into a StringInfo.
- *
- * Don't do anything lasting in here, it's quite possible that nothing will be done
- * with the data.
+ * The serial path and the parallel path use the same code, so that the frames
+ * they produce are identical.
  */
-static void
-WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write)
+void
+PDPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write)
 {
 	/* can't have sync rep confused by sending the same LSN several times */
 	if (!last_write)
@@ -1605,6 +1636,20 @@ WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xi
 	 * reserve space here.
 	 */
 	pq_sendint64(ctx->out, 0);	/* sendtime */
+}
+
+/*
+ * LogicalDecodingContext 'prepare_write' callback.
+ *
+ * Prepare a write into a StringInfo.
+ *
+ * Don't do anything lasting in here, it's quite possible that nothing will be done
+ * with the data.
+ */
+static void
+WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write)
+{
+	PDPrepareWrite(ctx, lsn, xid, last_write);
 }
 
 /*
@@ -2143,6 +2188,7 @@ exec_replication_command(const char *cmd_string)
 	initStringInfo(&output_message);
 	initStringInfo(&reply_message);
 	initStringInfo(&tmpbuf);
+	initStringInfo(&pd_frame_buf);
 
 	switch (cmd_node->type)
 	{
@@ -3443,15 +3489,15 @@ retry:
 }
 
 /*
- * Called while the walsender waits for the walreader to hand over the next
- * WAL record.
+ * Called while the walsender waits for the decode worker to hand over the
+ * next frame.
  *
- * The walreader is the only reader of the WAL, so the walsender spends most
- * of its time waiting for it.  The replication connection has to be serviced
- * even then, otherwise the subscriber would not see any keepalive and the
- * session would run into the replication timeout.
+ * The decode worker is the one that produces the frames, so the walsender
+ * spends most of its time waiting for it.  The replication connection has to
+ * be serviced even then, otherwise the subscriber would not see any
+ * keepalive and the session would run into the replication timeout.
  */
-static void
+static bool
 pd_walsender_idle(void)
 {
 	/* Check for input from the client */
@@ -3466,6 +3512,62 @@ pd_walsender_idle(void)
 
 	/* Send keepalive if the time has come */
 	WalSndKeepaliveIfNecessary();
+
+	/*
+	 * The client has asked to stop the streaming and the answer has been sent
+	 * to it, so the session is over.  The main loop of the walsender takes
+	 * care of the rest.
+	 */
+	return streamingDoneReceiving && streamingDoneSending &&
+		!pq_is_send_pending();
+}
+
+/*
+ * Write a frame the decode worker produced out to the network.
+ *
+ * The frame is the 'w' frame of the replication protocol.  The serial path
+ * builds it in the decoding context and writes it out in WalSndWriteData(),
+ * so this does the same for a frame that a decode worker built.
+ */
+static void
+pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
+{
+	TimestampTz now;
+
+	/*
+	 * Fill the send timestamp last, so that it is taken as late as possible.
+	 * This is somewhat ugly, but the protocol is set as it's already used for
+	 * several releases by streaming physical replication.
+	 */
+	resetStringInfo(&tmpbuf);
+	now = GetCurrentTimestamp();
+	pq_sendint64(&tmpbuf, now);
+	memcpy(&frame->data[1 + sizeof(int64) + sizeof(int64)],
+		   tmpbuf.data, sizeof(int64));
+
+	/* output previously gathered data in a CopyData packet */
+	PDTraceWrite(frame->data, frame->len);
+	pq_putmessage_noblock('d', frame->data, frame->len);
+
+	CHECK_FOR_INTERRUPTS();
+
+	/* Try to flush pending output to the client */
+	if (pq_flush_if_writable() != 0)
+		WalSndShutdown();
+
+	/* Track how far the session has come. */
+	LagTrackerWrite(end_lsn, now);
+
+	/* Try taking fast path unless we get too close to walsender timeout. */
+	if (now < TimestampTzPlusMilliseconds(last_reply_timestamp,
+										  wal_sender_timeout / 2) &&
+		!pq_is_send_pending())
+	{
+		return;
+	}
+
+	/* If we have pending write here, go to slow path */
+	ProcessPendingWrites();
 }
 
 /*
@@ -3487,13 +3589,6 @@ XLogSendLogical(void)
 	static XLogRecPtr flushPtr = InvalidXLogRecPtr;
 
 	/*
-	 * The record that was handed over last.  It is kept alive until the next
-	 * one arrives, because the decoding path may look at it while it produces
-	 * the output of the record.
-	 */
-	static DecodedXLogRecord *current_record = NULL;
-
-	/*
 	 * Don't know whether we've caught up yet. We'll set WalSndCaughtUp to
 	 * true in WalSndWaitForWal, if we're actually waiting. We also set to
 	 * true if XLogReadRecord() had to stop reading but WalSndWaitForWal
@@ -3503,44 +3598,24 @@ XLogSendLogical(void)
 
 	if (ParallelDecodeEnabled())
 	{
-		DecodedXLogRecord *decoded = NULL;
+		XLogRecPtr end_lsn;
 
 		/*
-		 * The walreader is the only reader of the WAL, so the records arrive
-		 * over the shared memory queue instead of being read here.
+		 * The decode workers produce the replication frames, so the walsender
+		 * waits for them to arrive and writes them out.  The frames are the
+		 * frames of the replication protocol, byte for byte the ones the
+		 * serial path produces.
 		 */
-		if (!ParallelDecodeNextWalRecord(&decoded))
-			return;
+		if (ParallelDecodeNextFrame(&pd_frame_buf, &end_lsn))
+			pd_walsender_write_frame(&pd_frame_buf, end_lsn);
 
 		/*
-		 * Hand the record over to the decoding path as if this process had
-		 * read it from the WAL itself.
+		 * How far the session has come is decided by the decoding, because the
+		 * frames the subscriber receives are what the lag is measured
+		 * against.
 		 */
-		if (current_record)
-		{
-			PDRecordFree(current_record);
-			current_record = NULL;
-		}
-
-		current_record = decoded;
-		logical_decoding_ctx->reader->record = decoded;
-		logical_decoding_ctx->reader->ReadRecPtr = decoded->lsn;
-		logical_decoding_ctx->reader->EndRecPtr = decoded->next_lsn;
-
-		/*
-		 * Note the lack of any call to LagTrackerWrite() which is handled by
-		 * WalSndUpdateProgress which is called by output plugin through
-		 * logical decoding write api.
-		 */
-		LogicalDecodingProcessRecord(logical_decoding_ctx, logical_decoding_ctx->reader);
-
-		sentPtr = logical_decoding_ctx->reader->EndRecPtr;
-
-		/*
-		 * How far the session has come is decided by the walreader, because it
-		 * is the one that reads the WAL.
-		 */
-		current_lsn = ParallelDecodeWalreaderPosition();
+		current_lsn = ParallelDecodePosition();
+		sentPtr = current_lsn;
 	}
 	else
 	{
