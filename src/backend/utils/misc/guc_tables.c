@@ -4027,6 +4027,22 @@ struct config_string ConfigureNamesString[] =
 	},
 
 	{
+		{"parallel_decode_trace_file", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the file that the publisher writes the replication "
+						 "frames it sends to."),
+			gettext_noop("This is a debugging aid: the file is the input of the "
+						 "frame level dump and diff tool, which compares the bytes "
+						 "produced by the serial decoding path against the bytes "
+						 "produced by the parallel path. An empty name disables the "
+						 "trace. The change takes effect in the next replication "
+						 "session.")
+		},
+		&parallel_decode_trace_file,
+		"",
+		NULL, NULL, NULL
+	},
+
+	{
 		{"archive_library", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Sets the library that will be called to archive a WAL file."),
 			gettext_noop("An empty string indicates that \"archive_command\" should be used.")

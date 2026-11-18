@@ -1467,6 +1467,13 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	ReplicationSlotAcquire(cmd->slotname, true);
 
 	/*
+	 * Start recording the replication frames we send, if the trace file was
+	 * configured.  This is a debugging aid used by the frame level dump and
+	 * diff tool; it is a no-op when the trace file is empty.
+	 */
+	PDTraceInit();
+
+	/*
 	 * Force a disconnect, so that the decoding code doesn't need to care
 	 * about an eventual switch from running in recovery, to running in a
 	 * normal environment. Client code is expected to handle reconnects.
@@ -1548,6 +1555,8 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	}
 	PG_END_TRY();
 
+	PDTraceShutdown();
+
 	FreeDecodingContext(logical_decoding_ctx);
 	ReplicationSlotRelease();
 
@@ -1614,6 +1623,7 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		   tmpbuf.data, sizeof(int64));
 
 	/* output previously gathered data in a CopyData packet */
+	PDTraceWrite(ctx->out->data, ctx->out->len);
 	pq_putmessage_noblock('d', ctx->out->data, ctx->out->len);
 
 	CHECK_FOR_INTERRUPTS();
@@ -4097,6 +4107,7 @@ WalSndKeepalive(bool requestReply, XLogRecPtr writePtr)
 	pq_sendbyte(&output_message, requestReply ? 1 : 0);
 
 	/* ... and send it wrapped in CopyData */
+	PDTraceWrite(output_message.data, output_message.len);
 	pq_putmessage_noblock('d', output_message.data, output_message.len);
 
 	/* Set local flag */

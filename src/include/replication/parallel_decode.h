@@ -56,9 +56,28 @@ extern PGDLLIMPORT int	parallel_decode_stream_min_size;
 extern PGDLLIMPORT int	parallel_decode_stream_segment_size;
 extern PGDLLIMPORT int	parallel_decode_work_mem;
 extern PGDLLIMPORT int	parallel_decode_batch_size;
+extern PGDLLIMPORT char *parallel_decode_trace_file;
 
 /* True when the publisher-side parallel path is requested. */
 extern bool ParallelDecodeEnabled(void);
+
+/*
+ * Wire trace facility.
+ *
+ * When parallel_decode_trace_file names a file, the walsender appends every
+ * replication frame it hands to the network to that file.  The file is the
+ * input of the frame level dump/diff tool, which compares the bytes produced
+ * by the serial path against the bytes produced by the parallel path.
+ *
+ * File format: a sequence of records, each one a 4 byte big endian length
+ * followed by that many bytes of payload.  A payload whose first byte is zero
+ * is a session marker (the remaining eight bytes hold the session id); every
+ * other payload is one replication frame, i.e. the payload of a CopyData
+ * message, which starts with the frame type ('w', 'k', 'r' or 'c').
+ */
+extern void PDTraceInit(void);
+extern void PDTraceWrite(const char *data, size_t len);
+extern void PDTraceShutdown(void);
 
 /*
  * Lifecycle, called from the walsender that owns the replication slot.
