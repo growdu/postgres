@@ -190,7 +190,15 @@
 | `streaming='on'`（协议 v2/v3） | xid + subxid | 8 |
 | `streaming='parallel'`（协议 v4） | xid + subxid + **abort_lsn** + **abort_time** | 24 |
 
-因此 worker 侧的 `LogicalDecodingContext` 必须把 `ctx->streaming` 取成**订阅端的模式值**（`LOGICALREP_STREAM_ON` / `LOGICALREP_STREAM_PARALLEL`），而不是一个"是否流式"的布尔值——否则 abort 帧的载荷与订阅端的解析预期错位，协议错位而非仅仅语义差异。模式的来源与协议版本的校验同源（事实 8a 的 `pgoutput.c:496-509`），由 walsender 在会话建立时确定、经控制通道下发给每个 worker（见 5.2 的 `PD_ENT_SESSION_INIT` 与 6.1 的插件实例化）。
+因此 worker 侧必须拿到**订阅端的流式模式**——但**不是把它写进 `ctx->streaming`**。`LogicalDecodingContext.streaming` 的类型是 **bool**（`logical.h:86`），它只表示"插件支持流式且已启用"，参与判断的是 `ReorderBufferCanStartStreaming()`；**模式值（`'f'` / `'t'` / `'p'`）存在 `PGOutputData.streaming` 里**（`pgoutput.h:32`，类型是 **char**），它是 pgoutput 插件实例的私有状态，由插件选项列表里的 `streaming` 选项经 `defGetStreamingMode()` 解析得到（`pgoutput.c:366-374`，默认值 `LOGICALREP_STREAM_OFF`，见 `pg_subscription.h:163-175`）。`pgoutput.c:493-510` 的两处赋值也印证了这个分工：`ctx->streaming`（bool）被置为 true/false，而 `data->streaming`（char）承载模式。
+
+由此得到 worker 侧插件实例化的硬要求：
+
+- **worker 必须拿到原始的插件选项列表**（`LogicalDecodingContext.output_plugin_options`，`logical.h:59`、`logical.c:297`），而不是一个"模式值"或"是否流式"的布尔——因为 `data->streaming` 是从那份选项列表解析出来的，**没有办法只靠一个模式字符把它复原**（选项里还有 `binary`、`messages`、`two_phase`、`publish_no_origin` 等一并影响字节格式）；
+- **worker 自己实例化插件**（`LoadOutputPlugin()` + `_PG_output_plugin_init`，`logical.c:755`），因而自己持有一份 `PGOutputData`，`data->streaming` 自然由同一份选项列表解析出正确的值；
+- **walsender 侧必须与 worker 用同一份选项列表**——它是 `START_REPLICATION` 的选项（`cmd->options`）在 `CreateDecodingContext()` 时传进去的，因此"下发给 worker"就是下发**同一份列表**，不是另行计算一个模式值。
+
+模式值与协议版本的校验同源（事实 8a 的 `pgoutput.c:496-509`），两者必须一起下发，否则会出现"允许流式但协议版本不够"的错配（见 5.2 的 `PD_ENT_SESSION_INIT` 与 6.1 的插件实例化）。
 
 **事实 9：复制槽绑定在 walsender 进程。** `logical.c:1693-1699` 的 `LogicalIncreaseXminForSlot()` 使用 `MyReplicationSlot`（进程局部变量），`snapbuild.c:1316` 在 `SnapBuildProcessRunningXacts()` 中调用它推进槽的 catalog_xmin。**拆分进程后，walreader 持有 snapbuild 却无法推进槽的 xmin**，必须由 walsender 代劳（见 5.2 的 `PMSG_WATERMARK_ADVANCE` / `PMSG_WATERMARK_ACK` 与 6.6）。
 
@@ -423,33 +431,61 @@ walreader            worker#0            walsender           订阅端
 
 | 环节 | 源码 | 行为 |
 | --- | --- | --- |
-| 帧头写 LSN | `walsender.c:1549-1560` `WalSndPrepareWrite()` | **只有 `last_write` 为真时才写入 `ctx->write_location`，否则写 0**。pgoutput 中 `last_write=true` 的只有：BEGIN、每条变更、COMMIT、PREPARE、COMMIT/ROLLBACK PREPARED、STREAM COMMIT；STREAM START / STREAM STOP 与 origin 消息写 0 |
+| 帧头写 LSN | `walsender.c:1549-1560` `WalSndPrepareWrite()` | **只有 `last_write` 为真时才写入 `ctx->write_location`，否则写 0**。pgoutput 的逐消息实际取值见下方"帧头 LSN 清单"——**`STREAM START`、`STREAM STOP`、`STREAM ABORT`、`STREAM PREPARE` 写的都是真值，不是 0** |
 | 订阅端跟踪 | `worker.c:3588-3594` | `last_received = max(last_received, start_lsn, end_lsn)`——**取最大值，不会倒退** |
 | **keepalive 走同一条路** | `walsender.c:4064-4075` `WalSndKeepalive()`；`walsender.c:3443` | keepalive 的 end_lsn 取 `sentPtr`，而**逻辑解码路径下 `sentPtr = logical_decoding_ctx->reader->EndRecPtr`——发布端的 WAL 读取位置**，不是"已送达事务的 LSN"。keepalive 在 `WalSndWaitForWal()`（`walsender.c:3519`）等处发出 |
 | 订阅端跟踪 keepalive | `worker.c:3608-3612` | `'k'` 消息分支同样执行 `last_received = max(last_received, end_lsn)`——**keepalive 与数据帧一样会抬高 `last_received`** |
+| **keepalive 的第二个来源** | `walsender.c:1718-1723` `WalSndUpdateProgress()` → `WalSndKeepalive(false, lsn)` | **跳过空事务**时（`skipped_xact && SyncRepRequested() && 同步备库状态已定义`）会发一条 keepalive，其 end_lsn 取 `ctx->write_location`（`logical.c:741`），即**那个空事务自己的 LSN**——它属于一个**尚未放行**的事务，同样必须钳制 |
 | 订阅端回报 | `worker.c:3778-3785` `get_flush_position()` | 无待 apply 事务时 `flushpos = writepos = recvpos`，即回报 `last_received` |
 | 发布端落槽 | `logical.c:1836-1850`、`:1915` `LogicalConfirmReceivedLocation()` | **无条件**把 `confirmed_flush` 设为回报值，没有"不得超过已发送位置"的上限 |
 | 重启跳过判据 | `logical.c:568-591` → `snapbuild.c:358` → `decode.c:1302` → `snapbuild.c:443-446` | `start_decoding_at = confirmed_flush`；**在事务的提交/回滚记录处**用 `ptr < start_decoding_at` 判断是否整体跳过该事务 |
 
+**帧头 LSN 清单（逐消息核对；实现时按此钳制）**
+
+| wire 消息 | 调用点 | `last_write` | 帧头 LSN（`ctx->write_location`） |
+| --- | --- | --- | --- |
+| `BEGIN` | `pgoutput.c:596` | `!send_replication_origin` | 事务首条变更的 LSN（`logical.c:872` → `txn->first_lsn`） |
+| 每条变更 | `pgoutput.c:1553` | `true` | 该变更的 LSN（`logical.c:1540` → `change->lsn`） |
+| `COMMIT` | `pgoutput.c:633` | `true` | 结束记录的**终点**（`logical.c:904` → `txn->end_lsn` = `buf->endptr`） |
+| `BEGIN PREPARE` / `PREPARE` | `pgoutput.c:646` / `:664` | `!send_replication_origin` / `true` | `txn->first_lsn` / 结束记录终点（`logical.c:945` / `:990`） |
+| `COMMIT PREPARED` / `ROLLBACK PREPARED` | `pgoutput.c:678` / `:694` | `true` | 结束记录终点（`logical.c:1035` / `:1081`） |
+| `TRUNCATE` | `pgoutput.c:805`、`:810` | `false` | **0** |
+| `M`（逻辑消息） | `pgoutput.c:1695` | `true` | 该消息的 LSN（`logical.c:1587` → `message_lsn`） |
+| origin 消息 | `pgoutput.c:2427` | `true` | origin 的 LSN（`logical.c:1674`） |
+| **`STREAM START`** | `pgoutput.c:1799` | `!send_replication_origin` | **事务首条变更的 LSN**（`logical.c:1315` → `first_lsn`）——**不是 0** |
+| **`STREAM STOP`** | `pgoutput.c:1823` | **`true`（恒真）** | **该流段最后一条变更的 LSN**（`logical.c:1364` → `last_lsn`，即**段内 max**）——**不是 0** |
+| **`STREAM ABORT`** | `pgoutput.c:1855` | **`true`（恒真）** | abort 记录的**终点**（`reorderbuffer.c:2948` 传入的是 `buf->record->EndRecPtr`，`logical.c:1406` → `abort_lsn`） |
+| `STREAM PREPARE` | `pgoutput.c:1904` | `true` | 结束记录终点（`logical.c:1451`） |
+| `STREAM COMMIT` | `pgoutput.c:1884` | `true` | 结束记录终点（`logical.c:1492`） |
+
+**这张表里最危险的两行是 `STREAM STOP` 与 `STREAM START`**：前者是整段的 max，最容易越过放行前沿；后者是事务的首变更 LSN。v0.8 曾把两者都写成"写 0"，据此推导出的钳制范围会漏掉它们——**漏钳即丢事务**。
+
 **由此得到真正的安全不变式**（不是"'w' 帧 LSN 不得倒退"）：
 
-> **S1**：任何**提交记录 LSN 小于 `confirmed_flush`** 的事务，必须已经**完整送达**订阅端。
-> 因为重启后 `start_decoding_at = confirmed_flush`，提交记录 LSN 更小的事务会被 `DecodeTXNNeedSkip()` **整体跳过**——它的 BEGIN 与全部变更都不会重发。（重读本身是从 `restart_lsn` 开始的，`walsender.c:1506`，所以只要事务被重发，它就是完整的；危险的不是"重发得不完整"，而是"根本不重发"。）
+> **S1**：任何**结束记录起始 LSN 小于 `confirmed_flush`** 的事务，必须已经**完整送达**订阅端。
+> "结束记录起始 LSN" = `buf->origptr`，与跳过判据 `SnapBuildXactNeedsSkip()`（`snapbuild.c:443-446`，比较 `ptr < start_decoding_at`）的**比较口径完全一致**。
+> 因为重启后 `start_decoding_at = confirmed_flush`，结束记录起始 LSN 更小的事务会被 `DecodeTXNNeedSkip()` **整体跳过**——它的 BEGIN 与全部变更都不会重发。（重读本身是从 `restart_lsn` 开始的，`walsender.c:1506`，所以只要事务被重发，它就是完整的；危险的不是"重发得不完整"，而是"根本不重发"。）
 
 **现状（串行）为什么自动满足 S1**：reorder buffer 按 WAL 顺序处理记录，事务按提交顺序送达。设已完整送达的事务集合为 `D`（送达序 = 提交序），`M` = 已送达帧的最大 LSN。`M` 只可能来自某个已送达事务的变更帧，其 LSN ≤ 该事务的提交记录 LSN ≤ `D` 中最后一个事务的提交记录 LSN；而任何尚未送达的事务，其提交记录必然位于 WAL 中 `M` 之后（否则它早已被 reorder buffer 处理并输出）→ 提交记录 LSN > M → 重启时不会被跳过。
 
-**并行模型下 S1 在哪里被破坏**：本设计让**提交消息**按 cseq 放行（= 提交序），这一半与现状等价 ✔；但**流式分片提前送达**是新的破坏源——分片里变更帧的 LSN 可以大于某个"已提交但因 barrier 尚未放行"的事务的提交记录 LSN。于是 `M` 被抬高，越过那个事务的提交记录 → 重启后该事务被跳过 → **丢变更**。
+**并行模型下 S1 在哪里被破坏**：本设计让**提交消息**按 cseq 放行（= 提交序），这一半与现状等价 ✔；但**流式分片提前送达**是新的破坏源——分片里变更帧的 LSN 可以大于某个"已提交但因 barrier 尚未放行"的事务的结束记录起始 LSN。于是 `M` 被抬高，越过那个事务的结束记录起点 → 重启后该事务被跳过 → **丢变更**。
 
-例：T1 的提交记录 LSN = 200（cseq=1，worker 慢，提交消息尚未放行）；T2（cseq=2）已提前输出一个分片，其中变更帧 LSN = 250。则 `M = 250 > 200`，重启后 `start_decoding_at = 250`，**T1 被整体跳过**。
+例：T1 的结束记录起始 LSN = 200（cseq=1，worker 慢，提交消息尚未放行）；T2（cseq=2）已提前输出一个分片，其中变更帧 LSN = 250。则 `M = 250 > 200`，重启后 `start_decoding_at = 250`，**T1 被整体跳过**。
 
-**还有第二个破坏源：keepalive。** 上表的两行说明 `'k'` 消息与 `'w'` 帧走的是同一条 `last_received` 通道，而 keepalive 的 end_lsn 取的是 `sentPtr` = **发布端的 WAL 读取位置**。串行下这个值是安全的——因为串行时"提交记录 LSN < `sentPtr` 的事务都已送达"（reorder buffer 按 WAL 序逐个输出，见上一段）。并行 + 尽早流式破坏的正是这条不变式：一个**已提交但因 barrier 尚未放行**的事务，其提交记录 LSN 可能远小于 WAL 读取位置。于是 keepalive 一发，`confirmed_flush` 就被抬到放行前沿之上 → 重启后该事务被整体跳过 → **丢变更**。
+**口径的方向性必须钉死**：上例里若把 T1 的 LSN 取成结束记录的**终点**（`buf->endptr`，帧头里写的就是它），F 就会落在（起点, 终点] 区间内，`confirmed_flush` 可能大于起点而小于终点 → 重启后 T1 仍被跳过 → **丢变更**。因此 F 一律取**记录起点**（7.4）。
+
+**还有第二个破坏源：keepalive。** 上表的两行说明 `'k'` 消息与 `'w'` 帧走的是同一条 `last_received` 通道，而 keepalive 的 end_lsn 取的是 `sentPtr` = **发布端的 WAL 读取位置**。串行下这个值是安全的——因为串行时"结束记录起始 LSN < `sentPtr` 的事务都已送达"（reorder buffer 按 WAL 序逐个输出，见上一段）。并行 + 尽早流式破坏的正是这条不变式：一个**已提交但因 barrier 尚未放行**的事务，其结束记录起始 LSN 可能远小于 WAL 读取位置。于是 keepalive 一发，`confirmed_flush` 就被抬到放行前沿之上 → 重启后该事务被整体跳过 → **丢变更**。
+
+**keepalive 有两个 LSN 来源，两个都要钳**：主路径是 `sentPtr`（发布端 WAL 读取位置，`walsender.c:3443`、`:4071`）；次路径是**跳过空事务**时的 `ctx->write_location`（`walsender.c:1718-1723`），它是那个空事务自己的 LSN，属于一个尚未放行的事务。
 
 **结论：钳制不能只做在数据帧上，必须覆盖所有携带 LSN 的 wire 消息**——`'w'` 帧头与 `'k'` keepalive 都要钳。
 
 因此 O3 的实现必须附带一条约束：
 
-> **C9（改写）**：wire 上任何一条携带 LSN 的帧，其 LSN **不得超过"下一个待放行事务（cseq = 放行水位 + 1）的提交记录 LSN"**。
-> 非流式事务的整事务字节因此必须跟随 cseq 一起放行；**流式分片必须被钳制**——walsender 在转发分片帧时把帧头两个 int64 改写为 `min(帧内 LSN, 放行前沿 LSN)`（详见 7.4）；**keepalive 的 end_lsn 必须同样钳制**，不能直接用 `sentPtr`（发布端的 WAL 读取位置）。
+> **C9（改写）**：wire 上任何一条携带 LSN 的帧，其 LSN **不得超过放行前沿 F**（定义见 7.4）。
+> 非流式事务的整事务字节因此必须跟随 cseq 一起放行；**流式分片必须被钳制**——walsender 在转发分片帧时把帧头两个 int64 改写为 `min(帧内 LSN, F)`（详见 7.4），**逐帧钳制**，不能整块只钳一次；**keepalive 的 end_lsn 必须同样钳制**，它的两个来源（`sentPtr` = 发布端 WAL 读取位置；跳过空事务时的 `ctx->write_location`）都要钳。
+>
+> **钳制用的是 F，而 F 必须取结束记录的"起点"**（`buf->origptr`），因为跳过判据 `SnapBuildXactNeedsSkip()` 比较的就是记录起点。**帧头里写的 `txn->end_lsn` 是记录终点**（`buf->endptr`）——两者不可混用：用终点做 F 会让 `confirmed_flush` 落在（起点, 终点] 区间内，重启后该事务被整体跳过（丢变更）。
 
 注意这**不是**"'w' 帧 LSN 不得倒退"：现状串行实现本身就产生倒退的帧 LSN（后提交事务的 BEGIN 帧 LSN 可能小于先提交事务的 COMMIT 帧 LSN），订阅端用取最大值的方式正是为此设计的。真正的判据是 S1。
 
@@ -695,13 +731,39 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 
 | 条目 | 何时产生 | 载荷 |
 | --- | --- | --- |
-| `PD_ENT_SESSION_INIT` | 会话建立时（walreader 启动后、转发任何 WAL 记录之前） | 订阅端的**流式模式值**（`LOGICALREP_STREAM_ON` / `LOGICALREP_STREAM_PARALLEL` / 不流式）、协商后的协议版本、复制槽名 |
+| `PD_ENT_SESSION_INIT` | 会话建立时（walreader 启动后、转发任何 WAL 记录之前） | **原始插件选项列表**（`LogicalDecodingContext.output_plugin_options` 的同一份拷贝，见事实 8c——worker 必须靠它解析出 `PGOutputData.streaming` 的模式值）、协商后的协议版本、复制槽名 |
 | `PD_ENT_WAL` | 一批属于该 worker 的事务的 WAL 记录 | 记录数 + 每条记录（见下） |
 | `PD_ENT_SNAPSHOT` | 事务首条记录之前 / 目录事务提交时 | 快照版本号 + 随附的失效消息 |
 | `PD_ENT_GLOBAL_INVAL` | `XLOG_XACT_INVALIDATIONS` 且 xid 无效 | 失效消息数组（广播到所有 worker，见 6.5） |
-| `PD_ENT_TXN_END` | 读到事务结束记录 / 检测到 cancel | xid、结束类型、**cseq**、**结束记录的 LSN 与载荷**（见下） |
+| `PD_ENT_TXN_END` | 读到**顶层**事务结束记录 / 检测到 cancel | xid、结束类型、**cseq**、**结束记录的 LSN 与载荷**（见下） |
+| `PD_ENT_SUBXACT_ABORT` | 读到**子事务**的 abort 记录 | 顶层 xid、**子 xid**、abort 记录的起始 LSN、abort 时间（见下） |
 
-**`PD_ENT_SESSION_INIT` 必须排在所有其它条目之前。** worker 的 output plugin 实例（6.1）在实例化时就要确定 `ctx->streaming`——它决定了**是否允许流式**（`ReorderBufferCanStartStreaming()`，`reorderbuffer.c:4028-4047`）与**`STREAM ABORT` 的载荷格式**（事实 8c）。这两项都只由订阅端的 `START_REPLICATION` 选项决定，worker 自己无从得知，因此必须由 walsender 在会话建立时统一下发，且早于任何 `PD_ENT_WAL`（否则 worker 可能已经按错误的模式产出了字节）。
+**`PD_ENT_SESSION_INIT` 必须排在所有其它条目之前。** worker 的 output plugin 实例（6.1）在实例化时就要确定两件事：**是否允许流式**（`ctx->streaming`，bool；参与 `ReorderBufferCanStartStreaming()`，`reorderbuffer.c:4028-4047`）与**`STREAM ABORT` 的载荷格式**（由 `PGOutputData.streaming` 的**模式值**决定，事实 8c）。这两项都只由订阅端的 `START_REPLICATION` 选项决定，worker 自己无从得知，因此必须由 walsender 在会话建立时统一下发，且早于任何 `PD_ENT_WAL`（否则 worker 可能已经按错误的模式产出了字节）。
+
+**下发的必须是原始选项列表，而不是加工过的模式值。** `data->streaming` 是 pgoutput 从选项列表里解析出来的（`pgoutput.c:366-374`），只下发一个模式字符无法复原它，也无���表达同一份选项里的其它开关（`binary` / `messages` / `two_phase` / `publish_no_origin`）。因此 `PD_ENT_SESSION_INIT` 携带**与 walsender 自己那份完全相同的选项列表**，worker 用它实例化自己的插件实例。
+
+**子事务 abort 是另一类事件，必须走单独的条目——它不是顶层事务的收尾。**
+
+`ROLLBACK TO SAVEPOINT` 会写一条**独立的** `XLOG_XACT_ABORT` 记录，其 `xl_xid` 是**子 xid**而不是顶层 xid（`xloginsert.c:926` 的 `rechdr->xl_xid = GetCurrentTransactionIdIfAny()` 在子事务里返回子 xid；`xact.c:1725`、`:1781-1793` 的 `RecordTransactionAbort(isSubXact = true)`）。解码侧对两种 abort 记录的处理是不同的：
+
+| abort 记录 | `xl_xid` | 记录内容 | 解码侧动作 |
+| --- | --- | --- | --- |
+| 顶层 abort | 顶层 xid | 带**被中止的子 xact 数组**（`xactdesc.c:141-185` 的 `parsed->subxacts[]`） | `decode.c:862-872`：先**逐个** abort 子 xact（每个都可能产出自己的 `STREAM ABORT`），**最后**才 abort 顶层 |
+| 子事务 abort | 子 xid | 无子 xact 数组 | `decode.c:874-875`：只 abort 该子 xact |
+
+**若把子事务 abort 当成顶层事务的结束事件处理，会静默丢数据。** 订阅端对 `STREAM ABORT` 的落地动作是**截断 spool 文件**：`worker.c:1791-1793` `BufFileTruncateFileSet(fd, subxact_data.subxacts[subidx].fileno, subxact_data.subxacts[subidx].offset)`，紧接着 `worker.c:1796` `subxact_data.nsubxacts = subidx;`——**连同其后已写入 spool 的子事务变更一起丢掉**。因此：
+
+- `STREAM ABORT` **不能推迟到顶层提交时再下发**。若推迟，截断发生时，其后子事务的有效变更已经被写入 spool 并被一并丢弃 → **丢数据**；
+- `STREAM ABORT` **也不能走普通流段块**——事实 13 规定 wire 上同时只能有一个打开的流段，订阅端在 `STREAM ABORT` 到达时若仍有打开的流段，会 `ereport(ERROR, "STREAM ABORT message without STREAM STOP")`（`worker.c:1824-1827`）→ 会话失败。
+
+因此子事务 abort 的下发规则是：
+
+1. **不分配 cseq、不受 barrier 门控**——它属于一个尚未提交的事务，没有提交序可言；
+2. **必须由持有该事务的 worker 在 WAL 顺序位置即时产出**，即在后续子事务的变更到达订阅端**之前**；
+3. **独占一块**（新增块类型 `PD_BLK_ABORT`，见 5.2.3），**wire 上连续**；
+4. 载荷：`toplevel_xid` / `subxid` / `abort_lsn` / `abort_time`，与 pgoutput 的 `logicalrep_write_stream_abort()`（`proto.c:1166-1184`）的字段一一对应——**worker 必须自己构造这段协议字节**，因为它不在任何一条 `PD_ENT_WAL` 记录里（结束记录按 5.2.2 的筛选规则被排除在 `PD_ENT_WAL` 之外）。
+
+**顶层 abort 可能连带产出多条 `STREAM ABORT`。** 顶层 abort 记录里的每个子 xact 都可能被中止，且每个被中止的子 xact 若已流式化就会产出自己的 `STREAM ABORT`（`reorderbuffer.c:2945-2951` 的 `rbtxn_is_streamed(txn)`），最后才是顶层自己的那条。**这 N+1 条都属于同一个顶层 abort 的收尾**，但它们的门控归属不同：子 xact 的那些**不占 cseq、不受门控**（即时下发），顶层那一条**占该顶层 abort 的 cseq、受门控**（随 barrier 放行）。
 
 **`PD_ENT_TXN_END` 必须携带结束记录本身的数据。** 事务结束记录（COMMIT / ABORT / PREPARE / COMMIT PREPARED）按 5.2.2 的筛选规则**不进入 `PD_ENT_WAL`**，worker 永远看不到它们。而 worker 侧的收尾工作需要这些字段：
 
@@ -774,6 +836,7 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | --- | --- | --- |
 | `PD_BLK_SEG` | 一个流段的字节：`STREAM_START` … `STREAM_STOP` | O2 / INV-2.1、INV-2.2（事实 13） |
 | `PD_BLK_TXN` | 一个**非流式**事务的完整字节：`BEGIN` … 变更 … `COMMIT` | 订阅端的 `in_remote_transaction` 状态（`worker.c:1006` / `:1035`）：`BEGIN` 与 `COMMIT` 之间不得插入别的字节，否则 `remote_final_lsn` 被覆盖，后续 `COMMIT` 会触发 `ereport(ERROR, "incorrect commit LSN ...")` |
+| `PD_BLK_ABORT` | 一条子事务 abort 的字节：`STREAM ABORT`（顶层 xid + 子 xid） | 事实 13（wire 上同时只能有一个打开的流段）与订阅端的截断语义（`worker.c:1824-1827`）：`STREAM ABORT` 到达时**不得有打开的流段**，因此它独占一块 |
 
 两者都必须**整块连续**出现在 wire 上，因此统一用 FIRST / MORE / LAST 边界标记表达，walsender 的规则完全一致：**一次取一整块，块未取完不得取其它 worker 的块**（C5）。
 
@@ -796,6 +859,7 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | `PD_BLK_TXN` | **是** | 块内的 `COMMIT` 必须与更早的 cseq 保持相对顺序 |
 | `PD_ENT_EVENT`（STREAM_COMMIT / STREAM_ABORT） | **是** | 同上 |
 | `PD_ENT_EVENT{END_ACK}` | **是** | 它本身就是 barrier 的推进凭据 |
+| `PD_BLK_ABORT`（子事务 abort） | **否** | 它属于一个**尚未提交**的事务，没有提交序可言；**必须即时下发**，否则订阅端的 spool 截断会连带丢弃其后子事务的有效变更（见 5.2.2） |
 
 因此 `PD_BLK_TXN` 必须**自带 cseq**（C11）。walsender 不能靠 `PMSG_COMMIT_SEQ` 来关联它——那是 walreader → walsender 的另一条通道，与 worker 的输出队列之间没有先后关系，两条通道的消息到达顺序不可比。
 
@@ -954,7 +1018,7 @@ WAL 页缓冲 --memcpy--> decode_buffer --memcpy--> shm_mq 环（memcpy）
 | `SnapBuildCurrentState(builder) < SNAPBUILD_FULL_SNAPSHOT` | `decode.c:475` | 一个**状态位** | 共享内存中的状态块（walreader 每批更新） |
 | `SnapBuildProcessChange(builder, xid, lsn)` | `decode.c:477` | 判定"该事务是否已有 base snapshot"，没有就分配 | walreader 完成分配并下发 `PD_ENT_SNAPSHOT`；worker 只需回答"本事务是否已有快照" |
 | `SnapBuildXactNeedsSkip(builder, lsn)` | `reorderbuffer.c:4037` | `ptr < builder->start_decoding_at`（`snapbuild.c:443-446`），**一个 LSN 比较** | 共享状态块里的 `start_decoding_at` |
-| `ReorderBufferCanStartStreaming()` | `reorderbuffer.c:4028-4047` | 上述状态 + `ctx->streaming` + `ctx->reader->ReadRecPtr` | 状态块 + `ctx->streaming`（worker 侧常量，取值 = 订阅端模式，见事实 8c）+ 本地记录 LSN |
+| `ReorderBufferCanStartStreaming()` | `reorderbuffer.c:4028-4047` | 上述状态 + `ctx->streaming`（**bool**）+ `ctx->reader->ReadRecPtr` | 状态块 + `ctx->streaming`（worker 侧常量，**取 true**——见事实 8c：它是 bool，不承载模式）+ 本地记录 LSN |
 | `SnapBuildProcessNewCid(builder, xid, lsn, xlrec)` | `snapbuild.c:828-861` | 三个 **reorder buffer** 调用：`ReorderBufferXidSetCatalogChanges` / `ReorderBufferAddNewTupleCids` / `ReorderBufferAddNewCommandId` | worker 侧替身直接调这三个 reorder buffer 函数（它们本来就在 worker 侧） |
 | `ReorderBufferSetRestartPoint(rb, ptr)` | `snapbuild.c:1887`、`:2051` | 把 `rb->current_restart_decoding_lsn` 设为 `ptr` | **不跨进程**——由 walreader 维护自己的本地镜像（见下） |
 
@@ -1099,7 +1163,11 @@ worker 侧的替身只需提供三个函数：
 | 情形 | 采用的 xmin | 理由 |
 | --- | --- | --- |
 | 所有 worker 均已上报且未超时 | `min(各 worker 上报值)` | 精确，槽可正常推进 |
-| 任一 worker 超时未上报 | `running->oldestRunningXid` | 保守，宁可停滞也不能提前回收目录 |
+| 任一 worker 超时未上报 | **`min(各 worker 最后一次成功上报的值, running->oldestRunningXid)`**，且**只允许沿用历史最小值、不允许前进** | 保守，宁可停滞也不能提前回收目录 |
+
+**兜底值不能只用 `oldestRunningXid`。** `oldestRunningXid` 只反映"此刻还在运行的事务"，而真正必须保住的是**所有在途事务所持快照的 xmin**——一个很老的长事务的快照 xmin 可以远小于当前的 `oldestRunningXid`（那个事务可能已经提交，但它派生的在途事务仍持有旧快照）。只按 `oldestRunningXid` 兜底会把 `catalog_xmin` 推得比安全值更激进 → 允许 vacuum 回收掉在途事务快照仍然需要的系统表元组 → 后续解码报 `catalog lookup failed` → 会话失败并反复重试。
+
+现状的正确做法可作参照：`SnapBuildAdjustXmin()`（`snapbuild.c:1300-1355`）取 `xmin = ReorderBufferGetOldestXmin(builder->reorder)`（`reorderbuffer.c:1047-1061`，即最老在途事务的 base snapshot xmin），**只有在一个在途事务都没有时**才回退到 `running->oldestRunningXid`。并行模型下"最老在途事务"分布在各 worker，因此兜底必须取各 worker 上报值的最小值。
 
 上报周期与超时阈值必须相互配合：`XLOG_RUNNING_XACTS` 的周期约为 `wal_writer_delay`（默认 10s），因此超时阈值必须大于它，否则会周期性地退到保守值。
 
@@ -1129,7 +1197,20 @@ else if (txn == NULL && ...)
 
 `restart_lsn` 的汇总**不需要 worker 上报**——它所需的两个值 walreader 在创建事务时就都有了。worker 侧的 `txn->restart_decoding_lsn` 是本地状态，不参与槽的推进。
 
-**推进判据必须一并修正。** `LogicalIncreaseRestartDecodingForSlot()` 的生效条件是 `current_lsn <= slot->data.confirmed_flush`（`logical.c:1783-1790`）。这个条件假设“`confirmed_flush` 之前的数据都已发完”，在并行模型下不再成立（见 7.4 关于 `'w'` 帧 LSN 的讨论）：事务 T 的数据可能还在 worker 里没解码完，订阅端却已经把 `confirmed_flush` 推过了 T 的位置。因此判据必须增加一条：**所有 worker 上 LSN 小于 `current_lsn` 的事务都已提交并输出完毕**。
+**推进判据必须一并修正。** `LogicalIncreaseRestartDecodingForSlot()` 的生效条件是 `current_lsn <= slot->data.confirmed_flush`（`logical.c:1783-1790`）。这个条件假设“`confirmed_flush` 之前的数据都已发完”，在并行模型下不再成立（见 7.4 关于 `'w'` 帧 LSN 的讨论）：事务 T 的数据可能还在 worker 里没解码完，订阅端却已经把 `confirmed_flush` 推过了 T 的位置。
+
+因此判据必须**整体替换**，而不是"在原条件上再增加一条"——原条件本身在并行模型下几乎恒不成立：`current_lsn` 是 walreader 的 WAL 读取位置，而 `confirmed_flush` 被放行前沿钳制后 ≤ F ≤ 读位置，于是 `restart_lsn` 只能一直挂在 `candidate_restart_valid` 上等确认 → **WAL 无限保留**（槽保留全部 WAL）。
+
+替换后的判据与配套协议：
+
+| 要素 | 内容 |
+| --- | --- |
+| `current_lsn` | walreader 的 WAL 读取位置（不再与 `confirmed_flush` 比较） |
+| 唯一条件 | **所有 LSN 小于 `current_lsn` 的事务都已提交并输出完毕**（"输出完毕" = 该事务的所有块已被 walsender 写出） |
+| 谁提供这个事实 | walreader 的**事务绑定表**（每个事务的 `first_lsn` 与它绑定的 worker）加上各 worker 的 `END_ACK`（已带 cseq，walreader 因此知道每个事务何时收尾） |
+| 判定方法 | walreader 取绑定表中所有 `first_lsn < current_lsn` 的事务，检查它们是否都收到了 `END_ACK`；全部收到即允许推进 |
+
+**worker 侧不得依赖 `txn->restart_decoding_lsn`。** 该字段的值来自 `rb->current_restart_decoding_lsn`（`reorderbuffer.c:688`），而 worker 的 reorder buffer 上没有人调 `ReorderBufferSetRestartPoint()` → 该值恒为 `InvalidXLogRecPtr`。**walreader 必须自己维护 `current_restart_decoding_lsn` 的本地副本**（见 6.1），并在创建事务绑定时把副本值记入绑定表——`restart_lsn` 的推进完全由 walreader 侧的绑定表算出，与 worker 的本地状态无关。
 
 #### 6.6.3 汇总消息
 
@@ -1160,6 +1241,7 @@ walreader 是 WAL 的唯一读取者，因此 WAL 顺序即提交顺序。walrea
 | PREPARE | 读到 `XLOG_XACT_PREPARE` 时 | 分配 | 是（`PREPARE` 消息） |
 | COMMIT PREPARED / ROLLBACK PREPARED | 读到对应记录时 | 分配 | 是 |
 | CANCEL | 由 `XLOG_RUNNING_XACTS` 清理游离事务时 | 分配 | **取决于是否流式**：流式事务发 `STREAM ABORT`，非流式事务不发任何消息（现状 `reorderbuffer.c:2946` 的 `ReorderBufferAbort()` 只在 `rbtxn_is_streamed(txn)` 时才调 `rb->stream_abort()`） |
+| **子事务 abort**（`ROLLBACK TO SAVEPOINT`） | 读到 `xl_xid` 为**子 xid** 的 `XLOG_XACT_ABORT` 记录时 | **不分配** | 是（`STREAM ABORT`，xid = 顶层、subxid = 子 xid）。**不受 barrier 门控，必须即时下发**（见 5.2.2） |
 
 **CANCEL 的收尾与其它结束事件不同，必须在 worker 侧分叉。** 事务被取消时，worker 侧的本地 `ReorderBufferTXN` 仍在（它从未提交），收尾动作是 `ReorderBufferAbort()`：
 
@@ -1168,7 +1250,9 @@ walreader 是 WAL 的唯一读取者，因此 WAL 顺序即提交顺序。walrea
 
 两种情况的 `END_ACK` 都必须发出。
 
-cseq 单调递增且连续分配（每个事务结束事件占一个序号），因此“空洞检测”退化为简单的“水位 + 计数”，无需复杂的乱位图。
+cseq 单调递增且连续分配（每个**顶层**事务结束事件占一个序号），因此“空洞检测”退化为简单的“水位 + 计数”，无需复杂的乱位图。**子事务 abort 不占 cseq**——它不是提交事件，且必须即时下发（5.2.2）。
+
+**walreader 必须能区分顶层 abort 与子事务 abort**：判据是 abort 记录的 `xl_xid` 是否命中自己的事务绑定表——命中即为顶层 abort（占一个 cseq），否则是子 xid（不占 cseq）。
 
 **cseq 分配与结束事件的处理是两件事。** walreader 分配 cseq 后，必须把结束事件（`PD_ENT_TXN_END`）路由给**持有该事务的 worker**——只有 worker 侧的本地 reorder buffer 持有该事务，才能执行收尾工作（结算流式分片、发出 commit/abort 消息、执行累积的失效、释放快照）。walreader 自己没有事务对象，不做这些事。
 
@@ -1226,11 +1310,11 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 **”数据可乱序”有一个必须明确的边界，形式与直觉不同：不是”'w' 帧 LSN 不得倒退”，而是 4.1.3 给出的不变式 S1。**
 
-要点回顾（推导见 4.1.3 的表）：帧头 LSN 只在 `last_write=true` 时才是真值（BEGIN、每条变更、COMMIT、PREPARE、STREAM COMMIT；STREAM START/STOP 写 0）；订阅端用**取最大值**跟踪 `last_received`；发布端把该值**无条件**写进 `confirmed_flush`；而重启时 `start_decoding_at = confirmed_flush`，**提交记录 LSN 小于它的事务会被整体跳过**。**keepalive 的 end_lsn 走同一条通道**（`'k'` 分支同样执行 `last_received = max(...)`），而它的取值是发布端的 WAL 读取位置——因此它同样受放行前沿约束。
+要点回顾（推导见 4.1.3 的表）：帧头 LSN 只在 `last_write=true` 时才是真值——**逐消息清单见 4.1.3，其中 `STREAM START`、`STREAM STOP`、`STREAM ABORT`、`STREAM PREPARE` 都写真值，不是 0**；订阅端用**取最大值**跟踪 `last_received`；发布端把该值**无条件**写进 `confirmed_flush`（`logical.c:1849`，**没有单调性检查**）；而重启时 `start_decoding_at = confirmed_flush`，**结束记录起始 LSN 小于它的事务会被整体跳过**（判据比的是**记录起点**：`decode.c:1302` 传 `buf->origptr`，`snapbuild.c:443-446` 比 `ptr < start_decoding_at`）。**keepalive 的 end_lsn 走同一条通道**（`'k'` 分支同样执行 `last_received = max(...)`），它的**两个来源**都要钳。
 
 于是安全条件是：
 
-> **S1**：任何**提交记录 LSN < `confirmed_flush`** 的事务，必须已经**完整送达**。
+> **S1**：任何**结束记录起始 LSN < `confirmed_flush`** 的事务，必须已经**完整送达**。（"结束记录起始 LSN" = `buf->origptr`，与跳过判据同口径。）
 
 串行现状自动满足它，因为事务按提交序送达、且 reorder buffer 按 WAL 序处理记录（任何变更帧的 LSN 都不会越过尚未输出的更早提交记录）。
 
@@ -1249,15 +1333,24 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 - **(b) 覆盖非流式事务**：它们的整事务字节（含 COMMIT）必须等自己的 cseq 被放行，因此其帧 LSN ≤ 自己的提交记录 LSN ≤ 放行前沿 ✔。
 - **(c) 覆盖流式分片与 keepalive**：分片不属于任何已放行事务，必须显式钳制；keepalive 同理——**它的 end_lsn 不能直接用 `sentPtr`**。
 
+**钳制为什么是安全的（实现者必须先知道这一点，否则不敢钳）**：订阅端只把帧头 LSN 用于 `last_received`（`worker.c:3590-3594`），**不用它做任何语义判断**；而 pgoutput 的变更类消息**载荷里不含变更 LSN**（`proto.c` 的所有变更写入函数都不带 `change->lsn`）。所以把帧头 LSN 钳小只会让 `last_received` 推进慢一点，不改变任何一条变更的语义。
+
+**但有一处不能钳**：`COMMIT` **载荷**里的 `end_lsn`（`txn->end_lsn` = 结束记录终点）经订阅端的 `store_flush_position()`（`worker.c:2280`）直接进入 flushpos → 回报给发布端 → 变成 `confirmed_flush`。这条路径**不钳**，因为它属于**已放行**事务，其终点天然 ≤ F（已放行事务的结束记录终点 ≤ 下一个未放行事务的结束记录起点，WAL 记录按序且不重叠）。这个论证必须写进实现说明，否则实现者可能"顺手"把载荷也钳了——那会破坏提交序判定。
+
 **放行前沿的定义（唯一口径，实现时按此写）**：
 
-> **放行前沿 F := cseq = 放行水位 + 1 的那个事务的提交记录 LSN。**
+> **放行前沿 F := min{ 所有"已分配 cseq 但尚未放行"的事务，其结束记录（COMMIT / ABORT / PREPARE / COMMIT PREPARED / ROLLBACK PREPARED）的**起始** LSN }。**
 
-- **F 的来源**：walreader 在读到事务结束记录、分配 cseq 时得知该提交记录 LSN，通过控制通道按 cseq 递增的顺序把 “cseq → 提交记录 LSN” 的映射发给 walsender；walsender 用它与自己的放行水位合成 F。**映射是有序的**，因此 walsender 永远知道 F 对应的是哪个 cseq。
-- **F 未知时怎么办**：只在会话刚开始、cseq = 放行水位 + 1 尚未分配时，F 未知。此时唯一的合法取值是**会话开始时的槽 `confirmed_flush`**（此时不存在”已提交但未放行”的事务）。
-- **明确禁止的取值**：**不得用”当前 WAL 读取位置”作为 F 的替代**。这是本设计最容易踩的坑：cseq 是在**读到结束记录时**分配的（7.1），而放行水位远滞后于 WAL 读取位置——稳态下”下一个待放行事务”的 cseq 早已分配好，F 是精确已知的；而一旦实现者按”拿不到精确值就用 WAL 读取位置”来处理，F 会越过某个已提交但未放行事务的提交记录 LSN，**直接破坏 S1**。
+- **口径必须与跳过判据完全一致**：跳过判据 `SnapBuildXactNeedsSkip()`（`snapbuild.c:443-446`）比较的是 `ptr < builder->start_decoding_at`，而 `ptr` 是**结束记录的起点**（`decode.c:1302` 传的是 `buf->origptr`）。因此 F 必须取 `buf->origptr`，**不得取 `buf->endptr`**（后者才是帧头里写的那个 LSN，也是 `txn->end_lsn`）。取错方向的后果：`confirmed_flush` 落在（起点, 终点] 区间内 → 重启后 `start_decoding_at` 大于该事务的记录起点 → **整个事务被跳过 → 丢变更**。
+- **abort 事务没有"提交记录"**：它用 **abort 记录的起始 LSN**（比 commit 起点更早，保守，安全）。
+- **F 的来源**：walreader 在读到事务结束记录、分配 cseq 时得知该记录起始 LSN，通过控制通道按 cseq 递增的顺序把 "cseq → 结束记录起始 LSN" 的映射发给 walsender；walsender 取所有"已分配但未放行"项的最小值合成 F。**映射是有序的**，walsender 因此永远知道 F 对应哪些 cseq。
+- **F 未知（集合为空）时怎么办**：集合为空意味着"walreader 已读到的结束记录全部放行"——**这不只是会话刚开始的特例，也是稳态常态**（发布端空闲、或只有低负载的非事务 WAL 时）。此时 F := **walreader 认证过的读取位置**，认证条件是"walreader 已读到的全部结束记录都已放行"，该认证必须**与映射一起下发**。
+- **明确禁止的取值**：**不得用"未经 walreader 认证的 WAL 读取位置"作为 F 的替代**。这是本设计最容易踩的坑：cseq 是在**读到结束记录时**分配的（7.1），而放行水位滞后于 WAL 读取位置；一旦实现者按"拿不到精确值就用 WAL 读取位置"来处理，F 会越过某个已提交但未放行事务的结束记录起点，**直接破坏 S1**。
+- **同样禁止的兜底**：**不得用"会话开始时的槽 `confirmed_flush`"**。集合为空是稳态常态而非例外；用会话起点的 `confirmed_flush` 兜底会把前沿**永久冻结在会话起点**——所有帧的 LSN 被钳到一个极小的常量 → 订阅端的 `last_received` 停在那里 → 它的 `lsn_mapping` 一旦被清空，`send_feedback()` 就用 `recvpos` 当 flushpos 上报（`worker.c:3753-3836`）→ 发布端 `LogicalConfirmReceivedLocation()` **无条件**写 `confirmed_flush`（`logical.c:1849`）→ **`confirmed_flush` 被拉回会话起点**，破坏 §17.7 的单调前进不变式，重连后整段区间被重发。
+- **取样次序（硬约束）**：walsender 写任何一帧之前必须按 **① 更新放行水位 → ② 取样 F → ③ 写帧** 的顺序执行。否则刚被放行的事务，其 `COMMIT` 帧头 LSN（= 记录终点）会被钳到它自己记录起点之下 → 订阅端 `recvpos` 回退 → 同样造成 `confirmed_flush` 回退。
+- **单调性要求**：钳制后的帧 LSN **不得小于所有已放行事务的结束记录终点 LSN**（已放行事务的终点天然 ≤ 下一个未放行事务的起点，因为 WAL 记录按序且不重叠），否则 `recvpos` 会倒退。
 
-**放行前沿还有一个必须注意的边界**：它约束的是**下一个待放行事务**的提交记录 LSN，而不是所有事务。若 walsender 已经放行到 cseq = k，则 F = 事务 k+1 的提交记录 LSN；任何已送达帧的 LSN 都不得越过它。这条约束由 walsender 单点执行——它是唯一同时知道”放行水位”与”正在转发的帧”的地方。
+**放行前沿还有一个必须注意的边界**：它约束的是**尚未放行的事务**，而不是所有事务。若 walsender 已经放行到 cseq = k，则 F 取 cseq > k 的那些事务的结束记录起始 LSN 的最小值；任何已送达帧的 LSN 都不得越过它。这条约束由 walsender 单点执行——它是唯一同时知道"放行水位"与"正在转发的帧"的地方。
 
 对流式事务，事务的最后一个分片与它的 `STREAM COMMIT` 之间隔着一个 cseq 屏障，会略微推迟提交可见性；这是可接受的代价，现状的串行实现本就有同样的提交路径队头阻塞。
 
@@ -1365,6 +1458,10 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | 快照无法达到 consistent | walreader | 报错终止（与现有 `DecodingContextFindStartpoint()` 行为一致） |
 | 队列积压超阈值 | walreader | 停止向该 worker 分配新事务（背压，非故障） |
 | 订阅端断开 / TCP 阻塞 | walsender | 现有 `WalSndKeepalive` 与反馈机制处理；阻塞压力自然反压 |
+| **订阅端 apply worker 崩溃** | 发布端 walsender | 订阅端 leader apply worker 同时承担 walreceiver 职责，崩溃即连接断开 → 发布端侧表现为"订阅端断开"，会话终止、槽释放；订阅端重启后从 `restart_lsn` 重放 |
+| **订阅端整库重启** | 发布端 walsender | 同上 |
+
+**订阅端侧故障在发布端的语义只有一条**：连接断开 → walsender 报错退出 → `ReplicationSlotRelease()`（`walsender.c:341`）释放槽（槽状态已落盘）→ 订阅端重连 → 新会话从 `restart_lsn` 重放。**发布端不需要为订阅端的故障做特殊处理**，但设计必须写明，因为它决定了"尽早流式"的风险边界——见 17.7 的"至少一次语义"与"会话重建后的订阅端状态复位"。
 
 原则：**任何可能造成变更丢失或乱序的故障，一律以终止会话的方式暴露，不做静默降级。** 若需要“降级为串行”的容错能力，应通过 GUC 显式开启并记录告警日志。
 
@@ -1577,6 +1674,13 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | P6 尽早流式 | 分片切分与提前下发 | 流式模式 GUC（`auto` / `immediate` / `buffered`，按订阅端模式解析）、批次粒度切分、结果区提前发送；**walsender 按放行前沿钳制分片帧 LSN 与 keepalive 的 end_lsn**（7.4 的方案 c） | 大事务在解码完成前即可到达订阅端（AC-4）；**且提前送达的分片与 keepalive 都不会把 `confirmed_flush` 抬到未放行事务的提交记录之上**（不变式 S1，用 kill/restart 实验验证无丢数据）；**非 parallel 订阅方的行为与现状一致**（未被强制流式化，8.1） |
 | P7 故障恢复 | 进程生命周期与故障处置 | worker 状态字、`bgw_notify_pid` 通知、barrier 超时、退出码与 `bgw_restart_time` 约束、cseq 作废路径 | kill worker 后会话及时终止而非静默停滞；重启后可从 `restart_lsn` 续传（AC-10、AC-11） |
 
+**P0 必须先有帧级比对工具与黄金文件。** 并行路径的正确性判据是"**与串行路径逐字节等价**"，没有这个工具就无法判定任何后续阶段是否引入了字节差异。因此 P0 的产出里必须包含：
+
+- 一个**帧级 dump / diff 工具**：把串行路径与并行路径产出的 wire 字节按帧（`'w'` / `'k'` / `'r'` / `'c'`）拆开并逐帧比对，输出第一处差异的帧序号、帧类型与两个 int64 头；
+- 一组**黄金文件**：在固定的 WAL 输入上，记录串行路径的帧序列，作为并行路径的比对基准。
+
+比对时必须允许两类**有意的**差异并显式列出：帧的**顺序**（并行路径的流段可以提前）与帧头 LSN 的**钳制值**（并行路径的钳制后 LSN 可能小于串行路径的原值）。除此之外的任何差异都是缺陷。
+
 推进顺序上的三条约束：
 
 1. **P1 之前不改解码路径。** 先把 WAL 读取搬走、解码仍留在 walsender，用现有路径验证进程拆分本身没有引入行为差异。
@@ -1698,8 +1802,9 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 | `restart_lsn` 单调前进 | 由 walreader 侧的绑定表算出**最老在途事务**的 `restart_decoding_lsn`，再经 `PMSG_WATERMARK_ADVANCE` / `PMSG_WATERMARK_ACK` 交 walsender 单点推进（6.6.2）。**它的推进判据不是"收到订阅端反馈"**，而是"该 LSN 之前的所有事务都已提交并输出完毕"——订阅端反馈只决定 `confirmed_flush`，两者是两条独立的路径（见下） |
 | `confirmed_flush` 单调前进 | 只反映订阅端已确认的位置（`LogicalConfirmReceivedLocation()` 无条件写入，无上界） |
 | 重放范围 = 未确认区间 | 重发的内容由 `restart_lsn` 与 `confirmed_flush` 共同界定，即“订阅端尚未确认”的区间 |
-| **跳过判据受控** | 重启时 `start_decoding_at = confirmed_flush`，**提交记录 LSN 小于它的事务会被整体跳过**（`decode.c:1302` → `snapbuild.c:443-446`）。因此必须保证不变式 S1（4.1.3）：已送达帧的 LSN 不得超过下一个待放行事务的提交记录 LSN |
-| 至少一次语义 | 订阅端可能收到已 apply 但未确认的事务而重复 apply。这是逻辑复制的既有语义，本设计不改变它 |
+| **跳过判据受控** | 重启时 `start_decoding_at = confirmed_flush`，**结束记录起始 LSN 小于它的事务会被整体跳过**（`decode.c:1302` 传 `buf->origptr` → `snapbuild.c:443-446` 比 `ptr < start_decoding_at`）。因此必须保证不变式 S1（4.1.3）：已送达帧的 LSN 不得超过放行前沿 F，而 F 用的是**结束记录起始 LSN** |
+| 至少一次语义 | **重发 = 至少一次**：已放行但未被订阅端确认（`confirmed_flush` 未覆盖）的事务会被重发。**去重靠发布端"跳过 `confirmed_flush` 之前的事务"实现（即不变式 S1），而不是让订阅端重复 apply**——PG 靠 replication origin 的 `remote_lsn`（`worker.c:2267` `replorigin_session_origin_lsn = commit_data->end_lsn`、`worker.c:4500` `origin_startpos = replorigin_session_get_progress(false)`）保证不重复 apply。**S1 一旦被破坏，重复 apply 才会真的发生** |
+| 会话重建后订阅端状态复位 | 被流式化的事务在会话中断后处于"半个事务"状态，重连后必须整段重发。订阅端的 `in_streamed_transaction` / `stream_xid` 状态必须复位（`worker.c:302-309`），否则第二个 `STREAM START` 会触发 `ereport(ERROR, "duplicate STREAM START message")`（`worker.c:1476-1479`）。**"尽早流式"意味着同一个事务的多个流段可能在多次会话中被反复重发**，必须验证订阅端每次都能干净复位 |
 | 绝不静默丢数据 | 任何不确定状态一律以终止会话暴露（第 9 章），不做静默降级 |
 | 会话内自洽 | cseq 分配者、cseq 消费者、共享内存区域三者同生共死 |
 
@@ -1726,6 +1831,10 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 6. **worker 状态字必须放在共享内存中。** 使“谁持有哪个 cseq”在故障后仍可判定（17.3）。
 7. **walreader 死亡必须立即使本会话的 cseq 作废。** 不等超时（17.4）。
 8. **槽相关的操作仍只由 walsender 执行**（FR-12）。walreader 与 worker 都不得直接操作复制槽。
+9. **walreader 必须维护 `current_restart_decoding_lsn` 的本地副本**，并在创建事务绑定时把副本值写入绑定表。`ReorderBufferSetRestartPoint()` 的目标改为 walreader 自己的 reorder buffer；**worker 不得依赖 `txn->restart_decoding_lsn`**（它恒为 `InvalidXLogRecPtr`，见 6.1、6.6.2）。
+10. **放行前沿 F 必须取结束记录的起始 LSN**（`buf->origptr`），且**逐帧钳制**——帧头两个 int64 一起钳，keepalive 的两个 LSN 来源都要钳（4.1.3、7.4）。
+11. **子事务 abort 必须即时下发**：不占 cseq、不受 barrier 门控、独占一块，且必须早于其后子事务的变更到达订阅端（5.2.2、5.2.3）。
+12. **worker 必须拿到原始插件选项列表**（`PD_ENT_SESSION_INIT`），并据此实例化自己的 output plugin——模式值在 `PGOutputData.streaming` 里，`ctx->streaming` 只是 bool（事实 8c、6.1）。
 
 ## 附录 A 术语表
 
@@ -1759,4 +1868,5 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 | v0.5 | 2026-11-18 | **新增第 4.1 节"顺序保证模型：三层契约"**：把顺序要求显式拆成 O1 事务内序 / O2 流段 framing 序 / O3 结束事件序三层，各配不变式与派生约束 C1–C10。**第 5 章按三层契约重写**：下行载荷必须是原始 WAL 记录（含推导）、下行/上行条目与块类型、控制类消息、低拷贝链（含 `shm_mq` 的 memcpy）、唤醒与 `force_flush` 策略、流控。**第 6 章重写**：base snapshot 的分配权归 walreader（worker 侧用只读替身）、快照版本池、xid-less 失效广播、复制槽的 xmin 与 restart_lsn 两个跨进程聚合点。**第 7 章**：barrier 靠结束事件确认（可为空）推进，PREPARE 不解绑事务，`'w'` 帧 LSN 不倒退。**第 8 章**：修正"协议 v4 允许同时流式多个事务"的事实错误、段的字节上限、并行模式禁用落盘。**同步修订** 2.3 记录分类、3.1 职责表、4.2–4.5 选型、10 章改造范围、11 章 GUC 与监控、12 章性能风险、13/14 章兼容与风险；`need.md` 同步修订 G2/AC-2 为语义等价、FR-1/4/7/8/9/12/13、新增 FR-18/FR-19、约束 5/8/10、NFR-3、风险表 |
 | v0.6 | 2026-11-18 | **修正 C9 与新增不变式 S1**：`'w'` 帧 LSN 链（`WalSndPrepareWrite()` 只在 `last_write` 时写帧 LSN → 订阅端取最大值 → 发布端无条件写 `confirmed_flush` → 重启时 `start_decoding_at = confirmed_flush` → 提交记录 LSN 小于它的事务被整体跳过）经源码逐环验证后，原 C9"'w' 帧 LSN 不得倒退"被证明**表述错误**（串行现状本身允许倒退，订阅端的取最大值跟踪正是为此设计）。改为不变式 **S1**："提交记录 LSN 小于 `confirmed_flush` 的事务必须已完整送达"，并据此把 C9 改写为"已送达帧的 LSN 不得超过下一个待放行事务的提交记录 LSN（放行前沿）"。**7.4 重写为三方案对比，取 (b) 数据跟随 cseq + (c) 分片帧 LSN 按放行前沿钳制**——后者堵住本设计引入的唯一一条新数据丢失路径。**新增约束 C11（受 cseq 门控的条目必须自带 cseq）与 C12（事务结束事件必须携带结束记录的 LSN 与载荷）**，并补齐 5.2.2 / 5.2.3 的载荷与门控表、6.1 的第三个 snapbuild 替身函数（`SnapBuildProcessNewCid()`）、6.5 的"广播=逐队列追加"语义。**第 3、5、9、11、12、14、15 章补齐**：子进程句柄（`BackgroundWorkerHandle`）的用途分工、共享内存尺寸上界（`MaxAllocSize` / `shm_mq_set_max_size()` / dsa 总容量）、walsender 的等待模型（长生命周期 `WaitEventSet` 同时挂 socket 与 latch，100ms 超时兜底）、GUC 变更只在下次会话生效、`bgw_notify_pid` 的 SIGUSR1 语义、风险表新增"提前流式抬高 `confirmed_flush`"一行。**15.1 新增收益测算**：单核解码上限约 8k–13k 事务/秒，N = 3~4 个 worker 即够 70MB/s——瓶颈不在解码而在 walsender 的每帧系统调用、段粒度串行下发与订阅端 apply 速率；15.2 列出 5 项待实测确认事项。`need.md` 同步：FR-19 改写、新增 FR-20（分片帧 LSN 钳制）与 AC-12（水位安全）、AC-1 口径与 G1 对齐、约束 5 改为三层、约束 13/14 新增、风险表改写 |
 | v0.7 | 2026-11-18 | **确立目标部署形态为"发布端并行解码 + 订阅端并行 apply"**。新增事实 **8a**（`streaming='parallel'` 的端到端生效链条：订阅端只在 `server_version >= 160000` 时才请求 `"parallel"`（`worker.c:4372-4378`）、发布端校验协议 v4（`pgoutput.c:501-505`）、`max_parallel_apply_workers_per_subscription` 默认 2、每个流式事务在订阅端分配一个 apply worker（`applyparallelworker.c:470`））与事实 **8b**（订阅端的并行来自"多个事务的流式分片在时间上重叠"，而现状发布端几乎不产生流段 → `streaming='parallel'` 拿不到可并行的流式事务）。新增 **3.5 目标部署形态**一节与 need.md 的 **4.4 目标部署形态 / 4.5 尽早流式是主路径**。**8.1 重写**：`parallel_decode_streaming_mode` 默认由 `buffered` 改为 `immediate`（语义沿用现有 `debug_logical_replication_streaming` 的两档），并给出三条理由（喂饱订阅端并行 apply、缩小挂起区消除死锁风险面、兑现"尽早发送"的产品目标）；新增 `parallel_decode_stream_min_size` 门槛，避免小事务过度流式化带来的帧数上升与订阅端每事务一次的 apply worker 分配开销。**11.1 GUC 表、12.1 达成条件、12.3 风险点、13 章兼容性第 11 条、14 章风险表、15 章 Q6** 同步。`need.md` 同步：FR-9 改为"流式是主路径"、新增约束 15（目标部署形态）与 16（保提交序与订阅端是否并行无关）、新增 AC-13（目标部署形态）、G1 与 AC-1 补达成前提、风险表新增两行 |
+| v0.9 | 2026-11-18 | **修正一轮正确性评审发现的 10 条未定义路径**。(1) **帧头 LSN 清单更正**：v0.8 把 `STREAM START` / `STREAM STOP` 写成"写 0"是错的——`pgoutput.c:1799` 的 `last_write = !send_replication_origin`、`:1823` 恒为 `true`，两者都写真值（分别是事务首变更 LSN 与**段内 max**），据此推导出的钳制范围会漏掉最危险的两个帧（4.1.3 新增逐消息清单）。(2) **放行前沿 F 钉到结束记录的"起点"**：`SnapBuildXactNeedsSkip()` 比较的是 `buf->origptr`（`decode.c:1302` → `snapbuild.c:443-446`），用终点（`buf->endptr`，也是帧头里写的那个）会让 `confirmed_flush` 落在（起点, 终点] 区间内 → 重启后整个事务被跳过 → 丢变更（4.1.3、7.4）。(3) **F 集合为空时的兜底改正**：v0.8 用"会话开始时的 `confirmed_flush`"兜底，而集合为空是**稳态常态**（发布端空闲），会把前沿永久冻结在会话起点 → `confirmed_flush` 被拉回 → 破坏单调性并造成重连后的全量重投；改为"**walreader 认证过的读取位置**"，并删掉被禁止的两种兜底（7.4）。(4) **补上取样次序与单调性约束**：放行水位 → 取样 F → 写帧；钳制后的帧 LSN 不小于已放行事务的结束记录终点（7.4）。(5) **补上钳制安全性的论证**：订阅端只把帧头 LSN 用于 `last_received`，变更载荷不含变更 LSN；`COMMIT` 载荷里的 `end_lsn` 不钳且其安全性有论证（7.4）。(6) **keepalive 的第二个 LSN 来源**：跳过空事务时的 `ctx->write_location`，同样要钳（4.1.3）。(7) **新增子事务 abort 的完整路径**：`ROLLBACK TO SAVEPOINT` 写的是独立的 `XLOG_XACT_ABORT`（`xl_xid` = 子 xid），订阅端对它做 spool 截断（`worker.c:1791-1796`）并连带丢弃其后子事务的有效变更 → 必须即时下发、不占 cseq、不受门控、独占一块（5.2.2 新增 `PD_ENT_SUBXACT_ABORT` 与 `PD_BLK_ABORT`、5.2.3、7.1）。(8) **顶层 abort 与子事务 abort 的区分规则**及其"N 条子 + 1 条顶层 `STREAM ABORT`"的门控归属（7.1）。(9) **xmin 兜底改为 `min(各 worker 最后上报值, oldestRunningXid)`**：只用 `oldestRunningXid` 会让 `catalog_xmin` 比安全值更激进 → 提前回收在途事务快照仍需要的系统表元组 → 会话反复失败（6.6.1）。(10) **`restart_lsn` 的推进判据整体替换**并给出可实现的协议（绑定表 + `END_ACK`），不再以 `confirmed_flush` 为门控——否则 `restart_lsn` 长期不推进、WAL 无限保留；补上 **walreader 维护 `current_restart_decoding_lsn` 本地副本**的硬约束，worker 不得依赖 `txn->restart_decoding_lsn`（6.6.2、17.8）。(11) **补上订阅端侧故障**（断连 / apply worker 崩溃 / 整库重启）与"会话重建后订阅端流式状态复位"，并**更正"至少一次语义"的表述**：去重靠发布端跳过 `confirmed_flush` 之前的事务（S1），不是让订阅端重复 apply（9、17.7）。(12) **事实 8c 更正**：`LogicalDecodingContext.streaming` 是 **bool**，模式值在 `PGOutputData.streaming`（char）里、由插件选项列表解析而来 → worker 必须拿到**原始插件选项列表**而不是模式值（2.4、5.2.2、6.1）。(13) **§16 新增帧级 dump / diff 工具与黄金文件**作为 P0 的前置产出（16） |
 | v0.8 | 2026-11-18 | **修正本特性自身的正确性与性能分析漏洞**。(1) **新增事实 8c**：`STREAM ABORT` 的载荷随订阅端流式模式而变（`pgoutput.c:1842`、`proto.c:1166-1184`：v2/v3 为 8 字节、v4 为 24 字节），worker 必须按**模式值**而非布尔值初始化 `ctx->streaming`——新增下行条目 `PD_ENT_SESSION_INIT`（5.2.2）并在 6.1 的插件实例化处点名。(2) **补上 keepalive 这条数据丢失路径**：`'k'` 消息的 end_lsn 取 `sentPtr` = 发布端的 WAL 读取位置（`walsender.c:3443`、`:4071`），订阅端照样并入 `last_received`（`worker.c:3608-3612`）→ `confirmed_flush` 被抬到未放行事务之上 → 重启后丢事务。因此 C9 与 §7.4 的钳制**必须同时覆盖 `'w'` 帧头与 `'k'` keepalive**。(3) **放行前沿口径唯一化**：恒等于 cseq = 放行水位 + 1 的事务的提交记录 LSN；未知时唯一合法取值是会话开始时的槽 `confirmed_flush`，**禁止**用当前 WAL 读取位置（原表述「前沿取当前 WAL 读取位置」易被误实现而破坏 S1）。(4) **修正流式门槛的默认值**：`parallel_decode_stream_min_size` 由 64KB 改为 **0**——15.1 的测算里 tpcc 每事务仅约 3KB，64KB 门槛会使**所有事务都不流式化**，订阅端永远收不到 STREAM START、并行 apply 根本不启动，70MB/s 目标与整个前提同时落空。同时**推翻了「过度流式化」的两项代价核算**：流式化不改变「每条变更一帧」，只多出每事务 2 帧（约 5%–10%）；订阅端每事务一个 apply worker 是**并行的机制本身**而非开销。(5) **流式激进程度按订阅端模式区分**：`parallel_decode_streaming_mode` 新增 `auto` 档并作为默认值——`streaming='parallel'` → `immediate`，`streaming='on'` → `buffered`（后者没有 apply worker，流式化会把它推到 `TRANS_LEADER_SERIALIZE` 的 spool 慢路径，对存量用户是性能回归）。(6) **apply worker 数不能只写「> 0」**：订阅端能并行回放的事务数 = `max_parallel_apply_workers_per_subscription`（默认 2，`launcher.c:412` 超限即拒绝启动），超出部分退化为 spool 慢路径；§3.5、§12.1、§12.3、§13、§14 同步为「按目标速率反推下限」。`need.md` 同步 |
