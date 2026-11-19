@@ -148,7 +148,19 @@ EOF
 	echo "   the workers sent $up signal(s) to the walsender"
 
 	echo "-- checking that the counters of the workers add up"
-	sum_up=$(pub -At -c "select sum(wakeups) from pg_parallel_decode_workers")
+	#
+	# The session publishes its counters every now and then, so the numbers it
+	# reports lag behind the numbers the workers report: the workers count a
+	# signal as soon as they send it, the session counts it when it publishes
+	# its statistics.  The two numbers only agree when the session has caught
+	# up, so wait for that instead of comparing the numbers of two different
+	# moments.
+	for i in $(seq 1 30); do
+		sum_up=$(pub -At -c "select sum(wakeups) from pg_parallel_decode_workers")
+		up=$(pub -At -c "select sum(wakeups_up) from pg_parallel_decode_wakeups")
+		[ -n "$up" ] && [ "$sum_up" = "$up" ] && break
+		sleep 1
+	done
 	[ "$sum_up" = "$up" ] || fail "the workers report $sum_up wakeups, the session reports $up"
 	echo "   the wakeups of the workers add up to the wakeups of the session"
 
