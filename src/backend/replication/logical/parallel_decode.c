@@ -30,6 +30,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "replication/parallel_decode.h"
+#include "replication/walsender_private.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -102,6 +103,8 @@ typedef struct PDPendingTxn
 	uint64		cseq;			/* the commit sequence number of the transaction */
 	List	   *frames;			/* the frames, in the order they were produced */
 	bool		acked;			/* the worker has reported the end of the transaction */
+	TimestampTz alloc_time;	/* when the walreader reported the transaction */
+	TimestampTz ack_time;		/* when the worker reported it decoded */
 } PDPendingTxn;
 
 /*
@@ -487,6 +490,8 @@ parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
 		pending->cseq = cseq;
 		pending->frames = NIL;
 		pending->acked = false;
+		pending->alloc_time = 0;
+		pending->ack_time = 0;
 	}
 
 	/*
@@ -532,9 +537,12 @@ parallel_decode_ack_txn(uint64 cseq)
 		pending->cseq = cseq;
 		pending->frames = NIL;
 		pending->acked = false;
+		pending->alloc_time = 0;
+		pending->ack_time = 0;
 	}
 
 	pending->acked = true;
+	pending->ack_time = GetCurrentTimestamp();
 }
 
 /*
@@ -642,6 +650,31 @@ parallel_decode_release_txns(void)
 					HASH_REMOVE, NULL);
 
 		/*
+		 * The transaction has made the round trip from the walreader to the
+		 * worker and back.  The time it took is the time the transaction
+		 * waited for its turn plus the time it was decoded, which is what the
+		 * monitoring views report as the latency of the transaction.
+		 */
+		if (pending->alloc_time != 0 && pending->ack_time != 0 &&
+			parallel_decode_ctl != NULL)
+		{
+			int64		latency;
+
+			/* the timestamps are in microseconds */
+			latency = pending->ack_time - pending->alloc_time;
+			if (latency < 0)
+				latency = 0;
+
+			parallel_decode_ctl->txn_count++;
+			parallel_decode_ctl->txn_latency_us_sum += (uint64) latency;
+			if ((uint64) latency > parallel_decode_ctl->txn_latency_us_max)
+				parallel_decode_ctl->txn_latency_us_max = (uint64) latency;
+		}
+
+		if (parallel_decode_ctl != NULL)
+			parallel_decode_ctl->cseq_released = parallel_decode_next_cseq;
+
+		/*
 		 * The transaction has been released, so it does not hold the release
 		 * frontier back anymore.
 		 */
@@ -671,6 +704,17 @@ static void
 parallel_decode_record_cseq(const PDCseqInfo *info)
 {
 	PDCseqInfo *entry;
+	PDPendingTxn *pending;
+	bool		found;
+
+	/*
+	 * The walreader hands out the commit sequence numbers in the order in
+	 * which the transactions end, so the highest one it reported is the
+	 * number of transactions that have ended (11.3).
+	 */
+	if (parallel_decode_ctl != NULL &&
+		info->cseq > parallel_decode_ctl->cseq_allocated)
+		parallel_decode_ctl->cseq_allocated = info->cseq;
 
 	/*
 	 * The position the walreader has read up to is only usable as the
@@ -691,6 +735,24 @@ parallel_decode_record_cseq(const PDCseqInfo *info)
 	 */
 	if (info->cseq < parallel_decode_next_cseq)
 		return;
+
+	/*
+	 * Remember when the transaction ended.  The time is the start of the
+	 * waiting of the transaction for its turn, which is what the monitoring
+	 * views report as the age of the longest pending commit.
+	 */
+	pending = (PDPendingTxn *) hash_search(parallel_decode_pending,
+										   &info->cseq, HASH_ENTER, &found);
+	if (!found)
+	{
+		pending->cseq = info->cseq;
+		pending->frames = NIL;
+		pending->acked = false;
+		pending->alloc_time = 0;
+		pending->ack_time = 0;
+	}
+	if (pending->alloc_time == 0)
+		pending->alloc_time = GetCurrentTimestamp();
 
 	entry = palloc(sizeof(PDCseqInfo));
 	memcpy(entry, info, sizeof(PDCseqInfo));
@@ -1609,6 +1671,132 @@ ParallelDecodePosition(void)
 }
 
 /*
+ * The time between two publications of the statistics of the session.
+ *
+ * The statistics are read by the SQL functions of the monitoring views, and
+ * the walsender publishes them from its main loop.  Publishing them for every
+ * frame would take the spinlock of the walsenders for every batch of frames,
+ * so they are published at a fixed rate instead.
+ */
+#define PD_STATS_PUBLISH_INTERVAL	100	/* milliseconds */
+
+/*
+ * When the statistics of the session were published the last time.
+ */
+static TimestampTz parallel_decode_stats_published = 0;
+
+/*
+ * Note that the session has written a frame of the given length to the
+ * subscriber.
+ */
+void
+ParallelDecodeCountOutput(size_t bytes)
+{
+	if (parallel_decode_ctl == NULL)
+		return;
+
+	parallel_decode_ctl->frames++;
+	parallel_decode_ctl->frame_bytes += bytes;
+}
+
+/*
+ * Note that the session has flushed its output buffer to the network.
+ *
+ * The counter is the number of the flushes, not the number of the write
+ * calls: a flush that finds nothing to write does not reach the network.
+ */
+void
+ParallelDecodeCountSocketWrite(void)
+{
+	if (parallel_decode_ctl == NULL)
+		return;
+
+	parallel_decode_ctl->socket_writes++;
+}
+
+/*
+ * Publish the statistics of the session for the monitoring views (11.3).
+ *
+ * The counters of the session live in the shared control block, which only
+ * the participants of the session can see.  They are copied into the shared
+ * memory of the walsenders, where the SQL functions read them.
+ */
+void
+ParallelDecodePublishStats(bool force)
+{
+	ParallelDecodeStats *stats;
+	PDPendingTxn *pending;
+	TimestampTz now;
+	bool		found;
+	int			i;
+
+	if (parallel_decode_ctl == NULL || MyWalSnd == NULL)
+		return;
+
+	now = GetCurrentTimestamp();
+
+	if (!force && parallel_decode_stats_published != 0)
+	{
+		long		elapsed;
+
+		elapsed = (long) (now - parallel_decode_stats_published) / 1000;
+		if (elapsed < PD_STATS_PUBLISH_INTERVAL)
+			return;
+	}
+	parallel_decode_stats_published = now;
+
+	/*
+	 * The transaction that has been waiting for its turn the longest is the
+	 * one at the head of the queue of the pending transactions.
+	 */
+	pending = (PDPendingTxn *) hash_search(parallel_decode_pending,
+										   &parallel_decode_next_cseq,
+										   HASH_FIND, &found);
+
+	SpinLockAcquire(&MyWalSnd->mutex);
+
+	stats = &MyWalSnd->pd_stats;
+	stats->active = true;
+	stats->num_workers = parallel_decode_ctl->num_workers;
+	if (stats->start_time == 0)
+		stats->start_time = now;
+	stats->cseq_allocated = parallel_decode_ctl->cseq_allocated;
+	stats->cseq_released = parallel_decode_ctl->cseq_released;
+	stats->pending_commit_age_us = (found && pending->alloc_time != 0) ?
+		(uint64) Max(now - pending->alloc_time, 0) : 0;
+	stats->txn_count = parallel_decode_ctl->txn_count;
+	stats->txn_latency_us_sum = parallel_decode_ctl->txn_latency_us_sum;
+	stats->txn_latency_us_max = parallel_decode_ctl->txn_latency_us_max;
+	stats->frames = parallel_decode_ctl->frames;
+	stats->frame_bytes = parallel_decode_ctl->frame_bytes;
+	stats->socket_writes = parallel_decode_ctl->socket_writes;
+	stats->wakeups_down = parallel_decode_ctl->walreader_wakeups;
+	stats->wakeups_up = 0;
+
+	for (i = 0; i < parallel_decode_ctl->num_workers; i++)
+	{
+		ParallelDecodeWorkerStats *wstats = &stats->workers[i];
+		ParallelDecodeWorkerSlot *slot = &parallel_decode_ctl->workers[i];
+
+		wstats->pid = slot->pid;
+		wstats->status = slot->status;
+		wstats->in_flight_txns = slot->in_flight_txns;
+		wstats->decoded_txns = slot->decoded_txns;
+		wstats->in_flight_bytes = slot->in_flight_bytes;
+		/*
+		 * The queue of the worker holds the records the walreader has handed
+		 * over and the worker has not decoded yet.
+		 */
+		wstats->queue_depth = (slot->records_sent >= slot->records_consumed) ?
+			slot->records_sent - slot->records_consumed : 0;
+		wstats->wakeups = slot->wakeups;
+		stats->wakeups_up += slot->wakeups;
+	}
+
+	SpinLockRelease(&MyWalSnd->mutex);
+}
+
+/*
  * Create the shared segment, the control block and the message queues, and
  * start the walreader and the decode workers.
  */
@@ -1673,6 +1861,18 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 
 	parallel_decode_ctl->walsender_pid = MyProcPid;
 	parallel_decode_ctl->num_workers = parallel_decode_num_workers;
+
+	/*
+	 * The statistics of the session start from scratch: the slot of the
+	 * walsender may have been used by another session before.
+	 */
+	if (MyWalSnd != NULL)
+	{
+		SpinLockAcquire(&MyWalSnd->mutex);
+		MemSet(&MyWalSnd->pd_stats, 0, sizeof(MyWalSnd->pd_stats));
+		SpinLockRelease(&MyWalSnd->mutex);
+	}
+	parallel_decode_stats_published = 0;
 	parallel_decode_ctl->streaming_mode = streaming_mode;
 	parallel_decode_ctl->start_lsn = start_lsn;
 	parallel_decode_ctl->database = slot->data.database;

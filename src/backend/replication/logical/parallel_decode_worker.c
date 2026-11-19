@@ -226,6 +226,21 @@ pd_worker_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 }
 
 /*
+ * Note that the worker has woken the walsender up.
+ *
+ * Every message the worker sends flushes the queue, which wakes the walsender
+ * up.  The counter is part of the statistics of the monitoring views (11.3).
+ */
+static void
+pd_worker_count_wakeup(void)
+{
+	if (pd_ctl == NULL || pd_worker_index < 0)
+		return;
+
+	pd_ctl->workers[pd_worker_index].wakeups++;
+}
+
+/*
  * The 'write' callback of the decoding context.
  *
  * The frame is complete at this point, so it is handed over to the walsender,
@@ -276,12 +291,14 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		 */
 		PDQueueSendRelation(pd_out_mqh, (uint64) pd_end_lsn, pd_current_cseq,
 							epoch, relid, ctx->out->data, ctx->out->len);
+		pd_worker_count_wakeup();
 
 		return;
 	}
 
 	PDQueueSendFrame(pd_out_mqh, (uint64) pd_end_lsn, pd_current_cseq,
 					 ctx->out->data, ctx->out->len);
+	pd_worker_count_wakeup();
 }
 
 /*
@@ -302,6 +319,7 @@ pd_worker_send_segment(void)
 
 	PDQueueSendSegment(pd_out_mqh, (uint64) pd_end_lsn, pd_segment_frames,
 					   pd_segment->data, pd_segment->len);
+	pd_worker_count_wakeup();
 
 	resetStringInfo(pd_segment);
 	pd_segment_frames = 0;
@@ -879,6 +897,13 @@ pd_worker_decode_loop(void)
 		LogicalDecodingProcessRecord(pd_ctx, pd_ctx->reader);
 
 		/*
+		 * The record has been decoded, so the queue of the walreader is one
+		 * record shorter.
+		 */
+		if (pd_ctl != NULL && pd_worker_index >= 0)
+			pd_ctl->workers[pd_worker_index].records_consumed++;
+
+		/*
 		 * Tell the walsender now and then that the worker is still working.
 		 * The report tells it that the worker is alive and how far it has come,
 		 * and it is what the stall detection is based on.
@@ -896,7 +921,18 @@ pd_worker_decode_loop(void)
 		 * for it before it lets the transactions that follow pass.
 		 */
 		if (pd_current_cseq != 0 && pd_wal_header.owner == pd_worker_index)
+		{
 			PDQueueSendEvent(pd_out_mqh, pd_current_cseq, PD_EVENT_END_ACK);
+			pd_worker_count_wakeup();
+
+			/*
+			 * The number of the transactions that are in flight is kept by
+			 * the walreader, which is the process that binds them to the
+			 * workers.
+			 */
+			if (pd_ctl != NULL && pd_worker_index >= 0)
+				pd_ctl->workers[pd_worker_index].decoded_txns++;
+		}
 
 		/*
 		 * The decoding path copies the data it keeps, so the record can go

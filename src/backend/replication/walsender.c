@@ -3579,6 +3579,9 @@ pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
 	PDTraceWrite(frame->data, frame->len);
 	pq_putmessage_noblock('d', frame->data, frame->len);
 
+	/* count the output of the session for the monitoring views */
+	ParallelDecodeCountOutput(frame->len);
+
 	CHECK_FOR_INTERRUPTS();
 
 	/* Track how far the session has come. */
@@ -3611,7 +3614,15 @@ pd_walsender_write_frames(void)
 	int64		batch_bytes = 0;
 
 	if (!ParallelDecodeNextFrame(&pd_frame_buf, &end_lsn))
+	{
+		/*
+		 * There is nothing to write at the moment.  Publish the statistics
+		 * of the session anyway, so that a session that is idle still shows
+		 * what it is doing.
+		 */
+		ParallelDecodePublishStats(false);
 		return;
+	}
 
 	pd_walsender_write_frame(&pd_frame_buf, end_lsn);
 	batch_bytes = pd_frame_buf.len;
@@ -3629,6 +3640,8 @@ pd_walsender_write_frames(void)
 	/* Write the batch out to the client. */
 	if (pq_flush_if_writable() != 0)
 		WalSndShutdown();
+	else
+		ParallelDecodeCountSocketWrite();
 
 	/*
 	 * The client is not keeping up with the stream, so wait until the data
@@ -3636,6 +3649,9 @@ pd_walsender_write_frames(void)
 	 */
 	if (pq_is_send_pending())
 		ProcessPendingWrites();
+
+	/* publish the statistics of the session for the monitoring views */
+	ParallelDecodePublishStats(false);
 }
 
 /*
@@ -4310,6 +4326,147 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
 							 values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+/*
+ * Returns the statistics of the publisher-side parallel decoding sessions.
+ *
+ * A session that uses the parallel path publishes its statistics in the
+ * shared memory of the walsenders, so that a session that monitors the
+ * publisher can see what the decoding sessions are doing (design document,
+ * 11.3).
+ */
+Datum
+pg_stat_get_parallel_decode_session(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_PARALLEL_DECODE_COLS	15
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (i = 0; i < max_wal_senders; i++)
+	{
+		WalSnd	   *walsnd = &WalSndCtl->walsnds[i];
+		ParallelDecodeStats stats;
+		Datum		values[PG_STAT_GET_PARALLEL_DECODE_COLS];
+		bool		nulls[PG_STAT_GET_PARALLEL_DECODE_COLS] = {0};
+		int			pid;
+
+		/* Collect data from shared memory */
+		SpinLockAcquire(&walsnd->mutex);
+		pid = walsnd->pid;
+		if (pid == 0 || !walsnd->pd_stats.active)
+		{
+			SpinLockRelease(&walsnd->mutex);
+			continue;
+		}
+		stats = walsnd->pd_stats;
+		SpinLockRelease(&walsnd->mutex);
+
+		values[0] = Int32GetDatum(pid);
+
+		if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+		{
+			/*
+			 * Only superusers and roles with privileges of pg_read_all_stats
+			 * can see details. Other users only get the pid value.
+			 */
+			MemSet(&nulls[1], true, PG_STAT_GET_PARALLEL_DECODE_COLS - 1);
+		}
+		else
+		{
+			values[1] = Int32GetDatum(stats.num_workers);
+			values[2] = TimestampTzGetDatum(stats.start_time);
+			values[3] = Int64GetDatum((int64) stats.cseq_allocated);
+			values[4] = Int64GetDatum((int64) stats.cseq_released);
+			values[5] = Int64GetDatum((int64) (stats.cseq_allocated -
+											   stats.cseq_released));
+			values[6] = Int64GetDatum((int64) stats.pending_commit_age_us);
+			values[7] = Int64GetDatum((int64) stats.txn_count);
+			values[8] = Int64GetDatum((int64) stats.txn_latency_us_sum);
+			values[9] = Int64GetDatum((int64) stats.txn_latency_us_max);
+			values[10] = Int64GetDatum((int64) stats.frames);
+			values[11] = Int64GetDatum((int64) stats.frame_bytes);
+			values[12] = Int64GetDatum((int64) stats.socket_writes);
+			values[13] = Int64GetDatum((int64) stats.wakeups_down);
+			values[14] = Int64GetDatum((int64) stats.wakeups_up);
+		}
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+/*
+ * Returns the statistics of the decode workers of the publisher-side
+ * parallel decoding sessions.
+ */
+Datum
+pg_stat_get_parallel_decode_workers(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_PARALLEL_DECODE_WORKERS_COLS	9
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (i = 0; i < max_wal_senders; i++)
+	{
+		WalSnd	   *walsnd = &WalSndCtl->walsnds[i];
+		ParallelDecodeStats stats;
+		Datum		values[PG_STAT_GET_PARALLEL_DECODE_WORKERS_COLS];
+		bool		nulls[PG_STAT_GET_PARALLEL_DECODE_WORKERS_COLS] = {0};
+		int			pid;
+		int			w;
+
+		/* Collect data from shared memory */
+		SpinLockAcquire(&walsnd->mutex);
+		pid = walsnd->pid;
+		if (pid == 0 || !walsnd->pd_stats.active)
+		{
+			SpinLockRelease(&walsnd->mutex);
+			continue;
+		}
+		stats = walsnd->pd_stats;
+		SpinLockRelease(&walsnd->mutex);
+
+		for (w = 0; w < stats.num_workers; w++)
+		{
+			ParallelDecodeWorkerStats *wstats = &stats.workers[w];
+
+			values[0] = Int32GetDatum(pid);
+
+			if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+			{
+				/*
+				 * Only superusers and roles with privileges of
+				 * pg_read_all_stats can see details. Other users only get the
+				 * pid value.
+				 */
+				MemSet(&nulls[1], true,
+					   PG_STAT_GET_PARALLEL_DECODE_WORKERS_COLS - 1);
+			}
+			else
+			{
+				values[1] = Int32GetDatum(w);
+				values[2] = Int32GetDatum((int32) wstats->pid);
+				values[3] = Int32GetDatum(wstats->status);
+				values[4] = Int64GetDatum((int64) wstats->in_flight_txns);
+				values[5] = Int64GetDatum((int64) wstats->decoded_txns);
+				values[6] = Int64GetDatum((int64) wstats->in_flight_bytes);
+				values[7] = Int64GetDatum((int64) wstats->queue_depth);
+				values[8] = Int64GetDatum((int64) wstats->wakeups);
+			}
+
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
+		}
 	}
 
 	return (Datum) 0;

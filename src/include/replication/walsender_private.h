@@ -16,6 +16,7 @@
 #include "lib/ilist.h"
 #include "nodes/nodes.h"
 #include "nodes/replnodes.h"
+#include "replication/parallel_decode_stats.h"
 #include "replication/syncrep.h"
 #include "storage/condition_variable.h"
 #include "storage/latch.h"
@@ -81,6 +82,14 @@ typedef struct WalSnd
 	 * Timestamp of the last message received from standby.
 	 */
 	TimestampTz replyTime;
+
+	/*
+	 * The statistics of the session, when it uses the publisher-side
+	 * parallel decoding.  The session publishes them for the monitoring
+	 * views (design document, 11.3); they are inactive for the sessions that
+	 * use the serial path.
+	 */
+	ParallelDecodeStats pd_stats;
 
 	ReplicationKind kind;
 } WalSnd;

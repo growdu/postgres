@@ -26,6 +26,10 @@ export PGBIN=${PGBIN:-/work/cwork/postgresql/build/pg/bin}
 ROOT=${PDTEST_ROOT:-/tmp/pdtest}
 PORT_PUB=${PORT_PUB:-5442}
 PORT_SUB=${PORT_SUB:-5443}
+#
+# The harness has to use the same ports and the same root, so they have to be
+# in the environment of the harness.
+export PDTEST_ROOT="$ROOT" PORT_PUB PORT_SUB
 ROWS=${ROWS:-200}
 
 export PATH="$PGBIN:$PATH"

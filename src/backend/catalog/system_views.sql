@@ -1044,6 +1044,99 @@ CREATE VIEW pg_stat_replication_slots AS
         LATERAL pg_stat_get_replication_slot(slot_name) as s
     WHERE r.datoid IS NOT NULL; -- excluding physical slots
 
+CREATE VIEW pg_parallel_decode_workers AS
+    SELECT
+            S.pid,
+            U.rolname AS usename,
+            S.application_name,
+            S.client_addr,
+            W.worker_index,
+            W.worker_pid,
+            W.status,
+            CASE W.status
+                WHEN 0 THEN 'unused'
+                WHEN 1 THEN 'starting'
+                WHEN 2 THEN 'running'
+                WHEN 3 THEN 'failed'
+                WHEN 4 THEN 'exited'
+                ELSE 'unknown'
+            END AS status_text,
+            W.in_flight_txns,
+            W.decoded_txns,
+            W.in_flight_bytes,
+            W.queue_depth,
+            W.wakeups
+    FROM pg_stat_get_parallel_decode_workers() AS W
+        JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = W.pid)
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+
+CREATE VIEW pg_parallel_decode_commit_lag AS
+    SELECT
+            S.pid,
+            U.rolname AS usename,
+            S.application_name,
+            S.client_addr,
+            D.cseq_allocated,
+            D.cseq_released,
+            D.commit_lag
+    FROM pg_stat_get_parallel_decode_session() AS D
+        JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+
+CREATE VIEW pg_parallel_decode_txn_latency AS
+    SELECT
+            S.pid,
+            U.rolname AS usename,
+            S.application_name,
+            S.client_addr,
+            D.txn_count,
+            D.txn_latency_us_sum,
+            D.txn_latency_us_max,
+            CASE WHEN D.txn_count > 0
+                 THEN D.txn_latency_us_sum / D.txn_count
+                 ELSE 0 END AS txn_latency_us_avg
+    FROM pg_stat_get_parallel_decode_session() AS D
+        JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+
+CREATE VIEW pg_parallel_decode_pending_commit_age AS
+    SELECT
+            S.pid,
+            U.rolname AS usename,
+            S.application_name,
+            S.client_addr,
+            D.commit_lag,
+            D.pending_commit_age_us
+    FROM pg_stat_get_parallel_decode_session() AS D
+        JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+
+CREATE VIEW pg_parallel_decode_walsender_frames AS
+    SELECT
+            S.pid,
+            U.rolname AS usename,
+            S.application_name,
+            S.client_addr,
+            D.frames,
+            D.frame_bytes,
+            D.socket_writes
+    FROM pg_stat_get_parallel_decode_session() AS D
+        JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+
+CREATE VIEW pg_parallel_decode_wakeups AS
+    SELECT
+            S.pid,
+            U.rolname AS usename,
+            S.application_name,
+            S.client_addr,
+            D.wakeups_down,
+            D.wakeups_up,
+            D.wakeups_down + D.wakeups_up AS wakeups_total
+    FROM pg_stat_get_parallel_decode_session() AS D
+        JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+
 CREATE VIEW pg_stat_database AS
     SELECT
             D.oid AS datid,

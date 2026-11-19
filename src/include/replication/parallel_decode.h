@@ -26,15 +26,10 @@
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
 #include "replication/logical.h"
+#include "replication/parallel_decode_stats.h"
 #include "storage/shm_mq.h"
 #include "storage/latch.h"
 #include "storage/shm_toc.h"
-
-/*
- * Upper bound on the number of decode workers in one session.  The bound is
- * compile-time because the shared control block is a fixed-size structure.
- */
-#define MAX_PARALLEL_DECODE_WORKERS		64
 
 /*
  * Streaming aggressiveness of the publisher.
@@ -154,6 +149,27 @@ extern void ParallelDecodeSessionStart(ReplicationSlot *slot,
 extern void ParallelDecodeSessionStop(void);
 
 /*
+ * Publish the statistics of the session for the monitoring views (11.3).
+ *
+ * The function copies the counters of the session out of the shared control
+ * block into the shared memory of the walsenders, where the SQL functions
+ * read them.  It is called by the walsender from time to time, and once more
+ * when the session ends.
+ *
+ * force publishes the statistics even when the last publication is recent.
+ */
+extern void ParallelDecodePublishStats(bool force);
+
+/*
+ * Note that the session has written a frame of the given length to the
+ * subscriber, and that it has flushed its output buffer to the network.
+ *
+ * The counters feed the monitoring views (11.3).
+ */
+extern void ParallelDecodeCountOutput(size_t bytes);
+extern void ParallelDecodeCountSocketWrite(void);
+
+/*
  * Entry points for the dynamically registered background workers.
  */
 extern void ParallelDecodeWorkerMain(Datum main_arg);
@@ -184,6 +200,23 @@ typedef struct ParallelDecodeWorkerSlot
 	uint64		error_lsn;		/* WAL position the failure was detected at */
 	char		errmsg[PD_MAX_ERROR_MESSAGE];	/* error text reported by the
 												 * worker */
+
+	/*
+	 * The counters of the monitoring views (11.3).
+	 *
+	 * Every counter has exactly one writer, so they are plain counters and
+	 * not atomics: records_sent is written by the walreader, the others by
+	 * the worker itself.  A reader may see a stale value, which is fine for
+	 * a monitoring counter.
+	 */
+	volatile uint64 records_sent;		/* WAL records the walreader handed
+										 * over */
+	volatile uint64 records_consumed;	/* WAL records the worker decoded */
+	volatile uint64 in_flight_txns;		/* transactions the worker decodes */
+	volatile uint64 decoded_txns;		/* transactions the worker finished */
+	volatile uint64 in_flight_bytes;	/* bytes the transactions produced */
+	volatile uint64 wakeups;			/* signals the worker sent to the
+										 * walsender */
 } ParallelDecodeWorkerSlot;
 
 typedef struct ParallelDecodeControl
@@ -263,7 +296,36 @@ typedef struct ParallelDecodeControl
 
 	/* Set by the walsender to ask all participants to wind down. */
 	volatile uint32 shutdown;
+
+	/*
+	 * The session counters of the monitoring views (11.3).  Like the counters
+	 * of the worker slots, every one of them has exactly one writer:
+	 * cseq_allocated and walreader_wakeups are written by the walreader,
+	 * cseq_released by the walsender.
+	 */
+	volatile uint64 cseq_allocated;		/* the highest commit sequence number
+										 * the walreader has handed out */
+	volatile uint64 cseq_released;		/* the highest commit sequence number
+										 * the walsender has released */
+	volatile uint64 walreader_wakeups;	/* signals the walreader sent to the
+										 * workers */
+	volatile uint64 wal_records;			/* WAL records handed to the
+										 * workers */
+
+	/*
+	 * The counters the walsender collects: the output of the session and the
+	 * time the decoding of the transactions took.  They are written by the
+	 * walsender only.
+	 */
+	volatile uint64 frames;			/* frames written to the subscriber */
+	volatile uint64 frame_bytes;	/* bytes written to the subscriber */
+	volatile uint64 socket_writes;	/* flushes of the output buffer */
+	volatile uint64 txn_count;		/* transactions the session decoded */
+	volatile uint64 txn_latency_us_sum;	/* sum of the decoding times */
+	volatile uint64 txn_latency_us_max;	/* longest decoding time */
 } ParallelDecodeControl;
+
+
 
 /* Payload handed to the dynamic background workers through bgw_extra. */
 typedef struct ParallelDecodeWorkerArg

@@ -112,6 +112,12 @@ static HTAB *pd_txns = NULL;
 static int64 pd_worker_bytes[MAX_PARALLEL_DECODE_WORKERS] = {0};
 
 /*
+ * The number of transactions that are in flight per worker.  It is part of
+ * the statistics of the monitoring views (11.3).
+ */
+static int64 pd_worker_txns[MAX_PARALLEL_DECODE_WORKERS] = {0};
+
+/*
  * The commit sequence number of the next transaction that ends.
  *
  * The walreader is the only reader of the WAL, so the order in which it sees
@@ -409,6 +415,21 @@ pd_walreader_pick_worker(void)
 }
 
 /*
+ * Publish the counters of a worker for the monitoring views (11.3).
+ */
+static void
+pd_walreader_publish_worker_counters(int worker)
+{
+	if (pd_ctl == NULL || worker < 0 || worker >= pd_num_workers)
+		return;
+
+	pd_ctl->workers[worker].in_flight_bytes =
+		(uint64) Max(pd_worker_bytes[worker], 0);
+	pd_ctl->workers[worker].in_flight_txns =
+		(uint64) Max(pd_worker_txns[worker], 0);
+}
+
+/*
  * The transaction id a record belongs to.
  *
  * Most records carry the id of the transaction they belong to.  The records
@@ -529,6 +550,8 @@ pd_walreader_record_txn(XLogReaderState *reader)
 			top->toplevel = toplevel;
 			top->worker = pd_walreader_pick_worker();
 			top->top = top;
+			pd_worker_txns[top->worker]++;
+			pd_walreader_publish_worker_counters(top->worker);
 		}
 
 		info = pd_walreader_enter_txn(xid);
@@ -543,6 +566,8 @@ pd_walreader_record_txn(XLogReaderState *reader)
 		info->toplevel = xid;
 		info->worker = pd_walreader_pick_worker();
 		info->top = info;
+		pd_worker_txns[info->worker]++;
+		pd_walreader_publish_worker_counters(info->worker);
 	}
 
 	return info->top;
@@ -576,6 +601,9 @@ pd_walreader_forget_txn(PDTxnInfo *info)
 	 * that owned it is up for the next transaction.
 	 */
 	pd_worker_bytes[info->worker] -= info->bytes;
+	pd_worker_txns[info->worker]--;
+
+	pd_walreader_publish_worker_counters(info->worker);
 
 	hash_search(pd_txns, &info->toplevel, HASH_REMOVE, NULL);
 }
@@ -1991,6 +2019,13 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 						ereport(ERROR,
 									(errcode(ERRCODE_IO_ERROR),
 									 errmsg("could not hand a WAL record to the parallel decoding session")));
+
+					/*
+					 * The record has been handed over, and the queue has been
+					 * flushed, so the worker has been woken up.
+					 */
+					pd_ctl->workers[i].records_sent++;
+					pd_ctl->walreader_wakeups++;
 				}
 			}
 			else
@@ -2001,7 +2036,12 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 					ereport(ERROR,
 							(errcode(ERRCODE_IO_ERROR),
 							 errmsg("could not hand a WAL record to the parallel decoding session")));
+
+				pd_ctl->workers[target].records_sent++;
+				pd_ctl->walreader_wakeups++;
 			}
+
+			pd_ctl->wal_records++;
 
 			/*
 			 * Account for the bytes the transaction has produced, so that the
@@ -2016,6 +2056,8 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 			{
 				info->bytes += buf->len;
 				pd_worker_bytes[worker] += buf->len;
+
+				pd_walreader_publish_worker_counters(worker);
 			}
 		}
 
