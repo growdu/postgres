@@ -99,12 +99,19 @@ static XLogRecPtr parallel_decode_walreader_pos = InvalidXLogRecPtr;
  * segment at a time, so they are kept together until they are written out.
  *
  * Keeping the frames of a segment together is also what keeps the work of the
- * walsender per frame small: the block is copied once, when it arrives, and
- * the frames inside it are written out without being copied again.
+ * walsender per frame small: the block takes over the buffer of the message
+ * it arrived in, so that the bytes of the segment are not copied again on the
+ * way to the socket, and the frames inside the block are written out without
+ * being copied again.
+ *
+ * The bytes of a block live in the buffer of the message they arrived in, so
+ * the block has to remember where that buffer starts: raw is the buffer, and
+ * data points into it.
  */
 typedef struct PDQueuedBlock
 {
 	char	   *data;			/* the bytes of the block */
+	char	   *raw;			/* the allocation the bytes live in */
 	size_t		len;			/* the number of bytes in data */
 	uint32		nframes;		/* the number of frames in the block */
 	bool		segmented;		/* the frames are length prefixed in data */
@@ -709,10 +716,14 @@ parallel_decode_release_held_bytes(size_t len)
  *
  * relid is the relation the frame defines, or InvalidOid when the frame does
  * not carry the definition of a relation.
+ *
+ * The frame takes over the buffer of the message it arrived in: data points
+ * into raw, and raw is the allocation that is freed when the block is.
  */
 static void
-parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
-								   XLogRecPtr end_lsn, Oid relid, uint64 epoch)
+parallel_decode_add_pending_frame(uint64 cseq, char *data, size_t len,
+								   char *raw, XLogRecPtr end_lsn, Oid relid,
+								   uint64 epoch)
 {
 	PDPendingTxn *pending;
 	PDQueuedBlock *block;
@@ -746,10 +757,13 @@ parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
 	 * The frame is kept as a block of its own, so that the frames of a
 	 * transaction and the frames of a stream segment are held in the same
 	 * way.
+	 *
+	 * The block takes over the buffer of the message the frame arrived in, so
+	 * that the bytes of the frame are not copied.
 	 */
 	block = palloc(sizeof(PDQueuedBlock));
-	block->data = palloc(len > 0 ? len : 1);
-	memcpy(block->data, data, len);
+	block->data = data;
+	block->raw = raw;
 	block->len = len;
 	block->nframes = 1;
 	block->segmented = false;
@@ -1122,7 +1136,7 @@ parallel_decode_release_txns(void)
 				 * back to it.
 				 */
 				parallel_decode_pending_bytes -= block->len;
-				pfree(block->data);
+				pfree(block->raw);
 				pfree(block);
 				continue;
 			}
@@ -1527,7 +1541,7 @@ parallel_decode_free_block(PDQueuedBlock *block)
 	if (block == NULL)
 		return;
 
-	pfree(block->data);
+	pfree(block->raw);
 	pfree(block);
 }
 
@@ -1658,9 +1672,12 @@ parallel_decode_note_worker_progress(int worker, XLogRecPtr position)
 /*
  * Handle a message of one of the decode workers.
  *
- * The payload belongs to the caller.
+ * The payload belongs to the caller.  The messages that carry frames hand the
+ * buffer of the payload over to the block that holds the frames, so that the
+ * bytes are not copied a second time; the function returns true when it has
+ * taken the buffer over, and the caller must not free it then.
  */
-static void
+static bool
 parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 								size_t len)
 {
@@ -1750,9 +1767,8 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					PDQueuedBlock *block;
 
 					block = palloc(sizeof(PDQueuedBlock));
-					block->data = palloc(fh.length > 0 ? fh.length : 1);
-					memcpy(block->data, (const char *) payload + sizeof(fh),
-						   fh.length);
+					block->data = (char *) payload + sizeof(fh);
+					block->raw = (char *) payload;
 					block->len = fh.length;
 					block->nframes = 1;
 					block->segmented = false;
@@ -1771,15 +1787,22 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 
 					parallel_decode_hold_block(block);
 					parallel_decode_release_held_frames();
+
+					/* The buffer of the message is the block now. */
+					return true;
 				}
 				else
+				{
 					parallel_decode_add_pending_frame(fh.cseq,
-													 (const char *) payload + sizeof(fh),
+													 (char *) payload + sizeof(fh),
 													 fh.length,
+													 (char *) payload,
 													 (XLogRecPtr) fh.end_lsn,
 													 InvalidOid, 0);
 
-				break;
+					/* The buffer of the message is the block now. */
+					return true;
+				}
 			}
 
 		case PD_ENT_RELATION:
@@ -1816,12 +1839,14 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 									"a transaction")));
 
 				parallel_decode_add_pending_frame(rh.cseq,
-												 (const char *) payload + sizeof(rh),
+												 (char *) payload + sizeof(rh),
 												 rh.length,
+												 (char *) payload,
 												 (XLogRecPtr) rh.end_lsn,
 												 (Oid) rh.relid, rh.epoch);
 
-				break;
+				/* The buffer of the message is the block now. */
+				return true;
 			}
 
 		case PD_ENT_SEGMENT:
@@ -1857,6 +1882,10 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 				 * copied out of the segment one by one.  The lengths are
 				 * checked here, so that a truncated segment is reported
 				 * before any of its frames is written out.
+				 *
+				 * The block takes over the buffer of the message, so that the
+				 * bytes of the segment are not copied again on the way to the
+				 * socket.
 				 */
 				for (i = 0; i < sh.nframes; i++)
 				{
@@ -1882,9 +1911,8 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 
 				block = palloc(sizeof(PDQueuedBlock));
 				block->len = len - sizeof(sh);
-				block->data = palloc(block->len > 0 ? block->len : 1);
-				memcpy(block->data, (const char *) payload + sizeof(sh),
-					   block->len);
+				block->data = (char *) payload + sizeof(sh);
+				block->raw = (char *) payload;
 				block->nframes = sh.nframes;
 				block->segmented = true;
 				block->end_lsn = (XLogRecPtr) sh.end_lsn;
@@ -1907,7 +1935,8 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 				parallel_decode_hold_block(block);
 				parallel_decode_release_held_frames();
 
-				break;
+				/* The buffer of the message is the block now. */
+				return true;
 			}
 
 		case PD_ENT_ERROR:
@@ -1957,6 +1986,9 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					 errmsg("unexpected message of type %u on the parallel decode "
 							"output channel", type)));
 	}
+
+	/* The payload was not taken over, so the caller has to free it. */
+	return false;
 }
 
 /*
@@ -2152,8 +2184,8 @@ ParallelDecodeNextFrame(PDFrame *frame)
 									   &payload, &len, true);
 			if (res == SHM_MQ_SUCCESS)
 			{
-				parallel_decode_handle_message(worker, type, payload, len);
-				pfree((void *) payload);
+				if (!parallel_decode_handle_message(worker, type, payload, len))
+					pfree((void *) payload);
 				got_message = true;
 				break;
 			}
@@ -2309,8 +2341,8 @@ ParallelDecodeNextFrameNoWait(PDFrame *frame)
 									   &payload, &len, true);
 			if (res == SHM_MQ_SUCCESS)
 			{
-				parallel_decode_handle_message(worker, type, payload, len);
-				pfree((void *) payload);
+				if (!parallel_decode_handle_message(worker, type, payload, len))
+					pfree((void *) payload);
 				got_message = true;
 				break;
 			}

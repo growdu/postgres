@@ -139,6 +139,34 @@ held 表的元素只会被**按位置从小到大**取出，所以用按 (位置
 `rel_dedup` / `slot_watermark` / `stream_order` / `subxact_abort` / `pending_area` / `copy_data` /
 `monitoring` / `repl` / `worker_death_repro` / `teardown`）。
 
+### 4.5 块接管消息缓冲（每字节少一次拷贝）
+
+块化之后，worker → walsender 的流段字节还要被**再拷一遍**：消息处理函数（`PD_ENT_SEGMENT`）把
+`rcv->buffer` 里的整段拷进新分配的块缓冲。这一次拷贝是可以去掉的：
+
+* `PDChunkReceiverRecv()`（`parallel_decode_msg.c:262-274`）在交付载荷时**把缓冲的所有权交给调用方**
+  （`rcv->buffer = NULL`），下一次调用会另分配一块新的，**不会复用旧缓冲**⇒ 块可以长期持有它；
+* 于是块不再拷贝，而是**接管**消息缓冲：`PDQueuedBlock` 多了一个 `raw` 字段（缓冲的起点），
+  `data` 指向 `raw` 里面（流段的头部在前面，所以 `data = raw + sizeof(PDSegmentHeader)`）；
+* `parallel_decode_handle_message()` 改成返回 `bool`，表示"缓冲已经被我接管了"，调用方据此决定
+  要不要 `pfree(payload)`。
+
+这条路径上一共**每一份流段字节被拷贝 5 次**，现在降到 **4 次**：
+
+| # | 拷贝 | 位置 |
+|---|---|---|
+| 1 | `ctx->out` → `pd_segment` | worker：`appendBinaryStringInfo`（`parallel_decode_worker.c:306`） |
+| 2 | `pd_segment` → `shm_mq` 环 | worker：`shm_mq_sendv` 的 `memcpy`（`shm_mq.c:1043`） |
+| 3 | 环 → `rcv->buffer` | walsender：`PDChunkReceiverRecv` 的 `memcpy`（`parallel_decode_msg.c:259`） |
+| ~~4~~ | ~~`rcv->buffer` → 块缓冲~~ | **已去掉**：块接管缓冲 |
+| 5 | 块 → `PqSendBuffer` | walsender：`pq_putmessage_noblock`（协议要求一条变更一个 CopyData，不能省） |
+
+剩下的 1、2、3 都在 worker / 接收侧，5 是协议本身的要求；串行关键路径（walsender）上现在只剩
+**一次拷贝**（第 5 次），这正是设计文档 §5.3 "串行路径上只剩一次拷贝" 的目标。
+
+> 第 3 次拷贝去不掉：`shm_mq_receive()` 返回的是**环里的指针**，接收方一读，发送方就可以覆写那圈内存，
+> 所以 walsender 必须把字节拷到自己的缓冲里。
+
 ---
 
 ## 5. 待实测
@@ -171,5 +199,22 @@ held 表的元素只会被**按位置从小到大**取出，所以用按 (位置
 ## 7. 后续（本次不做）
 
 - **worker 侧把非流式事务的帧攒成一个 `PD_BLK_TXN` 块**（设计文档 §5.2 的 `PD_BLK_TXN`）。当前非流式路径仍然是一条变更一条队列消息，walsender 侧只能逐帧持有。把一个事务的帧攒成一条队列消息，可以把**每帧一次 `shm_mq` 往返**摊薄成**每事务一次**——这是非流式路径上剩下的最大的一笔开销。注意：非流式事务的帧本来就要等到 cseq 轮到才放行，所以攒批**不增加延迟**。
+  *这条的必要性取决于 §8：并行解码如果把所有事务都变成流段（`stream_all_transactions`），非流式路径就只剩兼容意义，这条可以降级。*
+
 - **held 区的背压**：目前 `parallel_decode_held_max_bytes` 只告警、不限流（`parallel_decode.c:57`）。放行跟不上时 held 区会一直涨。加背压要小心与 barrier 的交互（可能死锁），需要单独设计。
+
+## 8. 方向：并行解码只走流式路径
+
+按"并行解码就是要所有事务都 stream 发出，区别只是一个 stream 块有多大"这条方向：
+
+* 事务在**进行中**攒够 `parallel_decode_stream_segment_size` 就以流段发出；没攒够的**在提交时**作为
+  一个流段发出（`reorderbuffer.c` 的 `ReorderBufferStreamAtCommit()`）。于是**每个事务都是流段**，
+  非流式的整事务块（`PD_BLK_TXN`）不再是热路径。
+* 这条路上**热路径只有一条**：worker 拼段 → 一条队列消息 → walsender 接管缓冲 → 逐帧写 socket。
+  本文 §4 的块化、§4.5 的接管缓冲，都是针对这一条路做的；每帧剩下的工作只有
+  **改帧头的时间戳、FR-20 钳制、`pq_putmessage_noblock`** 三项。
+* 因此 §7 的第一条（`PD_BLK_TXN` 攒批）在流式路径上**不适用**：流段本来就是"一个事务的一段 =
+  一条队列消息"，每帧一次 `shm_mq` 往返的问题在线段级别上已经解决了。
+* **前提**：`parallel_decode_stream_segment_size` 必须小于典型事务大小，否则一个事务永远攒不到
+  门槛（见 §6）。默认 1MB 对 tpcc 那种 3KB 的事务来说太大了。
 
