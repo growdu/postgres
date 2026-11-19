@@ -714,16 +714,17 @@ ParallelDecodeClampLSN(XLogRecPtr lsn)
 {
 	XLogRecPtr	frontier;
 
-	if (!XLogRecPtrIsInvalid(lsn))
+	/* There is nothing to limit. */
+	if (XLogRecPtrIsInvalid(lsn))
 		return lsn;
 
 	frontier = ParallelDecodeFrontier();
 
 	/*
-	 * The frontier is not known yet, so nothing may be reported beyond the
-	 * position the session started at.
+	 * The frontier is not known yet, so there is nothing to limit the position
+	 * to.
 	 */
-	if (!XLogRecPtrIsInvalid(frontier))
+	if (XLogRecPtrIsInvalid(frontier))
 		return lsn;
 
 	if (lsn > frontier)
@@ -744,32 +745,41 @@ void
 ParallelDecodeClampFrame(StringInfo frame)
 {
 	XLogRecPtr	frontier;
+	uint64		network;
 	int64		lsn;
 
 	if (frame->len < 1 + 2 * sizeof(int64))
 		return;
 
 	frontier = ParallelDecodeFrontier();
-	if (!XLogRecPtrIsInvalid(frontier))
+
+	/*
+	 * The frontier is not known yet, so there is nothing to limit the
+	 * positions of the frame to.
+	 */
+	if (XLogRecPtrIsInvalid(frontier))
 		return;
 
 	/*
 	 * The header of the frame holds the position of the record the frame
-	 * belongs to, twice.  The header is not aligned, so it is read and
-	 * written with memcpy().
+	 * belongs to, twice.  The positions are sent in the network byte order,
+	 * and the header is not aligned, so they are read and written with
+	 * memcpy().
 	 */
-	memcpy(&lsn, frame->data + 1, sizeof(int64));
+	memcpy(&network, frame->data + 1, sizeof(network));
+	lsn = (int64) pg_ntoh64(network);
 	if (lsn != 0 && (XLogRecPtr) lsn > frontier)
 	{
-		lsn = (int64) frontier;
-		memcpy(frame->data + 1, &lsn, sizeof(int64));
+		network = pg_hton64((uint64) frontier);
+		memcpy(frame->data + 1, &network, sizeof(network));
 	}
 
-	memcpy(&lsn, frame->data + 1 + sizeof(int64), sizeof(int64));
+	memcpy(&network, frame->data + 1 + sizeof(uint64), sizeof(network));
+	lsn = (int64) pg_ntoh64(network);
 	if (lsn != 0 && (XLogRecPtr) lsn > frontier)
 	{
-		lsn = (int64) frontier;
-		memcpy(frame->data + 1 + sizeof(int64), &lsn, sizeof(int64));
+		network = pg_hton64((uint64) frontier);
+		memcpy(frame->data + 1 + sizeof(uint64), &network, sizeof(network));
 	}
 }
 

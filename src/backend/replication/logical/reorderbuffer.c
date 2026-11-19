@@ -3153,6 +3153,91 @@ ReorderBufferAddSnapshot(ReorderBuffer *rb, TransactionId xid,
 }
 
 /*
+ * Does the buffer hold the transaction?
+ *
+ * The decode workers use this to find out whether they own a transaction: the
+ * worker that owns the transaction that committed executes its invalidation
+ * messages when the transaction ends, the other workers have to execute them
+ * right away.
+ */
+bool
+ReorderBufferHasTransaction(ReorderBuffer *rb, TransactionId xid)
+{
+	ReorderBufferTXN *txn;
+
+	if (!TransactionIdIsValid(xid))
+		return false;
+
+	txn = ReorderBufferTXNByXid(rb, xid, false, NULL, InvalidXLogRecPtr,
+								  false);
+
+	return txn != NULL;
+}
+
+/*
+ * Add a snapshot to all the transactions that are in flight, so that they see
+ * the new catalog contents from here on, and add the invalidation messages of
+ * the transaction that committed to the ones that are not the committing
+ * transaction itself.
+ *
+ * The transactions that do not have a base snapshot yet are skipped: they do
+ * not have any changes, so they do not need a snapshot yet.  The prepared
+ * transactions are skipped as well, because they must not see the new
+ * catalog contents.
+ *
+ * This is the counterpart of SnapBuildDistributeSnapshotAndInval() for the
+ * parallel decoding path.  There the snapshot is built by the walreader,
+ * which is the only process that reads the WAL, and it is handed down to the
+ * decode workers, which hold the transactions of their own.
+ *
+ * xid is the transaction the invalidation messages belong to.  They are not
+ * added to that transaction itself: it executes them when it ends.
+ */
+void
+ReorderBufferDistributeSnapshot(ReorderBuffer *rb, XLogRecPtr lsn,
+								 Snapshot snap, TransactionId xid,
+								 uint32 ninvalidations,
+								 SharedInvalidationMessage *msgs)
+{
+	dlist_iter	txn_i;
+
+	Assert(snap != NULL);
+
+	dlist_foreach(txn_i, &rb->toplevel_by_lsn)
+	{
+		ReorderBufferTXN *txn;
+
+		txn = dlist_container(ReorderBufferTXN, node, txn_i.cur);
+
+		if (!ReorderBufferXidHasBaseSnapshot(rb, txn->xid))
+			continue;
+
+		if (rbtxn_prepared(txn) || rbtxn_skip_prepared(txn))
+			continue;
+
+		/*
+		 * The transaction holds a reference of its own to the snapshot, so the
+		 * reference count has to be raised before the snapshot is handed out.
+		 */
+		SnapBuildSnapIncRefcount(snap);
+		ReorderBufferAddSnapshot(rb, txn->xid, lsn, snap);
+
+		/*
+		 * The invalidation messages of the committing transaction are added to
+		 * the other transactions that are in flight.  The committing transaction
+		 * itself executes them when it ends.
+		 */
+		if (txn->xid != xid && ninvalidations > 0)
+		{
+			Assert(msgs != NULL);
+
+			ReorderBufferAddInvalidations(rb, txn->xid, lsn,
+									  ninvalidations, msgs);
+		}
+	}
+}
+
+/*
  * Set up the transaction's base snapshot.
  *
  * If we know that xid is a subtransaction, set the base snapshot on the

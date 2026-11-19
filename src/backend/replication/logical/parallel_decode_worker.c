@@ -30,6 +30,8 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/parallel_decode.h"
+#include "replication/reorderbuffer.h"
+#include "replication/snapbuild.h"
 #include "replication/slot.h"
 #include "storage/condition_variable.h"
 #include "storage/ipc.h"
@@ -90,6 +92,15 @@ static uint64 pd_current_cseq = 0;
 
 /* The position the walsender has been told about. */
 static XLogRecPtr pd_reported_lsn = InvalidXLogRecPtr;
+
+/*
+ * The version of the snapshot the worker holds.
+ *
+ * The walreader numbers the snapshots it publishes, and the workers refer to
+ * a snapshot by its version.  The version tells the worker whether the
+ * messages it receives are about the snapshot it holds.
+ */
+static uint64 pd_snapshot_version = 0;
 
 /*
  * The number of records between two reports of the decoding position.
@@ -225,8 +236,6 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 static void
 pd_worker_send_segment(void)
 {
-	StringInfoData msg;
-
 	if (pd_segment_frames == 0)
 	{
 		resetStringInfo(pd_segment);
@@ -234,7 +243,6 @@ pd_worker_send_segment(void)
 		return;
 	}
 
-	resetStringInfo(&msg);
 	PDQueueSendSegment(pd_out_mqh, (uint64) pd_end_lsn, pd_segment_frames,
 					   pd_segment->data, pd_segment->len);
 
@@ -291,15 +299,279 @@ pd_worker_update_progress(LogicalDecodingContext *ctx, XLogRecPtr lsn,
  * caught-up decision and for the lag the subscriber sees.  The message is
  * sent when the worker runs out of work, so that the records that produced no
  * output still advance the position.
+ *
+ * A report that does not advance the position is sent when it is forced: the
+ * walsender tells from the time of the report whether the worker is still
+ * working, and a worker that owns no transaction never advances its position.
  */
 static void
-pd_worker_send_position(void)
+pd_worker_send_position(XLogRecPtr position, bool force)
 {
-	if (pd_end_lsn <= pd_reported_lsn)
+	if (!force && position <= pd_reported_lsn)
 		return;
 
-	PDQueueSendPosition(pd_out_mqh, (uint64) pd_end_lsn);
-	pd_reported_lsn = pd_end_lsn;
+	/*
+	 * The position never goes backwards: the marker the walreader sends may
+	 * name a position that the worker has already reported past.
+	 */
+	if (position < pd_reported_lsn)
+		position = pd_reported_lsn;
+
+	PDQueueSendPosition(pd_out_mqh, (uint64) position);
+	pd_reported_lsn = position;
+}
+
+/*
+ * Build the snapshot the walreader handed down.
+ *
+ * The walreader is the only process that reads the WAL, so it is the only one
+ * that builds the snapshots.  The worker materializes the snapshot here,
+ * because the decoding path needs a snapshot it can install as the historic
+ * snapshot.
+ *
+ * The snapshot and the array of the committed transactions are allocated in one
+ * block: they are freed together.
+ */
+static Snapshot
+pd_worker_build_snapshot(const PDSnapshotContent *content,
+						 const TransactionId *xip)
+{
+	SnapshotData *snap;
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(pd_ctx->context);
+
+	snap = palloc0(sizeof(SnapshotData) +
+				   sizeof(TransactionId) * content->xcnt);
+
+	snap->snapshot_type = SNAPSHOT_HISTORIC_MVCC;
+	snap->xmin = content->xmin;
+	snap->xmax = content->xmax;
+	snap->curcid = content->curcid;
+	snap->xcnt = content->xcnt;
+	snap->xip = (TransactionId *) (snap + 1);
+	snap->subxcnt = 0;
+	snap->subxip = NULL;
+	snap->suboverflowed = false;
+	snap->takenDuringRecovery = false;
+	snap->copied = false;
+	snap->active_count = 0;
+	snap->regd_count = 0;
+	snap->snapXactCompletionCount = 0;
+
+	if (content->xcnt > 0)
+	{
+		memcpy(snap->xip, xip, sizeof(TransactionId) * content->xcnt);
+
+		/*
+		 * The array has to be sorted: the snapshot is searched with bsearch().
+		 */
+		qsort(snap->xip, snap->xcnt, sizeof(TransactionId), xidComparator);
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return (Snapshot) snap;
+}
+
+/*
+ * Handle a snapshot message.
+ *
+ * The messages tell the worker about the state of the snapshot builder of the
+ * walreader, about the content of the snapshot the transactions are decoded
+ * with, and about the moments at which the transactions that are in flight
+ * have to switch over to a new snapshot.
+ */
+static void
+pd_worker_handle_snapshot(const void *payload, size_t len)
+{
+	const PDSnapshotHeader *header = payload;
+	const char *data;
+	size_t		datalen;
+
+	if (len < sizeof(PDSnapshotHeader))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("parallel decode snapshot message is too short (%zu bytes)",
+						(size_t) len)));
+
+	data = (const char *) payload + sizeof(PDSnapshotHeader);
+	datalen = len - sizeof(PDSnapshotHeader);
+
+	if (header->flags & PD_SNAPSHOT_CONTENT)
+	{
+		const PDSnapshotContent *content = (const PDSnapshotContent *) data;
+		Snapshot	snap;
+
+		if (datalen < sizeof(PDSnapshotContent))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode snapshot message is too short (%zu bytes)",
+							(size_t) len)));
+
+		if (datalen < sizeof(PDSnapshotContent) +
+			sizeof(TransactionId) * content->xcnt)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode snapshot message is truncated")));
+
+		/*
+		 * The versions of the snapshots grow, so a message that carries a
+		 * version the worker has already seen is out of order.
+		 */
+		if (header->version <= pd_snapshot_version)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode snapshot message is out of order")));
+
+		snap = pd_worker_build_snapshot(content,
+										(const TransactionId *) (data + sizeof(PDSnapshotContent)));
+
+		pd_snapshot_version = header->version;
+
+		SnapBuildSetSnapshot(pd_ctx->snapshot_builder, snap);
+	}
+	else if (header->flags & PD_SNAPSHOT_BASE)
+	{
+		Snapshot	snap;
+
+		snap = SnapBuildGetSnapshot(pd_ctx->snapshot_builder);
+		if (snap == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode base snapshot message arrived before the "
+							"content of the snapshot")));
+
+		if (header->version != pd_snapshot_version)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode base snapshot message refers to an unknown "
+							"version of the snapshot")));
+
+		/*
+		 * The transaction holds a reference of its own to the snapshot.
+		 */
+		SnapBuildSnapIncRefcount(snap);
+		ReorderBufferSetBaseSnapshot(pd_ctx->reorder, header->xid,
+									  header->lsn, snap);
+	}
+	else if (header->flags & PD_SNAPSHOT_SWITCH)
+	{
+		Snapshot	snap;
+		SharedInvalidationMessage *msgs = NULL;
+
+		if (datalen < sizeof(SharedInvalidationMessage) * header->ninvalidations)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode snapshot message is truncated")));
+
+		if (header->ninvalidations > 0)
+			msgs = (SharedInvalidationMessage *) data;
+
+		snap = SnapBuildGetSnapshot(pd_ctx->snapshot_builder);
+		if (snap == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode snapshot switch message arrived before the "
+							"content of the snapshot")));
+
+		/*
+		 * The transactions that are in flight switch over to the new snapshot,
+		 * and the invalidation messages of the transaction that committed are
+		 * added to them.
+		 */
+		ReorderBufferDistributeSnapshot(pd_ctx->reorder, header->lsn, snap,
+										 header->xid, header->ninvalidations,
+										 msgs);
+
+		/*
+		 * The worker that owns the transaction that committed executes the
+		 * invalidation messages itself, when the transaction ends.  Every other
+		 * worker has to execute them right away: the catalog caches of a
+		 * worker are private to its process, and nothing else would ever
+		 * invalidate them.
+		 */
+		if (header->ninvalidations > 0 &&
+			!ReorderBufferHasTransaction(pd_ctx->reorder, header->xid))
+			ReorderBufferImmediateInvalidation(pd_ctx->reorder,
+											   header->ninvalidations, msgs);
+	}
+	else if (header->flags & PD_SNAPSHOT_STATE)
+	{
+		SnapBuildSetState(pd_ctx->snapshot_builder,
+						  (SnapBuildState) header->state,
+						  header->start_decoding_at,
+						  header->next_phase_at);
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("parallel decode snapshot message has unknown flags (%u)",
+						header->flags)));
+}
+
+/*
+ * Handle the invalidation messages of a record that has no transaction.
+ *
+ * The invalidation messages affect the catalog state of the whole cluster, so
+ * every worker has to execute them.
+ */
+static void
+pd_worker_handle_inval(const void *payload, size_t len)
+{
+	const PDInvalHeader *header = payload;
+	const char *data;
+	size_t		datalen;
+
+	if (len < sizeof(PDInvalHeader))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("parallel decode invalidation message is too short (%zu bytes)",
+						(size_t) len)));
+
+	data = (const char *) payload + sizeof(PDInvalHeader);
+	datalen = len - sizeof(PDInvalHeader);
+
+	if (datalen < sizeof(SharedInvalidationMessage) * header->ninvalidations)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("parallel decode invalidation message is truncated")));
+
+	if (header->ninvalidations > 0)
+		ReorderBufferImmediateInvalidation(pd_ctx->reorder,
+										   header->ninvalidations,
+										   (SharedInvalidationMessage *) data);
+}
+
+/*
+ * Handle the marker the walreader sends.
+ *
+ * The records of a transaction are only handed to the worker that owns it, so
+ * a worker that owns no transaction does not see the records the walreader
+ * reads.  The marker tells it how far the walreader has come, so that it can
+ * report that it has decoded everything that was meant for it.
+ *
+ * The marker does not advance the decoding position of the worker itself: it
+ * says that the walreader has come further.  The worker reports the position
+ * of the marker, because every record that was meant for it has been decoded
+ * by the time the marker reaches it.  That way the position of the session is
+ * the position the walreader has read up to, exactly as it is in the serial
+ * path, even when the worker owns no transaction at all.
+ */
+static void
+pd_worker_handle_marker(const void *payload, size_t len)
+{
+	uint64		position;
+
+	if (len < sizeof(position))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("parallel decode marker message is too short (%zu bytes)",
+						(size_t) len)));
+
+	memcpy(&position, payload, sizeof(position));
+
+	pd_worker_send_position((XLogRecPtr) position, true);
 }
 
 /*
@@ -347,6 +619,11 @@ pd_worker_report_error(const char *message)
 /*
  * Get the next WAL record the walreader has read.
  *
+ * The walreader sends more than records: it also tells the worker about the
+ * snapshots the transactions are decoded with, about the invalidation messages
+ * that affect the whole cluster, and how far it has read.  Those messages are
+ * handled here, and the loop goes on to the next message.
+ *
  * On PD_RECV_RECORD the record belongs to the caller, which frees it with
  * PDRecordFree().
  */
@@ -377,33 +654,62 @@ pd_worker_recv_record(DecodedXLogRecord **record, bool nowait)
 								   &len, nowait);
 		if (res == SHM_MQ_SUCCESS)
 		{
-			if (type != PD_ENT_WAL)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("unexpected message of type %u on the parallel decode "
-								"WAL channel", type)));
+			if (type == PD_ENT_WAL)
+			{
+				if (len < sizeof(PDWalHeader))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("parallel decode WAL message is too short (%zu bytes)",
+									(size_t) len)));
 
-			if (len < sizeof(PDWalHeader))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("parallel decode WAL message is too short (%zu bytes)",
-								(size_t) len)));
+				/*
+				 * The header tells the worker which worker owns the transaction
+				 * of the record, and which commit sequence number the record
+				 * was given when it ends a transaction.
+				 */
+				memcpy(&pd_wal_header, payload, sizeof(PDWalHeader));
+
+				*record = PDRecordDeserialize((const char *) payload + sizeof(PDWalHeader),
+											  len - sizeof(PDWalHeader));
+				pfree((void *) payload);
+
+				return PD_RECV_RECORD;
+			}
+
+			switch (type)
+			{
+				case PD_ENT_SNAPSHOT:
+					pd_worker_handle_snapshot(payload, len);
+					break;
+
+				case PD_ENT_GLOBAL_INVAL:
+					pd_worker_handle_inval(payload, len);
+					break;
+
+				case PD_ENT_MARKER:
+					pd_worker_handle_marker(payload, len);
+					break;
+
+				default:
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("unexpected message of type %u on the parallel decode "
+									"WAL channel", type)));
+			}
 
 			/*
-			 * The header tells the worker which worker owns the transaction of
-			 * the record, and which commit sequence number the record was given
-			 * when it ends a transaction.
+			 * The message was not a record, so the loop goes on to the next
+			 * message of the queue.
 			 */
-			memcpy(&pd_wal_header, payload, sizeof(PDWalHeader));
-
-			*record = PDRecordDeserialize((const char *) payload + sizeof(PDWalHeader),
-										  len - sizeof(PDWalHeader));
 			pfree((void *) payload);
-
-			return PD_RECV_RECORD;
+			continue;
 		}
 		if (res == SHM_MQ_DETACHED)
 			return PD_RECV_STOPPED;
+
+		/* The caller asked not to wait, so give up after the first try. */
+		if (nowait)
+			return PD_RECV_EMPTY;
 
 		/*
 		 * There is nothing to do but wait for the walreader.  The walreader is
@@ -416,10 +722,6 @@ pd_worker_recv_record(DecodedXLogRecord **record, bool nowait)
 					   pd_wait_event);
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
-
-		/* The caller asked not to wait, so give up after the first try. */
-		if (nowait)
-			return PD_RECV_EMPTY;
 	}
 }
 
@@ -460,7 +762,7 @@ pd_worker_decode_loop(void)
 		res = pd_worker_recv_record(&record, true);
 		if (res == PD_RECV_EMPTY)
 		{
-			pd_worker_send_position();
+			pd_worker_send_position(pd_end_lsn, false);
 			res = pd_worker_recv_record(&record, false);
 		}
 		if (res != PD_RECV_RECORD)
@@ -492,7 +794,7 @@ pd_worker_decode_loop(void)
 		if (++since_report >= PD_POSITION_REPORT_INTERVAL)
 		{
 			since_report = 0;
-			pd_worker_send_position();
+			pd_worker_send_position(pd_end_lsn, false);
 		}
 
 		/*
@@ -656,6 +958,16 @@ ParallelDecodeWorkerMain(Datum main_arg)
 											XL_ROUTINE(.page_read = pd_worker_read_page),
 											PDPrepareWrite, pd_worker_write,
 											pd_worker_update_progress);
+
+	/*
+	 * The worker does not drive the snapshot builder.  The walreader is the
+	 * only process that reads the WAL, so it is the only one that knows which
+	 * snapshot a transaction is decoded with and when the transactions that are
+	 * in flight have to switch over to a new one.  The builder of the worker is
+	 * a stand-in: it is told about the state of the builder of the walreader
+	 * and about the snapshots the transactions are decoded with.
+	 */
+	SnapBuildSetRole(pd_ctx->snapshot_builder, SNAPBUILD_ROLE_STANDIN);
 
 	/*
 	 * The decoding context published the copy of the slot as the slot of this

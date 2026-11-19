@@ -449,6 +449,22 @@ PDQueueSendPosition(shm_mq_handle *mqh, uint64 end_lsn)
 }
 
 /*
+ * Tell a decode worker how far the walreader has read.
+ *
+ * The records of a transaction are only handed to the worker that owns it,
+ * so a worker that owns no transaction does not see the records the walreader
+ * reads.  The marker tells it how far the walreader has come, so that the
+ * worker can report that it has decoded everything that was meant for it.
+ */
+void
+PDQueueSendMarker(shm_mq_handle *mqh, uint64 position)
+{
+	pd_queue_send_chunked(mqh, PD_ENT_MARKER, NULL, 0, &position,
+						  sizeof(position), PARALLEL_DECODE_CHUNK_SIZE, false,
+						  true);
+}
+
+/*
  * Serialize the options of the output plugin.
  *
  * Every option of the plugins that ship with PostgreSQL carries a plain

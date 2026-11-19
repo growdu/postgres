@@ -22,6 +22,7 @@
 
 #include "postgres.h"
 
+#include "access/transam.h"
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
 #include "replication/logical.h"
@@ -335,7 +336,8 @@ typedef enum ParallelDecodeEntryType
 	PD_ENT_FRAME = 11,			/* worker -> walsender */
 	PD_ENT_POSITION = 12,		/* worker -> walsender */
 	PD_ENT_CSEQ = 13,			/* walreader -> walsender */
-	PD_ENT_SEGMENT = 14			/* worker -> walsender */
+	PD_ENT_SEGMENT = 14,		/* worker -> walsender */
+	PD_ENT_MARKER = 15			/* walreader -> worker */
 } ParallelDecodeEntryType;
 
 /*
@@ -424,6 +426,86 @@ typedef struct PDWalHeader
 	 */
 	uint64		cseq;
 } PDWalHeader;
+
+/*
+ * The flags of a snapshot message.
+ *
+ * A snapshot message tells the decode workers about the state of the snapshot
+ * builder and about the snapshots the transactions are decoded with.  The
+ * walreader is the only process that drives the builder, so it is the only one
+ * that knows which snapshot a transaction is decoded with.
+ */
+#define PD_SNAPSHOT_STATE		0x0001	/* the state of the builder */
+#define PD_SNAPSHOT_CONTENT	0x0002	/* the content of the snapshot follows */
+#define PD_SNAPSHOT_BASE		0x0004	/* the base snapshot of a transaction */
+#define PD_SNAPSHOT_SWITCH		0x0008	/* the running transactions switch over */
+#define PD_SNAPSHOT_INVAL		0x0010	/* invalidation messages follow */
+
+/*
+ * The header of a snapshot message.
+ *
+ * The message carries the parts of the state of the snapshot builder that the
+ * decode workers need, and the events that change the snapshot the running
+ * transactions are decoded with.
+ *
+ * The layout of the payload depends on the flags:
+ *
+ *   PD_SNAPSHOT_CONTENT	the content of the snapshot follows the header;
+ *   PD_SNAPSHOT_BASE		the base snapshot of the transaction xid is the
+ *				snapshot the message carries the version of;
+ *   PD_SNAPSHOT_SWITCH	the transactions that are in flight switch over to
+ *				the snapshot of this message;
+ *   PD_SNAPSHOT_INVAL		the invalidation messages follow the payload.
+ *
+ * A message that carries the content of a snapshot (PD_SNAPSHOT_CONTENT) is
+ * sent to every worker: every worker holds transactions that may have to
+ * switch over to the snapshot.  A message that assigns the base snapshot of a
+ * transaction (PD_SNAPSHOT_BASE) is sent to the worker that owns the
+ * transaction only.
+ */
+typedef struct PDSnapshotHeader
+{
+	uint64		version;		/* the version of the snapshot */
+	uint32		flags;			/* PD_SNAPSHOT_* */
+	uint32		ninvalidations;	/* the number of invalidation messages that
+								 * follow the payload */
+	int32		state;			/* the state of the snapshot builder */
+	XLogRecPtr	lsn;			/* the position the event happened at */
+	XLogRecPtr	start_decoding_at;	/* the position the decoding starts at */
+	TransactionId xid;		/* the transaction the event belongs to */
+	TransactionId next_phase_at;	/* the transaction the next phase of the
+									 * builder starts at */
+} PDSnapshotHeader;
+
+/*
+ * The content of a snapshot.
+ *
+ * The array of the committed transactions follows the header.  It holds the
+ * transactions that are treated as committed by the snapshot, which is what
+ * makes the catalog rows they wrote visible to the decoding.
+ */
+typedef struct PDSnapshotContent
+{
+	TransactionId xmin;
+	TransactionId xmax;
+	CommandId	curcid;
+	uint32		xcnt;
+	/* the array of the committed transactions follows */
+} PDSnapshotContent;
+
+/*
+ * The header of a message that carries invalidation messages.
+ *
+ * The messages follow the header.  They are the invalidation messages of a
+ * record that has no transaction, which have to be executed by every worker:
+ * the catalog caches of the workers are private to their process, so the
+ * invalidation has to reach all of them.
+ */
+typedef struct PDInvalHeader
+{
+	uint32		ninvalidations;
+	/* the invalidation messages follow */
+} PDInvalHeader;
 
 /*
  * The header of a frame message.
@@ -578,6 +660,7 @@ extern void PDQueueSendEvent(shm_mq_handle *mqh, uint64 cseq, uint32 event);
  * receiver for all of its messages.
  */
 extern void PDQueueSendPosition(shm_mq_handle *mqh, uint64 end_lsn);
+extern void PDQueueSendMarker(shm_mq_handle *mqh, uint64 position);
 
 /*
  * The output plugin options, in the serialized form.

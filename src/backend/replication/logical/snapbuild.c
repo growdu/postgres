@@ -281,6 +281,16 @@ struct SnapBuild
 		/* This array must be sorted in xidComparator order */
 		TransactionId *xip;
 	}			catchange;
+
+	/*
+	 * The role of this builder.
+	 *
+	 * The builders of the serial path and of the walreader are driven by the
+	 * process that reads the WAL.  The builder of a decode worker is a
+	 * stand-in: it is told about the state of the builder of the walreader and
+	 * it never builds a snapshot of its own.
+	 */
+	SnapBuildRole role;
 };
 
 /*
@@ -298,7 +308,7 @@ static Snapshot SnapBuildBuildSnapshot(SnapBuild *builder);
 
 static void SnapBuildFreeSnapshot(Snapshot snap);
 
-static void SnapBuildSnapIncRefcount(Snapshot snap);
+extern void SnapBuildSnapIncRefcount(Snapshot snap);
 
 static void SnapBuildDistributeSnapshotAndInval(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid);
 
@@ -343,6 +353,7 @@ AllocateSnapshotBuilder(ReorderBuffer *reorder,
 	builder->state = SNAPBUILD_START;
 	builder->context = context;
 	builder->reorder = reorder;
+	builder->role = SNAPBUILD_ROLE_SERIAL;
 	/* Other struct members initialized by zeroing via palloc0 above */
 
 	builder->committed.xcnt = 0;
@@ -419,6 +430,86 @@ SnapBuildCurrentState(SnapBuild *builder)
 }
 
 /*
+ * Turn the builder into the stand-in of a decode worker, or into the builder
+ * of the walreader.
+ *
+ * The stand-in does not build snapshots of its own: it is told about the
+ * state of the builder of the walreader and about the snapshots the
+ * transactions are decoded with.
+ */
+void
+SnapBuildSetRole(SnapBuild *builder, SnapBuildRole role)
+{
+	builder->role = role;
+}
+
+/*
+ * Hand the state of the builder down to a decode worker.
+ *
+ * The state of the builder is advanced by the walreader, which is the only
+ * process that reads the WAL.  The workers learn about the changes from the
+ * messages the walreader sends them, so that they see the same state the
+ * walreader has at the position of the record they are decoding.
+ */
+void
+SnapBuildSetState(SnapBuild *builder, SnapBuildState state,
+				   XLogRecPtr start_decoding_at, TransactionId next_phase_at)
+{
+	builder->state = state;
+	builder->start_decoding_at = start_decoding_at;
+	builder->next_phase_at = next_phase_at;
+}
+
+/*
+ * The snapshot the builder currently holds, or NULL if it has none.
+ */
+Snapshot
+SnapBuildGetSnapshot(SnapBuild *builder)
+{
+	return builder->snapshot;
+}
+
+/*
+ * Install the snapshot the stand-in of a decode worker works with.
+ *
+ * The stand-in never builds a snapshot of its own: the walreader hands the
+ * content of the snapshot down, and the worker keeps it here, from where the
+ * decoding path picks it up.
+ */
+void
+SnapBuildSetSnapshot(SnapBuild *builder, Snapshot snap)
+{
+	Assert(builder->role == SNAPBUILD_ROLE_STANDIN);
+	Assert(snap != NULL);
+
+	if (builder->snapshot != NULL)
+		SnapBuildSnapDecRefcount(builder->snapshot);
+
+	builder->snapshot = snap;
+
+	/* the builder holds a reference of its own */
+	SnapBuildSnapIncRefcount(builder->snapshot);
+}
+
+/*
+ * The position from which on the transactions are decoded.
+ */
+XLogRecPtr
+SnapBuildGetStartDecodingAt(SnapBuild *builder)
+{
+	return builder->start_decoding_at;
+}
+
+/*
+ * The transaction the next phase of the builder starts at.
+ */
+TransactionId
+SnapBuildGetNextPhaseAt(SnapBuild *builder)
+{
+	return builder->next_phase_at;
+}
+
+/*
  * Return the LSN at which the two-phase decoding was first enabled.
  */
 XLogRecPtr
@@ -451,7 +542,7 @@ SnapBuildXactNeedsSkip(SnapBuild *builder, XLogRecPtr ptr)
  * This is used when handing out a snapshot to some external resource or when
  * adding a Snapshot as builder->snapshot.
  */
-static void
+void
 SnapBuildSnapIncRefcount(Snapshot snap)
 {
 	snap->active_count++;
@@ -719,6 +810,13 @@ SnapBuildGetOrBuildSnapshot(SnapBuild *builder)
 {
 	Assert(builder->state == SNAPBUILD_CONSISTENT);
 
+	/*
+	 * The stand-in of a decode worker never builds a snapshot: it uses the
+	 * one the walreader has handed down.
+	 */
+	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+		return builder->snapshot;
+
 	/* only build a new snapshot if we don't have a prebuilt one */
 	if (builder->snapshot == NULL)
 	{
@@ -804,6 +902,16 @@ SnapBuildOwnsTransaction(SnapBuild *builder)
 bool
 SnapBuildProcessChange(SnapBuild *builder, TransactionId xid, XLogRecPtr lsn)
 {
+	/*
+	 * The stand-in of a decode worker does not decide whether a change is
+	 * decoded: the walreader has already made that decision, and it only sends
+	 * the records of the transactions that are decoded to the worker that owns
+	 * them.  All the stand-in has to answer is whether the transaction has a
+	 * base snapshot, which is the case once the worker has been handed one.
+	 */
+	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+		return ReorderBufferXidHasBaseSnapshot(builder->reorder, xid);
+
 	/*
 	 * We can't handle data in transactions if we haven't built a snapshot
 	 * yet, so don't store them.
@@ -907,6 +1015,16 @@ SnapBuildDistributeSnapshotAndInval(SnapBuild *builder, XLogRecPtr lsn, Transact
 {
 	dlist_iter	txn_i;
 	ReorderBufferTXN *txn;
+
+	/*
+	 * The walreader of a parallel decoding session does not distribute the
+	 * snapshot itself: the transactions that are in flight are held by the
+	 * decode workers, and the walreader tells them to switch over to the new
+	 * snapshot.  The tracking buffer of the walreader does not hold the
+	 * changes of the transactions, so there is nothing to distribute here.
+	 */
+	if (builder->role == SNAPBUILD_ROLE_WALREADER)
+		return;
 
 	/*
 	 * Iterate through all toplevel transactions. This can include
@@ -1115,6 +1233,14 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 	TransactionId xmax = xid;
 
 	/*
+	 * The stand-in of a decode worker does not track the commits: the walreader
+	 * is the only process that knows which transactions changed the catalogs,
+	 * and it is the one that decides whether a new snapshot is needed.
+	 */
+	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+		return;
+
+	/*
 	 * Transactions preceding BUILDING_SNAPSHOT will neither be decoded, nor
 	 * will they be part of a snapshot.  So we don't need to record anything.
 	 */
@@ -1305,6 +1431,24 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	TransactionId xmin;
 
 	/*
+	 * The stand-in of a decode worker does not advance the state of the
+	 * builder: the walreader does that, and it tells the workers about the
+	 * changes.  All the worker has to do here is to abort the transactions it
+	 * still holds that are not running anymore, which is what the serial path
+	 * does as well.
+	 */
+	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+	{
+		xmin = ReorderBufferGetOldestXmin(builder->reorder);
+		if (xmin == InvalidTransactionId)
+			xmin = running->oldestRunningXid;
+
+		ReorderBufferAbortOld(builder->reorder, xmin);
+
+		return;
+	}
+
+	/*
 	 * If we're not consistent yet, inspect the record to see whether it
 	 * allows to get closer to being consistent. If we are consistent, dump
 	 * our snapshot so others or we, after a restart, can use it.
@@ -1343,7 +1487,14 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	 * snapshots; use it if so.  If not, we need only consider the snapshots
 	 * we'll produce later, which can't be less than the oldest running xid in
 	 * the record we're reading now.
+	 *
+	 * The walreader of a parallel decoding session does not own the slot:
+	 * the walsender does.  It therefore must not touch the watermarks of the
+	 * slot, they are advanced by the process that owns it.
 	 */
+	if (builder->role == SNAPBUILD_ROLE_WALREADER)
+		return;
+
 	xmin = ReorderBufferGetOldestXmin(builder->reorder);
 	if (xmin == InvalidTransactionId)
 		xmin = running->oldestRunningXid;

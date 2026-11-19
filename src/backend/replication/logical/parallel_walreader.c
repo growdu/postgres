@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam_xlog.h"
 #include "access/xlog.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
@@ -28,14 +29,24 @@
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
+#include "replication/logical.h"
+#include "replication/message.h"
 #include "replication/parallel_decode.h"
+#include "replication/reorderbuffer.h"
+#include "replication/slot.h"
+#include "replication/snapbuild.h"
+#include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+#include "storage/sinval.h"
+#include "storage/standbydefs.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/wait_event.h"
 
 /*
@@ -117,6 +128,96 @@ static uint64 pd_next_cseq = 1;
  * failure happened.
  */
 static XLogRecPtr pd_read_lsn = InvalidXLogRecPtr;
+
+/*
+ * The tracking reorder buffer and the snapshot builder of the walreader.
+ *
+ * The walreader is the only reader of the WAL, so it is the only process that
+ * can drive the snapshot builder: it decides which snapshot a transaction is
+ * decoded with, and when the transactions that are in flight have to switch
+ * over to a new one.  The decode workers do not have a builder of their own,
+ * they use a read-only stand-in that is told about the state of the builder
+ * of the walreader.
+ *
+ * The reorder buffer does not hold any changes: it mirrors the state the
+ * snapshot builder works on, so that the builder can tell which transactions
+ * are in flight, which of them have a base snapshot and which of them changed
+ * the catalogs.
+ */
+static ReorderBuffer *pd_rb = NULL;
+static SnapBuild *pd_builder = NULL;
+
+/*
+ * The decoding context of the shadow decoding.
+ *
+ * The walreader does not produce any output, so it has no output plugin.  The
+ * context exists because the snapshot builder reaches for it through the
+ * reorder buffer: it uses it to find out which transactions it owns.  The
+ * walreader owns all of them.
+ */
+static LogicalDecodingContext *pd_shadow_ctx = NULL;
+
+/*
+ * The copy of the replication slot the walreader works on.
+ *
+ * The walsender owns the slot, so the walreader cannot hold it.  The
+ * decoding path only reads a few fields of it, so a copy that carries those
+ * fields is enough.
+ */
+static ReplicationSlot *pd_slot_copy = NULL;
+
+/*
+ * The version of the snapshot that was published last.
+ *
+ * The version is what the workers refer to a snapshot by: the walreader hands
+ * the content of a snapshot down together with its version, and the workers
+ * refer to the snapshot by the version when they are told which snapshot a
+ * transaction is decoded with.
+ */
+static uint64 pd_snapshot_version = 0;
+
+/*
+ * The snapshot that was published last, NULL if there is none.
+ *
+ * The walreader compares it with the snapshot the builder holds to find out
+ * whether a new snapshot has been built, which is when the content of the
+ * snapshot has to be handed down.
+ */
+static Snapshot pd_published_snapshot = NULL;
+
+/*
+ * The state of the builder and the start of the decoding window that were
+ * published last.
+ *
+ * They are published whenever they change, so that the workers skip exactly
+ * the transactions the serial path skips.
+ */
+static int pd_published_state = -1;
+static XLogRecPtr pd_published_start_decoding_at = InvalidXLogRecPtr;
+static TransactionId pd_published_next_phase_at = InvalidTransactionId;
+
+/*
+ * The result of the shadow decoding of a record: which worker the record is
+ * forwarded to.
+ *
+ * PD_FORWARD_NONE means that the record is not forwarded at all, PD_FORWARD_ALL
+ * that it goes to every worker, and PD_FORWARD_OWNER that it goes to the
+ * worker that owns the transaction of the record.  Every other value is the
+ * index of the worker the record belongs to.
+ */
+#define PD_FORWARD_NONE		(-1)
+#define PD_FORWARD_ALL		(-2)
+#define PD_FORWARD_OWNER		(-3)
+
+/*
+ * The number of records between two markers.
+ *
+ * A marker tells the decode workers how far the walreader has read.  The
+ * records of a transaction are only handed to the worker that owns it, so a
+ * worker that owns no transaction does not see any records at all.  Without
+ * the marker such a worker could not tell that it has nothing left to do.
+ */
+#define PD_POSITION_MARK_RECORDS	64
 
 /*
  * SIGTERM handler: ask the walreader to exit at the next opportunity.
@@ -329,6 +430,21 @@ pd_walreader_record_xid(XLogReaderState *reader)
 				xlrec = (xl_xact_abort *) XLogRecGetData(reader);
 				ParseAbortRecord(XLogRecGetInfo(reader), xlrec, &parsed);
 
+				return parsed.twophase_xid;
+			}
+		case XLOG_XACT_PREPARE:
+			{
+				xl_xact_parsed_prepare parsed;
+				xl_xact_prepare *xlrec;
+
+				xlrec = (xl_xact_prepare *) XLogRecGetData(reader);
+				ParsePrepareRecord(XLogRecGetInfo(reader), xlrec, &parsed);
+
+				/*
+				 * The record belongs to the prepared transaction, not to the
+				 * backend that prepared it: the changes of the prepared
+				 * transaction are decoded by the worker that owns it.
+				 */
 				return parsed.twophase_xid;
 			}
 		default:
@@ -666,6 +782,914 @@ pd_walreader_report_error(const char *message)
 }
 
 /*
+ * Build the copy of the replication slot the walreader works on.
+ *
+ * The walsender owns the slot, so the walreader cannot hold it.  The decoding
+ * path only reads a few fields of it, so a copy that carries those fields is
+ * enough.
+ */
+static ReplicationSlot *
+pd_walreader_build_slot_copy(ParallelDecodeControl *ctl)
+{
+	ReplicationSlot *slot;
+
+	slot = palloc0(sizeof(ReplicationSlot));
+
+	/*
+	 * The copy is not a real slot, but every backend releases the slot it
+	 * owns when it exits, so the fields that the release path touches have to
+	 * be initialized.  The condition variable in particular: broadcasting on
+	 * an uninitialized one never returns.
+	 */
+	SpinLockInit(&slot->mutex);
+	ConditionVariableInit(&slot->active_cv);
+	slot->active_pid = MyProcPid;
+
+	namestrcpy(&slot->data.name, ctl->slot_name);
+	namestrcpy(&slot->data.plugin, ctl->plugin_name);
+	slot->data.database = ctl->database;
+	slot->data.two_phase = ctl->two_phase;
+	slot->data.two_phase_at = ctl->two_phase_at;
+	slot->data.restart_lsn = ctl->start_lsn;
+	slot->data.confirmed_flush = ctl->start_lsn;
+
+	return slot;
+}
+
+/*
+ * Clear the copy of the slot before the walreader exits.
+ *
+ * The walreader does not own a slot: it works on a copy of the fields of the
+ * slot of the walsender.  The callback has to be a before_shmem_exit one,
+ * because that is where the release of the slot happens.  The callbacks run in
+ * the reverse order of their registration, so this one runs before the
+ * release.
+ */
+static void
+pd_walreader_clear_slot(int code, Datum arg)
+{
+	MyReplicationSlot = NULL;
+}
+
+/*
+ * Set up the state the walreader shares with the decode workers.
+ *
+ * The walreader drives the snapshot builder, so it owns a builder of its own.
+ * The reorder buffer it works on does not hold the changes of the
+ * transactions: it mirrors the state the builder works on.
+ */
+static void
+pd_walreader_setup_shadow(ParallelDecodeControl *ctl)
+{
+	MemoryContext ctx_context;
+
+	/*
+	 * The copy of the slot has to be published before the reorder buffer is
+	 * allocated: the allocation looks at it.
+	 */
+	pd_slot_copy = pd_walreader_build_slot_copy(ctl);
+	MyReplicationSlot = pd_slot_copy;
+
+	pd_rb = ReorderBufferAllocate();
+
+	/*
+	 * The builder starts at the position the decoding starts at, which is the
+	 * same value the decode workers use for their own stand-in.  The walreader
+	 * reads the WAL from an earlier position, so that it sees the records that
+	 * bring the builder to a consistent state.
+	 */
+	pd_builder = AllocateSnapshotBuilder(pd_rb, InvalidTransactionId,
+										 ctl->start_lsn, false, false,
+										 ctl->two_phase_at);
+	SnapBuildSetRole(pd_builder, SNAPBUILD_ROLE_WALREADER);
+
+	ctx_context = AllocSetContextCreate(CurrentMemoryContext,
+										"parallel decode walreader shadow context",
+										ALLOCSET_DEFAULT_SIZES);
+
+	pd_shadow_ctx = palloc0(sizeof(LogicalDecodingContext));
+	pd_shadow_ctx->context = ctx_context;
+	pd_shadow_ctx->slot = pd_slot_copy;
+	pd_shadow_ctx->reorder = pd_rb;
+	pd_shadow_ctx->snapshot_builder = pd_builder;
+	pd_shadow_ctx->fast_forward = false;
+
+	/*
+	 * The walreader owns every transaction: the workers are the ones that
+	 * decode the transactions, and they only decode the ones they own.
+	 */
+	pd_shadow_ctx->txn_owner = -1;
+	pd_shadow_ctx->worker_index = -1;
+
+	/*
+	 * The walreader has no output plugin, so it cannot tell whether a
+	 * prepared transaction is filtered.  It treats every prepare as filtered,
+	 * which does not matter: the tracking buffer does not decode anything,
+	 * and the worker that owns the transaction makes the decision that
+	 * counts.
+	 */
+	pd_shadow_ctx->twophase = false;
+
+	/* The snapshot builder reaches for the context through the buffer. */
+	pd_rb->private_data = pd_shadow_ctx;
+
+	pd_published_state = SNAPBUILD_START;
+	pd_published_start_decoding_at = ctl->start_lsn;
+}
+
+/*
+ * Send a message to every decode worker.
+ *
+ * The message is appended to the queue of every worker, so that it reaches
+ * them in the order of the WAL: the position of an event in the WAL is the
+ * position of the message in the queue.
+ */
+static void
+pd_walreader_broadcast(uint16 type, const void *payload, size_t len)
+{
+	int			i;
+
+	for (i = 0; i < pd_num_workers; i++)
+	{
+		if (!PDQueueSendChunked(pd_wal_mqh[i], type, payload, len,
+								 PARALLEL_DECODE_CHUNK_SIZE, false, true))
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("could not hand a message to the parallel decoding session")));
+	}
+}
+
+/*
+ * Send a message to one decode worker.
+ */
+static void
+pd_walreader_send_to(int worker, uint16 type, const void *payload, size_t len)
+{
+	if (!PDQueueSendChunked(pd_wal_mqh[worker], type, payload, len,
+							 PARALLEL_DECODE_CHUNK_SIZE, false, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("could not hand a message to the parallel decoding session")));
+}
+
+/*
+ * Tell the decode workers how far the walreader has read.
+ */
+static void
+pd_walreader_send_marker(XLogRecPtr position)
+{
+	uint64		pos = (uint64) position;
+	int			i;
+
+	for (i = 0; i < pd_num_workers; i++)
+		PDQueueSendMarker(pd_wal_mqh[i], pos);
+}
+
+/*
+ * Publish the content of the snapshot the builder holds.
+ *
+ * The content is sent to every worker: the transactions the workers hold may
+ * have to switch over to the snapshot, and the transactions that start from
+ * here on are decoded with it.
+ *
+ * The version of the snapshot is what the workers refer to it by, so it grows
+ * every time a new snapshot is published.
+ */
+static void
+pd_walreader_publish_content(XLogRecPtr lsn)
+{
+	PDSnapshotHeader header;
+	PDSnapshotContent content;
+	StringInfoData buf;
+	Snapshot	snap;
+	int			i;
+
+	snap = SnapBuildGetSnapshot(pd_builder);
+	if (snap == NULL)
+		return;
+
+	initStringInfo(&buf);
+
+	header.version = ++pd_snapshot_version;
+	header.flags = PD_SNAPSHOT_CONTENT;
+	header.ninvalidations = 0;
+	header.state = SnapBuildCurrentState(pd_builder);
+	header.lsn = lsn;
+	header.start_decoding_at = SnapBuildGetStartDecodingAt(pd_builder);
+	header.xid = InvalidTransactionId;
+	header.next_phase_at = SnapBuildGetNextPhaseAt(pd_builder);
+
+	content.xmin = snap->xmin;
+	content.xmax = snap->xmax;
+	content.curcid = snap->curcid;
+	content.xcnt = snap->xcnt;
+
+	appendBinaryStringInfo(&buf, (const char *) &header, sizeof(header));
+	appendBinaryStringInfo(&buf, (const char *) &content, sizeof(content));
+
+	for (i = 0; i < snap->xcnt; i++)
+		appendBinaryStringInfo(&buf, (const char *) &snap->xip[i],
+							   sizeof(TransactionId));
+
+	pd_walreader_broadcast(PD_ENT_SNAPSHOT, buf.data, buf.len);
+
+	pfree(buf.data);
+
+	pd_published_snapshot = snap;
+}
+
+/*
+ * Publish the content of the snapshot, if the snapshot has changed.
+ *
+ * The content has to reach the workers before they are told which snapshot
+ * they are to use, so that they have it when the message that refers to it
+ * arrives.
+ */
+static void
+pd_walreader_publish_content_if_changed(XLogRecPtr lsn)
+{
+	if (SnapBuildGetSnapshot(pd_builder) != pd_published_snapshot)
+		pd_walreader_publish_content(lsn);
+}
+
+/*
+ * Tell the worker that owns a transaction which snapshot the transaction is
+ * decoded with.
+ *
+ * The message goes to the owner of the transaction only: the other workers do
+ * not hold the transaction.
+ *
+ * The transaction is named by its top level transaction id, because that is
+ * the transaction the snapshot belongs to: the snapshot of a transaction that
+ * has subtransactions is the snapshot of its top level transaction.
+ *
+ * The position the message carries is the position of the change that gave the
+ * transaction its base snapshot, which is what the serial path records as the
+ * position of the base snapshot of the transaction.
+ */
+static void
+pd_walreader_publish_base(XLogRecPtr lsn, TransactionId xid, int worker)
+{
+	PDSnapshotHeader header;
+
+	header.version = pd_snapshot_version;
+	header.flags = PD_SNAPSHOT_BASE;
+	header.ninvalidations = 0;
+	header.state = SnapBuildCurrentState(pd_builder);
+	header.lsn = lsn;
+	header.start_decoding_at = SnapBuildGetStartDecodingAt(pd_builder);
+	header.xid = xid;
+	header.next_phase_at = SnapBuildGetNextPhaseAt(pd_builder);
+
+	pd_walreader_send_to(worker, PD_ENT_SNAPSHOT, &header, sizeof(header));
+}
+
+/*
+ * Tell the workers that the transactions which are in flight switch over to
+ * the snapshot that was published last.
+ *
+ * The invalidation messages of the transaction that committed go with the
+ * message: they are added to the transactions that are in flight, so that
+ * they see the new catalog contents.  The committing transaction itself
+ * executes them when it ends, which is what the serial path does as well.
+ */
+static void
+pd_walreader_publish_switch(XLogRecPtr lsn, TransactionId xid,
+							uint32 ninvalidations,
+							SharedInvalidationMessage *msgs)
+{
+	PDSnapshotHeader header;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	header.version = pd_snapshot_version;
+	header.flags = PD_SNAPSHOT_SWITCH;
+	header.ninvalidations = ninvalidations;
+	header.state = SnapBuildCurrentState(pd_builder);
+	header.lsn = lsn;
+	header.start_decoding_at = SnapBuildGetStartDecodingAt(pd_builder);
+	header.xid = xid;
+	header.next_phase_at = SnapBuildGetNextPhaseAt(pd_builder);
+
+	if (ninvalidations > 0)
+		header.flags |= PD_SNAPSHOT_INVAL;
+
+	appendBinaryStringInfo(&buf, (const char *) &header, sizeof(header));
+	if (ninvalidations > 0)
+		appendBinaryStringInfo(&buf, (const char *) msgs,
+							   ninvalidations * sizeof(SharedInvalidationMessage));
+
+	pd_walreader_broadcast(PD_ENT_SNAPSHOT, buf.data, buf.len);
+
+	pfree(buf.data);
+}
+
+/*
+ * Tell the workers about the state of the snapshot builder.
+ *
+ * The workers need the state to decide whether they decode a record at all,
+ * they need the start of the decoding window to skip the transactions that
+ * ended before the decoding started, and they need the transaction the next
+ * phase of the builder starts at to skip the transactions that the builder
+ * itself skips.  All of them are published whenever they change, so that the
+ * workers are in step with the walreader.
+ */
+static void
+pd_walreader_publish_state(XLogRecPtr lsn)
+{
+	PDSnapshotHeader header;
+	int			state;
+	XLogRecPtr	start_decoding_at;
+	TransactionId next_phase_at;
+
+	state = SnapBuildCurrentState(pd_builder);
+	start_decoding_at = SnapBuildGetStartDecodingAt(pd_builder);
+	next_phase_at = SnapBuildGetNextPhaseAt(pd_builder);
+
+	if (state == pd_published_state &&
+		start_decoding_at == pd_published_start_decoding_at &&
+		next_phase_at == pd_published_next_phase_at)
+		return;
+
+	header.version = pd_snapshot_version;
+	header.flags = PD_SNAPSHOT_STATE;
+	header.ninvalidations = 0;
+	header.state = state;
+	header.lsn = lsn;
+	header.start_decoding_at = start_decoding_at;
+	header.xid = InvalidTransactionId;
+	header.next_phase_at = next_phase_at;
+
+	pd_walreader_broadcast(PD_ENT_SNAPSHOT, &header, sizeof(header));
+
+	pd_published_state = state;
+	pd_published_start_decoding_at = start_decoding_at;
+	pd_published_next_phase_at = next_phase_at;
+}
+
+/*
+ * Broadcast the invalidation messages of a record that has no transaction.
+ *
+ * The invalidation messages of such a record affect the catalog state of the
+ * whole cluster, so every worker has to execute them: the catalog caches of
+ * the workers are private to their process.
+ */
+static void
+pd_walreader_publish_inval(uint32 ninvalidations,
+						   SharedInvalidationMessage *msgs)
+{
+	PDInvalHeader header;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	header.ninvalidations = ninvalidations;
+
+	appendBinaryStringInfo(&buf, (const char *) &header, sizeof(header));
+	if (ninvalidations > 0)
+		appendBinaryStringInfo(&buf, (const char *) msgs,
+							   ninvalidations * sizeof(SharedInvalidationMessage));
+
+	pd_walreader_broadcast(PD_ENT_GLOBAL_INVAL, buf.data, buf.len);
+
+	pfree(buf.data);
+}
+
+/*
+ * The worker that owns a transaction.
+ *
+ * The entry of the transaction holds the worker that owns it, so the lookup
+ * is the same one the routing of the records uses.
+ */
+static int
+pd_walreader_owner_of(TransactionId xid)
+{
+	PDTxnInfo *info;
+
+	info = pd_walreader_find_txn(xid);
+	if (info == NULL)
+		return PD_FORWARD_NONE;
+
+	return info->top->worker;
+}
+
+/*
+ * Apply the gating of the decoding path to a record that changes a table.
+ *
+ * The gating decides whether the change is decoded at all.  The first change
+ * of a transaction also determines the snapshot the transaction is decoded
+ * with, so the base snapshot is published here as well.
+ *
+ * Returns true when the change is decoded.
+ */
+static bool
+pd_walreader_gate_change(TransactionId xid, XLogRecPtr lsn)
+{
+	PDTxnInfo *info;
+	bool		had_base;
+	bool		gated;
+	int			worker;
+
+	had_base = ReorderBufferXidHasBaseSnapshot(pd_rb, xid);
+
+	gated = SnapBuildProcessChange(pd_builder, xid, lsn);
+
+	/*
+	 * The snapshot may have been built just now, in which case its content
+	 * has to be handed down before the transaction is told which snapshot it
+	 * is decoded with.
+	 */
+	pd_walreader_publish_content_if_changed(lsn);
+
+	if (!had_base && ReorderBufferXidHasBaseSnapshot(pd_rb, xid))
+	{
+		worker = pd_walreader_owner_of(xid);
+		if (worker >= 0)
+		{
+			info = pd_walreader_find_txn(xid);
+
+			/*
+			 * The position the message carries is the position of the change
+			 * that gave the transaction its base snapshot.  That is the
+			 * position the serial path records as the position of the base
+			 * snapshot of the transaction.
+			 */
+			pd_walreader_publish_base(lsn, info->top->toplevel, worker);
+		}
+	}
+
+	return gated;
+}
+
+/*
+ * Handle a record that ends a transaction.
+ *
+ * The snapshot builder has to know about the commit: a transaction that
+ * changed the catalogs makes the transactions that are in flight switch over
+ * to a new snapshot, and the invalidation messages of the transaction go with
+ * the switch.
+ */
+static void
+pd_walreader_shadow_commit(XLogRecPtr lsn, TransactionId xid,
+						   int nsubxacts, TransactionId *subxacts,
+						   uint32 xinfo, bool aborted)
+{
+	Snapshot	old_snapshot;
+	uint32		ninvalidations;
+	SharedInvalidationMessage *msgs = NULL;
+
+	old_snapshot = SnapBuildGetSnapshot(pd_builder);
+
+	SnapBuildCommitTxn(pd_builder, lsn, xid, nsubxacts, subxacts, xinfo);
+
+	/*
+	 * The invalidation messages of the transaction have to be read before the
+	 * transaction is forgotten.  They are accumulated under the top level
+	 * transaction, so that is the one they have to be asked for.
+	 */
+	ninvalidations = ReorderBufferGetInvalidations(pd_rb, xid, &msgs);
+
+	/*
+	 * The transaction changed the catalogs, so a new snapshot was built.  Its
+	 * content is handed down first, so that the workers have it when they are
+	 * told to switch over to it.
+	 */
+	if (SnapBuildGetSnapshot(pd_builder) != old_snapshot)
+	{
+		pd_walreader_publish_content(lsn);
+		pd_walreader_publish_switch(lsn, xid, ninvalidations, msgs);
+	}
+
+	/*
+	 * The transaction is over, so the tracking buffer does not have to keep
+	 * it.  The forget executes the invalidation messages of the transaction,
+	 * which is what the serial path does as well.  An aborted transaction did
+	 * not change the catalogs, so its invalidation messages are dropped.
+	 */
+	if (aborted)
+		ReorderBufferAbort(pd_rb, xid, lsn, (TimestampTz) 0);
+	else
+		ReorderBufferForget(pd_rb, xid, lsn);
+}
+
+/*
+ * The shadow decoding of a record of the heap rmgr.
+ *
+ * The walreader does not decode the tuples, but it has to know what the
+ * records do to the snapshot builder, and which worker has to decode them.
+ */
+static int
+pd_walreader_shadow_heap(XLogReaderState *reader, XLogRecPtr lsn, uint8 info,
+						  TransactionId xid)
+{
+	ReorderBufferProcessXid(pd_rb, xid, lsn);
+
+	if (SnapBuildCurrentState(pd_builder) < SNAPBUILD_FULL_SNAPSHOT)
+		return PD_FORWARD_NONE;
+
+	switch (info & XLOG_HEAP_OPMASK)
+	{
+		case XLOG_HEAP_INSERT:
+		case XLOG_HEAP_HOT_UPDATE:
+		case XLOG_HEAP_UPDATE:
+		case XLOG_HEAP_DELETE:
+		case XLOG_HEAP_TRUNCATE:
+			if (pd_walreader_gate_change(xid, lsn))
+				return PD_FORWARD_OWNER;
+			return PD_FORWARD_NONE;
+
+		case XLOG_HEAP_INPLACE:
+			/*
+			 * In-place updates only ever happen on catalog tuples, so they
+			 * mark the transaction as catalog modifying.
+			 */
+			if (!TransactionIdIsValid(xid))
+				return PD_FORWARD_NONE;
+
+			(void) pd_walreader_gate_change(xid, lsn);
+			ReorderBufferXidSetCatalogChanges(pd_rb, xid, lsn);
+			return PD_FORWARD_OWNER;
+
+		case XLOG_HEAP_LOCK:
+			/* we don't care about row level locks */
+			return PD_FORWARD_NONE;
+
+		case XLOG_HEAP_CONFIRM:
+			if (pd_walreader_gate_change(xid, lsn))
+				return PD_FORWARD_OWNER;
+			return PD_FORWARD_NONE;
+
+		default:
+			elog(ERROR, "unexpected RM_HEAP_ID record type: %u", info);
+			return PD_FORWARD_NONE;
+	}
+}
+
+/*
+ * The shadow decoding of a record of the heap2 rmgr.
+ */
+static int
+pd_walreader_shadow_heap2(XLogReaderState *reader, XLogRecPtr lsn, uint8 info,
+						   TransactionId xid)
+{
+	ReorderBufferProcessXid(pd_rb, xid, lsn);
+
+	if (SnapBuildCurrentState(pd_builder) < SNAPBUILD_FULL_SNAPSHOT)
+		return PD_FORWARD_NONE;
+
+	switch (info & XLOG_HEAP_OPMASK)
+	{
+		case XLOG_HEAP2_MULTI_INSERT:
+			if (pd_walreader_gate_change(xid, lsn))
+				return PD_FORWARD_OWNER;
+			return PD_FORWARD_NONE;
+
+		case XLOG_HEAP2_NEW_CID:
+			{
+				xl_heap_new_cid *xlrec;
+
+				xlrec = (xl_heap_new_cid *) XLogRecGetData(reader);
+				SnapBuildProcessNewCid(pd_builder, xid, lsn, xlrec);
+
+				return PD_FORWARD_OWNER;
+			}
+
+		case XLOG_HEAP2_REWRITE:
+		case XLOG_HEAP2_PRUNE_ON_ACCESS:
+		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
+		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
+		case XLOG_HEAP2_VISIBLE:
+		case XLOG_HEAP2_LOCK_UPDATED:
+			return PD_FORWARD_NONE;
+
+		default:
+			elog(ERROR, "unexpected RM_HEAP2_ID record type: %u", info);
+			return PD_FORWARD_NONE;
+	}
+}
+
+/*
+ * The shadow decoding of a record of the xact rmgr.
+ */
+static int
+pd_walreader_shadow_xact(XLogReaderState *reader, XLogRecPtr lsn, uint8 info)
+{
+	TransactionId xid = XLogRecGetXid(reader);
+
+	switch (info & XLOG_XACT_OPMASK)
+	{
+		case XLOG_XACT_COMMIT:
+		case XLOG_XACT_COMMIT_PREPARED:
+			{
+				xl_xact_commit *xlrec;
+				xl_xact_parsed_commit parsed;
+				TransactionId commit_xid;
+
+				xlrec = (xl_xact_commit *) XLogRecGetData(reader);
+				ParseCommitRecord(XLogRecGetInfo(reader), xlrec, &parsed);
+
+				commit_xid = TransactionIdIsValid(parsed.twophase_xid) ?
+					parsed.twophase_xid : xid;
+
+				pd_walreader_shadow_commit(lsn, commit_xid,
+										   parsed.nsubxacts, parsed.subxacts,
+										   parsed.xinfo, false);
+
+				return PD_FORWARD_OWNER;
+			}
+
+		case XLOG_XACT_ABORT:
+		case XLOG_XACT_ABORT_PREPARED:
+			{
+				xl_xact_abort *xlrec;
+				xl_xact_parsed_abort parsed;
+				TransactionId abort_xid;
+
+				xlrec = (xl_xact_abort *) XLogRecGetData(reader);
+				ParseAbortRecord(XLogRecGetInfo(reader), xlrec, &parsed);
+
+				abort_xid = TransactionIdIsValid(parsed.twophase_xid) ?
+					parsed.twophase_xid : xid;
+
+				pd_walreader_shadow_commit(lsn, abort_xid, 0, NULL, 0, true);
+
+				return PD_FORWARD_OWNER;
+			}
+
+		case XLOG_XACT_ASSIGNMENT:
+			/*
+			 * The subtransaction is assigned to the top level transaction
+			 * while the records are processed, so there is nothing to do
+			 * here.  The record is forwarded, because the worker needs it to
+			 * make the same assignment.
+			 */
+			return PD_FORWARD_OWNER;
+
+		case XLOG_XACT_INVALIDATIONS:
+			{
+				xl_xact_invals *invals;
+
+				invals = (xl_xact_invals *) XLogRecGetData(reader);
+
+				if (TransactionIdIsValid(xid))
+				{
+					/*
+					 * The invalidation messages are accumulated, so that they
+					 * are executed when the transaction ends.
+					 */
+					ReorderBufferAddInvalidations(pd_rb, xid, lsn,
+												  invals->nmsgs, invals->msgs);
+					ReorderBufferXidSetCatalogChanges(pd_rb, xid, lsn);
+
+					return PD_FORWARD_OWNER;
+				}
+
+				/*
+				 * The invalidation messages of a record that has no
+				 * transaction affect the catalog state of the whole cluster,
+				 * so every worker has to execute them.
+				 */
+				ReorderBufferImmediateInvalidation(pd_rb, invals->nmsgs,
+												   invals->msgs);
+				pd_walreader_publish_inval(invals->nmsgs, invals->msgs);
+
+				return PD_FORWARD_NONE;
+			}
+
+		case XLOG_XACT_PREPARE:
+			{
+				xl_xact_parsed_prepare parsed;
+				xl_xact_prepare *xlrec;
+
+				xlrec = (xl_xact_prepare *) XLogRecGetData(reader);
+				ParsePrepareRecord(XLogRecGetInfo(reader), xlrec, &parsed);
+
+				/*
+				 * The walreader has no output plugin, so it cannot tell whether
+				 * the prepared transaction is filtered.  It treats every
+				 * prepare as filtered, which does not matter: the tracking
+				 * buffer does not decode anything, and the worker that owns
+				 * the transaction makes the decision that counts.
+				 */
+				ReorderBufferProcessXid(pd_rb, parsed.twophase_xid, lsn);
+
+				return PD_FORWARD_OWNER;
+			}
+
+		default:
+			elog(ERROR, "unexpected RM_XACT_ID record type: %u", info);
+			return PD_FORWARD_NONE;
+	}
+}
+
+/*
+ * The shadow decoding of a record of the standby rmgr.
+ */
+static int
+pd_walreader_shadow_standby(XLogReaderState *reader, XLogRecPtr lsn,
+							 uint8 info)
+{
+	ReorderBufferProcessXid(pd_rb, XLogRecGetXid(reader), lsn);
+
+	switch (info & ~XLR_INFO_MASK)
+	{
+		case XLOG_RUNNING_XACTS:
+			{
+				xl_running_xacts *running;
+
+				running = (xl_running_xacts *) XLogRecGetData(reader);
+
+				SnapBuildProcessRunningXacts(pd_builder, lsn, running);
+
+				/*
+				 * The workers have to abort the transactions they still hold
+				 * that are not running anymore, so the record goes to all of
+				 * them.
+				 */
+				return PD_FORWARD_ALL;
+			}
+
+		case XLOG_STANDBY_LOCK:
+			return PD_FORWARD_NONE;
+
+		case XLOG_INVALIDATIONS:
+			/*
+			 * The invalidation messages are processed at the command level
+			 * through XLOG_XACT_INVALIDATIONS.
+			 */
+			return PD_FORWARD_NONE;
+
+		default:
+			elog(ERROR, "unexpected RM_STANDBY_ID record type: %u", info);
+			return PD_FORWARD_NONE;
+	}
+}
+
+/*
+ * The shadow decoding of a record of the logical message rmgr.
+ */
+static int
+pd_walreader_shadow_logicalmsg(XLogReaderState *reader, XLogRecPtr lsn,
+								TransactionId xid)
+{
+	xl_logical_message *message;
+
+	ReorderBufferProcessXid(pd_rb, xid, lsn);
+
+	if (SnapBuildCurrentState(pd_builder) < SNAPBUILD_FULL_SNAPSHOT)
+		return PD_FORWARD_NONE;
+
+	message = (xl_logical_message *) XLogRecGetData(reader);
+
+	/*
+	 * The messages of another database are not decoded.
+	 */
+	if (message->dbId != pd_shadow_ctx->slot->data.database)
+		return PD_FORWARD_NONE;
+
+	if (message->transactional)
+	{
+		if (!pd_walreader_gate_change(xid, lsn))
+			return PD_FORWARD_NONE;
+
+		return PD_FORWARD_OWNER;
+	}
+
+	/*
+	 * A message that is not part of a transaction is decoded with the
+	 * snapshot the builder holds, so the snapshot has to exist and its
+	 * content has to be handed down.
+	 */
+	if (SnapBuildCurrentState(pd_builder) != SNAPBUILD_CONSISTENT ||
+		SnapBuildXactNeedsSkip(pd_builder, lsn))
+		return PD_FORWARD_NONE;
+
+	SnapBuildGetOrBuildSnapshot(pd_builder);
+	pd_walreader_publish_content_if_changed(lsn);
+
+	/*
+	 * A message that is not part of a transaction does not belong to a
+	 * transaction, so there is no owner to pick.  It is handed to the worker
+	 * that has the least work, so that the messages are spread out.  It must
+	 * go to exactly one worker: the message is not part of a transaction, so
+	 * there is nothing that would keep the workers from producing it twice.
+	 */
+	return pd_walreader_pick_worker();
+}
+
+/*
+ * The shadow decoding of a record of the xlog rmgr.
+ */
+static int
+pd_walreader_shadow_xlog(XLogReaderState *reader, XLogRecPtr lsn, uint8 info)
+{
+	ReorderBufferProcessXid(pd_rb, XLogRecGetXid(reader), lsn);
+
+	switch (info & ~XLR_INFO_MASK)
+	{
+		case XLOG_CHECKPOINT_SHUTDOWN:
+		case XLOG_END_OF_RECOVERY:
+			SnapBuildSerializationPoint(pd_builder, lsn);
+			return PD_FORWARD_NONE;
+
+		case XLOG_CHECKPOINT_ONLINE:
+		case XLOG_PARAMETER_CHANGE:
+		case XLOG_NOOP:
+		case XLOG_NEXTOID:
+		case XLOG_SWITCH:
+		case XLOG_BACKUP_END:
+		case XLOG_RESTORE_POINT:
+		case XLOG_FPW_CHANGE:
+		case XLOG_FPI_FOR_HINT:
+		case XLOG_FPI:
+		case XLOG_OVERWRITE_CONTRECORD:
+		case XLOG_CHECKPOINT_REDO:
+			return PD_FORWARD_NONE;
+
+		default:
+			elog(ERROR, "unexpected RM_XLOG_ID record type: %u", info);
+			return PD_FORWARD_NONE;
+	}
+}
+
+/*
+ * The shadow decoding of a record.
+ *
+ * The walreader does not decode the tuples of the records, but it has to know
+ * what the records do to the snapshot builder: which transactions are
+ * catalog modifying, which snapshot a transaction is decoded with, and when
+ * the transactions that are in flight have to switch over to a new one.
+ *
+ * The function mirrors the gating of the decoding path (see decode.c) and
+ * tells which worker the record has to be forwarded to.
+ */
+static int
+pd_walreader_shadow_decode(XLogReaderState *reader, XLogRecPtr lsn)
+{
+	uint8		rmgr_id = XLogRecGetRmid(reader);
+	uint8		info = XLogRecGetInfo(reader);
+	TransactionId xid = XLogRecGetXid(reader);
+	int			routing;
+
+	/*
+	 * If the top level xid is valid, the subtransaction has to be assigned to
+	 * the top level transaction.  This is done for every record, before the
+	 * record is looked at, which is what the decoding path does as well.
+	 */
+	if (TransactionIdIsValid(XLogRecGetTopXid(reader)))
+		ReorderBufferAssignChild(pd_rb,
+								  XLogRecGetTopXid(reader),
+								  xid, lsn);
+
+	switch (rmgr_id)
+	{
+		case RM_XLOG_ID:
+			routing = pd_walreader_shadow_xlog(reader, lsn, info);
+			break;
+
+		case RM_XACT_ID:
+			routing = pd_walreader_shadow_xact(reader, lsn, info);
+			break;
+
+		case RM_STANDBY_ID:
+			routing = pd_walreader_shadow_standby(reader, lsn, info);
+			break;
+
+		case RM_HEAP_ID:
+			routing = pd_walreader_shadow_heap(reader, lsn, info, xid);
+			break;
+
+		case RM_HEAP2_ID:
+			routing = pd_walreader_shadow_heap2(reader, lsn, info, xid);
+			break;
+
+		case RM_LOGICALMSG_ID:
+			routing = pd_walreader_shadow_logicalmsg(reader, lsn, xid);
+			break;
+
+		default:
+			/*
+			 * The rmgr has no decoding callback, so the decoding path only
+			 * deals with the transaction id of the record.
+			 */
+			ReorderBufferProcessXid(pd_rb, xid, lsn);
+			routing = PD_FORWARD_NONE;
+			break;
+	}
+
+	/*
+	 * The state of the builder and the snapshot it holds are handed down to
+	 * the workers before the record they belong to is forwarded, so that the
+	 * workers decode the record with the same state the walreader has.
+	 */
+	pd_walreader_publish_content_if_changed(lsn);
+	pd_walreader_publish_state(lsn);
+
+	return routing;
+}
+
+/*
  * Read the WAL and hand the records over to the decoding side.
  */
 static void
@@ -678,6 +1702,8 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 	PDTxnInfo   *info;
 	uint64		cseq;
 	int			worker;
+	int			routing;
+	int			marked;
 	int			i;
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -693,7 +1719,15 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 
 	XLogBeginRead(reader, start_lsn);
 
+	/*
+	 * The shadow context needs the reader, because the assertions of the
+	 * reorder buffer look at the position the reader is at.
+	 */
+	pd_shadow_ctx->reader = reader;
+
 	buf = makeStringInfo();
+
+	marked = 0;
 
 	/*
 	 * The fault injection is a debugging facility: it makes the walreader fail,
@@ -731,6 +1765,13 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		if (record == NULL)
 		{
 			/*
+			 * There is no more WAL at the moment.  Tell the workers how far the
+			 * walreader has come, so that they can report that they have
+			 * decoded everything that was meant for them.
+			 */
+			pd_walreader_send_marker(pd_read_lsn);
+
+			/*
 			 * There is no more WAL at the moment.  Wait a little and try
 			 * again; the page read callback normally blocks instead of
 			 * getting us here.
@@ -767,47 +1808,97 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 								   reader->record->next_lsn, worker);
 
 		/*
+		 * Let the snapshot builder of the walreader see the record.  The
+		 * builder is the one that decides which snapshot a transaction is
+		 * decoded with, and the workers are told about it, so that they decode
+		 * the transactions with the same snapshot the serial path uses.
+		 *
+		 * The shadow decoding also tells which worker the record belongs to.
+		 */
+		routing = pd_walreader_shadow_decode(reader, reader->record->lsn);
+
+		/*
 		 * Hand the record over.  The record points into the reader's decode
 		 * buffer, which the next read reuses, so it has to be copied before
 		 * we go on.
 		 *
-		 * Every worker sees every record: the snapshot builders of the
-		 * workers have to stay in step with each other, or the snapshots
-		 * they build would differ.  The header tells the workers who owns
-		 * the transaction of the record; the ones that do not own it decode
-		 * the record for the sake of their snapshot builder, but they do not
-		 * accumulate its changes.
+		 * Only the worker that owns the transaction gets the record: the
+		 * workers hold the transactions of their own, and the snapshot builder
+		 * of the walreader is the one that keeps them in step.  The records
+		 * that every worker needs are the ones that say which transactions are
+		 * still running.
 		 */
-		resetStringInfo(buf);
-		wal_header.owner = worker;
-		wal_header.cseq = cseq;
-		appendBinaryStringInfo(buf, (const char *) &wal_header,
-								sizeof(wal_header));
-		PDRecordSerialize(reader->record, buf);
-
-		for (i = 0; i < pd_num_workers; i++)
+		if (routing != PD_FORWARD_NONE)
 		{
-			if (!PDQueueSendChunked(pd_wal_mqh[i], PD_ENT_WAL, buf->data,
-									 buf->len, PARALLEL_DECODE_CHUNK_SIZE, false,
-									 true))
-				ereport(ERROR,
-						(errcode(ERRCODE_IO_ERROR),
-						 errmsg("could not hand a WAL record to the parallel decoding session")));
+			int		target;
+
+			switch (routing)
+			{
+				case PD_FORWARD_ALL:
+					target = -1;
+					break;
+				case PD_FORWARD_OWNER:
+					target = worker;
+					break;
+				default:
+					target = routing;
+					break;
+			}
+
+			resetStringInfo(buf);
+			wal_header.owner = target;
+			wal_header.cseq = cseq;
+			appendBinaryStringInfo(buf, (const char *) &wal_header,
+								sizeof(wal_header));
+			PDRecordSerialize(reader->record, buf);
+
+			if (target < 0)
+			{
+				for (i = 0; i < pd_num_workers; i++)
+				{
+					if (!PDQueueSendChunked(pd_wal_mqh[i], PD_ENT_WAL, buf->data,
+											 buf->len, PARALLEL_DECODE_CHUNK_SIZE, false,
+											 true))
+						ereport(ERROR,
+									(errcode(ERRCODE_IO_ERROR),
+									 errmsg("could not hand a WAL record to the parallel decoding session")));
+				}
+			}
+			else
+			{
+				if (!PDQueueSendChunked(pd_wal_mqh[target], PD_ENT_WAL,
+										 buf->data, buf->len,
+										 PARALLEL_DECODE_CHUNK_SIZE, false, true))
+					ereport(ERROR,
+							(errcode(ERRCODE_IO_ERROR),
+							 errmsg("could not hand a WAL record to the parallel decoding session")));
+			}
+
+			/*
+			 * Account for the bytes the transaction has produced, so that the
+			 * next transaction goes to the worker that has the least work.
+			 *
+			 * The transaction of a record that ends it is over, and its entry is
+			 * gone: the bytes of such a record do not have to be accounted for,
+			 * because the in-flight bytes of the transaction have been released
+			 * already.
+			 */
+			if (info != NULL && !recdesc.ended && target >= 0)
+			{
+				info->bytes += buf->len;
+				pd_worker_bytes[worker] += buf->len;
+			}
 		}
 
 		/*
-		 * Account for the bytes the transaction has produced, so that the
-		 * next transaction goes to the worker that has the least work.
-		 *
-		 * The transaction of a record that ends it is over, and its entry is
-		 * gone: the bytes of such a record do not have to be accounted for,
-		 * because the in-flight bytes of the transaction have been released
-		 * already.
+		 * Tell the workers how far the walreader has come every now and then.
+		 * A worker that owns no transaction does not see any records, so the
+		 * marker is what tells it that it has nothing left to do.
 		 */
-		if (info != NULL && !recdesc.ended)
+		if (++marked >= PD_POSITION_MARK_RECORDS)
 		{
-			info->bytes += buf->len;
-			pd_worker_bytes[worker] += buf->len;
+			marked = 0;
+			pd_walreader_send_marker(reader->record->next_lsn);
 		}
 
 		/* Tell the walsender how far we have come. */
@@ -876,6 +1967,17 @@ ParallelWalreaderMain(Datum main_arg)
 							   128, &hash_ctl,
 							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
+
+	/*
+	 * Set up the state the walreader shares with the decode workers: the
+	 * snapshot builder and the reorder buffer that mirrors it.
+	 *
+	 * The walreader does not own the slot, so it works on a copy of the
+	 * fields of the slot of the walsender.  The exit path must not try to
+	 * release it.
+	 */
+	pd_walreader_setup_shadow(ctl);
+	before_shmem_exit(pd_walreader_clear_slot, (Datum) 0);
 
 	ctl->walreader_pid = MyProcPid;
 	ctl->walreader_status = PD_WORKER_STATUS_RUNNING;

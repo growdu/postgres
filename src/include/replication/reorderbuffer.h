@@ -701,6 +701,11 @@ extern void ReorderBufferSetBaseSnapshot(ReorderBuffer *rb, TransactionId xid,
 										 XLogRecPtr lsn, Snapshot snap);
 extern void ReorderBufferAddSnapshot(ReorderBuffer *rb, TransactionId xid,
 									 XLogRecPtr lsn, Snapshot snap);
+extern void ReorderBufferDistributeSnapshot(ReorderBuffer *rb, XLogRecPtr lsn,
+											 Snapshot snap, TransactionId xid,
+											 uint32 ninvalidations,
+											 SharedInvalidationMessage *msgs);
+extern bool ReorderBufferHasTransaction(ReorderBuffer *rb, TransactionId xid);
 extern void ReorderBufferAddNewCommandId(ReorderBuffer *rb, TransactionId xid,
 										 XLogRecPtr lsn, CommandId cid);
 extern void ReorderBufferAddNewTupleCids(ReorderBuffer *rb, TransactionId xid,
