@@ -1906,8 +1906,12 @@ ReorderBufferFreeSnap(ReorderBuffer *rb, Snapshot snap)
 static void
 ReorderBufferStreamCommit(ReorderBuffer *rb, ReorderBufferTXN *txn)
 {
-	/* we should only call this for previously streamed transactions */
-	Assert(rbtxn_is_streamed(txn));
+	/*
+	 * The transaction has either been streamed while it was in progress, or
+	 * it is streamed now: the parallel decoding path asks for every
+	 * transaction to be streamed, and a transaction that was not streamed
+	 * while it was in progress is streamed when it commits.
+	 */
 
 	ReorderBufferStreamTXN(rb, txn);
 
@@ -2666,6 +2670,66 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 }
 
 /*
+ * Should the transaction be streamed now that it commits?
+ *
+ * The publisher-side parallel decoding path can be asked to stream every
+ * transaction: the subscriber applies the transactions in parallel, and a
+ * transaction that is not streamed gives its apply worker nothing to do.  A
+ * transaction that was streamed while it was in progress has been sent
+ * already, so only the transactions that are still whole when they commit are
+ * streamed here.
+ *
+ * The transaction is streamed in one segment, so the subscriber receives it
+ * as a stream block and can apply it in parallel.
+ */
+static bool
+ReorderBufferStreamAtCommit(ReorderBuffer *rb, ReorderBufferTXN *txn)
+{
+	LogicalDecodingContext *ctx = rb->private_data;
+
+	/* The serial path never streams a transaction that was not streamed. */
+	if (ctx == NULL || !ctx->stream_all_transactions)
+		return false;
+
+	/* A transaction that was streamed already has been sent. */
+	if (rbtxn_is_streamed(txn))
+		return false;
+
+	/*
+	 * The changes of a transaction can only be streamed once the snapshot is
+	 * consistent: the subscriber cannot apply them before that.
+	 */
+	if (!ReorderBufferCanStartStreaming(rb))
+		return false;
+
+	/*
+	 * A transaction without changes has nothing to stream.  The check is the
+	 * one that ReorderBufferStreamTXN() does as well.
+	 */
+	if (txn->base_snapshot == NULL)
+		return false;
+
+	/*
+	 * A prepared transaction is not committed yet: the two-phase commit path
+	 * keeps its own behavior, so the transaction is not streamed here.  The
+	 * flag is set before ReorderBufferPrepare() and
+	 * ReorderBufferFinishPrepared() replay the transaction, so this also
+	 * covers the prepare record itself.
+	 */
+	if (rbtxn_prepared(txn))
+		return false;
+
+	/*
+	 * A transaction below the minimum size is not streamed at all: it reaches
+	 * the subscriber as a whole transaction block.
+	 */
+	if (ctx->stream_min_size > 0 && txn->total_size < ctx->stream_min_size)
+		return false;
+
+	return true;
+}
+
+/*
  * Perform the replay of a transaction and its non-aborted subtransactions.
  *
  * Subtransactions previously have to be processed by
@@ -2696,10 +2760,14 @@ ReorderBufferReplay(ReorderBufferTXN *txn,
 	 * 'streamed' way. That is, we first stream the remaining part of the
 	 * transaction, and then invoke stream_commit message.
 	 *
+	 * A transaction that was not streamed while it was in progress is
+	 * streamed here when the parallel decoding path asks for every
+	 * transaction to be streamed.
+	 *
 	 * Called after everything (origin ID, LSN, ...) is stored in the
 	 * transaction to avoid passing that information directly.
 	 */
-	if (rbtxn_is_streamed(txn))
+	if (rbtxn_is_streamed(txn) || ReorderBufferStreamAtCommit(rb, txn))
 	{
 		ReorderBufferStreamCommit(rb, txn);
 		return;
@@ -3714,9 +3782,13 @@ ReorderBufferLargestStreamableTopTXN(ReorderBuffer *rb)
  * whole reorder buffer is checked by the caller first, because it is the sum
  * of the sizes of the transactions the buffer holds: if it is below the
  * threshold, no transaction in it can be above it.
+ *
+ * A transaction that is below the minimum size is not streamed at all: it
+ * reaches the subscriber as a whole transaction block.
  */
 static bool
-ReorderBufferStreamableTxnReached(ReorderBuffer *rb, Size segment_size)
+ReorderBufferStreamableTxnReached(ReorderBuffer *rb, Size segment_size,
+								  Size min_size)
 {
 	ReorderBufferTXN *txn;
 
@@ -3725,6 +3797,9 @@ ReorderBufferStreamableTxnReached(ReorderBuffer *rb, Size segment_size)
 
 	txn = ReorderBufferLargestStreamableTopTXN(rb);
 	if (txn == NULL)
+		return false;
+
+	if (min_size > 0 && txn->total_size < min_size)
 		return false;
 
 	return txn->total_size >= segment_size;
@@ -3761,19 +3836,17 @@ ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 	 * The parallel decoding path decides on its own how eagerly the changes
 	 * of a transaction are streamed.  The serial path leaves these at zero,
 	 * which keeps its behavior unchanged.
+	 *
+	 * The two sizes have different meanings: the segment size is the size a
+	 * transaction has to reach before it is streamed in a segment of its own,
+	 * and the minimum size is the size a transaction has to reach before it
+	 * may be streamed at all.
 	 */
 	if (ctx != NULL)
 	{
 		segment_size = ctx->stream_segment_size;
 		min_size = ctx->stream_min_size;
 	}
-
-	/*
-	 * A transaction may only be streamed once it has reached the minimum
-	 * size, so the threshold is the larger of the two.
-	 */
-	if (min_size > segment_size)
-		segment_size = min_size;
 
 	/*
 	 * Bail out if debug_logical_replication_streaming is buffered and we
@@ -3799,7 +3872,7 @@ ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 			rb->size > 0) ||
 		   (segment_size > 0 &&
 			rb->size >= segment_size &&
-			ReorderBufferStreamableTxnReached(rb, segment_size)))
+			ReorderBufferStreamableTxnReached(rb, segment_size, min_size)))
 	{
 		/*
 		 * Pick the largest transaction and evict it from memory by streaming,

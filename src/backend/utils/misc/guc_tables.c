@@ -2992,11 +2992,14 @@ struct config_int ConfigureNamesInt[] =
 		{"parallel_decode_stream_min_size", PGC_SIGHUP, REPLICATION_SENDING,
 			gettext_noop("Sets the minimum size in bytes of a transaction that is "
 						 "streamed by the publisher."),
-			gettext_noop("Zero means that every transaction is streamed. A threshold "
-						 "larger than the typical transaction size stops the "
-						 "subscriber from receiving STREAM START messages, which "
-						 "prevents parallel apply from starting at all. The change "
-						 "takes effect in the next replication session.")
+			gettext_noop("A transaction below this size is not streamed: it reaches "
+						 "the subscriber as a whole transaction block. Zero means "
+						 "that every transaction is streamed, so that the "
+						 "subscriber can apply the transactions in parallel. A "
+						 "threshold larger than the typical transaction size stops "
+						 "the subscriber from receiving STREAM START messages, "
+						 "which prevents parallel apply from starting at all. The "
+						 "change takes effect in the next replication session.")
 		},
 		&parallel_decode_stream_min_size,
 		0, 0, INT_MAX,
@@ -3005,11 +3008,16 @@ struct config_int ConfigureNamesInt[] =
 
 	{
 		{"parallel_decode_stream_segment_size", PGC_SIGHUP, REPLICATION_SENDING,
-			gettext_noop("Sets the maximum size in bytes of a single stream segment "
+			gettext_noop("Sets the size in bytes of a single stream segment "
 						 "produced by the publisher."),
-			gettext_noop("Only one stream segment may be open on the wire at a time, "
-						 "so this bounds the time a segment can block the others. "
-						 "The change takes effect in the next replication session.")
+			gettext_noop("A transaction that has accumulated this many bytes is "
+						 "streamed in a segment of this size, so that it reaches "
+						 "the subscriber before it is complete; a transaction that "
+						 "stays below it is streamed in a single segment when it "
+						 "commits. Only one stream segment may be open on the wire "
+						 "at a time, so this bounds the time a segment can block "
+						 "the others. The change takes effect in the next "
+						 "replication session.")
 		},
 		&parallel_decode_stream_segment_size,
 		1024 * 1024, 0, INT_MAX,
