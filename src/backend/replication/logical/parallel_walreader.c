@@ -130,6 +130,22 @@ static uint64 pd_next_cseq = 1;
 static XLogRecPtr pd_read_lsn = InvalidXLogRecPtr;
 
 /*
+ * The invalidation epoch of the session.
+ *
+ * The epoch grows every time the catalog the decoding depends on changes,
+ * that is, every time a new snapshot is published or a set of invalidation
+ * messages is broadcast.  The workers use it to tell whether the definition
+ * of a relation that has been sent already still describes the relation: a
+ * definition that was sent before the last change of the catalog does not
+ * describe the relation anymore.
+ *
+ * The epoch is the same for the whole session: the walreader is the only
+ * process that drives the snapshot builder, so it is the only one that knows
+ * when the catalog changed.
+ */
+static uint64 pd_epoch = 0;
+
+/*
  * The tracking reorder buffer and the snapshot builder of the walreader.
  *
  * The walreader is the only reader of the WAL, so it is the only process that
@@ -741,6 +757,82 @@ pd_walreader_send_cseq(uint64 cseq, XLogRecPtr end_lsn, XLogRecPtr read_lsn,
 }
 
 /*
+ * Hand the watermarks of the slot over to the walsender.
+ *
+ * The slot of the session has two watermarks that depend on the transactions
+ * that are in flight: the xmin of the catalog and the position the decoding
+ * may restart from.  The walreader does not own the slot, so it cannot
+ * advance them, but it is the only process that sees every transaction of the
+ * session, so it is the one that computes them.
+ *
+ * The computation is the one the serial path does when it sees a running
+ * xacts record, and the values are the same: the walreader holds every
+ * transaction of the session in its tracking buffer, so the oldest
+ * transaction it holds is the oldest transaction of the session.
+ *
+ * The walsender advances the watermarks of the slot once the subscriber has
+ * confirmed the position the values are valid at.
+ */
+static void
+pd_walreader_send_watermark(XLogRecPtr lsn, TransactionId oldest_running)
+{
+	PDWatermark	wm;
+	ReorderBufferTXN *txn;
+
+	/*
+	 * The xmin of the catalog is the xmin of the snapshot of the oldest
+	 * transaction that is still in flight.  When no transaction holds a base
+	 * snapshot, the oldest running transaction is the best guess.
+	 */
+	wm.xmin = ReorderBufferGetOldestXmin(pd_rb);
+	if (wm.xmin == InvalidTransactionId)
+		wm.xmin = oldest_running;
+
+	wm.oldest_running = oldest_running;
+
+	/*
+	 * The position the values are valid at.  The watermarks of the slot may
+	 * only be advanced once the subscriber has confirmed this position.
+	 */
+	wm.read_lsn = (uint64) lsn;
+
+	/*
+	 * The position the decoding may restart from is the restart point of the
+	 * oldest transaction that is still in flight: the decoding has to start
+	 * there, so that the changes of that transaction are not lost.
+	 *
+	 * It is only known when the builder is consistent: before that the
+	 * snapshot the decoding works on is not stable yet.
+	 */
+	wm.restart_lsn = 0;
+
+	if (SnapBuildCurrentState(pd_builder) >= SNAPBUILD_CONSISTENT)
+	{
+		txn = ReorderBufferGetOldestTXN(pd_rb);
+
+		if (txn != NULL && txn->restart_decoding_lsn != InvalidXLogRecPtr)
+			wm.restart_lsn = (uint64) txn->restart_decoding_lsn;
+
+		/*
+		 * No transaction is in flight, so the decoding may restart from the
+		 * last snapshot the builder has serialized.  The restart point of
+		 * the reorder buffer is only set at the positions where the snapshot
+		 * is on disk, so it is a safe place to restart from.
+		 */
+		else if (txn == NULL &&
+				 pd_rb->current_restart_decoding_lsn != InvalidXLogRecPtr)
+			wm.restart_lsn = (uint64) pd_rb->current_restart_decoding_lsn;
+	}
+
+	if (!PDQueueSend(pd_control_mqh, PD_ENT_WATERMARK, &wm, sizeof(wm),
+					 false, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("could not hand the watermarks of the slot to the parallel "
+						"decoding session")));
+}
+
+/*
  * Report an error to the walsender.
  *
  * The walsender has to end the session anyway: the walreader is the only
@@ -970,7 +1062,15 @@ pd_walreader_publish_content(XLogRecPtr lsn)
 
 	initStringInfo(&buf);
 
+	/*
+	 * A new snapshot means that the catalog the decoding depends on has
+	 * changed, so the epoch of the session grows.  The workers use it to tell
+	 * whether the definitions they have sent still describe the relations.
+	 */
+	pd_epoch++;
+
 	header.version = ++pd_snapshot_version;
+	header.epoch = pd_epoch;
 	header.flags = PD_SNAPSHOT_CONTENT;
 	header.ninvalidations = 0;
 	header.state = SnapBuildCurrentState(pd_builder);
@@ -1033,6 +1133,7 @@ pd_walreader_publish_base(XLogRecPtr lsn, TransactionId xid, int worker)
 	PDSnapshotHeader header;
 
 	header.version = pd_snapshot_version;
+	header.epoch = pd_epoch;
 	header.flags = PD_SNAPSHOT_BASE;
 	header.ninvalidations = 0;
 	header.state = SnapBuildCurrentState(pd_builder);
@@ -1064,6 +1165,7 @@ pd_walreader_publish_switch(XLogRecPtr lsn, TransactionId xid,
 	initStringInfo(&buf);
 
 	header.version = pd_snapshot_version;
+	header.epoch = pd_epoch;
 	header.flags = PD_SNAPSHOT_SWITCH;
 	header.ninvalidations = ninvalidations;
 	header.state = SnapBuildCurrentState(pd_builder);
@@ -1113,6 +1215,7 @@ pd_walreader_publish_state(XLogRecPtr lsn)
 		return;
 
 	header.version = pd_snapshot_version;
+	header.epoch = pd_epoch;
 	header.flags = PD_SNAPSHOT_STATE;
 	header.ninvalidations = 0;
 	header.state = state;
@@ -1144,6 +1247,14 @@ pd_walreader_publish_inval(uint32 ninvalidations,
 
 	initStringInfo(&buf);
 
+	/*
+	 * The invalidation messages change the catalog caches of the workers, so
+	 * the definitions they have sent do not describe the relations anymore.
+	 * The epoch of the session grows, so that the workers know it.
+	 */
+	pd_epoch++;
+
+	header.epoch = pd_epoch;
 	header.ninvalidations = ninvalidations;
 
 	appendBinaryStringInfo(&buf, (const char *) &header, sizeof(header));
@@ -1501,6 +1612,24 @@ pd_walreader_shadow_standby(XLogReaderState *reader, XLogRecPtr lsn,
 				running = (xl_running_xacts *) XLogRecGetData(reader);
 
 				SnapBuildProcessRunningXacts(pd_builder, lsn, running);
+
+				/*
+				 * Abort the transactions the walreader still holds that are
+				 * older than the oldest transaction that is running.  This is
+				 * what the serial path does with the buffer that holds the
+				 * transactions of the session, and it keeps the buffer from
+				 * holding transactions that will never end: such a
+				 * transaction would hold the position the decoding may
+				 * restart from back forever.
+				 */
+				ReorderBufferAbortOld(pd_rb, running->oldestRunningXid);
+
+				/*
+				 * The watermarks of the slot depend on the transactions that
+				 * are in flight.  The walreader computes them and hands them
+				 * over to the walsender, which owns the slot.
+				 */
+				pd_walreader_send_watermark(lsn, running->oldestRunningXid);
 
 				/*
 				 * The workers have to abort the transactions they still hold

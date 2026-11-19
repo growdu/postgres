@@ -393,6 +393,31 @@ PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
 }
 
 /*
+ * Send a frame that carries the definition of a relation to the walsender.
+ *
+ * The frame is preceded by a PDRelationHeader, which tells the walsender
+ * which relation the definition belongs to and in which epoch of the session
+ * it was produced.  The walsender uses that information to send the
+ * definition of a relation to the subscriber once.
+ */
+void
+PDQueueSendRelation(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
+					uint64 epoch, Oid relid,
+					const char *frame, size_t len)
+{
+	PDRelationHeader rh;
+
+	rh.end_lsn = end_lsn;
+	rh.cseq = cseq;
+	rh.epoch = epoch;
+	rh.relid = relid;
+	rh.length = (uint32) len;
+
+	pd_queue_send_chunked(mqh, PD_ENT_RELATION, &rh, sizeof(rh), frame, len,
+						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+}
+
+/*
  * Send a stream segment to the walsender.
  *
  * The segment is preceded by a PDSegmentHeader, which tells the walsender how

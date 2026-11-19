@@ -337,7 +337,9 @@ typedef enum ParallelDecodeEntryType
 	PD_ENT_POSITION = 12,		/* worker -> walsender */
 	PD_ENT_CSEQ = 13,			/* walreader -> walsender */
 	PD_ENT_SEGMENT = 14,		/* worker -> walsender */
-	PD_ENT_MARKER = 15			/* walreader -> worker */
+	PD_ENT_MARKER = 15,		/* walreader -> worker */
+	PD_ENT_WATERMARK = 16,		/* walreader -> walsender */
+	PD_ENT_RELATION = 17		/* worker -> walsender */
 } ParallelDecodeEntryType;
 
 /*
@@ -466,6 +468,7 @@ typedef struct PDWalHeader
 typedef struct PDSnapshotHeader
 {
 	uint64		version;		/* the version of the snapshot */
+	uint64		epoch;			/* the invalidation epoch of the session */
 	uint32		flags;			/* PD_SNAPSHOT_* */
 	uint32		ninvalidations;	/* the number of invalidation messages that
 								 * follow the payload */
@@ -503,9 +506,55 @@ typedef struct PDSnapshotContent
  */
 typedef struct PDInvalHeader
 {
+	uint64		epoch;			/* the invalidation epoch of the session */
 	uint32		ninvalidations;
 	/* the invalidation messages follow */
 } PDInvalHeader;
+
+/*
+ * The watermarks of the session.
+ *
+ * The slot of the session has two watermarks that have to be computed from
+ * the state of the transactions that are in flight: the xmin of the catalog
+ * and the position the decoding may restart from.
+ *
+ * The walreader is the only process that sees every transaction of the
+ * session, because it is the one that binds the transactions to the decode
+ * workers.  It therefore computes the watermarks, in exactly the way the
+ * serial path computes them, and hands them over to the walsender, which is
+ * the process that owns the slot and may advance its watermarks.
+ */
+typedef struct PDWatermark
+{
+	/*
+	 * The position the decoding may restart from, or zero when there is none
+	 * yet.  It is the restart point of the oldest transaction that is still in
+	 * flight: the decoding has to start there, so that the changes of that
+	 * transaction are not lost.
+	 */
+	uint64		restart_lsn;
+
+	/*
+	 * The xmin of the catalog: the xmin of the snapshot of the oldest
+	 * transaction that is still in flight.
+	 */
+	TransactionId xmin;
+
+	/*
+	 * The oldest transaction id that is running, as the running xacts record
+	 * reported it.  It is the fallback of the xmin of the catalog, for the
+	 * case that no transaction holds a base snapshot.
+	 */
+	TransactionId oldest_running;
+
+	/*
+	 * The position the watermarks are valid at.  It is the position of the
+	 * running xacts record the values were computed from, and it is the
+	 * position the subscriber has to confirm before the watermarks of the
+	 * slot may be advanced.
+	 */
+	uint64		read_lsn;
+} PDWatermark;
 
 /*
  * The header of a frame message.
@@ -533,6 +582,29 @@ typedef struct PDFrameHeader
 	uint64		cseq;				/* commit sequence number of the transaction */
 	uint32		length;			/* length of the frame that follows */
 } PDFrameHeader;
+
+/*
+ * The header of a frame that carries the definition of a relation.
+ *
+ * The decode workers each have their own cache of the relations they have
+ * sent, so every worker that touches a relation produces its definition.  The
+ * walsender is the one that knows in which order the transactions reach the
+ * subscriber, so it is the one that decides which of the definitions are
+ * needed: the definition of a relation has to reach the subscriber before the
+ * first change of the relation, and the transactions reach the subscriber in
+ * the order of their commit sequence numbers.
+ *
+ * The frame is sent as a message of its own type, so that the frames that do
+ * not carry a definition do not have to carry the information about it.
+ */
+typedef struct PDRelationHeader
+{
+	uint64		end_lsn;			/* decoding position after the record */
+	uint64		cseq;				/* commit sequence number of the transaction */
+	uint64		epoch;				/* the epoch of the session the frame belongs to */
+	uint32		relid;				/* the relation the definition belongs to */
+	uint32		length;			/* length of the frame that follows */
+} PDRelationHeader;
 
 /*
  * The events a decode worker reports to the walsender.
@@ -633,6 +705,18 @@ extern bool PDQueueSendChunked(shm_mq_handle *mqh, uint16 type,
  */
 extern void PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
 							  const char *frame, size_t len);
+
+/*
+ * Send a frame that carries the definition of a relation to the walsender.
+ *
+ * The frame is preceded by a PDRelationHeader, which tells the walsender
+ * which relation the definition belongs to and in which epoch of the session
+ * it was produced.  The walsender uses that information to send the
+ * definition of a relation to the subscriber once.
+ */
+extern void PDQueueSendRelation(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
+								uint64 epoch, Oid relid,
+								const char *frame, size_t len);
 
 /*
  * Send a stream segment to the walsender.

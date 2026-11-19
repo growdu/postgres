@@ -82,6 +82,10 @@ typedef struct PDQueuedFrame
 	char	   *data;			/* the frame */
 	size_t		len;			/* the length of the frame */
 	XLogRecPtr	end_lsn;		/* the decoding position after the record */
+	Oid			relid;			/* the relation the frame defines, or
+									 * InvalidOid for the other frames */
+	uint64		epoch;			/* the epoch of the session the definition
+									 * was produced in */
 } PDQueuedFrame;
 
 /*
@@ -105,6 +109,26 @@ typedef struct PDPendingTxn
  * commit sequence number.
  */
 static HTAB *parallel_decode_pending = NULL;
+
+/*
+ * The relations whose definition the session has sent to the subscriber.
+ *
+ * Every decode worker has its own cache of the relations it has sent, so
+ * every worker that touches a relation produces its definition.  The walsender
+ * is the one that knows in which order the transactions reach the
+ * subscriber, so it is the one that decides which of the definitions are
+ * needed: the definition of a relation has to reach the subscriber before the
+ * first change of the relation, and the transactions reach the subscriber in
+ * the order of their commit sequence numbers.  The definition of the
+ * transaction with the smallest sequence number is therefore the one that is
+ * needed, and the others are dropped.
+ *
+ * The table maps a relation to the epoch of the session in which its
+ * definition was sent.  A definition that was produced before the last change
+ * of the catalog does not describe the relation anymore, so it may not be
+ * reused: the epoch tells the definitions apart.
+ */
+static HTAB *parallel_decode_sent_relations = NULL;
 
 /*
  * The commit sequence number of the transaction whose frames may be sent next.
@@ -444,10 +468,13 @@ ParallelDecodeWalreaderPosition(void)
 
 /*
  * Remember a frame of a transaction that is waiting for its turn.
+ *
+ * relid is the relation the frame defines, or InvalidOid when the frame does
+ * not carry the definition of a relation.
  */
 static void
 parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
-								   XLogRecPtr end_lsn)
+								   XLogRecPtr end_lsn, Oid relid, uint64 epoch)
 {
 	PDPendingTxn *pending;
 	PDQueuedFrame *frame;
@@ -479,6 +506,8 @@ parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
 	memcpy(frame->data, data, len);
 	frame->len = len;
 	frame->end_lsn = end_lsn;
+	frame->relid = relid;
+	frame->epoch = epoch;
 
 	pending->frames = lappend(pending->frames, frame);
 }
@@ -509,6 +538,64 @@ parallel_decode_ack_txn(uint64 cseq)
 }
 
 /*
+ * The entry of the table of the relations whose definition has been sent.
+ */
+typedef struct PDSentRelation
+{
+	Oid			relid;			/* the relation */
+	uint64		epoch;			/* the epoch the definition was sent in */
+	bool		sent;			/* has the definition been sent at all */
+} PDSentRelation;
+
+/*
+ * Decide whether the definition of a relation has to be dropped.
+ *
+ * The definition is not needed when the subscriber has seen it already.  The
+ * transactions reach the subscriber in the order of their commit sequence
+ * numbers, so the definition that was sent by the transaction with the
+ * smallest sequence number reaches the subscriber before the changes of the
+ * transactions that follow it.
+ *
+ * A definition of an older epoch does not describe the relation anymore: it
+ * was produced before the last change of the catalog.  Such a definition is
+ * not sent either, because the subscriber has the newer one, which describes
+ * the relation as it is now.
+ */
+static bool
+parallel_decode_relation_sent(PDQueuedFrame *frame)
+{
+	PDSentRelation *entry;
+	bool		found;
+
+	entry = (PDSentRelation *) hash_search(parallel_decode_sent_relations,
+										   &frame->relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->relid = frame->relid;
+		entry->epoch = 0;
+		entry->sent = false;
+	}
+
+	/*
+	 * The subscriber has the definition already.
+	 */
+	if (entry->sent && entry->epoch >= frame->epoch)
+		return true;
+
+	/*
+	 * Remember the definition.  A definition of an older epoch does not
+	 * replace the one of a newer epoch.
+	 */
+	if (!entry->sent || frame->epoch > entry->epoch)
+	{
+		entry->epoch = frame->epoch;
+		entry->sent = true;
+	}
+
+	return false;
+}
+
+/*
  * Let the transactions that have their turn pass.
  *
  * A transaction has its turn when it is the one the walsender is waiting for
@@ -532,7 +619,23 @@ parallel_decode_release_txns(void)
 			break;
 
 		foreach(lc, pending->frames)
-			parallel_decode_ready = lappend(parallel_decode_ready, lfirst(lc));
+		{
+			PDQueuedFrame *frame = (PDQueuedFrame *) lfirst(lc);
+
+			/*
+			 * The definition of a relation is sent to the subscriber once.
+			 * The transactions reach the subscriber in the order of their
+			 * commit sequence numbers, so the definition that the transaction
+			 * with the smallest sequence number produces is the one that has
+			 * to be sent: the subscriber sees it before the changes of the
+			 * transactions that follow it.
+			 */
+			if (frame->relid != InvalidOid &&
+				parallel_decode_relation_sent(frame))
+				continue;
+
+			parallel_decode_ready = lappend(parallel_decode_ready, frame);
+		}
 
 		list_free(pending->frames);
 		hash_search(parallel_decode_pending, &parallel_decode_next_cseq,
@@ -636,6 +739,39 @@ parallel_decode_drain_control(void)
 			memcpy(&info, payload, sizeof(info));
 
 			parallel_decode_record_cseq(&info);
+		}
+		else if (type == PD_ENT_WATERMARK)
+		{
+			PDWatermark	wm;
+
+			if (len < sizeof(wm))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("parallel decode watermark message is too short "
+								"(%zu bytes)", (size_t) len)));
+
+			memcpy(&wm, payload, sizeof(wm));
+
+			/*
+			 * The walreader computed the watermarks of the slot: it is the
+			 * only process that sees every transaction of the session.  The
+			 * walsender owns the slot, so it is the one that may advance
+			 * them.
+			 *
+			 * The watermarks may only be advanced once the subscriber has
+			 * confirmed the position they are valid at.  The functions of
+			 * the decoding path take care of that: they remember the
+			 * values as candidates, and a candidate is applied when the
+			 * confirmation of the subscriber reaches the position it was
+			 * computed at.
+			 */
+			if (TransactionIdIsValid(wm.xmin))
+				LogicalIncreaseXminForSlot((XLogRecPtr) wm.read_lsn,
+										   wm.xmin);
+
+			if (wm.restart_lsn != 0)
+				LogicalIncreaseRestartDecodingForSlot((XLogRecPtr) wm.read_lsn,
+										  (XLogRecPtr) wm.restart_lsn);
 		}
 		else if (type == PD_ENT_ERROR)
 		{
@@ -930,6 +1066,8 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 						   fh.length);
 					frame->len = fh.length;
 					frame->end_lsn = (XLogRecPtr) fh.end_lsn;
+					frame->relid = InvalidOid;
+					frame->epoch = 0;
 
 					parallel_decode_ready = lappend(parallel_decode_ready, frame);
 				}
@@ -937,7 +1075,50 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					parallel_decode_add_pending_frame(fh.cseq,
 													 (const char *) payload + sizeof(fh),
 													 fh.length,
-													 (XLogRecPtr) fh.end_lsn);
+													 (XLogRecPtr) fh.end_lsn,
+													 InvalidOid, 0);
+
+				break;
+			}
+
+		case PD_ENT_RELATION:
+			{
+				PDRelationHeader rh;
+
+				if (len < sizeof(rh))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("parallel decode relation message is too short (%zu bytes)",
+									(size_t) len)));
+
+				memcpy(&rh, payload, sizeof(rh));
+
+				if ((size_t) rh.length + sizeof(rh) != len)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("parallel decode relation message has an inconsistent length "
+									"(%u declared, %zu received)",
+									rh.length, (size_t) len - sizeof(rh))));
+
+				parallel_decode_note_worker_progress(worker,
+														(XLogRecPtr) rh.end_lsn);
+
+				/*
+				 * The frame carries the definition of a relation.  It belongs to
+				 * a transaction, so it waits for the turn of the transaction
+				 * like the other frames do.
+				 */
+				if (rh.cseq == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("parallel decode relation message does not belong to "
+									"a transaction")));
+
+				parallel_decode_add_pending_frame(rh.cseq,
+												 (const char *) payload + sizeof(rh),
+												 rh.length,
+												 (XLogRecPtr) rh.end_lsn,
+												 (Oid) rh.relid, rh.epoch);
 
 				break;
 			}
@@ -992,6 +1173,8 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					memcpy(frame->data, data, frame_len);
 					frame->len = frame_len;
 					frame->end_lsn = (XLogRecPtr) sh.end_lsn;
+					frame->relid = InvalidOid;
+					frame->epoch = 0;
 
 					parallel_decode_ready = lappend(parallel_decode_ready, frame);
 
@@ -1605,6 +1788,22 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 											  128, &hash_ctl,
 											  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
+
+	/*
+	 * The table of the relations whose definition the session has sent to the
+	 * subscriber.  Only the walsender writes to it, so it needs no lock.
+	 */
+	{
+		HASHCTL		hash_ctl;
+
+		memset(&hash_ctl, 0, sizeof(hash_ctl));
+		hash_ctl.keysize = sizeof(Oid);
+		hash_ctl.entrysize = sizeof(PDSentRelation);
+		hash_ctl.hcxt = CurrentMemoryContext;
+		parallel_decode_sent_relations = hash_create("Parallel decode sent relations",
+													  128, &hash_ctl,
+													  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
 	parallel_decode_next_cseq = 1;
 	parallel_decode_ready = NIL;
 
@@ -1789,6 +1988,12 @@ ParallelDecodeSessionStop(void)
 	{
 		hash_destroy(parallel_decode_pending);
 		parallel_decode_pending = NULL;
+	}
+
+	if (parallel_decode_sent_relations)
+	{
+		hash_destroy(parallel_decode_sent_relations);
+		parallel_decode_sent_relations = NULL;
 	}
 
 	for (i = 0; i < MAX_PARALLEL_DECODE_WORKERS; i++)

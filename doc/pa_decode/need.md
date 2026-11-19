@@ -256,7 +256,7 @@
 | **订阅端未开 parallel apply** | 期望落空：发布端已并行、订阅端仍串行 apply，端到端无收益 | 目标部署形态写进用户可见文档与 GUC 说明（4.4、约束 15）；监控项暴露订阅端的 streaming 模式与 apply worker 数量。 |
 | **目录缓存 N 倍** | 每个 worker 各自做发布关系判定与 DDL 后的全量重扫，DDL 密集时是 N 倍目录扫描 CPU | 把“关系 → 发布列表 / schema”做成只读共享内存表（walreader 维护、worker 只读）。 |
 | 进程间通信引入额外延迟 | 小事务场景劣化 | 需实测小事务延迟，与串行路径做对比（AC-8）；批次按字节阈值而非按事务切。 |
-| 插件状态按 worker 复制，RELATION 消息重复 | 冗余带宽 | 首版容忍该冗余（重复 RELATION 语义正确），把共享关系表列为后续优化。 |
+| 插件状态按 worker 复制，RELATION 消息重复 | 冗余带宽 | **已解决**（`design.md` 6.7）：去重判定放在 walsender 侧，由它按 cseq 放行序判定——同一关系每个 epoch 恰好发一条（实测并行路径 4 条 → 1 条，与串行路径一致）。放在共享内存里让 worker 自行判定**不安全**：worker 之间的到达顺序与 cseq 序无关。 |
 | 复制槽水位推进跨进程归属不清 | 槽保留 xmin 漂移或过旧；`restart_lsn` 推进过早 | 由 walsender 代 walreader 执行槽相关操作，两个水位都需跨进程聚合（FR-12）。 |
 | worker 崩溃未被检测，复制静默停滞 | 复制链路悄悄挂死 | 三级检测机制：共享内存状态字 + worker 退出通知 + walreader 归因；barrier 等待带超时兜底（FR-15）。 |
 | cseq 分配者与消费者不同步 | barrier 永久卡死 | cseq 与 walreader 同生命周期，walreader 死亡即作废全部 cseq 并立即失败（FR-16）。**并且 barrier 靠 worker 的结束事件确认推进（含空事件）**，否则非流式 abort / cancel 会造成永久空洞（FR-7）。 |

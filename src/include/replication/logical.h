@@ -131,6 +131,28 @@ typedef struct LogicalDecodingContext
 	int			worker_index;
 
 	/*
+	 * The hook that is called before the output plugin writes the definition
+	 * of a relation.
+	 *
+	 * The serial path has one decoding context and one cache of the relations
+	 * it has sent already, so it sends the definition of a relation once.  The
+	 * parallel path has one decoding context per decode worker, so every
+	 * worker would send the definition of a relation once, and the subscriber
+	 * would receive it as many times as there are workers.
+	 *
+	 * The hook tells the session that the frame that is written next carries
+	 * the definition of a relation.  The session uses that knowledge to send
+	 * the definition of a relation to the subscriber once: the walsender is
+	 * the one that knows in which order the transactions reach the
+	 * subscriber, so it is the one that can tell whether the definition that
+	 * a worker has produced is needed at all.
+	 *
+	 * A NULL hook means that the session does not know anything about the
+	 * frames the plugin produces, which is what the serial path does.
+	 */
+	void (*rel_definition_hook) (struct LogicalDecodingContext *ctx, Oid relid);
+
+	/*
 	 * The publisher-side parallel decoding path streams the changes of a
 	 * transaction before the transaction is complete, so that they reach the
 	 * subscriber early.  These two fields say how eagerly that happens.

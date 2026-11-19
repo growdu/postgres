@@ -94,6 +94,38 @@ static uint64 pd_current_cseq = 0;
 static XLogRecPtr pd_reported_lsn = InvalidXLogRecPtr;
 
 /*
+ * The invalidation epoch of the session.
+ *
+ * The walreader numbers the epochs of the session, and it tells the
+ * workers about them together with the invalidation messages.  The
+ * epoch tells the walsender whether the definition of a relation that has
+ * been sent already still describes the relation: a definition that was
+ * sent before the last change of the catalog does not.
+ */
+static uint64 pd_epoch = 0;
+
+/*
+ * The relation whose definition the plugin is about to write.
+ *
+ * The output plugin tells the worker that the frame it writes next carries
+ * the definition of a relation, so that the worker can hand the frame over
+ * to the walsender as a definition.  The walsender decides whether the
+ * definition is needed at all: it knows in which order the transactions
+ * reach the subscriber.
+ */
+static Oid pd_pending_relid = InvalidOid;
+
+/*
+ * The epoch the definition belongs to.
+ *
+ * It is the epoch the worker knows when the definition is produced.  The
+ * walsender uses it to tell the definitions of a relation that were produced
+ * before the last change of the catalog apart from the ones that describe
+ * the relation as it is now.
+ */
+static uint64 pd_pending_epoch = 0;
+
+/*
  * The version of the snapshot the worker holds.
  *
  * The walreader numbers the snapshots it publishes, and the workers refer to
@@ -208,6 +240,18 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 				bool last_write)
 {
 	uint32		len;
+	Oid			relid;
+	uint64		epoch;
+
+	/*
+	 * The plugin may have told us that this frame carries the definition of a
+	 * relation.  The information is used once: the frame that follows the
+	 * call of the hook is the one that carries the definition.
+	 */
+	relid = pd_pending_relid;
+	epoch = pd_pending_epoch;
+	pd_pending_relid = InvalidOid;
+	pd_pending_epoch = 0;
 
 	if (pd_segment_active)
 	{
@@ -219,6 +263,19 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		appendBinaryStringInfo(pd_segment, (char *) &len, sizeof(len));
 		appendBinaryStringInfo(pd_segment, ctx->out->data, ctx->out->len);
 		pd_segment_frames++;
+
+		return;
+	}
+
+	if (relid != InvalidOid)
+	{
+		/*
+		 * The frame carries the definition of a relation.  It is sent as a
+		 * message of its own type, so that the walsender can tell it apart
+		 * from the other frames and decide whether the subscriber needs it.
+		 */
+		PDQueueSendRelation(pd_out_mqh, (uint64) pd_end_lsn, pd_current_cseq,
+							epoch, relid, ctx->out->data, ctx->out->len);
 
 		return;
 	}
@@ -416,6 +473,14 @@ pd_worker_handle_snapshot(const void *payload, size_t len)
 					 errmsg("parallel decode snapshot message is truncated")));
 
 		/*
+		 * The epoch of the session grows every time the catalog changes,
+		 * and the messages carry it, so that the worker knows which
+		 * definitions it has sent still describe the relations.
+		 */
+		if (header->epoch > pd_epoch)
+			pd_epoch = header->epoch;
+
+		/*
 		 * The versions of the snapshots grow, so a message that carries a
 		 * version the worker has already seen is out of order.
 		 */
@@ -536,6 +601,14 @@ pd_worker_handle_inval(const void *payload, size_t len)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("parallel decode invalidation message is truncated")));
+
+	/*
+	 * The invalidation messages change the catalog caches of the worker,
+	 * so the definitions it has sent do not describe the relations
+	 * anymore.  The epoch of the session tells the worker that.
+	 */
+	if (header->epoch > pd_epoch)
+		pd_epoch = header->epoch;
 
 	if (header->ninvalidations > 0)
 		ReorderBufferImmediateInvalidation(pd_ctx->reorder,
@@ -723,6 +796,25 @@ pd_worker_recv_record(DecodedXLogRecord **record, bool nowait)
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
 	}
+}
+
+/*
+ * Note that the plugin is about to write the definition of a relation.
+ *
+ * The frame that follows the call is the one that carries the definition.
+ * The worker remembers the relation until the frame has been sent, so that
+ * it can hand the frame over to the walsender as a definition.
+ *
+ * The walsender decides whether the subscriber needs the definition: it
+ * knows in which order the transactions reach the subscriber, and the
+ * definition of a relation has to reach the subscriber before the first
+ * change of the relation.
+ */
+static void
+pd_worker_rel_definition_hook(LogicalDecodingContext *ctx, Oid relid)
+{
+	pd_pending_relid = relid;
+	pd_pending_epoch = pd_epoch;
 }
 
 /*
@@ -1002,6 +1094,13 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	 */
 	pd_ctx->stream_segment_size = (Size) ctl->stream_segment_size;
 	pd_ctx->stream_min_size = (Size) ctl->stream_min_size;
+
+	/*
+	 * The worker tells the walsender which frames carry the definition of a
+	 * relation, so that the definition of a relation is sent to the
+	 * subscriber once and not once for every worker.
+	 */
+	pd_ctx->rel_definition_hook = pd_worker_rel_definition_hook;
 
 	/*
 	 * The frames of a stream segment have to reach the subscriber without the

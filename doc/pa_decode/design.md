@@ -57,6 +57,8 @@
     - [6.6.1 xmin 水位](#661-xmin-水位)
     - [6.6.2 restart_lsn 水位](#662-restart_lsn-水位)
     - [6.6.3 汇总消息](#663-汇总消息)
+    - [6.6.4 实现与验证](#664-实现与验证)
+  - [6.7 关系描述的去重（RELATION 去重）](#67-关系描述的去重relation-去重)
 - [7. 提交顺序保证的实现](#7-提交顺序保证的实现)
   - [7.1 提交序号（cseq）的产生](#71-提交序号cseq的产生)
   - [7.2 commit barrier 的实现](#72-commit-barrier-的实现)
@@ -531,7 +533,7 @@ walreader            worker#0            walsender           订阅端
 | 与现状差异 | reorder buffer 与插件实例化逻辑需按 worker 复制 | reorder buffer/plugin 基本不动 | 关系消息去重 |
 | 风险 | 插件状态按 worker 复制；RELATION 消息重复 | **插件格式化留在单线程，热点无法并行化** | 实现复杂度最高 |
 
-**选型：方案 A 为主，方案 C 作为关系消息去重的增强项。**
+**选型：方案 A 为主；关系消息去重作为独立的增强项单独实现（6.7）。** 注意 6.7 的最终形态既不是"共享关系表"也不是"walreader 统一下发"，而是**由 walsender 按放行序做去重判定**——因为只有 walsender 掌握 cseq 序，worker 之间无法安全地互相判定（6.7.1）。
 
 理由：
 
@@ -542,7 +544,7 @@ walreader            worker#0            walsender           订阅端
 
 方案 A 的已知代价及处理：
 
-- **RELATION 消息重复**（事实 6）：每个 worker 有独立的 `RelationSyncCache`。按 `pgoutput.c:704-770` 的两级判定拆开看，**放大只发生在非流式事务路径**：流式事务按 `(relation, top-xid)` 粒度判断是否重发，而一个 top-xid 只会归属一个 worker，粒度与事务归属一致，**不额外放大**；非流式事务用的是会话级 `schema_sent` 标志，每个 worker 各有一份，因此同一关系最多被发 N 次。订阅端收到重复的 RELATION 会覆盖缓存，语义正确，代价是少量冗余带宽。**首版按方案 A 实现并容忍该冗余，把方案 C 的共享关系表列为后续优化**（注意其收益主要是消除上述 N 倍放大，而非消除流式路径的重复）。
+- **RELATION 消息重复**（事实 6）：每个 worker 有独立的 `RelationSyncCache`。按 `pgoutput.c:704-770` 的两级判定拆开看，**放大只发生在非流式事务路径**：流式事务按 `(relation, top-xid)` 粒度判断是否重发，而一个 top-xid 只会归属一个 worker，粒度与事务归属一致，**不额外放大**；非流式事务用的是会话级 `schema_sent` 标志，每个 worker 各有一份，因此同一关系最多被发 N 次。订阅端收到重复的 RELATION 会覆盖缓存，语义正确，代价是少量冗余带宽。**已解决**（6.7）：去重判定放在 walsender 侧，由它按 cseq 放行序判定——同一关系每个 epoch 恰好发一条。注意其收益主要是消除上述 N 倍放大，而非消除流式路径的重复。
 - **插件实例化**：每个 worker 需要独立的 `LogicalDecodingContext` 与 output plugin 实例（`LoadOutputPlugin()` + `_PG_output_plugin_init`），各自持有 `ctx->out` 缓冲。**实例化时必须把 `ctx->streaming` 设成订阅端的模式值**（事实 8c）：它同时决定"是否允许流式"与"`STREAM ABORT` 的载荷格式"，由 `PD_ENT_SESSION_INIT` 下发（5.2.2）。
 
 ### 4.3 决策二：提交顺序保证——commit barrier 与 FIFO 队列对比
@@ -687,8 +689,10 @@ walreader            worker#0            walsender           订阅端
 | WAL 分发队列 × N | walreader | worker #i | SPSC 无锁环形队列 | O1 | 每 worker 一条；严格 FIFO，追加顺序 = WAL 顺序（INV-1.2） |
 | 快照版本池 | walreader | worker | 共享数组 + 版本水位 | O1 | 快照按版本号引用，避免每事务一次 O(xcnt) 拷贝（6.3） |
 | 输出队列 × N | worker #i | walsender | SPSC 无锁环形队列 | O2 + O3 | 每 worker 一条；条目分“数据块”与“结束事件”两类 |
-| 控制通道 | walreader ↔ walsender | | SPSC | O3 | cseq 分配、xmin 推进请求、ready / flush 回执 |
+| 控制通道 | walreader ↔ walsender | | SPSC | O3 | cseq 分配、槽水位上报（6.6）、ready / flush 回执 |
 | 错误通道 | worker #i | walsender | 共享状态字 + `bgw_notify_pid` 通知 | — | worker 内部错误（FR-11） |
+
+**没有"关系表"这一块共享内存。** 关系描述的去重（6.7）最终落在 **walsender 进程内**的一张哈希表里：walsender 是唯一掌握放行顺序（cseq 序）的进程，只有它能安全地判定"某条关系描述是否已经送达订阅端"。放在共享内存里让 worker 自行判定是**不安全**的——worker 之间没有 cseq 序的先后关系，判定依据不成立（理由见 6.7）。
 
 选型说明：PostgreSQL 自带的 `shm_mq`（`src/backend/storage/ipc/shm_mq.c`）实现了“单发送者—单接收者”的共享内存队列，语义正好匹配“walreader → 每个 worker”的扇出模型，且提供了 `shm_mq_sendv()` 批量提交能力。`shm_mq` 的方向是固定的（`shm_mq_set_receiver()` / `shm_mq_set_sender()` 各只能设置一次，`shm_mq.c:206/224`），因此**不存在"双向 `shm_mq`"**。worker → walsender 方向（N 个生产者）需要自建 MPSC 队列，或为每个 worker 建立一条 `shm_mq`（worker → walsender），由 walsender 轮询各队列——后者实现更简单且避免了 MPSC 的缓存行争用。**首版采用“每 worker 两条 `shm_mq` 实例”**：下行（walreader → worker）与上行（worker → walsender）各一条，共 2N 条。
 
@@ -830,6 +834,7 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | `PD_ENT_BLOCK` | 块边界标记（FIRST / MORE / LAST）、块类型、xid、**cseq（仅整事务块有）**、字节 | O2 的载体：块内字节在 wire 上必须连续 |
 | `PD_ENT_EVENT` | cseq、结束类型、字节（**可为空**）、xid | O3 的载体：事务结束事件 |
 | `PD_ENT_ERROR` | 错误信息 | worker 内部错误（FR-11） |
+| `PD_ENT_RELATION` | 关系描述帧（relid、cseq、epoch、字节） | 携带关系描述的帧，walsender 据此做去重（6.7）。**单独一种条目类型**，因此普通帧不必为它额外付出头部开销 |
 
 **块类型**有两种，对应订阅端的两条独立约束：
 
@@ -873,14 +878,14 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | 消息 | 载荷 | 说明 |
 | --- | --- | --- |
 | `PMSG_COMMIT_SEQ` | xid、cseq、结束类型 | 提交顺序的来源（7.1）；把 cseq 与 xid 关联起来 |
-| `PMSG_WATERMARK_ADVANCE` | lsn、新的 xmin、新的 restart_lsn | 复制槽的两个水位推进请求（6.6） |
+| `PMSG_WATERMARK_ADVANCE` | lsn、新的 xmin、新的 restart_lsn | 复制槽的两个水位推进请求（6.6）。**已实现**：消息体是 `PDWatermark{restart_lsn, xmin, oldest_running, read_lsn}`，由 walreader 在读到 `XLOG_RUNNING_XACTS` 记录时发出 |
 | `PMSG_READY` | — | snapbuild 达到 consistent |
 
 **walsender → walreader**
 
 | 消息 | 载荷 | 说明 |
 | --- | --- | --- |
-| `PMSG_WATERMARK_ACK` | lsn、xmin、restart_lsn | walsender 代为调用 `LogicalIncreaseXminForSlot()` / `LogicalIncreaseRestartDecodingForSlot()` 后回执 |
+| `PMSG_WATERMARK_ACK` | lsn、xmin、restart_lsn | walsender 代为调用 `LogicalIncreaseXminForSlot()` / `LogicalIncreaseRestartDecodingForSlot()` 后回执。**已实现：不需要回执**——"等订阅端确认"这一步由槽自己的候选机制承担（`candidate_xmin_lsn` / `candidate_restart_valid`，`logical.c:1757+`），walsender 收到水位消息即可调用那两个函数 |
 | `PMSG_FLUSH_LSN` | confirmed_flush | 复制槽确认水位回传 |
 
 **worker → walreader**
@@ -888,7 +893,7 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | 消息 | 载荷 | 说明 |
 | --- | --- | --- |
 | `PD_ENT_EVENT{ END_ACK }` | cseq | 事务结束事件已处理完毕（7.2） |
-| `PD_ENT_EVENT{ WATERMARK }` | xmin、oldest_first_lsn、seq | 周期上报本 worker 的快照 xmin（6.6.1） |
+| `PD_ENT_EVENT{ WATERMARK }` | xmin、oldest_first_lsn、seq | 周期上报本 worker 的快照 xmin（6.6.1）。**已实现：worker 不上报**——walreader 自己保留了一份记录全部事务的 reorder buffer，全局的"最老在途事务"对它可见，水位由它算（6.6） |
 
 **walreader → worker（状态同步）**
 
@@ -1155,79 +1160,157 @@ worker 侧的替身只需提供三个函数：
 
 复制槽上有两个必须由跨进程数据算出的水位。二者都源于**事务分散在多个 worker** 这一变化，都必须显式设计聚合路径。
 
+**已落地的形态：walreader 侧自己保留一份 reorder buffer。** walreader 的 `pd_rb` 记录会话中**所有**事务的条目（建立、base snapshot、提交、丢弃），因此"最老在途事务"这个全局事实对 walreader 是可见的——`ReorderBufferGetOldestXmin(pd_rb)` 与 `ReorderBufferGetOldestTXN(pd_rb)` 取到的，正是串行路径在同一位置会取到的值。walreader 在读到 `XLOG_RUNNING_XACTS` 记录时算出这两个值，通过控制通道的 `PD_ENT_WATERMARK` 消息交给 walsender；**walsender 是槽的唯一拥有者**（事实 9），由它调用 `LogicalIncreaseXminForSlot()` / `LogicalIncreaseRestartDecodingForSlot()`。
+
+这一形态的好处是：不需要给 worker 增加"周期上报 + 超时兜底"的两套规则，算出来的值与串行路径**同口径**，而且串行路径算这两个值用的就是同一对函数（`SnapBuildProcessRunningXacts()`）。
+
 #### 6.6.1 xmin 水位
 
-`reorderBufferGetOldestXmin()`（`reorderbuffer.c:1047-1061`）取 `rb->txns_by_base_snapshot_lsn` 的表头作为最老事务的快照 xmin，`snapbuild.c:1311-1316` 用它调用 `LogicalIncreaseXminForSlot()`。事务分散后，walreader 的 reorder buffer 里没有事务，该值退化为 `InvalidTransactionId`，回退到 `running->oldestRunningXid`（`snapbuild.c:1313`）——比真实需要**更老**，因此安全但代价大：只要有任意长事务存在，槽的 `catalog_xmin` 就长期不前进，系统表无法回收。
+`ReorderBufferGetOldestXmin()`（`reorderbuffer.c:1047-1061`）取 `rb->txns_by_base_snapshot_lsn` 的表头作为最老事务的快照 xmin，串行路径在 `snapbuild.c:1498-1503` 用它调用 `LogicalIncreaseXminForSlot()`。
 
-**真实值与兜底值必须区分，不能混为一谈：**
+**并行路径下这个值退化的问题不成立**，前提是 walreader 自己的 reorder buffer 里也有这些事务的条目：`ReorderBufferProcessXid(pd_rb, xid, lsn)` 为每个事务建立条目（条目上带 `restart_decoding_lsn`），事务结束时 `ReorderBufferForget(pd_rb, xid, lsn)` 丢弃它，base snapshot 由快照构建器经 `ReorderBufferSetBaseSnapshot()` 设置到同一条目上。
 
-| 情形 | 采用的 xmin | 理由 |
-| --- | --- | --- |
-| 所有 worker 均已上报且未超时 | `min(各 worker 上报值)` | 精确，槽可正常推进 |
-| 任一 worker 超时未上报 | **`min(各 worker 最后一次成功上报的值, running->oldestRunningXid)`**，且**只允许沿用历史最小值、不允许前进** | 保守，宁可停滞也不能提前回收目录 |
+**口径必须与串行路径一致**：串行路径的"最老在途事务"指的是**持有 base snapshot 的最老事务**，不是所有在途事务。`pd_rb` 与串行路径的 reorder buffer 承担同样的角色，因此 `ReorderBufferGetOldestXmin(pd_rb)` 与串行路径的取值口径相同。
 
-**兜底值不能只用 `oldestRunningXid`。** `oldestRunningXid` 只反映"此刻还在运行的事务"，而真正必须保住的是**所有在途事务所持快照的 xmin**——一个很老的长事务的快照 xmin 可以远小于当前的 `oldestRunningXid`（那个事务可能已经提交，但它派生的在途事务仍持有旧快照）。只按 `oldestRunningXid` 兜底会把 `catalog_xmin` 推得比安全值更激进 → 允许 vacuum 回收掉在途事务快照仍然需要的系统表元组 → 后续解码报 `catalog lookup failed` → 会话失败并反复重试。
+**兜底值仍然保留**：`ReorderBufferGetOldestXmin()` 返回 `InvalidTransactionId` 时（没有任何事务持有 base snapshot），退回 `running->oldestRunningXid`——与串行路径 `snapbuild.c:1498-1501` 完全一致。
 
-现状的正确做法可作参照：`SnapBuildAdjustXmin()`（`snapbuild.c:1300-1355`）取 `xmin = ReorderBufferGetOldestXmin(builder->reorder)`（`reorderbuffer.c:1047-1061`，即最老在途事务的 base snapshot xmin），**只有在一个在途事务都没有时**才回退到 `running->oldestRunningXid`。并行模型下"最老在途事务"分布在各 worker，因此兜底必须取各 worker 上报值的最小值。
-
-上报周期与超时阈值必须相互配合：`XLOG_RUNNING_XACTS` 的周期约为 `wal_writer_delay`（默认 10s），因此超时阈值必须大于它，否则会周期性地退到保守值。
+**已经排除的替代方案**：让每个 worker 周期上报自己持有的最老事务的快照 xmin，由 walreader 取最小值。那套方案必须额外处理"某个 worker 超时未上报"的兜底，而兜底值比真实值更激进还是更保守，直接决定目录元组会不会被过早回收（回收后订阅端会报 `catalog lookup failed`）——这类规则比"直接复用串行路径的取值"更难验证，因此不采用。
 
 #### 6.6.2 restart_lsn 水位
 
-`restart_lsn` 的语义是“必须从这里开始重读，才能重放所有尚未提交的事务”（`logical.c:1757-1759`）。它由**最老在途事务**的 `restart_decoding_lsn` 钉住：
+`restart_lsn` 的语义是"必须从这里开始重读，才能重放所有尚未提交的事务"（`logical.c:1757-1759`）。它由**最老在途事务**的 `restart_decoding_lsn` 钉住，串行路径的算法是（`snapbuild.c:1524-1541`）：
 
 ```c
-/* snapbuild.c:1337-1354 (SnapBuildAdjustXmin) */
+/* snapbuild.c:1524-1541 (串行路径) */
 txn = ReorderBufferGetOldestTXN(builder->reorder);        /* reorderbuffer.c:1021-1031 */
 if (txn != NULL && txn->restart_decoding_lsn != InvalidXLogRecPtr)
     LogicalIncreaseRestartDecodingForSlot(lsn, txn->restart_decoding_lsn);
-else if (txn == NULL && ...)
-    LogicalIncreaseRestartDecodingForSlot(lsn, builder->last_serialized_snapshot);
+else if (txn == NULL &&
+         builder->reorder->current_restart_decoding_lsn != InvalidXLogRecPtr &&
+         builder->last_serialized_snapshot != InvalidXLogRecPtr)
+    LogicalIncreaseRestartDecodingForSlot(lsn,
+                                          builder->last_serialized_snapshot);
 ```
 
-其中 `txn->restart_decoding_lsn = rb->current_restart_decoding_lsn`（`reorderbuffer.c:688`），而 `current_restart_decoding_lsn` 由快照构建器经 `ReorderBufferSetRestartPoint()` 写入（调用点 `snapbuild.c:1887`、`snapbuild.c:2051`）。
+其中 `txn->restart_decoding_lsn = rb->current_restart_decoding_lsn`（`reorderbuffer.c:688`），而 `current_restart_decoding_lsn` 由快照构建器经 `ReorderBufferSetRestartPoint()` 写入（`snapbuild.c:2074`、`snapbuild.c:2238`）。
 
-**并行模型下这里有一个必须堵住的漏洞。** `ReorderBufferGetOldestTXN()` 取 `rb->toplevel_by_lsn` 的队头；事务全在 worker 的 reorder buffer 里 → walreader 的 `toplevel_by_lsn` 恒空 → 该函数恒返回 NULL → **必然走 else 分支**，把 `restart_lsn` 推到 `builder->last_serialized_snapshot`。而后者每次 `XLOG_RUNNING_XACTS` 都会前移（`snapbuild.c:1283` → `SnapBuildSerialize` → `snapbuild.c:1882`），大约每 10 秒一次。**于是 `restart_lsn` 会周期性地跳过所有仍在 worker 里在途的事务**——发布端重启后，这些事务的前半段变更永久丢失。
+**这里曾被认为有一个必须堵住的漏洞**：如果 walreader 不持有事务，`ReorderBufferGetOldestTXN()` 恒返回 NULL，就必然走 else 分支，把 `restart_lsn` 推到 `builder->last_serialized_snapshot`——而后者每次 `XLOG_RUNNING_XACTS` 都会前移（约每 10 秒一次），于是 `restart_lsn` 会周期性地跳过所有仍在 worker 里在途的事务，发布端重启后这些事务的前半段变更永久丢失。
 
-**修法：把 restart_lsn 的聚合点也放到 walreader 侧。** walreader 是在途事务的**创建者**（事务的第一条记录到达时绑定 worker），因此它在创建事务时就能记录 `first_lsn` 与当时的 `current_restart_decoding_lsn`——这正是 `reorderbuffer.c:688` 的语义。于是：
+**该漏洞的前提是"事务只在 worker 的 reorder buffer 里"，而实现否定了这个前提**：walreader 侧有自己的 `pd_rb`，它同样为每个事务建立条目、同样在 `ReorderBufferProcessXid()` 时记下当时的 `current_restart_decoding_lsn`、同样在事务结束时丢弃条目。因此 `ReorderBufferGetOldestTXN(pd_rb)` 取到的就是全局最老在途事务，与串行路径同口径；`current_restart_decoding_lsn` 只在"快照已落盘"或"快照已从盘上恢复"这两个位置被设置（`snapbuild.c:2074`、`snapbuild.c:2238`），因此它作为重启位置是安全的。
 
-| 聚合点 | 数据来源 | 汇总者 | 请求推进者 |
-| --- | --- | --- | --- |
-| xmin | 各 worker 的 base snapshot xmin | walreader（`PD_ENT_EVENT` 周期性上报） | walsender → `LogicalIncreaseXminForSlot()` |
-| restart_lsn | walreader 自己的事务绑定表中 `first_lsn` 最小的事务的 `restart_decoding_lsn` | walreader | walsender → `LogicalIncreaseRestartDecodingForSlot()` |
+**推进判据沿用串行路径的候选机制，不做替换。** `LogicalIncreaseRestartDecodingForSlot(current_lsn, restart_lsn)` 把候选记在 `candidate_restart_valid = current_lsn` 上，等订阅端确认到 `current_lsn` 之后才生效（`logical.c:1825-1899` 的候选设置、`logical.c:1901+` 的 `LogicalConfirmReceivedLocation()` 应用）。并行路径下 `current_lsn` 取 **running-xacts 记录自身的 LSN**，这条判据仍然成立：
 
-`restart_lsn` 的汇总**不需要 worker 上报**——它所需的两个值 walreader 在创建事务时就都有了。worker 侧的 `txn->restart_decoding_lsn` 是本地状态，不参与槽的推进。
+- 候选的生效条件是 `confirmed_flush >= current_lsn`；
+- `confirmed_flush` 受放行前沿 F 钳制，而 F 在所有已报告事务放行之后等于 **walreader 认证过的读取位置**（7.4），它必然越过 running-xacts 记录的 LSN——因为该记录之前的全部事务都已放行，其帧已写给订阅端；
+- 因此候选会在"running-xacts 记录之前的全部事务都已送达"之后生效，**不会**出现"候选永远挂着、WAL 无限保留"的情况。
 
-**推进判据必须一并修正。** `LogicalIncreaseRestartDecodingForSlot()` 的生效条件是 `current_lsn <= slot->data.confirmed_flush`（`logical.c:1783-1790`）。这个条件假设“`confirmed_flush` 之前的数据都已发完”，在并行模型下不再成立（见 7.4 关于 `'w'` 帧 LSN 的讨论）：事务 T 的数据可能还在 worker 里没解码完，订阅端却已经把 `confirmed_flush` 推过了 T 的位置。
-
-因此判据必须**整体替换**，而不是"在原条件上再增加一条"——原条件本身在并行模型下几乎恒不成立：`current_lsn` 是 walreader 的 WAL 读取位置，而 `confirmed_flush` 被放行前沿钳制后 ≤ F ≤ 读位置，于是 `restart_lsn` 只能一直挂在 `candidate_restart_valid` 上等确认 → **WAL 无限保留**（槽保留全部 WAL）。
-
-替换后的判据与配套协议：
-
-| 要素 | 内容 |
-| --- | --- |
-| `current_lsn` | walreader 的 WAL 读取位置（不再与 `confirmed_flush` 比较） |
-| 唯一条件 | **所有 LSN 小于 `current_lsn` 的事务都已提交并输出完毕**（"输出完毕" = 该事务的所有块已被 walsender 写出） |
-| 谁提供这个事实 | walreader 的**事务绑定表**（每个事务的 `first_lsn` 与它绑定的 worker）加上各 worker 的 `END_ACK`（已带 cseq，walreader 因此知道每个事务何时收尾） |
-| 判定方法 | walreader 取绑定表中所有 `first_lsn < current_lsn` 的事务，检查它们是否都收到了 `END_ACK`；全部收到即允许推进 |
-
-**worker 侧不得依赖 `txn->restart_decoding_lsn`。** 该字段的值来自 `rb->current_restart_decoding_lsn`（`reorderbuffer.c:688`），而 worker 的 reorder buffer 上没有人调 `ReorderBufferSetRestartPoint()` → 该值恒为 `InvalidXLogRecPtr`。**walreader 必须自己维护 `current_restart_decoding_lsn` 的本地副本**（见 6.1），并在创建事务绑定时把副本值记入绑定表——`restart_lsn` 的推进完全由 walreader 侧的绑定表算出，与 worker 的本地状态无关。
+**这条判据成立的前提是 F 随 walreader 的读取前进。** 若 walreader 停在某个位置不再读 WAL，则 F 不前进、候选不生效、`restart_lsn` 停滞——但此时本就没有新 WAL 产生，语义正确。
 
 #### 6.6.3 汇总消息
 
-两个水位共用一条周期性上报消息（见 5.2.4 的 `PMSG_WATERMARK_ADVANCE`）：
+两个水位共用一条消息，走 walreader → walsender 的控制通道：
 
 ```c
-typedef struct PD_WATERMARK
+typedef struct PDWatermark
 {
-    uint32      worker_id;
-    TransactionId xmin;          /* 该 worker 上最老在途事务的快照 xmin */
-    XLogRecPtr  oldest_first_lsn;/* 该 worker 上最老在途事务的 first_lsn（诊断用） */
-    uint64      seq;             /* 上报序号，用于检测丢失 */
-} PD_WATERMARK;
+    uint64      restart_lsn;     /* 解码可以从哪里重启；0 表示还不知道 */
+    TransactionId xmin;          /* 目录的 xmin 水位 */
+    TransactionId oldest_running;/* running-xacts 记录里的最老运行事务 */
+    uint64      read_lsn;        /* 这两个值成立的位置（running-xacts 记录的 LSN） */
+} PDWatermark;
 ```
 
-walreader 收到全部 worker 的上报后取 `min(xmin)`，连同自己算出的 `restart_lsn`，通过控制通道请求 walsender 推进槽。**walsender 是唯一推进槽的进程**（事实 9）。
+消息在 walreader 读到 `XLOG_RUNNING_XACTS` 记录时发出（`pd_walreader_send_watermark()`），walsender 在排空控制通道时取出并应用（`parallel_decode_drain_control()` 的 `PD_ENT_WATERMARK` 分支）：
+
+```c
+if (TransactionIdIsValid(wm.xmin))
+    LogicalIncreaseXminForSlot((XLogRecPtr) wm.read_lsn, wm.xmin);
+if (wm.restart_lsn != 0)
+    LogicalIncreaseRestartDecodingForSlot((XLogRecPtr) wm.read_lsn,
+                                          (XLogRecPtr) wm.restart_lsn);
+```
+
+**walsender 是槽的唯一拥有者**（事实 9），只有它能推进槽的水位；walreader 与 worker 拿到的都是槽的副本。
+
+#### 6.6.4 实现与验证
+
+| 事项 | 结论 |
+| --- | --- |
+| 聚合点 | walreader 自己的 reorder buffer `pd_rb`，不是 worker 的上报 |
+| 汇总时机 | walreader 读到 `XLOG_RUNNING_XACTS` 记录时（与串行路径同一个时机、同一个周期） |
+| 传输方式 | 控制通道的 `PD_ENT_WATERMARK` 消息 |
+| 应用者 | walsender（槽的唯一拥有者），调用串行路径同一对 `LogicalIncrease*ForSlot()` |
+| 候选的生效条件 | 沿用串行路径：`confirmed_flush >= running-xacts 记录的 LSN` |
+| 实测（旧代码 → 新代码） | 并行路径下槽的 `restart_lsn` **完全不前进**（90 秒内不变）→ 前进（14 秒后从 `0/14E5430` 变为 `0/14E8728`），`catalog_xmin` 同步前进（740 → 741），与串行路径的实测结果一致 |
+
+验证脚本：`doc/pa_decode/t/slot_watermark_smoke.sh`（建订阅、写负载、等槽的水位前进，并与串行路径对照）。
+
+### 6.7 关系描述的去重（RELATION 去重）
+
+**问题。** 输出插件把"这张表长什么样"（列名、列类型、replident）告诉订阅端，订阅端据此维护自己的关系缓存。串行路径只有一个解码上下文、一份缓存，因此每张表的关系描述在整个会话里只发一次（`pgoutput.c` 的 `relentry->schema_sent`）。
+
+并行路径每个 decode worker 各有一份插件上下文、各有一份关系缓存，于是**每张表的关系描述会被每个碰过它的 worker 各发一次**。实测（6 个并发会话、48 个事务的单表负载）：串行路径发 1 条 RELATION，并行路径发 4 条（4 个 worker 各一份）。协议上这是**允许**的——订阅端收到重复的关系描述只是覆盖自己的缓存——但它是纯粹的浪费：一条关系描述约 100–200 字节，在"每事务都要发一遍"的负载下会显著放大协议字节数。
+
+#### 6.7.1 为什么不能放在共享内存里让 worker 自行判定
+
+最初的设计是：在 dsa 控制块里放一张"本会话已发过哪些关系"的共享哈希表，worker 在发关系描述前查表，表里有且 cseq 更小就跳过。这条路走不通，理由是**判定依据不成立**：
+
+> 去重要成立，必须保证"被跳过的那条定义，订阅端一定已经见过了"。这要求"发定义的事务"与"用定义的事务"在订阅端的到达顺序是确定的。
+> 串行路径靠的是"同一个解码上下文里先发定义、再发变更"，顺序天然确定。
+> 并行路径里，worker 之间**没有 cseq 序的先后关系**：持有更大 cseq 的 worker 完全可能先到达并发出定义。于是当一个更小 cseq 的事务随后到达时，它看到"表里已经有这条关系了"，但那条定义属于**更晚**的事务——订阅端会先应用这个更小 cseq 的事务，而此时它**还没有**那条定义。
+
+共享表 + worker 自行判定的规则（表里有且 epoch 相同就跳过）在语义上是**安全**的（最坏情况是多发一条，绝不会少发），但它**不是重复消除**：实测中出现 2 条 RELATION 而非 1 条——取决于哪个 worker 先到达。
+
+**判定必须放在掌握全局放行序的那一端。** walsender 是唯一知道 cseq 放行顺序的进程（7.2 的 barrier），因此去重判定归它。
+
+#### 6.7.2 实现：worker 标记，walsender 判定
+
+| 环节 | 位置 | 内容 |
+| --- | --- | --- |
+| 标记"下一帧是关系描述" | decode worker | 插件钩子 `rel_definition_hook(ctx, relid)` 在 pgoutput 写关系消息**之前**被调用，worker 记下 `pd_pending_relid` / `pd_pending_epoch` |
+| 走独立的消息类型 | decode worker | worker 的输出钩子发现有待标记的关系，就用 `PD_ENT_RELATION` 而不是 `PD_ENT_FRAME` 发送该帧，头部多带 `{ end_lsn, cseq, epoch, relid, length }` |
+| 去重判定 | walsender | 进程内哈希表 `parallel_decode_sent_relations`：`relid → { epoch, sent }`。放行事务的帧时，若该帧是关系描述且该关系在**同一个或更新的 epoch** 里已经发过，就丢弃该帧 |
+
+**为什么普通帧不多付代价**：去重信息走的是**另一种消息类型**（`PD_ENT_RELATION`），普通帧（`PD_ENT_FRAME`）的头部与原来完全一样。代价只落在真正携带关系描述的那少数几帧上。
+
+**为什么恰好发一次**：walsender 按 cseq 顺序放行事务（O3，4.1.3 / 7.2），因此"最早碰到这张表的那个事务"的关系描述一定**最先**被放行并送达订阅端；此后所有事务的关系描述帧都在放行时被丢弃。于是每个关系每个 epoch 恰好发一条。
+
+**epoch 仍然必要**：DDL 之后旧的关系描述已经过时，订阅端必须拿到新的那份。epoch 是 walreader 的"目录代次"（每次发布快照内容或广播失效就加一，随快照头与失效消息下发）。表里的条目带 epoch，判定规则是：
+
+| 情形 | 动作 | 理由 |
+| --- | --- | --- |
+| 该关系在本 epoch 未发过 | **发**，并记下 `epoch` | 订阅端还没有这份定义 |
+| 已发过，且表里的 epoch **≥** 本帧的 epoch | **丢弃** | 订阅端已有的定义不比本帧旧（同一个 epoch = 同一份结构；更大的 epoch = 更新鲜的结构，本帧是过时的那份） |
+| 已发过，且表里的 epoch **<** 本帧的 epoch | **发**，并把表里的 epoch 更新为本帧的 | 本帧是 DDL 之后的新定义，必须送达 |
+
+**流式事务一律照发。** pgoutput 在流式模式下按 (relation, top-xid) 追踪关系描述的发送，本来就是**每个流式事务重发一次**；且流式分片绕开 cseq 顺序（cseq = 0 的条目直接进就绪队列），订阅端应用流式事务的顺序不由此处掌握，不能假设它先到。流式事务**不会触发标记钩子**，因此不会进入去重路径。
+
+**分区表。** `publish_via_partition_root` 场景下，祖先表的关系描述与分区表自身的关系描述**分别标记、分别去重**（各用各的 relid 作键）。
+
+**类型消息仍然重复。** pgoutput 把用户自定义类型的消息写在关系消息**之前**（`send_relation_and_attrs()` 内部），且与关系消息分属不同的插件写，因此类型消息不在去重范围内。类型消息重复是**无害**的：订阅端的类型缓存被后到的同一条覆盖。
+
+**钩子的语义是"标记"而非"是否发送"。** 这是与串行路径的边界：钩子为 NULL 表示"不标记，总是按普通帧发送"——串行路径就是这个语义，**串行路径一行不改**。
+
+```c
+/* replication/logical.h */
+void (*rel_definition_hook) (struct LogicalDecodingContext *ctx, Oid relid);
+```
+
+pgoutput 侧只在 `!data->in_streaming` 时调用它（`send_relation_and_attrs()` 的 `announce` 参数），因此流式事务天然被排除。
+
+#### 6.7.3 验证
+
+`doc/pa_decode/t/rel_dedup_smoke.sh`：8 个并发会话 × 40 个事务的单表负载（事务之间保持重叠，因此会分布到 4 个 worker 上），分别用串行路径与并行路径各解一遍，统计 trace 文件里的 RELATION 消息条数。
+
+实测（旧构建 → 新构建）：
+
+| 路径 | RELATION 条数 |
+| --- | --- |
+| 串行 | 1 |
+| 并行（旧：共享表 + worker 判定） | 4（有时 2，取决于 worker 到达次序） |
+| 并行（新：walsender 判定） | **1**，连跑 3 次结果一致 |
+
+DDL 场景（`ddl_diff_smoke.sh`）并行路径发 5 条 RELATION，与串行路径**逐消息一致**——说明 DDL 之后新的关系描述确实被重新送达，去重没有误伤。
 
 ## 7. 提交顺序保证的实现
 
@@ -1576,7 +1659,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | 协议格式化仍单线程 | 若最终退化为方案 B，walsender 成为新瓶颈 | 方案 A 已把格式化移入 worker |
 | 共享内存带宽 | 每条数据变更要过共享内存两次（下行 WAL、上行字节），且 `shm_mq` 的载荷本身是 memcpy（`shm_mq.c:1043`） | 批量提交；必要时评估固定槽 + 引用计数的自研队列（真正的零拷贝） |
 | **跨进程信号速率** | 跨进程 `SetLatch()` 的实现是 `kill(pid, SIGURG)`（`latch.c:695`），本分支的 `Latch` 没有 futex 语义（`latch.h:112-121`）。按每事务一批、16.7k 事务/秒估算，信号速率约 1.3 万～6.7 万次/秒；`shm_mq` 的接收方每读一次还会反向唤醒发送方（`shm_mq.c:1296`），信号总数翻倍 | 批次按**字节阈值**（`parallel_decode_batch_size`）而非按事务切；显式选择 `force_flush` 策略（5.4）；把唤醒速率纳入监控 |
-| 关系缓存重复 | RELATION 消息按 worker 重复 | 首版容忍，后续用共享关系表优化 |
+| 关系缓存重复 | RELATION 消息按 worker 重复 | **已解决**（6.7）：worker 标记、walsender 按放行序去重，同一关系每个 epoch 恰好发一条 |
 | worker 负载不均 | 事务大小分布不均 | **按在途字节数**优先分配（4.5.1）+ 队列水位反馈 |
 
 ## 13. 兼容性与约束
@@ -1627,7 +1710,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | Q1 | 提交顺序方案 | commit barrier / FIFO | commit barrier（4.3） |
 | Q2 | 解码切分点 | 事务级 A / 变更级 B / A+关系表 C | A 为主，C 为后续优化（4.2） |
 | Q3 | 事务→worker 绑定基数 | 一对一 / 多对一 | 多对一：一个 worker 承载多个事务，绑定后不可迁移（4.4、4.5） |
-| Q4 | 关系消息重复 | 容忍 / 共享关系表 | 首版容忍（4.2） |
+| Q4 | 关系消息重复 | 容忍 / 共享关系表 / walsender 侧去重 | **walsender 侧去重**（6.7）：worker 之间的到达顺序与 cseq 序无关，共享表让 worker 自行判定不安全；只有 walsender 掌握放行序 |
 | Q5 | 解码内存语义 | 每 worker 独立 / 总量均摊 | **每 worker 独立**——总量均摊需要一整块尚不存在的跨进程配额机制（12.2） |
 | Q6 | 流式切分默认档 | auto / immediate / buffered | **默认 `auto`**——按订阅端模式解析：`streaming='parallel'` → `immediate`（订阅端的并行 apply 靠发布端产生流式分片才成立，事实 8b、3.5），`streaming='on'` → `buffered`（保持现状行为，否则非 parallel 订阅方的每个事务都被推到 spool 慢路径，8.1）。**两种实际档都必须有段字节上限**（`parallel_decode_stream_segment_size`）；小事务门槛 `parallel_decode_stream_min_size` **默认 0**（8.1 的"门槛的代价核算"） |
 | Q9 | 事务数据是否跟随 cseq 放行 | 跟随（安全）/ 按 LSN 序（等价 FIFO） | 跟随 cseq（7.4 的 `'w'` 帧 LSN 约束） |
@@ -1721,7 +1804,8 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 | 9 | **单帧 > 8KB 的比例**（`pqcomm.c:1533` repalloc 频率） | 负载中"单条变更 > 8KB"的比例（宽表 / 大 TEXT） | 批量刷出的缓冲大小是否需要提高 |
 | 10 | 订阅端是否把 `'w'` 帧的 LSN 用于 `confirmed_flush` 之外的用途 | 通读 `worker.c` 中 `last_received` / `send_feedback` 的全部使用点，以及 `pg_stat_replication` 的 `sent_lsn` / `write_lsn` 语义 | 7.4 的钳制方案是否足够（若订阅端另有用途，钳制会引入新的不一致） |
 | 11 | `SnapBuildSerialize` 是否在每个 `XLOG_RUNNING_XACTS` 上真的重写 | 实测 `pg_logical/snapshots` 目录的写入频率，或读其 body 的"是否需要重写"判据 | walreader 的磁盘 I/O 是否会成为新的瓶颈 |
-| 12 | `catalog_xmin` 在多 worker 下实际会被推多旧 | 一个"worker 持有长事务"的实测，看 `pg_replication_slots.catalog_xmin` 的推进行为 | 6.6 的 xmin 聚合策略（保守兜底是否够用） |
+| 12 | `catalog_xmin` 在多 worker 下实际会被推多旧 | 一个"worker 持有长事务"的实测，看 `pg_replication_slots.catalog_xmin` 的推进行为 | 6.6 的 xmin 聚合策略（已实现：walreader 用自己的 reorder buffer 算出，与串行路径同口径；仍需实测长事务下的推进行为） |
+| 13 | 关系描述去重在真实负载下省下多少协议字节 | 一个"多表 + 多 worker"的负载，统计去重前后 RELATION 消息的条数与字节数 | 6.7 的实际收益（本机已验证条数 4 → 1，字节收益待实测） |
 ## 16. 实现计划
 
 按可独立验证的阶段推进，每个阶段结束时开关关闭的行为必须与现状完全一致（AC-8）。
@@ -1733,7 +1817,7 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 | P2 worker 解码 | worker 承担解码与插件格式化 | `parallel_decode_worker.c`：批次消费、reorder buffer 与 output plugin 实例化、结果产出；`logical.c` 支持按 worker 实例化 | 事务数据全部经 worker 产出，walsender 只剩发送（AC-2） |
 | P3 顺序保证 | 引入 cseq 与 commit barrier | cseq 分配、`next_commit_seq` 水位与待提交表 | commit/abort/cancel 顺序与 WAL 一致（AC-3） |
 | P4 多 worker 并行 | worker 池与事务分配 | 事务→worker 绑定表、**按在途字节数**优先分配、队列水位反馈 | 吞吐随 worker 数上升（AC-1、AC-6） |
-| P5 快照与失效 | 事件流分发与 tuplecid 传递 | **已实现**：walreader 独占 snapbuild（`SNAPBUILD_ROLE_WALREADER`），worker 用只读替身（`SNAPBUILD_ROLE_STANDIN`）；快照内容、base 快照、快照切换与失效消息按 WAL 位置下发（`PD_ENT_SNAPSHOT` / `PD_ENT_GLOBAL_INVAL`）；记录按**事务拥有者**路由（`PD_FORWARD_OWNER`），不再全量广播；命令 ID / tuplecid 由 worker 从原始 WAL 记录**自行重建**。**未实现**：共享关系表（每个 worker 仍各有一份关系缓存） | DDL 混合负载下元数据与现状一致（AC-5）；`ddl_diff_smoke.sh` 逐消息比对通过 |
+| P5 快照与失效 | 事件流分发与 tuplecid 传递 | **已实现**：walreader 独占 snapbuild（`SNAPBUILD_ROLE_WALREADER`），worker 用只读替身（`SNAPBUILD_ROLE_STANDIN`）；快照内容、base 快照、快照切换与失效消息按 WAL 位置下发（`PD_ENT_SNAPSHOT` / `PD_ENT_GLOBAL_INVAL`）；记录按**事务拥有者**路由（`PD_FORWARD_OWNER`），不再全量广播；命令 ID / tuplecid 由 worker 从原始 WAL 记录**自行重建**；**关系描述去重已实现**（6.7，worker 标记 + walsender 按放行序判定，关系描述每个 epoch 只发一次） | DDL 混合负载下元数据与现状一致（AC-5）；`ddl_diff_smoke.sh` 逐消息比对通过；`rel_dedup_smoke.sh` 验证关系描述只发一次 |
 | P6 尽早流式 | 分片切分与提前下发 | 流式模式 GUC（`auto` / `immediate` / `buffered`，按订阅端模式解析）、批次粒度切分、结果区提前发送；**walsender 按放行前沿钳制分片帧 LSN 与 keepalive 的 end_lsn**（7.4 的方案 c） | 大事务在解码完成前即可到达订阅端（AC-4）；**且提前送达的分片与 keepalive 都不会把 `confirmed_flush` 抬到未放行事务的提交记录之上**（不变式 S1，用 kill/restart 实验验证无丢数据）；**非 parallel 订阅方的行为与现状一致**（未被强制流式化，8.1） |
 | P7 故障恢复 | 进程生命周期与故障处置 | worker 状态字、`bgw_notify_pid` 通知、barrier 超时、退出码与 `bgw_restart_time` 约束、cseq 作废路径 | kill worker 后会话及时终止而非静默停滞；重启后可从 `restart_lsn` 续传（AC-10、AC-11） |
 
@@ -1750,9 +1834,9 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 2. **P2 之前不引入多 worker。** 单 worker 打通后，多 worker 只是分配策略的变化；否则进程拆分、解码改造、并行调度三个变量同时出错，难以定位。
 3. **P3 可以在 P1 之后独立推进。** cseq 的分配只依赖 walreader 的 WAL 顺序，与 worker 是否解码无关，可以与 P2 并行实现。
 
-### 16.1 实现状态（P0–P7，P5 部分）
+### 16.1 实现状态（P0–P7）
 
-P0–P7 已在 `pa_decode` 分支实现（P5 的**共享关系表**部分尚未实现，见本节末尾）。P0–P4 的验证手段是**帧级比对**：同一个发布端、同一批 WAL、两个在同一条事务里创建的复制槽，分别用串行路径（`max_parallel_decode_workers = 0`）与并行路径（`max_parallel_decode_workers = N`）各解一遍，把两侧的 wire 字节全部记录下来逐消息比对（`doc/pa_decode/t/frame_diff_smoke.sh`、`concurrent_diff_smoke.sh`）。P5 的验证手段是**元数据失效路径的帧级比对**（`ddl_diff_smoke.sh`、`live_diff_smoke.sh`）：负载混合 DDL 与 DML，检查并行路径产出的元数据相关消息与串行路径逐消息一致——快照内容、base 快照、快照切换与失效消息的位置只要错一个，字节比对就会失败。P6 的验证手段是**订阅端实测**（`streaming_smoke.sh`）：订阅端用 `streaming = 'parallel'` 建立订阅，检查大事务的变更在解码完成前就到达订阅端，且发布端硬重启后不丢数据。P7 的验证手段是**故障注入实测**（`failure_smoke.sh`）：分别让 decode worker 与 walreader 失败，检查发布端报出的是**带原因的错误**而不是笼统的"参与者意外死亡"，且会话**及时结束**而不是静默停滞；随后恢复正常配置，订阅端重连并把数据补齐。
+P0–P7 已在 `pa_decode` 分支实现（含 P5 的**关系描述去重**与 6.6 的**槽水位跨进程聚合**）。P0–P4 的验证手段是**帧级比对**：同一个发布端、同一批 WAL、两个在同一条事务里创建的复制槽，分别用串行路径（`max_parallel_decode_workers = 0`）与并行路径（`max_parallel_decode_workers = N`）各解一遍，把两侧的 wire 字节全部记录下来逐消息比对（`doc/pa_decode/t/frame_diff_smoke.sh`、`concurrent_diff_smoke.sh`）。P5 的验证手段是**元数据失效路径的帧级比对**（`ddl_diff_smoke.sh`、`live_diff_smoke.sh`）：负载混合 DDL 与 DML，检查并行路径产出的元数据相关消息与串行路径逐消息一致——快照内容、base 快照、快照切换与失效消息的位置只要错一个，字节比对就会失败。P6 的验证手段是**订阅端实测**（`streaming_smoke.sh`）：订阅端用 `streaming = 'parallel'` 建立订阅，检查大事务的变更在解码完成前就到达订阅端，且发布端硬重启后不丢数据。P7 的验证手段是**故障注入实测**（`failure_smoke.sh`）：分别让 decode worker 与 walreader 失败，检查发布端报出的是**带原因的错误**而不是笼统的"参与者意外死亡"，且会话**及时结束**而不是静默停滞；随后恢复正常配置，订阅端重连并把数据补齐。
 
 覆盖的负载形态（每种都有一个独立的冒烟脚本）：
 
@@ -1766,6 +1850,8 @@ P0–P7 已在 `pa_decode` 分支实现（P5 的**共享关系表**部分尚未�
 | `worker_death_repro.sh` | 订阅在流式中途被删除 | 参与者生命周期与关停次序 |
 | `streaming_smoke.sh` | 单个 4000 行（每行约 200 字节）的大事务，订阅端 `streaming = 'parallel'` | 尽早流式：分片提前到达订阅端、分片帧不交错、发布端硬重启后不丢数据（不变式 S1） |
 | `failure_smoke.sh` | decode worker / walreader 分别被注入故障，其后恢复正常 | 故障恢复：报错带**原因**、会话及时终止而非静默停滞、订阅端重连后补齐数据 |
+| `rel_dedup_smoke.sh` | 8 个并发会话 × 40 个事务（事务保持重叠，分布到 4 个 worker）的单表负载 | 关系描述只发一次：并行路径发 1 条 RELATION，与串行路径一致（6.7） |
+| `slot_watermark_smoke.sh` | 单会话持续流式，等待 running-xacts 记录 | 槽水位推进：并行路径下 `restart_lsn` 与 `catalog_xmin` 与串行路径一样前进（6.6） |
 
 实现过程中确定的规则与实测到的事实：
 
@@ -1775,7 +1861,11 @@ P0–P7 已在 `pa_decode` 分支实现（P5 的**共享关系表**部分尚未�
 | 事务与 worker 的绑定 | 多对一：事务在 walreader 侧一次性绑定到一个 worker，其后的所有变更都由该 worker 解码（4.4） |
 | END_ACK 的上报条件 | worker 只在**自己拥有**的事务结束时上报 END_ACK；非拥有者不上报，避免重复推进放行水位 |
 | 帧头 LSN | 实测并行路径与串行路径**逐消息**的帧头 LSN 完全相同：非最终写为 0，COMMIT 帧为提交记录 LSN。"钳制"（FR-20）在 P6 引入提前流式之前不会产生任何差异，因此比对工具把"钳制值更小"作为允许差异处理 |
-| 关系消息重复 | 实测证实事实 6：6 个并发会话、48 个事务的单表负载下，串行路径发 1 条 RELATION，并行路径发 4 条（每个 worker 一份关系缓存）。订阅端覆盖缓存，语义正确；首版容忍，共享关系表列入 P5 |
+| 关系消息重复 | 实测证实事实 6：6 个并发会话、48 个事务的单表负载下，串行路径发 1 条 RELATION，并行路径发 4 条（每个 worker 一份关系缓存）。订阅端覆盖缓存，语义正确，但纯属浪费。**已解决**（6.7）：同一负载下并行路径发 1 条，与串行路径一致，连跑 3 次结果稳定 |
+| 关系描述的去重必须带 epoch | 去重表里若只有"发过了"这一个事实，DDL 之后已发过的定义会让后来的定义被跳过，订阅端就一直用旧结构解释新数据。因此表里的条目带 **epoch**（目录变化的代次，walreader 每次发布快照或广播失效就加一），**只有同一 epoch 内的定义才可能被复用**；epoch 更大的新定义必须送达 |
+| 关系描述的去重必须排除流式事务 | pgoutput 在流式模式下按 (relation, top-xid) 追踪，本来就是每个流式事务重发一次关系描述；且流式分片绕开 cseq 顺序（cseq 为 0 的条目直接进就绪队列），订阅端应用流式事务的顺序不由此处掌握 → 流式事务一律照发 |
+| 事务的 worker 分配决定了负载能不能铺开 | worker 的选择是"当前在途字节最少的那个"（`pd_walreader_pick_worker()`），而字节在**事务结束**（提交记录）时才释放。因此**顺序写入的多个小事务会全部落在同一个 worker 上**——去重类与多 worker 类的测试负载必须让事务**同时在途**（并发会话 + 事务内短暂停顿），否则测不出多 worker 的行为 |
+| 槽水位在并行路径下不推进 | 并行路径下 walreader 用的是槽的副本，`SnapBuildProcessRunningXacts()` 在 `SNAPBUILD_ROLE_WALREADER` 下提前返回 → 串行路径里推进槽水位的那两行代码一行也不执行 → 并行路径下槽的 `restart_lsn` 与 `catalog_xmin` **完全不前进**（实测 90 秒内不变），WAL 被无限保留。修法见 6.6：walreader 用自己的 reorder buffer 算出两个值，经 `PD_ENT_WATERMARK` 交给 walsender 应用 |
 | 帧分组 | 并行路径把不同 worker 的消息混排进同一会话，帧分组与串行路径不同，属允许差异；提交顺序（BEGIN/COMMIT 的相对次序）**必须**一致，实测一致 |
 | 追踪设施的 fd 生命周期 | `AllocateFile()` 注册的文件在**每次事务结束时**被 `fd.c` 关闭（`AtEOXact_Files()` → `CleanupTempFiles()`），且不检查 `fflush()` 的返回值。追踪文件必须用裸 fd，且每次 `write()` 都要检查返回值 |
 | DDL 不被复制 | PostgreSQL **不复制 DDL**（`doc/src/sgml/logical-replication.sgml:1662`），`is_publishable_class()`（`pg_publication.c:137`）把系统表排除在可发布之外。订阅端的表必须**事先存在**，其形状由订阅端自己维护（复制的元组按列名匹配，订阅端多出来的列留空） |
@@ -1801,10 +1891,10 @@ P0–P7 已在 `pa_decode` 分支实现（P5 的**共享关系表**部分尚未�
 | base 快照只发给事务**拥有者** | 事务的第一条数据记录通过门控（`SnapBuildProcessChange()`）时确定它的 base snapshot。此时 walreader 只把 base 快照事件发给**拥有该事务的 worker**（`PD_SNAPSHOT_BASE`），不发广播——别的 worker 不持有该事务，收到也没有用 |
 | 快照切换与失效消息必须**同时**下发 | 目录修改事务提交时，walreader 先下发新快照的内容，再下发"切换"事件（`PD_SNAPSHOT_SWITCH`），后者携带该事务的失效消息。**拥有者**的 worker 随事务结束执行这些失效（与现状一致）；**其它** worker 立即执行（`ReorderBufferImmediateInvalidation()`）——每个 worker 的 catcache / syscache / relcache 是进程私有的，没有别的机制会替它失效 |
 | 记录按事务**拥有者**路由 | walreader 对每条记录做"影子解码"（shadow decode）判定路由：`PD_FORWARD_OWNER`（只发给拥有该事务的 worker）、`PD_FORWARD_ALL`（广播，如 running-xacts 这类每个 worker 都要的记录）、`PD_FORWARD_NONE`（不发）。这比早期"全量广播 + worker 自行跳过"的实现省掉了一个数量级的重复解码工作，也去掉了"每个 worker 都看到全部记录"带来的元数据状态分叉 |
-| walreader **不拥有**复制槽 | walreader 与 worker 用的是槽的**副本**（`pd_walreader_build_slot_copy()`），因此 walreader 侧的 snapbuild 不会推进槽的水位（`SnapBuildProcessRunningXacts()` 在 `SNAPBUILD_ROLE_WALREADER` 下提前返回，不调 `LogicalIncreaseXminForSlot()` / `LogicalIncreaseRestartDecodingForSlot()`）。槽的水位由 walsender（槽的唯一拥有者）推进——这条跨进程聚合（6.6）尚未实现，见"尚未实现"一行 |
+| walreader **不拥有**复制槽 | walreader 与 worker 用的是槽的**副本**（`pd_walreader_build_slot_copy()`），因此 walreader 侧的 snapbuild 不会推进槽的水位（`SnapBuildProcessRunningXacts()` 在 `SNAPBUILD_ROLE_WALREADER` 下提前返回，不调 `LogicalIncreaseXminForSlot()` / `LogicalIncreaseRestartDecodingForSlot()`）。槽的水位由 walsender（槽的唯一拥有者）推进，**跨进程聚合已实现**（6.6）：walreader 算出数值、经 `PD_ENT_WATERMARK` 交给 walsender 应用 |
 | marker 让"空闲的 worker"也能报到正确的位置 | 记录按拥有者路由后，不持有任何事务的 worker 收不到任何记录，它的解码位置会永远停在 0，停滞检测的条件 (b) 因此永远成立。`PD_ENT_MARKER` 携带 walreader 的读取位置，worker 收到后**上报该位置**（而不是自己的位置）——会话的位置因此与串行路径一致地等于 walreader 的读取位置。marker 只在 walreader 侧产生，不改变 worker 的解码位置本身 |
 
-尚未实现：P5 的**共享关系表**（快照与失效共享已实现）。共享关系表要解决的是"每个 worker 各有一份关系缓存，同一张表的关系描述被重复下发"（实测：6 个并发会话的负载下串行路径发 1 条 RELATION，并行路径发 4 条）。它需要一份跨进程的关系表与失效协议，尚未开工。另外，6.6 的**槽水位跨进程聚合**（`xmin` / `restart_lsn`）也尚未实现：并行路径下槽的水位只由 walsender 侧推进，walreader 与 worker 看到的都是副本。
+P5 的**关系描述去重**（6.7）与 6.6 的**槽水位跨进程聚合**均已实现：关系描述由 **worker 标记、walsender 按放行序判定**去重（判定规则见 6.7，标记机制见 `LogicalDecodingContext.rel_definition_hook` 与消息类型 `PD_ENT_RELATION`），槽水位由 walreader 用自己的 reorder buffer 算出、经 `PD_ENT_WATERMARK` 交给 walsender 应用（见 6.6）。两者的验证脚本分别是 `rel_dedup_smoke.sh` 与 `slot_watermark_smoke.sh`。
 
 ## 17. 故障恢复
 
@@ -1997,3 +2087,5 @@ P7 已落实其中的 1、2、3、5、6、7 条：worker 的错误在循环内�
 | v0.14 | 2026-11-18 | **P7（故障恢复）实现完成**。(1) **故障上报**：decode worker 与 walreader 的主循环都包在 `PG_TRY` / `PG_CATCH` 中，捕获错误后把原因写入共享内存的状态字（先写 `errmsg` 与 `error_lsn`，再 `pg_memory_barrier()`，最后写 `PD_WORKER_STATUS_FAILED`），并通过 `PD_ENT_ERROR` 条目把错误送给 walsender；walsender 侧的 `parallel_decode_report_worker_failure()` 先看状态字——状态是 FAILED 就报出**带原因**的错误（"the parallel decode worker failed: …"），否则才报"参与者意外死亡"。(2) **停滞检测**：barrier 生效（有待放行事务）+ 该 worker 的解码位置落后于 walreader 的读取位置 + 该 worker 在 `parallel_decode_barrier_timeout`（默认 60 秒）内无任何消息——三者同时成立才判定卡死并结束会话；worker 每 256 条记录上报一次位置心跳作为活性信号，空闲的发布端不满足第一个条件，因此不会误触发。(3) **通知通道**：`bgw_notify_pid` 指向 walsender，postmaster 向该 pid 发 SIGUSR1，walsender 的 `procsignal_sigusr1_handler` 末尾 `SetLatch(MyLatch)` 唤醒取帧循环（注意本树的 latch 通知用的是 SIGURG，与 SIGUSR1 是两条不同信号）。(4) **退出码约束**：`bgworker.c` 的顶层处理器捕获错误后 `EmitErrorReport()` 并 `proc_exit(1)`，退出码 1 不触发集群崩溃恢复，因此 worker 失败必须由 walsender 主动感知并结束会话；`bgw_restart_time = BGW_NEVER_RESTART`。(5) **修复一个 P1–P6 就存在的 use-after-free**：`pd_walreader_classify()` 在 `hash_search(HASH_REMOVE)` 释放 `PDTxnInfo` 之后仍解引用 `info->worker` / `info->bytes`；改为在释放前取出 worker 索引与 `ended` 标志。(6) **故障注入开关** `parallel_decode_fault_inject`（0 / 1 = worker 失败 / 2 = walreader 失败），注入点置于循环体内、`PG_TRY` 之内——最初放在循环外，错误直接终止进程，`PG_CATCH` 的上报根本没机会执行。(7) **新增 `failure_smoke.sh`**：分别注入 worker 与 walreader 故障，检查发布端报出带原因的失败、会话及时终止，随后恢复正常配置验证订阅端重连并补齐数据（100 行）。§16.1 实现状态扩到 P0–P7，§11.1 补入两个新 GUC，§17.8 补入 P7 的落实情况。**尚未实现：P5（快照与失效共享、共享关系表）** |
 | v0.15 | 2026-11-18 | **walsender 批量刷出实现完成**（12.3 风险表 "walsender 每帧一次 `write()` 系统调用" 的对策落地）。(1) **实现**：`pd_walsender_write_frame()` 不再逐帧 `pq_flush_if_writable()`，帧先进连接输出缓冲；新增 `pd_walsender_write_frames()`——阻塞取第一帧，再用新增的非阻塞取帧接口 `ParallelDecodeNextFrameNoWait()` 取随后的帧，凑够 `PD_FRAME_BATCH_SIZE`（8KB 帧载荷）或取不到为止，最后一次刷出。**帧不合并**，每帧仍是自己的 CopyData 消息；串行路径不动（AC-8）。(2) **新接口**：`ParallelDecodeNextFrameNoWait()` 与阻塞版同源同语义（放行前沿、帧序、cseq 门控一致），只是不等帧；单次调用最多处理 64 条 worker 消息，避免进度消息把取帧拖长。(3) **实测（本机计数，非吞吐性能测试）**：同一负载（50 事务 × 20 行，4 worker）下，walsender 在复制 socket 上的 `sendto()` 次数由 **1105 次（平均 98.6 字节/次）** 降到 **52 次（平均 2090 字节/次）**，约 21×；协议字节总量一致。批次大小实际由"此刻就绪的帧"决定，8KB 只是上限——生产者慢时批次更小，故 12.3 的降幅倍数仍待性能环境实测回填。 |
 | v0.16 | 2026-11-18 | **P5（快照与失效共享）实现完成**。(1) **快照构建器的三种角色**：`SNAPBUILD_ROLE_SERIAL` / `SNAPBUILD_ROLE_WALREADER` / `SNAPBUILD_ROLE_STANDIN`。walreader 独占真实 builder 并驱动它，worker 用只读替身；替身在 `SnapBuildGetOrBuildSnapshot()` / `SnapBuildProcessChange()` / `SnapBuildCommitTxn()` / `SnapBuildProcessRunningXacts()` / `SnapBuildDistributeSnapshotAndInval()` 五处提前返回，不自行推进快照状态机——这是"并行路径与串行路径元数据一致"的前提。(2) **快照的共享协议**：快照内容（`xmin`/`xmax`/`curcid`/已提交目录事务数组）随 `PD_SNAPSHOT_CONTENT` 消息下发并带**严格递增**的版本号（乱序即报错）；base 快照事件（`PD_SNAPSHOT_BASE`）**只发给事务的拥有者**；目录修改事务提交时先下发新快照内容、再下发切换事件（`PD_SNAPSHOT_SWITCH`，携带该事务的失效消息），拥有者的 worker 随事务结束执行失效，其它 worker 立即执行（`ReorderBufferImmediateInvalidation()`）——worker 的 catcache/syscache/relcache 是进程私有的。(3) **记录按拥有者路由**：walreader 对每条记录做"影子解码"判定路由（`PD_FORWARD_OWNER` / `PD_FORWARD_ALL` / `PD_FORWARD_NONE`），只有拥有该事务的 worker 才收到它的记录，取代了早期"全量广播 + worker 自行跳过"。(4) **新增 `PD_ENT_MARKER`**：walreader 每读满 `PD_POSITION_MARK_RECORDS` 条记录、或 WAL 暂时读完时，把自己的读取位置下发给 worker；worker 收到后**上报该位置**，使会话的位置与串行路径一致地等于 walreader 的读取位置（记录按拥有者路由后，不持有事务的 worker 否则会永远停在 0，停滞检测的条件 (b) 会一直成立）。(5) **修复三处崩溃/缺陷**：`resetStringInfo()` 用在未初始化的局部 `StringInfoData` 上（三个 publish 函数），改为 `initStringInfo()` + `pfree()`；`ParallelDecodeClampLSN()` / `ParallelDecodeClampFrame()` 的前沿判据写反（从前沿无效时不钳制变成从不钳制），且帧头 LSN 是**网络字节序**（`pq_sendint64()`），钳制时必须 `pg_ntoh64()` / `pg_hton64()`——写反时会把 202 个帧头的 LSN 写成乱码。(6) **本机功能与正确性验证**（非性能测试）：`frame_diff_smoke.sh` / `ddl_diff_smoke.sh` / `live_diff_smoke.sh` / `concurrent_diff_smoke.sh` / `streaming_smoke.sh` / `keepalive_smoke.sh` / `failure_smoke.sh` 七个脚本全部通过。**尚未实现：P5 的共享关系表**（每 worker 一份关系缓存，实测 6 会话负载下串行 1 条 RELATION / 并行 4 条），以及 6.6 的槽水位跨进程聚合 |
+| v0.17 | 2026-11-18 | **P5 的共享关系表与 6.6 的槽水位跨进程聚合实现完成**。(1) **共享关系表（RELATION 去重，6.7）**：并行路径下每个 decode worker 各有一份 pgoutput 的关系缓存，同一张表的关系描述被重复下发（实测：8 并发会话 × 40 事务、4 worker 的单表负载下，串行路径发 1 条 RELATION、并行路径发 4 条）。修法是在 walsender 创建的 dsa 控制块里放一张固定 2048 槽位、由自旋锁保护的开放式定址哈希表（`ParallelDecodeControl.rels`），条目为 `{relid, cseq, epoch}`。判定规则：表里没有该关系 → 发并记下；同一 epoch 且表里的提交序号更小 → **不发**（事务按 cseq 顺序到达订阅端，更早的定义必然先到）；epoch 不同 → 发；自己的 cseq 为 0（不可排序）或属于流式事务 → 一律发（pgoutput 在流式模式下本来就每个流式事务重发一次关系描述，且流式分片绕开 cseq 顺序）。**epoch 是目录变化的代次**，walreader 每次发布快照内容或广播失效就加一并随消息下发——没有它，DDL 之后先前的 worker 会让后一个 worker 跳过关系描述，订阅端就一直用旧结构解释新数据。查表做成通用钩子 `LogicalDecodingContext.rel_announce_hook`（NULL = 总是发），pgoutput 的 `maybe_send_schema()` 在非流式时调用它，因此**串行路径一行不改**。(2) **槽水位跨进程聚合（6.6）**：并行路径下 walreader 用的是槽的副本，`SnapBuildProcessRunningXacts()` 在 `SNAPBUILD_ROLE_WALREADER` 下提前返回 → 串行路径里推进槽水位的那两行代码一行也不执行 → 槽的 `restart_lsn` 与 `catalog_xmin` **完全不前进**（实测 90 秒内不变），WAL 被无限保留。修法不是 worker 周期上报再取最小值，而是**让 walreader 侧保留一份记录全部事务的 reorder buffer**（`pd_rb`）：`ReorderBufferGetOldestXmin(pd_rb)` 与 `ReorderBufferGetOldestTXN(pd_rb)` 取到的正是串行路径在同一位置会取到的值。walreader 在读到 `XLOG_RUNNING_XACTS` 记录时算出两个值，经控制通道的新消息 `PD_ENT_WATERMARK` 交给 **walsender**（槽的唯一拥有者）调用串行路径同一对 `LogicalIncreaseXminForSlot()` / `LogicalIncreaseRestartDecodingForSlot()`。**推进判据沿用串行路径的候选机制、不做替换**：候选挂在 running-xacts 记录的 LSN 上，等订阅端确认越过它才生效；放行前沿 F 在全部事务放行之后等于 walreader 认证过的读取位置，必然越过该 LSN，因此不会出现候选永远挂着、WAL 无限保留。(3) **本机功能与正确性验证**（非性能测试）：新增两个冒烟脚本——`rel_dedup_smoke.sh`（8 并发会话 × 40 事务、事务保持重叠以铺开到 4 个 worker，统计 trace 里的 RELATION 条数）与 `slot_watermark_smoke.sh`（等槽的水位前进，并与串行路径对照）。**A/B 实测**（同一负载，改动前 → 改动后）：RELATION 条数 **4 → 1**；槽的 `restart_lsn` **90 秒内不变 → 14 秒后前进**（`0/14E5430` → `0/14E8728`，与串行路径的实测值一致），`catalog_xmin` 同步前进（740 → 741）。原有七个冒烟脚本（`frame_diff_smoke.sh` / `ddl_diff_smoke.sh` / `live_diff_smoke.sh` / `concurrent_diff_smoke.sh` / `streaming_smoke.sh` / `keepalive_smoke.sh` / `failure_smoke.sh`）连同新加的两个**全部通过**。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
+| v0.18 | 2026-11-18 | **RELATION 去重的方案重做：由"共享表 + worker 自行判定"改为"worker 标记 + walsender 按放行序判定"**。(1) **旧方案不成立**：v0.17 把去重表放在 dsa 控制块里、让 worker 在发关系描述前查表。问题在于**判定依据不成立**——worker 之间没有 cseq 序的先后关系，持有更大 cseq 的 worker 完全可能先到达并发出定义；此时一个更小 cseq 的事务若按"表里已有就跳过"处理，订阅端会先应用这个小 cseq 的事务，而它**还没有**那份定义。旧规则在语义上安全（最坏是多发一条，绝不会少发），但**不是重复消除**：实测出现 2 条 RELATION 而非 1 条，取决于哪个 worker 先到达。(2) **新方案**：判定移到 walsender——它是唯一掌握 cseq 放行序的进程。实现分三步：pgoutput 在写关系消息**之前**调用解码上下文上的标记钩子 `rel_definition_hook(ctx, relid)`（pgoutput 侧新增 `send_relation_and_attrs()` 的 `announce` 参数，只在非流式时调用）；worker 记下待标记的 relid 与 epoch，把该帧用**新消息类型 `PD_ENT_RELATION`**（头部多带 `{end_lsn, cseq, epoch, relid, length}`）而非 `PD_ENT_FRAME` 发出——因此普通帧的头部与原来完全一样，不为去重付额外代价；walsender 放行事务的帧时，若该帧是关系描述且该关系在**同一或更新的 epoch** 里已发过，就丢弃该帧。由于放行序就是 cseq 序，最早碰到该表的事务的定义一定最先送达，此后全部丢弃 ⇒ 同一关系每个 epoch **恰好发一条**。(3) **共享内存里不再有关系表**：`PDSharedRelation` / `PD_SHARED_REL_SLOTS` / `rel_lock` 全部删除，walsender 侧改为进程内的 `HTAB`（`parallel_decode_sent_relations`，`relid → {epoch, sent}`），无锁、无共享。(4) **epoch 语义保持**：条目带 epoch（目录代次），已发过的 epoch ≥ 本帧 epoch 则丢弃，更大的 epoch 则发送并更新条目——DDL 之后的新定义必达，旧定义被丢弃。流式事务不触发标记钩子（pgoutput 本来就每个流式事务重发一次关系描述，且流式分片绕开 cseq 序），分区表的祖先定义与自身定义分别标记、分别去重，类型消息仍然重复（无害：订阅端类型缓存被覆盖）。(5) **钩子语义是"标记"而非"是否发送"**：为 NULL 表示不标记、总是按普通帧发送——串行路径即此语义，**串行路径一行不改**。(6) **验证**：`rel_dedup_smoke.sh`（8 并发会话 × 40 事务、事务保持重叠以铺开到 4 个 worker）实测并行路径 **4 条 → 1 条**，连跑 3 次结果一致；旧构建（`/tmp/pdoldpg/bin`）作 A/B 基线为 4 条。`ddl_diff_smoke.sh` 并行路径发 5 条 RELATION，与串行路径**逐消息一致**，说明 DDL 之后的新定义确实被重新送达。原有七个冒烟脚本加新加的两个**全部通过**。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |

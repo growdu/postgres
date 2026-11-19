@@ -93,7 +93,8 @@ static void publication_invalidation_cb(Datum arg, int cacheid,
 										uint32 hashvalue);
 static void send_relation_and_attrs(Relation relation, TransactionId xid,
 									LogicalDecodingContext *ctx,
-									Bitmapset *columns);
+									Bitmapset *columns,
+									bool announce);
 static void send_repl_origin(LogicalDecodingContext *ctx,
 							 RepOriginId origin_id, XLogRecPtr origin_lsn,
 							 bool send_origin);
@@ -752,16 +753,25 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 	 * Send the schema.  If the changes will be published using an ancestor's
 	 * schema, not the relation's own, send that ancestor's schema before
 	 * sending relation's own (XXX - maybe sending only the former suffices?).
+	 *
+	 * The hook is called for every definition that is written, so that the
+	 * session can tell the frames that carry a definition apart from the
+	 * other frames.  It is not called for the definitions of a streamed
+	 * transaction: such a transaction sends the definition of a relation in
+	 * every stream block it opens, because the subscriber may apply the
+	 * transactions in an order that is not known here.
 	 */
 	if (relentry->publish_as_relid != RelationGetRelid(relation))
 	{
 		Relation	ancestor = RelationIdGetRelation(relentry->publish_as_relid);
 
-		send_relation_and_attrs(ancestor, xid, ctx, relentry->columns);
+		send_relation_and_attrs(ancestor, xid, ctx, relentry->columns,
+								 !data->in_streaming);
 		RelationClose(ancestor);
 	}
 
-	send_relation_and_attrs(relation, xid, ctx, relentry->columns);
+	send_relation_and_attrs(relation, xid, ctx, relentry->columns,
+							 !data->in_streaming);
 
 	if (data->in_streaming)
 		set_schema_sent_in_streamed_txn(relentry, topxid);
@@ -775,7 +785,8 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 static void
 send_relation_and_attrs(Relation relation, TransactionId xid,
 						LogicalDecodingContext *ctx,
-						Bitmapset *columns)
+						Bitmapset *columns,
+						bool announce)
 {
 	TupleDesc	desc = RelationGetDescr(relation);
 	int			i;
@@ -806,6 +817,15 @@ send_relation_and_attrs(Relation relation, TransactionId xid,
 		logicalrep_write_typ(ctx->out, xid, att->atttypid);
 		OutputPluginWrite(ctx, false);
 	}
+
+	/*
+	 * The definition of the relation is written now.  The session is told
+	 * about it, so that it can tell this frame apart from the other frames
+	 * the plugin produces.  The hook is called right before the write, so
+	 * that the frame that follows is the one that carries the definition.
+	 */
+	if (announce && ctx->rel_definition_hook != NULL)
+		ctx->rel_definition_hook(ctx, RelationGetRelid(relation));
 
 	OutputPluginPrepareWrite(ctx, false);
 	logicalrep_write_rel(ctx->out, xid, relation, columns);
