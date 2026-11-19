@@ -229,6 +229,27 @@ pd_worker_stopped(void)
 }
 
 /*
+ * Has the session been asked to wind down?
+ *
+ * This is the cheap half of pd_worker_stopped(): it does not ask the operating
+ * system whether the walsender is still there, so it can be called on the path
+ * of every frame.  It is used to keep the worker from handing over a frame
+ * that nobody is going to read: the send blocks when the queue of the
+ * walsender is full, and the walsender is not reading any more once the
+ * session is winding down.
+ */
+static bool
+pd_worker_shutdown_requested(void)
+{
+	if (got_sigterm)
+		return true;
+	if (pd_ctl == NULL)
+		return true;
+
+	return pd_ctl->shutdown != 0;
+}
+
+/*
  * XLogReaderRoutine->page_read callback.
  *
  * The worker never reads the WAL: the walreader is the only reader of it, and
@@ -262,6 +283,15 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 	uint32		len;
 	Oid			relid;
 	uint64		epoch;
+
+	/*
+	 * The session is winding down, so the frame is of no use anymore.  It is
+	 * dropped instead of being handed over: the walsender is not reading the
+	 * queue any more, and the send would block until the shared segment goes
+	 * away.
+	 */
+	if (pd_worker_shutdown_requested())
+		return;
 
 	/*
 	 * The plugin may have told us that this frame carries the definition of a
@@ -316,6 +346,19 @@ pd_worker_send_segment(void)
 	XLogRecPtr	position;
 
 	if (pd_segment_frames == 0)
+	{
+		resetStringInfo(pd_segment);
+		pd_segment_frames = 0;
+		return;
+	}
+
+	/*
+	 * The session is winding down, so the segment is of no use anymore.  It is
+	 * dropped instead of being handed over: the walsender is not reading the
+	 * queue any more, and the send would block until the shared segment goes
+	 * away.
+	 */
+	if (pd_worker_shutdown_requested())
 	{
 		resetStringInfo(pd_segment);
 		pd_segment_frames = 0;
@@ -400,6 +443,14 @@ static void
 pd_worker_send_position(XLogRecPtr position, bool force)
 {
 	if (!force && position <= pd_reported_lsn)
+		return;
+
+	/*
+	 * The session is winding down, so the report is of no use anymore.  It is
+	 * not sent: the walsender is not reading the queue any more, and the send
+	 * would block until the shared segment goes away.
+	 */
+	if (pd_worker_shutdown_requested())
 		return;
 
 	/*
@@ -1042,6 +1093,32 @@ pd_worker_wakeup_counter(void)
 }
 
 /*
+ * Detach from the queues of the worker.
+ *
+ * The worker is the receiver on the channel the walreader hands the records
+ * over on, and the sender on the channel the walsender reads the frames from.
+ * Detaching from both of them tells the processes on the other end that
+ * nothing more is going to come: the walreader does not wait for a record
+ * that is never going to arrive, and the walsender does not wait for a frame
+ * that is never going to be produced.
+ */
+static void
+pd_worker_detach_queues(void)
+{
+	if (pd_wal_mqh != NULL)
+	{
+		shm_mq_detach(pd_wal_mqh);
+		pd_wal_mqh = NULL;
+	}
+
+	if (pd_out_sender.mqh != NULL)
+	{
+		shm_mq_detach(pd_out_sender.mqh);
+		pd_out_sender.mqh = NULL;
+	}
+}
+
+/*
  * Main entry point of a decode worker.
  *
  * The worker attaches to the shared segment created by the walsender, claims
@@ -1060,6 +1137,7 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	ReplicationSlot *slot;
 	List	   *options;
 	int			slot_index = -1;
+	volatile bool stopping = false;
 
 	/* Setup signal handling. */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -1228,42 +1306,68 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	}
 	PG_CATCH();
 	{
-		ErrorData  *edata;
-
 		/*
-		 * Copy the error data before anything else: the error context is gone
-		 * as soon as the error is rethrown.
+		 * The queue was detached, so the session is going away: the walsender
+		 * is gone, or it has asked the participants to stop.  That is not a
+		 * failure of the worker, so the worker stops quietly instead of
+		 * reporting an error that nobody is going to read.
 		 */
-		edata = CopyErrorData();
-
-		/*
-		 * The report is best effort: if it cannot be sent, the walsender
-		 * notices that the worker is gone anyway.
-		 */
-		PG_TRY(report);
+		if (PDQueueDetached() && pd_worker_stopped())
 		{
-			pd_worker_report_error(edata->message);
+			stopping = true;
 		}
-		PG_CATCH(report);
+		else
 		{
-			/* The error could not be reported. */
+			ErrorData  *edata;
+
+			/*
+			 * Copy the error data before anything else: the error context is
+			 * gone as soon as the error is rethrown.
+			 */
+			edata = CopyErrorData();
+
+			/*
+			 * The report is best effort: if it cannot be sent, the walsender
+			 * notices that the worker is gone anyway.
+			 */
+			PG_TRY(report);
+			{
+				pd_worker_report_error(edata->message);
+			}
+			PG_CATCH(report);
+			{
+				/* The error could not be reported. */
+			}
+			PG_END_TRY(report);
+
+			FreeErrorData(edata);
+
+			/*
+			 * Rethrow the error, so that it is logged and the worker exits with
+			 * a code that does not make the postmaster restart the cluster.
+			 */
+			PG_RE_THROW();
 		}
-		PG_END_TRY(report);
-
-		FreeErrorData(edata);
-
-		/*
-		 * Rethrow the error, so that it is logged and the worker exits with a
-		 * code that does not make the postmaster restart the cluster.
-		 */
-		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	ctl->workers[slot_index].status = PD_WORKER_STATUS_EXITED;
 
-	ereport(LOG,
-			(errmsg("parallel decode worker %d stopped", slot_index)));
+	if (stopping)
+		ereport(LOG,
+				(errmsg("parallel decode worker %d stopped while the session was "
+						"ending", slot_index)));
+	else
+		ereport(LOG,
+				(errmsg("parallel decode worker %d stopped", slot_index)));
+
+	/*
+	 * Detach from the queues, so that the processes on the other end do not
+	 * wait for a message that is never going to come.  A walreader that is
+	 * blocked handing over a record to this worker would wait for it until the
+	 * shared segment goes away.
+	 */
+	pd_worker_detach_queues();
 
 	/*
 	 * The decoding context published the copy of the slot as the slot of this

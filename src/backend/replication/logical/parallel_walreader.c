@@ -300,6 +300,57 @@ pd_walreader_stopped(void)
 }
 
 /*
+ * Has the session been asked to wind down?
+ *
+ * This is the cheap half of pd_walreader_stopped(): it does not ask the
+ * operating system whether the walsender is still there, so it can be called
+ * on the path of every record.  It is used to keep the walreader from handing
+ * over a record that nobody is going to read: the send blocks when the queue
+ * of the worker is full, and a worker that is winding down does not read any
+ * more.
+ */
+static bool
+pd_walreader_shutdown_requested(void)
+{
+	if (got_sigterm)
+		return true;
+	if (pd_ctl == NULL)
+		return true;
+
+	return pd_ctl->shutdown != 0;
+}
+
+/*
+ * Detach from the queues of the walreader.
+ *
+ * The walreader is the sender on the channels the workers receive the records
+ * on, and on the control channel the walsender reads.  Detaching from them
+ * tells the processes on the other end that nothing more is going to come: a
+ * worker does not wait for a record that is never going to arrive, and the
+ * walsender does not wait for a message that is never going to be sent.
+ */
+static void
+pd_walreader_detach_queues(void)
+{
+	int			i;
+
+	if (pd_control_mqh != NULL)
+	{
+		shm_mq_detach(pd_control_mqh);
+		pd_control_mqh = NULL;
+	}
+
+	for (i = 0; i < pd_num_workers; i++)
+	{
+		if (pd_wal_sender[i].mqh != NULL)
+		{
+			shm_mq_detach(pd_wal_sender[i].mqh);
+			pd_wal_sender[i].mqh = NULL;
+		}
+	}
+}
+
+/*
  * XLogReaderRoutine->page_read callback.
  *
  * This is where the walreader waits for new WAL.  It cannot use the
@@ -825,6 +876,14 @@ pd_walreader_send_cseq(uint64 cseq, XLogRecPtr end_lsn, XLogRecPtr read_lsn,
 	 */
 	info.owner = worker;
 
+	/*
+	 * The session is winding down, so the walsender is not reading the control
+	 * channel any more.  The message is not sent: the send blocks when the
+	 * channel is full, and the walsender would not read it anyway.
+	 */
+	if (pd_walreader_shutdown_requested())
+		return;
+
 	if (!PDQueueSend(pd_control_mqh, PD_ENT_CSEQ, &info, sizeof(info),
 					 false, true))
 		ereport(ERROR,
@@ -861,6 +920,14 @@ pd_walreader_send_read_pos(XLogRecPtr lsn)
 	 * control channel quiet while the publisher is idle.
 	 */
 	if (last_sent == lsn)
+		return;
+
+	/*
+	 * The session is winding down, so the walsender is not reading the control
+	 * channel any more.  The message is not sent: the send blocks when the
+	 * channel is full, and the walsender would not read it anyway.
+	 */
+	if (pd_walreader_shutdown_requested())
 		return;
 
 	if (!PDQueueSend(pd_control_mqh, PD_ENT_READ_POS, &pos, sizeof(pos),
@@ -940,6 +1007,14 @@ pd_walreader_send_watermark(XLogRecPtr lsn, TransactionId oldest_running)
 				 pd_rb->current_restart_decoding_lsn != InvalidXLogRecPtr)
 			wm.restart_lsn = (uint64) pd_rb->current_restart_decoding_lsn;
 	}
+
+	/*
+	 * The session is winding down, so the walsender is not reading the control
+	 * channel any more.  The message is not sent: the send blocks when the
+	 * channel is full, and the walsender would not read it anyway.
+	 */
+	if (pd_walreader_shutdown_requested())
+		return;
 
 	if (!PDQueueSend(pd_control_mqh, PD_ENT_WATERMARK, &wm, sizeof(wm),
 					 false, true))
@@ -1149,6 +1224,14 @@ pd_walreader_broadcast(uint16 type, const void *payload, size_t len)
 {
 	int			i;
 
+	/*
+	 * The session is winding down, so the workers are not reading their queues
+	 * any more.  The message is not sent: the send blocks when the queue is
+	 * full, and the workers would not read it anyway.
+	 */
+	if (pd_walreader_shutdown_requested())
+		return;
+
 	for (i = 0; i < pd_num_workers; i++)
 	{
 		size_t		pending = pd_wal_sender[i].pending;
@@ -1170,6 +1253,14 @@ static void
 pd_walreader_send_to(int worker, uint16 type, const void *payload, size_t len)
 {
 	size_t		pending = pd_wal_sender[worker].pending;
+
+	/*
+	 * The session is winding down, so the worker is not reading its queue any
+	 * more.  The message is not sent: the send blocks when the queue is full,
+	 * and the worker would not read it anyway.
+	 */
+	if (pd_walreader_shutdown_requested())
+		return;
 
 	if (!PDQueueSendUnbatched(&pd_wal_sender[worker], type, payload, len))
 		ereport(ERROR,
@@ -1195,6 +1286,16 @@ static void
 pd_walreader_send_worker(int worker, uint16 type, const void *payload, size_t len)
 {
 	PDQueueSender *sender = &pd_wal_sender[worker];
+
+	/*
+	 * The session is winding down, so the worker is not reading its queue any
+	 * more.  The message is not sent: the send blocks when the queue is full,
+	 * and the worker would not read it anyway.  A worker that is waiting for a
+	 * record notices that the walreader is gone when the walreader detaches
+	 * from the queue.
+	 */
+	if (pd_walreader_shutdown_requested())
+		return;
 
 	if (!PDQueueSendChunked(sender->mqh, type, payload, len,
 							 PARALLEL_DECODE_CHUNK_SIZE, false, false))
@@ -2298,6 +2399,7 @@ ParallelWalreaderMain(Datum main_arg)
 	int			slot_index = -1;
 	int			i;
 	int64		ready_payload[2];
+	volatile bool stopping = false;
 
 	/* Setup signal handling. */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -2414,42 +2516,68 @@ ParallelWalreaderMain(Datum main_arg)
 	}
 	PG_CATCH();
 	{
-		ErrorData  *edata;
-
 		/*
-		 * Copy the error data before anything else: the error context is gone
-		 * as soon as the error is rethrown.
+		 * The queue was detached, so the session is going away: the walsender
+		 * is gone, or it has asked the participants to stop.  That is not a
+		 * failure of the walreader, so the walreader stops quietly instead of
+		 * reporting an error that nobody is going to read.
 		 */
-		edata = CopyErrorData();
-
-		/*
-		 * The report is best effort: if it cannot be sent, the walsender
-		 * notices that the walreader is gone anyway.
-		 */
-		PG_TRY(report);
+		if (PDQueueDetached() && pd_walreader_stopped())
 		{
-			pd_walreader_report_error(edata->message);
+			stopping = true;
 		}
-		PG_CATCH(report);
+		else
 		{
-			/* The error could not be reported. */
+			ErrorData  *edata;
+
+			/*
+			 * Copy the error data before anything else: the error context is
+			 * gone as soon as the error is rethrown.
+			 */
+			edata = CopyErrorData();
+
+			/*
+			 * The report is best effort: if it cannot be sent, the walsender
+			 * notices that the walreader is gone anyway.
+			 */
+			PG_TRY(report);
+			{
+				pd_walreader_report_error(edata->message);
+			}
+			PG_CATCH(report);
+			{
+				/* The error could not be reported. */
+			}
+			PG_END_TRY(report);
+
+			FreeErrorData(edata);
+
+			/*
+			 * Rethrow the error, so that it is logged and the walreader exits
+			 * with a code that does not make the postmaster restart the
+			 * cluster.
+			 */
+			PG_RE_THROW();
 		}
-		PG_END_TRY(report);
-
-		FreeErrorData(edata);
-
-		/*
-		 * Rethrow the error, so that it is logged and the walreader exits with
-		 * a code that does not make the postmaster restart the cluster.
-		 */
-		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	ctl->walreader_status = PD_WORKER_STATUS_EXITED;
 
-	ereport(LOG,
-			(errmsg("parallel decode walreader stopped")));
+	if (stopping)
+		ereport(LOG,
+				(errmsg("parallel decode walreader stopped while the session was "
+						"ending")));
+	else
+		ereport(LOG,
+				(errmsg("parallel decode walreader stopped")));
+
+	/*
+	 * Detach from the queues, so that the processes on the other end do not
+	 * wait for a message that is never going to come: the workers would wait
+	 * for a record, and the walsender for a message on the control channel.
+	 */
+	pd_walreader_detach_queues();
 
 	proc_exit(0);
 }

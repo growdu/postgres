@@ -48,6 +48,26 @@ pd_mq_result_name(shm_mq_result res)
 }
 
 /*
+ * Set when a send failed because the queue was detached.
+ *
+ * The queue is detached when the process on the other end has gone away, or
+ * when the shared segment of the session is going away.  Both are the normal
+ * way for a participant to learn that the session is ending, so the
+ * participants look at this flag to tell the end of the session apart from a
+ * failure of the decoding.
+ */
+static bool pd_queue_detached = false;
+
+/*
+ * Did the last send fail because the queue was detached?
+ */
+bool
+PDQueueDetached(void)
+{
+	return pd_queue_detached;
+}
+
+/*
  * Send one entry.
  *
  * Returns true when the entry was handed over to the queue, and false when
@@ -93,6 +113,14 @@ PDQueueSend(shm_mq_handle *mqh, uint16 type, const void *payload, size_t len,
 
 	if (res == SHM_MQ_WOULD_BLOCK)
 		return false;
+
+	/*
+	 * The queue was detached: the process on the other end is gone, or the
+	 * shared segment of the session is going away.  The flag tells the
+	 * participant that this is the end of the session and not a failure of
+	 * the decoding.
+	 */
+	pd_queue_detached = true;
 
 	ereport(ERROR,
 			(errcode(ERRCODE_IO_ERROR),
@@ -347,10 +375,23 @@ pd_queue_send_chunked(shm_mq_handle *mqh, uint16 type,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("could not send a parallel decode payload: the queue is full")));
 		if (res != SHM_MQ_SUCCESS)
+		{
+			/*
+			 * The queue was detached: the process on the other end is gone, or
+			 * the shared segment of the session is going away.  The flag tells
+			 * the participant that this is the end of the session and not a
+			 * failure of the decoding.
+			 *
+			 * The transfer is incomplete, but that does not matter: the
+			 * receiver is gone as well, or it is about to go.
+			 */
+			pd_queue_detached = true;
+
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("could not send a parallel decode payload: %s",
 							pd_mq_result_name(res))));
+		}
 
 		data += this_chunk;
 		remaining -= this_chunk;

@@ -723,6 +723,21 @@ extern bool PDQueueSend(shm_mq_handle *mqh, uint16 type, const void *payload,
 						size_t len, bool nowait, bool force_flush);
 
 /*
+ * Did the last send fail because the queue was detached?
+ *
+ * A queue is detached when the process on the other end has gone away, or
+ * when the shared segment of the session is going away.  During the teardown
+ * of a session that is the normal way for a participant to learn that it has
+ * to stop, so the participants use this flag to tell the end of the session
+ * apart from a failure of the decoding: the error that the send raises is
+ * not a failure of the participant, it is the end of the session.
+ *
+ * The flag is set by the send functions and it is never reset: a participant
+ * that has seen a detached queue stops anyway.
+ */
+extern bool PDQueueDetached(void);
+
+/*
  * Receive one entry.  The payload points into the ring buffer of the queue
  * and is valid only until the next receive from the same queue.  Returns
  * SHM_MQ_WOULD_BLOCK if the queue is empty and nowait was requested.

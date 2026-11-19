@@ -269,10 +269,33 @@ static XLogRecPtr parallel_decode_worker_position[MAX_PARALLEL_DECODE_WORKERS];
 static instr_time parallel_decode_worker_progress[MAX_PARALLEL_DECODE_WORKERS];
 
 /*
+ * Read the messages the walreader has sent on the control channel.
+ *
+ * The declaration is here because the frames that have no commit sequence
+ * number need the release frontier, which is computed from those messages.
+ */
+static void parallel_decode_drain_control(void);
+
+/*
+ * Take the frames that are on their way off the output queues.
+ *
+ * The declaration is here because the exit path of the walsender uses it: a
+ * worker that is blocked handing over a frame needs room in the queue before
+ * it can notice that the session is winding down.
+ */
+static void parallel_decode_drain_output_queues(void);
+
+/*
  * Make sure that the workers and the walreader never outlive the session
  * that started them.  This runs on every process exit path, including the
  * ones that do not go through ParallelDecodeSessionStop(), so it only raises
  * the shutdown flag: waiting for the workers here would not be safe.
+ *
+ * The output queues are drained as well.  A worker that is blocked handing
+ * over a frame can only notice the shutdown flag after it has finished the
+ * transfer, and it can only finish the transfer when the queue has room for
+ * it.  Draining the queues gives it that room, so that the worker stops on
+ * its own instead of running into the end of the shared segment.
  *
  * The callback has to be a before_shmem_exit one.  proc_exit() runs the
  * before_shmem_exit callbacks first, then unmaps the dynamic shared memory
@@ -284,16 +307,12 @@ static void
 parallel_decode_before_shmem_exit(int code, Datum arg)
 {
 	if (parallel_decode_ctl)
+	{
 		parallel_decode_ctl->shutdown = 1;
-}
 
-/*
- * Read the messages the walreader has sent on the control channel.
- *
- * The declaration is here because the frames that have no commit sequence
- * number need the release frontier, which is computed from those messages.
- */
-static void parallel_decode_drain_control(void);
+		parallel_decode_drain_output_queues();
+	}
+}
 
 /*
  * Returns true when the given process still exists.
@@ -2575,6 +2594,9 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
  * a worker that is blocked handing over a frame can only notice the shutdown
  * flag after it has finished the transfer, and it can only finish the transfer
  * when the queue has room for it.
+ *
+ * The messages are not looked at: the function is called on the exit path of
+ * the walsender as well, and an error there would only make the exit worse.
  */
 static void
 parallel_decode_drain_output_queues(void)
@@ -2584,19 +2606,29 @@ parallel_decode_drain_output_queues(void)
 	for (worker = 0; worker < parallel_decode_num_workers; worker++)
 	{
 		shm_mq_handle *mqh = parallel_decode_out_mqh[worker];
-		uint16		type;
-		const void *payload;
-		size_t		len;
+		Size		nbytes;
+		void	   *data;
 
 		if (mqh == NULL)
 			continue;
 
-		while (PDQueueRecv(mqh, &type, &payload, &len, true) == SHM_MQ_SUCCESS)
+		while (shm_mq_receive(mqh, &nbytes, &data, true) == SHM_MQ_SUCCESS)
 		{
 			/* The frame is dropped. */
 		}
 	}
 }
+
+/*
+ * The time the teardown of the session waits for a participant to exit.
+ *
+ * The wait is a safety net: the participants are asked to stop, and they stop
+ * on their own.  A participant that does not stop must not hold the teardown
+ * up forever, so the wait is given up after this long.  The participant that
+ * is still running then runs into the end of the shared segment, which it
+ * treats as the end of the session.
+ */
+#define PD_TEARDOWN_TIMEOUT_MS		30000
 
 /*
  * Wait for a background worker to exit.
@@ -2608,6 +2640,11 @@ parallel_decode_drain_output_queues(void)
 static void
 parallel_decode_wait_for_worker(BackgroundWorkerHandle *handle)
 {
+	instr_time	start;
+	instr_time	now;
+
+	INSTR_TIME_SET_CURRENT(start);
+
 	for (;;)
 	{
 		pid_t		pid;
@@ -2621,6 +2658,21 @@ parallel_decode_wait_for_worker(BackgroundWorkerHandle *handle)
 			break;
 
 		parallel_decode_drain_output_queues();
+
+		/*
+		 * The wait is bounded: a participant that does not stop must not hold
+		 * the teardown of the session up forever.
+		 */
+		INSTR_TIME_SET_CURRENT(now);
+		if (INSTR_TIME_GET_DOUBLE(now) - INSTR_TIME_GET_DOUBLE(start) >=
+			(double) PD_TEARDOWN_TIMEOUT_MS / 1000.0)
+		{
+			ereport(WARNING,
+					(errmsg("the parallel decoding session did not stop a participant "
+							"within %d milliseconds",
+							PD_TEARDOWN_TIMEOUT_MS)));
+			break;
+		}
 
 		/*
 		 * The postmaster sets our latch when the worker exits, so the wait
@@ -2656,9 +2708,23 @@ ParallelDecodeSessionStop(void)
 	parallel_decode_ctl->shutdown = 1;
 
 	/*
-	 * Terminate the decode workers first, then the walreader: the walreader
-	 * may still be feeding the workers.
+	 * Terminate the walreader first, then the decode workers.
+	 *
+	 * The walreader is the producer: it is the only one that reads the WAL, and
+	 * it hands the records over to the workers.  Stopping it first means that
+	 * the workers are not left waiting for a record that is never going to
+	 * arrive.  The workers are the consumers: they hand the frames over to the
+	 * walsender, and the walsender drains the output queues while it waits for
+	 * them, so that a worker that is blocked handing over a frame can finish
+	 * the transfer and notice the shutdown flag.
 	 */
+	if (parallel_decode_walreader_handle)
+	{
+		TerminateBackgroundWorker(parallel_decode_walreader_handle);
+		parallel_decode_wait_for_worker(parallel_decode_walreader_handle);
+		parallel_decode_walreader_handle = NULL;
+	}
+
 	for (i = 0; i < parallel_decode_num_workers; i++)
 	{
 		if (parallel_decode_worker_handles[i])
@@ -2667,13 +2733,6 @@ ParallelDecodeSessionStop(void)
 			parallel_decode_wait_for_worker(parallel_decode_worker_handles[i]);
 			parallel_decode_worker_handles[i] = NULL;
 		}
-	}
-
-	if (parallel_decode_walreader_handle)
-	{
-		TerminateBackgroundWorker(parallel_decode_walreader_handle);
-		parallel_decode_wait_for_worker(parallel_decode_walreader_handle);
-		parallel_decode_walreader_handle = NULL;
 	}
 
 	for (i = 0; i < MAX_PARALLEL_DECODE_WORKERS; i++)
