@@ -423,3 +423,84 @@ from pg_replication_slots;
 (b) 指标口径不对（协议字节率 vs 有效数据率，见 §9.2），
 还是 (c) **发布端正在被 WAL 的产生速度拖着走，真正的目标是"跟上"而不是"到 70"**。
 
+### 9.8 "CPU 全闲、事务并发上不去"：放行链是一条一次一个事务的串行链
+
+**现象**：tpcc 100 事务并发，发布端发出去了的事务并发只有 65，订阅端 apply worker 起不来；
+**发布端与订阅端的 CPU 全部富余**。CPU 富余而速率上不去 ⇒ **系统是被"等"住的，不是在"算"**。
+
+#### 9.8.1 放行链的结构（代码事实）
+
+| 环节 | 位置 | 事实 |
+| --- | --- | --- |
+| 放行顺序 | `parallel_decode.c:1056-1199` | `parallel_decode_release_txns()` 只放行 `pending[parallel_decode_next_cseq]`——**严格按 cseq，一次一个** |
+| 段的��置 | `parallel_decode_worker.c:355-370` | `position = (pd_current_cseq != 0) ? pd_record_lsn : pd_end_lsn`；提交时产生的那一段带的是**它自己提交记录的位置** |
+| 放行闸门 | `parallel_decode.c:968-980` | `frame_may_go(end_lsn)` = `frontier ≥ end_lsn`，而 frontier = **最老的未放行事务的提交位置** |
+
+三条合起来：**事务 k 的数据必须等事务 k-1 被放行之后才能上线**。wire 上事务是一个接一个、
+按提交序交付的。订阅端的并行**不来自 wire 的交错**，而来自"apply worker 在 apply 上一个事务时，
+leader 已经在收下一个事务的字节"。
+
+⇒ **发布端的速率上限 = 1/(放行链单次往返) × B，而不是 CPU。**
+放行链的一次往返是跨进程的：walreader 读到提交记录 → 交给 worker → worker 解码 → 发 END_ACK
+（`PDQueueSendEvent` → `PDQueueSendUnbatched`，立即刷出，`parallel_decode_msg.c:648-657`）
+→ walsender 放行。
+
+50MB/s ÷ 8KB ≈ **6.25k 事务/秒** ⇒ 单次往返 ≈ **160 µs**。这是"进程间唤醒 + 解码 + 往返"的量级。
+
+#### 9.8.2 往返里最大的一项：64KB 的批刷出间隔
+
+**队列的批只在字节阈值到时才刷出，没有基于时间的刷出**：
+
+* walreader → worker：`pd_walreader_send_worker()` 里 `pd_wal_pending >= PDQueueBatchSize()`
+  才 `pd_walreader_flush_queues()`（`parallel_walreader.c:1313-1314`）；
+  另一个刷出点是"没有更多 WAL 了"（`:2236`）——高负载下永远走不到；
+* worker → walsender：worker 只在"没有记录可解码"时刷出（`parallel_decode_worker.c:957`），
+  或批满 64KB。
+
+`PDQueueBatchSize()` = `min(parallel_decode_batch_size, PARALLEL_DECODE_QUEUE_SIZE/4)`，
+**默认 64KB**。在 130MB/s 的 WAL 速率下：**64KB 一批 ≈ 0.5 ms**，
+一条提交记录在批里的**平均等待 ≈ 0.25 ms**——与上面推出来的 160 µs 同量级。
+
+⇒ **提交记录（也就是解锁放行链的那条记录）要等下一次批刷出才被 worker 看见。**
+⇒ **放行链的往返时延由批间隔主导，而批间隔由 `parallel_decode_batch_size` 决定。**
+
+#### 9.8.3 决定性判据（发布端自己就能测）
+
+| 测量 | 判读 |
+| --- | --- |
+| `select txn_count, txn_latency_us_avg, txn_latency_us_max from pg_parallel_decode_txn_latency;` | 这个延迟就是**"cseq 分配 → END_ACK"**，即放行链的单次往返。**若 `txn_latency_us_avg × 放行速率 ≈ 1`，就证明链是串行的、时延就是吞吐上限** |
+| `select cseq_allocated, cseq_released, commit_lag from pg_parallel_decode_commit_lag;` | `commit_lag` 稳定在几十上百 ⇒ 链后面压着一串事务，速率由链决定 |
+| `select commit_lag, pending_commit_age_us from pg_parallel_decode_pending_commit_age;` | 最老的待提交事务的年龄 |
+| `select wakeups_down, wakeups_up from pg_parallel_decode_wakeups;` | 唤醒速率。若下行唤醒 ≈ 事务数，说明**每事务一次唤醒**，批没有摊薄 |
+
+**⇒ 最省事的一次实验（单变量、纯 GUC）**：
+
+```sql
+-- 发布端
+alter system set parallel_decode_batch_size = 8192;   -- 64KB -> 8KB
+select pg_reload_conf();
+```
+
+批间隔从 0.5 ms 降到约 30 µs，放行链的往返应当随之下降，事务速率应当上升。
+**如果速率不动，假设就被否掉了**（这正是 `systematic-debugging` 要的单变量实验）。
+注意：批变小 ⇒ 唤醒变多（130MB/s ÷ 8KB ≈ 16k 次/秒的下行唤醒），要一并看 `pg_parallel_decode_wakeups`。
+
+#### 9.8.4 如果批间隔不是主因：代码上的两个候选
+
+| 候选 | 位置 | 改法 |
+| --- | --- | --- |
+| **提交记录应当单独刷出** | walreader 只在批满时刷 | 转发一条**提交记录**时立刻刷出那一批——提交记录正是解锁放行链的那条消息，其它记录（变更、位置标记）继续按批走 |
+| **放行链的串行段** | `parallel_decode_release_txns()` 一次只放行一个 cseq | 放行循环本来就能一次放行多个已 ACK 的事务（`for(;;)`），所以只要 ACK 是一批一起来的，链就能摊薄；问题在于 ACK 到达的节奏由批间隔决定 |
+
+#### 9.8.5 并发数 65 vs 100 的口径要先定
+
+"发出去的事务并发"有两种读法，含义完全不同：
+
+| 读法 | 怎么量 | 含义 |
+| --- | --- | --- |
+| **发布端在途事务数**（已开工未结束） | `select sum(in_flight_txns) from pg_parallel_decode_workers;` | 反映**负载本身**的并发：tpcc 的 warehouse/district 行锁会让一部分事务排队，这部分与解码无关 |
+| **已上线但订阅端未提交的事务数** | 订阅端侧（apply worker 的在途数） | 反映**放行链**的深度：链一次放行一个，这个数就是链的积压 |
+
+⇒ 在拿 65 去和 100 比之前，先确认量的是哪一个。**如果是前者，65 < 100 可能是 tpcc 的行锁
+（负载属性），不是解码瓶颈；如果是后者，它就是放行链积压的直接证据。**
+
