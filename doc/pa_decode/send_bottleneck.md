@@ -225,3 +225,152 @@ held 表的元素只会被**按位置从小到大**取出，所以用按 (位置
   事务才会在**进行中**被切段发出。默认 1MB 对 tpcc 那种 3KB 的事务来说太大，于是它们都在提交时
   才被流式化（见 §6）——功能正确，但端到端时延接近整事务下发，收益只剩"订阅端能并行 apply"。**待实测**。
 
+---
+
+## 9. 从 50MB/s 到 70MB/s：缺口在哪
+
+**口径**：本机不跑性能测试，下文所有数字都是**静态推算**（依据 `design.md` §15.1 的 tpcc 常数），
+一律**待实测**。唯一的事实输入是用户报告的"发送端 50MB/s"。
+
+### 9.1 前提变了：`immediate` 档把 RELATION 重发变成了常态
+
+§6 之前，发布端在 tpcc 下**一个流段都不产生**（段大小默认 1MB，事务只有 3KB），走的是整事务块路径，
+RELATION 由发布端自己的去重（`design.md` §6.7）压到"每关系每 epoch 一条"。改成"每个事务都是流段"之后：
+
+* pgoutput 在流式模式下按 **(relation, top-xid)** 追踪关系描述是否已发（`pgoutput.c:743/767/1887`），
+  于是**每个事务都要为它触及的每张表重发一次 RELATION**；
+* 这条路径**进不了发布端的去重**：`maybe_send_schema()` 调 `send_relation_and_attrs(..., announce = !data->in_streaming)`，
+  而 `rel_definition_hook` 只在 `announce` 为真时触发（`pgoutput.c:827`）⇒ 流式模式下钩子不触发 ⇒
+  worker 不会把它标成关系帧（`parallel_decode_worker.c:279-335` 里 `pd_segment_active` 的判断在关系判断之前），
+  它作为**普通帧**被拼进流段 ⇒ walsender 的 `parallel_decode_relation_sent()` 去重**看不到它**。
+* `design.md` §6.7 已经写明"流式事务一律照发"，这是**有意为之**，不是 bug。
+
+**关键结论：这部分字节发布端消不掉。** 订阅端的 apply worker 是从流里拿到关系描述的
+（`worker.c:559-643` 的 `handle_streamed_transaction()` 对每条消息（含 RELATION/TYPE）做一次 `pa_send_data`，
+leader 自己也用 `apply_handle_relation()` → `logicalrep_relmap_update()` 刷新缓存）。
+发布端把 RELATION 吞掉，apply worker 就没有这份定义可用。而"订阅端源码一行不改"是硬边界
+⇒ **RELATION 重发是当前设计下的固定开销**。
+
+按 `design.md` §15.1 的静态估算（tpcc NewOrder：5 张表、约 600 B/条 RELATION）：
+
+| 常数 | `buffered`（整事务块） | `immediate`（每事务流段） |
+| --- | --- | --- |
+| B：每事务协议字节 | 约 5 KB | 约 **8 KB**（其中 RELATION 重发约 **3 KB**） |
+| C：每事务帧数 | 约 25 | 约 **30**（其中 RELATION 约 **5**） |
+
+⇒ **`immediate` 档下约 37.5% 的协议字节、约 17% 的帧是纯冗余的 RELATION 重发。**
+
+### 9.2 缺口换算
+
+| 指标 | 50MB/s（用户实测） | 70MB/s（`design.md` §12.1 的 G1） | 缺口 |
+| --- | --- | --- | --- |
+| 事务/秒 | 约 6.25k | 约 8.75k | **+2.5k** |
+| 帧/秒 | 约 187k | 约 262k | **+75k** |
+| 协议字节/秒 | 50 MB | 70 MB | **+20 MB** |
+| 其中 RELATION 重发 | 约 18.8 MB | 约 26.3 MB | +7.5 MB |
+| **有效变更字节/秒** | **约 31 MB** | **约 44 MB** | +13 MB |
+| walreader 要读的 WAL 记录/秒（2–4 记录/变更） | 约 310k–625k | 约 437k–875k | +130k–250k |
+
+**第一件事是口径，不是代码。** G1 的 70MB/s 是"协议字节率"，而在 `immediate` 档下这 70MB/s 里有
+**约 26MB 是重发的关系描述**。如果 70MB/s 的本意是"有效数据吞吐"，那发布端要写的是 **约 135MB/s 的协议字节**，
+缺口是 **2.7 倍**而不是 1.4 倍。两者的整改方向完全不同，**先定口径**。
+
+### 9.3 三个候选瓶颈（按可能性排序）
+
+发布端逐帧的**剩余**工作已经很少了（§4.5、§8）：改帧头时间戳（一次 8 字节 `memcpy`）+ FR-20 钳制
+（两个 `int64` 的 `pg_ntoh64`/`pg_hton64` + `memcpy`）+ `pq_putmessage_noblock`（拷进 8KB 的 `PqSendBuffer`）。
+按每帧约 0.2 µs 静态估，**补上 75k 帧/秒只多花约 15 ms/秒 ≈ 1.5% 的一个核**；
+socket 写次数 70MB/s ÷ 8KB ≈ 8.5k 次/秒，也微不足道。**walsender 的逐帧路径已经榨不出 20% 了。**
+
+于是剩下的三个候选：
+
+| # | 候选 | 性质 | 规模（静态估算，待实测） |
+| --- | --- | --- | --- |
+| 1 | **订阅端 leader 的每帧派发**：`PQgetCopyData` → `apply_dispatch` → 流式事务里每条变更一次 `pa_send_data` | 订阅端 leader 上的 O(changes) 串行工作量。`design.md` §15.1 把它列为**端到端瓶颈 #1**，且"只改发布端"这条边界**无法从发布端缓解** | 现有 187k 帧/秒已需 0.4–0.9 核；再补 75k 帧/秒再加 0.15–0.4 核 |
+| 2 | **订阅端 apply worker 容量**：`max_parallel_apply_workers_per_subscription` 默认 **2**，超限即 `TRANS_LEADER_SERIALIZE`（落盘慢路径） | 端到端并行度的**硬上限**。`design.md` §12.1 按目标变更率反推的下限是 **4–40** | 低于下限 ⇒ 多出来的事务全部走 spool 慢路径 ⇒ 端到端**反而更慢** |
+| 3 | **walreader 的每条 WAL 记录成本** | 唯一 WAL 读取者，单进程：CRC32C + 分类 + shadow decode + 序列化拷贝 + `shm_mq` 拷贝 | 现有 310k–625k 记录/秒；按每记录约 1 µs 估已占 0.3–0.6 核，**再补 130k–250k 记录/秒就可能顶到单核** |
+
+**这三个候选有一个共同点：没有一个是"walsender 的逐帧开销"。** 50MB/s 到 70MB/s 的缺口，
+在发布端**进程内**已经很难再找到可观的收益；真正的杠杆在订阅端配置（#2）、订阅端协议（#1，本设计管不到）、
+以及 walreader 的单进程成本（#3，要动架构）。
+
+### 9.4 分诊步骤（性能机上，约 20 分钟）
+
+先做这一步再动代码。**四个检查项，按顺序做**：
+
+**① 确认 trace 文件是关的。** `parallel_decode_trace_file` 只要非空，`PDTraceWrite()`
+（`parallel_decode_trace.c:154-174`）就会**每帧**往磁盘写 4 字节长度 + 帧内容——两次 `write()` 系统调用
+加一次落盘。18.7 万帧/秒 × 2 次系统调用 = 3.7 万次/秒的系统调用加上磁盘写。**这一个开关就足以
+把速率压到 50MB/s 这个量级**，而它恰好是本仓库冒烟脚本的默认做法（`doc/pa_decode/t/*.sh` 普遍设了它）。
+性能机上必须 `parallel_decode_trace_file = ''`。
+
+**② 看 walsender 的 CPU 占用。**
+
+```sql
+-- 发布端，间隔 10s 采两次做差
+select frames, frame_bytes, socket_writes from pg_parallel_decode_walsender_frames;
+```
+
+| 观察 | 判读 |
+| --- | --- |
+| walsender 进程 CPU ≪ 100%，字节率却稳定在 50MB/s | **发布端不是瓶颈**——它阻塞在 `write()` 上，**限速在下游**（订阅端消费能力或网络），去查 #1/#2 |
+| walsender 进程 CPU ≈ 100% | 发布端进程内到顶了，去查 #3（walreader 是另一个进程，也要单独看） |
+| `frame_bytes / socket_writes` ≈ 8192 | 批量刷出正常（8KB 缓冲），**系统调用率不是问题** |
+| `frame_bytes / socket_writes` ≪ 8192 | 批量刷出没生效——每帧一次 `write()`，先查这里 |
+
+**③ 看订阅端的 apply worker 占用。**
+
+```sql
+-- 订阅端
+select parallel_apply_workers from pg_stat_subscription;   -- 应接近配置值，且不是恒定等于上限
+```
+
+`parallel_apply_workers` 长期贴着 `max_parallel_apply_workers_per_subscription` ⇒ 池子不够，
+超出的事务在落盘 spool 慢路径上 ⇒ **端到端被订阅端卡住，而发布端看起来"发不出去"**。
+把 `max_parallel_apply_workers_per_subscription` 调到 **8–16** 再测一遍（订阅端**配置**改动，
+不改订阅端源码，允许）。
+
+**④ 看放行前沿有没有卡住。** 这是一条与 CPU 无关的限速路径：
+
+```sql
+select cseq_allocated, cseq_released, commit_lag from pg_parallel_decode_commit_lag;
+select commit_lag, pending_commit_age_us from pg_parallel_decode_pending_commit_age;
+```
+
+`cseq_allocated` 持续增长而 `cseq_released` 停滞 ⇒ 有事务卡在提交序上，它后面的所有字节都发不出去
+（held 区只涨不落，`parallel_decode_held_max_bytes` 只告警不限流）。tpcc 里一个长事务就能造成这个现象。
+
+### 9.5 各侧的杠杆
+
+**发布端（能改的）**
+
+| 杠杆 | 预期收益 | 代价 |
+| --- | --- | --- |
+| 关掉 `parallel_decode_trace_file` | 若开着，**这一个就可能是全部差距** | 无 |
+| 加大 `parallel_decode_batch_size`（默认 64KB） | 减少跨进程唤醒（`kill(pid, SIGURG)`）的次数；按 §5.4 第 9 项，唤醒次数与"字节数/批大小"同阶 | 共享内存占用线性上升；唤醒速率本来就不是瓶颈（`pg_parallel_decode_wakeups` 采样确认） |
+| 加大 `max_parallel_decode_workers` | **解码侧不是瓶颈**（§15.1：N = 3~4 就够）⇒ 收益递减 | 共享内存与信号开销线性上升 |
+| 调小 `parallel_decode_stream_segment_size`（默认 1MB） | 对 tpcc（3KB 事务）**没有任何吞吐影响**——事务仍然在提交时才被流式化，只是切段点变了 | 只影响时延，不影响速率 |
+| 减少 walreader 的每记录成本 | 需要动架构（walreader 是唯一 WAL 读取者），本轮不做 | 大 |
+
+**发布端（改不了的）**
+
+* **RELATION 重发**（9.1）：订阅端 apply worker 依赖它，订阅端源码不能改 ⇒ 消不掉。
+* **帧数**：协议规定一条逻辑消息一个 CopyData，订阅端 `apply_dispatch()` 一个 CopyData 只解析一条消息
+  ⇒ 合并帧要改协议。
+
+**订阅端（配置可改，源码不改）**
+
+* `max_parallel_apply_workers_per_subscription`：从默认 2 提到 8–16（`design.md` §12.1 的下限是 4–40）。
+* 订阅端 leader 的每帧派发是端到端瓶颈 #1，只能靠协议改（批量 CopyData）解决，**超出本设计边界**。
+
+### 9.6 结论
+
+1. **发布端的逐帧发送路径已经不是瓶颈**：每帧剩余工作只有时间戳、钳制、一次 `pq_putmessage_noblock`，
+   补齐 50→70MB/s 的缺口只多花约 1.5% 的一个核。继续在这条路径上做优化，预期收益接近 0。
+2. **先定口径**：70MB/s 是"协议字节率"（含约 37.5% 的 RELATION 重发）还是"有效数据吞吐"？
+   前者的缺口是 1.4 倍，后者的缺口是 2.7 倍。
+3. **分诊优先于改代码**：trace 文件是否关着、walsender 的 CPU 占用、订阅端 apply worker 的占用、
+   放行前沿有没有卡住——这四项能直接指出瓶颈在哪一端，本机不跑性能测试，必须在性能机上做。
+4. **最可能的两个瓶颈都不在发布端的发送路径上**：订阅端 leader 的每帧派发（协议问题，本设计管不到）
+   与订阅端 apply worker 容量（配置可改，最便宜）。
+
