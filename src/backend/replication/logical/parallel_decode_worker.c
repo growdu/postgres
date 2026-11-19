@@ -1266,6 +1266,22 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	pd_ctx->stream_min_size = (Size) ctl->stream_min_size;
 
 	/*
+	 * The parallel decoding path streams every transaction, so that the
+	 * subscriber can apply the transactions in parallel.  A transaction that
+	 * was not streamed while it was in progress is streamed when it commits.
+	 *
+	 * The transactions below the minimum size are the exception: they reach
+	 * the subscriber as a whole transaction block.  The decision about them is
+	 * made by the reorder buffer, which knows the size of the transaction.
+	 *
+	 * The plugin has to support streaming, and the subscriber has to have
+	 * asked for it: the streaming callbacks of the plugin fail when the
+	 * subscriber did not ask for streaming.
+	 */
+	pd_ctx->stream_all_transactions =
+		(ctl->streaming_mode == PD_STREAMING_IMMEDIATE && pd_ctx->streaming);
+
+	/*
 	 * The worker tells the walsender which frames carry the definition of a
 	 * relation, so that the definition of a relation is sent to the
 	 * subscriber once and not once for every worker.
