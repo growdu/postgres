@@ -173,8 +173,8 @@ FROM pg_parallel_decode_wakeups;
 | --- | --- | --- | --- | --- |
 | `max_parallel_decode_workers` | int | `0` | 0 – 64 | 并行解码 worker 的数量；0 = 关闭并行路径 |
 | `parallel_decode_streaming_mode` | enum | `auto` | `auto` / `immediate` / `buffered` | 事务流式化的激进程度 |
-| `parallel_decode_stream_min_size` | int | `0` | 0 – INT_MAX | 小于这个字节数的事务**不**流式化 |
-| `parallel_decode_stream_segment_size` | int | `1MB` | 0 – INT_MAX | 单个流段的字节上限 |
+| `parallel_decode_stream_min_size` | int | `0` | 0 – INT_MAX | 小于这个字节数的事务**完全不被**流式化（0 = 每个事务都被流式化） |
+| `parallel_decode_stream_segment_size` | int | `1MB` | 0 – INT_MAX | 单个流段的字节上限（只是分段点，不决定事务是否被流式化） |
 | `parallel_decode_work_mem` | int | `-1` | -1 – INT_MAX | 每个 decode worker 的解码内存上限；-1 = 用 `logical_decoding_work_mem` |
 | `parallel_decode_batch_size` | int | `64KB` | 0 – INT_MAX | 队列消息的合并批次大小；0 = 不合并 |
 | `parallel_decode_barrier_timeout` | int | `60` | 0 – INT_MAX | 停滞检测的超时（秒）；0 = 关闭检测 |
@@ -217,9 +217,11 @@ FROM pg_parallel_decode_wakeups;
 
 #### 4.2.3 `parallel_decode_stream_min_size`
 
-**小于这个字节数的事务不流式化**，走整事务下发（整个事务的字节作为一个块发出去）。
+**小于这个字节数的事务完全不被流式化**，走整事务下发（整个事务的字节作为一个块发出去）。
 
-**默认必须是 `0`**（不设门槛）。门槛若大于典型事务大小，所有事务都不流式化 → 订阅端收不到 `STREAM START` → **并行 apply 根本不启动**。这是一个很容易踩的坑：调大这个参数看起来像"减少开销"，实际上会让订阅端的并行 apply 整个失效。
+**`0` 的含义是"每个事务都被流式化"**——包括在进行中没有攒够段大小、**在提交时才被流式化**的那些事务。
+
+**默认必须是 `0`**（不设门槛）。门槛若大于典型事务大小，低于门槛的事务都不流式化 → 订阅端收不到 `STREAM START` → **并行 apply 根本不启动**。这是一个很容易踩的坑：调大这个参数看起来像"减少开销"，实际上会让订阅端的并行 apply 整个失效。
 
 只有当"整事务下发"和"流式下发"之间的差异对某些特定负载有实际意义时才动它。
 
@@ -230,6 +232,8 @@ FROM pg_parallel_decode_wakeups;
 **单个流段的字节上限**，默认 1MB。
 
 它决定了"一个流段最长能独占 wire 多久"。由于 wire 上同时只能有一个打开的流段，一个卡住的流段会把其它 worker 的产出一起堵住——这是并行路径的固有代价，只能靠限制段的粒度来限制单块时长。
+
+**它只是分段点，不决定"事务是否被流式化"**：没攒够这个大小的事务，在 `immediate` 档下仍然会在**提交时**作为一个流段发出（订阅端一样能并行 apply）。因此它影响的是**时延**而不是功能——段大小远大于典型事务大小时，每个事务都在提交时才被流式化。
 
 调小的代价是：流段更碎，`STREAM START` / `STREAM STOP` 的协议消息更多（每事务多 2 帧）。
 

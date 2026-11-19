@@ -180,21 +180,27 @@ held 表的元素只会被**按位置从小到大**取出，所以用按 (位置
 | 每帧的剩余开销 | 改时间戳 + 钳制 + `pq_putmessage_noblock` 三项 |
 | 帧率 | `pg_parallel_decode_walsender_frames`（设计文档 §11.3）采样 |
 
-## 6. 还没有解决的事：20MB/s 未必是发布端的发送能力
+## 6. 一个流段都没有产生的问题（已解决）
 
-**这一条比上面所有的优化都重要。** 测出 20MB/s 的那次运行，发布端很可能**一个流段都没有产生**：
+**这一条比上面所有的优化都重要。** 测出 20MB/s 的那次运行，发布端很可能**一个流段都没有产生**。
 
-* 流式门槛在 `ReorderBufferCheckMemoryLimit()`（`reorderbuffer.c:3800`）：`segment_size > 0 && rb->size >= segment_size && ReorderBufferStreamableTxnReached(rb, segment_size)`，而 `ReorderBufferStreamableTxnReached()`（`:3719`）要求 `txn->total_size >= segment_size`（`:3730`）；`segment_size = max(ctx->stream_segment_size, ctx->stream_min_size)`（`:3767`、`:3775`），这两个值在**会话开始时**从 GUC 取（`parallel_decode.c:2589`）。
-* `parallel_decode_stream_segment_size` 默认 **1MB**（`parallel_decode.c:53`），`parallel_decode_stream_min_size` 默认 0（`:52`）。⇒ **一个事务要先攒够 1MB 的变更才会产生 STREAM START**。tpcc 那种 3KB 的事务永远达不到，于是走普通事务块。
+**当时的状态：**
+
+* 流式门槛在 `ReorderBufferCheckMemoryLimit()`：`segment_size > 0 && rb->size >= segment_size && ReorderBufferStreamableTxnReached(rb, segment_size)`，而 `ReorderBufferStreamableTxnReached()` 要求 `txn->total_size >= segment_size`；`segment_size = max(ctx->stream_segment_size, ctx->stream_min_size)`，这两个值在**会话开始时**从 GUC 取。
+* `parallel_decode_stream_segment_size` 默认 **1MB**，`parallel_decode_stream_min_size` 默认 0。⇒ **一个事务要先攒够 1MB 的变更才会产生 STREAM START**。tpcc 那种 3KB 的事务永远达不到，于是走普通事务块。
 
 后果有两个：
 
 1. **订阅端不会启动并行 apply**（它看不到 STREAM START），apply 是串行的 ⇒ 端到端速率被订阅端卡住，发布端"发不出去"未必是发布端慢。
 2. **本文改的 held 表根本没有被触发**（held 表装的是"没有 cseq 的帧"，只有流段和子事务 abort 属于这一类）。非流式路径上，发送侧的每帧开销是：worker 一次 `shm_mq_send` + walsender 一次 `shm_mq_receive`（一次自旋锁）+ 接收缓冲的一次 `palloc`+`memcpy` + 块的一次 `palloc`+`memcpy` + 两个 list cell。
 
-所以在动发送路径之前，**先把 `parallel_decode_stream_segment_size` 调到小于典型事务大小**（tpcc 要调到 KB 级），否则测出来的是"串行 apply 的速率"，不是发布端的发送能力。
+**现在的状态（已解决）：** 并行解码路径在 `immediate` 档下把 `LogicalDecodingContext.stream_all_transactions` 打开，**没攒够段大小的事务在提交时作为一个流段发出**（`reorderbuffer.c` 的 `ReorderBufferStreamAtCommit()`，由 `ReorderBufferReplay()` 在提交时调用）。于是只要 `parallel_decode_stream_min_size = 0`（默认），**每个事务都是流段**，订阅端一定会看到 STREAM START。
 
-`parallel_decode_stream_min_size` 的帮助文本写的是"Zero means that every transaction is streamed"，但实现是 `if (min_size > segment_size) segment_size = min_size;`——min_size 只能把门槛**抬高**，0 并不等于"全都流式"。这条文档与实现不一致由 peer 会话在改发布端 GUC 时一并对齐。
+* 两个尺寸的语义不再重叠：段大小只是**分段点**，最小大小是"能不能被流式化"的门槛；旧的 `if (min_size > segment_size) segment_size = min_size;` 已删除（两个尺寸不再互相抬高）。
+* 提交时流式化有四个前提（见设计文档 §8.1）：路径是并行解码路径且会话被要求立即流式、事务此前没有被流式化、快照是一致的、事务不是两阶段提交的准备事务。
+* 低于 `parallel_decode_stream_min_size` 的事务仍然以整事务块的形式下发。
+
+**仍然成立的一条：** 段大小决定了"事务在**进行中**就被切段发出"的比例。默认 1MB 对 tpcc 那种 3KB 的事务来说太大，因此这些事务都在**提交时**才被流式化——端到端时延因此接近整事务下发，收益只剩"订阅端能并行 apply"。**这一条待实测**（设计文档 §15.2 第 15 项）。
 
 ## 7. 后续（本次不做）
 
@@ -215,6 +221,7 @@ held 表的元素只会被**按位置从小到大**取出，所以用按 (位置
   **改帧头的时间戳、FR-20 钳制、`pq_putmessage_noblock`** 三项。
 * 因此 §7 的第一条（`PD_BLK_TXN` 攒批）在流式路径上**不适用**：流段本来就是"一个事务的一段 =
   一条队列消息"，每帧一次 `shm_mq` 往返的问题在线段级别上已经解决了。
-* **前提**：`parallel_decode_stream_segment_size` 必须小于典型事务大小，否则一个事务永远攒不到
-  门槛（见 §6）。默认 1MB 对 tpcc 那种 3KB 的事务来说太大了。
+* **性能上的前提**（不再是正确性上的前提）：`parallel_decode_stream_segment_size` 小于典型事务大小，
+  事务才会在**进行中**被切段发出。默认 1MB 对 tpcc 那种 3KB 的事务来说太大，于是它们都在提交时
+  才被流式化（见 §6）——功能正确，但端到端时延接近整事务下发，收益只剩"订阅端能并行 apply"。**待实测**。
 

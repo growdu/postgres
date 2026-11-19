@@ -833,7 +833,9 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 
 | 条目 | 载荷 | 说明 |
 | --- | --- | --- |
-| `PD_ENT_BLOCK` | 块边界标记（FIRST / MORE / LAST）、块类型、xid、**cseq（仅整事务块有）**、字节 | O2 的载体：块内字节在 wire 上必须连续 |
+| `PD_ENT_BLOCK` | 块边界标记（FIRST / MORE / LAST）、块类型、xid、**cseq（仅整事务块有）**、字节 | O2 的载体：块内字节在 wire 上必须连续。**实现没有用它**：块边界由消息边界表达（见本节末尾），枚举值保留为预留 |
+| `PD_ENT_SEGMENT` | 一个流段的全部字节（帧之间用 `uint32` 长度前缀分隔） | 流段的载体，对应下表的 `PD_BLK_SEG` |
+| `PD_ENT_FRAME` | 一帧的字节（头里带 cseq、end_lsn） | 非流式事务的一帧（`PD_BLK_TXN`）与子事务 abort（`PD_BLK_ABORT`）；**cseq == 0 表示这一帧没有提交序**，受放行前沿约束 |
 | `PD_ENT_EVENT` | cseq、结束类型、字节（**可为空**）、xid | O3 的载体：事务结束事件 |
 | `PD_ENT_ERROR` | 错误信息 | worker 内部错误（FR-11） |
 | `PD_ENT_RELATION` | 关系描述帧（relid、cseq、epoch、字节） | 携带关系描述的帧，walsender 据此做去重（6.7）。**单独一种条目类型**，因此普通帧不必为它额外付出头部开销 |
@@ -844,10 +846,10 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | 块类型 | 内容 | 连续性约束来源 |
 | --- | --- | --- |
 | `PD_BLK_SEG` | 一个流段的字节：`STREAM_START` … `STREAM_STOP` | O2 / INV-2.1、INV-2.2（事实 13） |
-| `PD_BLK_TXN` | 一个**非流式**事务的完整字节：`BEGIN` … 变更 … `COMMIT` | 订阅端的 `in_remote_transaction` 状态（`worker.c:1006` / `:1035`）：`BEGIN` 与 `COMMIT` 之间不得插入别的字节，否则 `remote_final_lsn` 被覆盖，后续 `COMMIT` 会触发 `ereport(ERROR, "incorrect commit LSN ...")` |
+| `PD_BLK_TXN` | 一个**非流式**事务的一帧（实现上一帧一条消息） | 订阅端的 `in_remote_transaction` 状态（`worker.c:1006` / `:1035`）：`BEGIN` 与 `COMMIT` 之间不得插入别的字节，否则 `remote_final_lsn` 被覆盖，后续 `COMMIT` 会触发 `ereport(ERROR, "incorrect commit LSN ...")` |
 | `PD_BLK_ABORT` | 一条子事务 abort 的字节：`STREAM ABORT`（顶层 xid + 子 xid） | 事实 13（wire 上同时只能有一个打开的流段）与订阅端的截断语义（`worker.c:1824-1827`）：`STREAM ABORT` 到达时**不得有打开的流段**，因此它独占一块 |
 
-两者都必须**整块连续**出现在 wire 上，因此统一用 FIRST / MORE / LAST 边界标记表达，walsender 的规则完全一致：**一次取一整块，块未取完不得取其它 worker 的块**（C5）。
+两者都必须**整块连续**出现在 wire 上。实现用**消息边界**表达块边界（一条消息 = 一块，见本节末尾），walsender 的规则完全一致：**一次取一整块，块未取完不得取其它 worker 的块**（C5）。
 
 `PD_ENT_EVENT` 的字节**可为空**：非流式事务的 abort / cancel 不产生任何 wire 消息（`reorderbuffer.c:2946`），但 cseq 水位仍必须推进——因此空事件也要回执（C3，见 7.2）。
 
@@ -858,7 +860,9 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | 事务形态 | 数据 | 结束事件 |
 | --- | --- | --- |
 | 被流式（分段下发） | 若干 `PD_BLK_SEG`，解码过程中陆续产出，**不带 cseq**——此时事务尚未提交，cseq 还不存在 | `PD_ENT_EVENT`，携带 cseq，载荷是 `STREAM_COMMIT` / `STREAM_ABORT` 字节；另有一条 `END_ACK` |
-| 未被流式（整事务下发） | 一个 `PD_BLK_TXN`，在 `PD_ENT_TXN_END` 到达时一次性产出，**携带该 cseq** | 同样有 `END_ACK`（字节可为空） |
+| 未被流式（整事务下发） | 若干条 `PD_ENT_FRAME`（一条变更一条消息），在 `PD_ENT_TXN_END` 到达时陆续产出，**携带该 cseq** | 同样有 `END_ACK`（字节可为空） |
+
+**并行解码路径下每个事务都是流段。** `immediate` 档把 `stream_all_transactions` 打开：进行中攒够 `parallel_decode_stream_segment_size` 的事务照常切段下发，**没攒够的在提交时作为一个流段发出**（8.1）。因此上表的第一行是并行解码路径的热路径，第二行只在 `buffered` 档（`streaming='on'`）与串行路径上出现。
 
 **携带 cseq 的条目受 cseq 门控；不携带 cseq 的条目受放行前沿约束**（见 7.4.1）：
 
@@ -870,9 +874,11 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | `PD_ENT_EVENT{END_ACK}` | **是** | 否 | 它本身就是 barrier 的推进凭据 |
 | `PD_BLK_ABORT`（子事务 abort） | 否 | **是** | 它属于一个**尚未提交**的事务，没有提交序可言；但同样不得越过已经结束的事务的结束事件。**必须及时下发**，否则订阅端的 spool 截断会连带丢弃其后子事务的有效变更（见 5.2.2） |
 
-因此 `PD_BLK_TXN` 必须**自带 cseq**（C11）。walsender 不能靠 `PMSG_COMMIT_SEQ` 来关联它——那是 walreader → walsender 的另一条通道，与 worker 的输出队列之间没有先后关系，两条通道的消息到达顺序不可比。
+因此 `PD_BLK_TXN` 必须**自带 cseq**（C11）。walsender 不能靠 `PMSG_COMMIT_SEQ` 来关联它——那是 walreader → walsender 的另一条通道，与 worker 的输出队列之间没有先后关系，两条通道的消息到达顺序不可比。实现里这个 cseq 的载体是 `PD_ENT_FRAME` 的头。
 
 第二种形态下，`PD_BLK_TXN` 整体要等自己的 cseq 被放行才能下发。它自带 cseq，walsender 直接把它挂进按 cseq 排序的挂起表——与 7.2 的 `pending_commits` 是同一张表，不需要额外的关联机制。
+
+**块边界由消息边界表达。** 实现不引入 FIRST / MORE / LAST 标记：**一块 = 一条队列消息**。消息载荷超过队列槽位时由 chunked 传输拆分，并在接收方由 `PDChunkReceiverRecv()` 重组完之后才交给上层——重组期间该消息独占接收缓冲，因此"块内字节在 wire 上连续"由消息边界保证，不需要额外的边界标记。
 
 #### 5.2.4 控制类消息
 
@@ -939,6 +945,15 @@ WAL 页缓冲 --memcpy--> decode_buffer --memcpy--> [共享内存 WAL 批次]
 
 差别在于：现状这 4 次拷贝全部在**一个**进程里串行发生；方案 A 里除了“共享内存 → socket”这一次，其余都发生在 N 个 worker 中**并行**完成。**串行路径上只剩一次拷贝**，这是本节的目标。
 
+**这条目标已经达成**（块化之后，见 5.2.3 与 `send_bottleneck.md`），实际链路是：
+
+```text
+worker:     ctx->out --memcpy--> pd_segment --memcpy--> shm_mq 环
+walsender:  环 --memcpy--> 接收缓冲 --(接管，不拷贝)--> 块缓冲 --memcpy--> socket
+```
+
+即 **walsender 侧只剩一次拷贝**（块 → socket）。
+
 **但这条拷贝链必须把队列本身的 memcpy 算进去。** `shm_mq` 的载荷不是零拷贝的：`shm_mq_send_bytes()`（`shm_mq.c:1043`）用 `memcpy` 把数据拷进环形缓冲；`shm_mq_sendv()` 的 iovec 只是"源端 gather"，不是 scatter/gather 零拷贝。因此实际链路是：
 
 ```text
@@ -963,7 +978,7 @@ WAL 页缓冲 --memcpy--> decode_buffer --memcpy--> shm_mq 环（memcpy）
 - **WAL 记录的跨进程传递必须拷贝**：`XLogReadRecord()` 返回的记录指向 reader 私有的解码缓冲，其生命周期契约是“仅在下一次 `XLogReadRecord()` 之前有效”（`xlogreader.c:385-387`），下一次读取会复用该区域（`XLogReleasePreviousRecord`，`xlogreader.c:249-309`）。因此 walreader 必须在读取下一条记录前把当前记录拷入共享内存，或采用上面第 2 条的双缓冲方案。
 - **拷贝的不只是主数据，还有 block 数据**：tuple 数据位于 block 0 的 block image 中（`decode.c:930`），UPDATE/DELETE 各有两块。因此下行条目必须整体拷贝“记录头 + 主数据 + 各 block 的数据”，拷贝量与 WAL 记录的实际大小成正比，而不是与主数据大小成正比。
 - **PG 17 的循环解码缓冲使“直接拷贝原始字节”不可行**：`XLogReadRecordAlloc()`（`xlogreader.c:440-470`）把解码结果**就地**放在循环缓冲里，`DecodedXLogRecord` 覆盖了记录头区域。因此 walreader 能拿到的是**已解码的结构**（`DecodedXLogRecord`：header / toplevel_xid / record_origin / main_data / blocks[]），而不是磁盘上的原始字节。下行条目按 5.2.2 的字段集从 `DecodedXLogRecord` 序列化，worker 侧再组装回标准形态（5.2.2）。
-- **输出侧不需要额外拷贝**：worker 把插件产出的字节按 FIRST / MORE / LAST 边界切成块片段直接写入共享内存输出队列，walsender 取出后原样写入 socket。整块连续性由“walsender 一次只取一整块”保证，而不是靠拷贝成一个连续大块。
+- **输出侧不需要额外拷贝**：worker 把插件产出的字节拼成一段（一段 = 一条队列消息），walsender 取出后**接管**那块缓冲，帧的字节直接指向它，逐帧写进 socket 缓冲。整块连续性由“消息边界 = 块边界”保证，而不是靠拷贝成一个连续大块。
 - **本分支已有现成的跨进程序列化格式可借鉴**：`ReorderBufferSerializeChange()` / `ReorderBufferRestoreChange()`（`reorderbuffer.c:3805-4018` / `4400-4567`）实现了变更（含 tuple 载荷、消息、失效消息、快照、truncate）的完整序列化与还原，用于 spill 到磁盘。它是“把解码结果跨进程搬运”这件事的现成模板，方案 B 以及 worker → walsender 的结果传递都可以直接参照其格式。
 
 ### 5.4 调度与唤醒
@@ -1507,7 +1522,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 - **新增 GUC 控制流式激进程度**，取值沿用现有调试选项 `debug_logical_replication_streaming` 的两档语义（`reorderbuffer.c:3645-3661`）：`buffered`（按内存阈值）与 `immediate`（达到批次粒度即输出），**外加一档 `auto`**。`auto` 是本设计的默认值，它**按订阅端的流式模式决定实际档位**（见下）；
 - **必须给段设置字节上限**（新增 GUC `parallel_decode_stream_segment_size`）。没有上限时，O2 会把并行解码的产出全部堵死，段的独占时间无上界。`immediate` 档的批次粒度即为这个上限的一种取值；
-- **流式门槛 `parallel_decode_stream_min_size` 默认取 0（不设门槛）**——理由见下"门槛的代价核算"，它与发布端的收益目标直接冲突；
+- **流式门槛 `parallel_decode_stream_min_size` 默认取 0（不设门槛）**——理由见下"门槛的代价核算"，它与发布端的收益目标直接冲突。**0 的含义是"每个事务都被流式化"**，包括在进行中没有攒够段大小、**在提交时才被流式化**的那些事务；门槛大于 0 的含义是"低于门槛的事务**完全不被流式化**"，它们以整事务块的形式到达订阅端；
 - 与 barrier 的关系：尽早流式与 commit barrier 基本正交——**分片提前发，提交仍按 cseq 放行**（分片属于事务内部，没有 cseq）。唯一的耦合是：**分片不得越过已经结束的事务的结束事件**（见 7.4.1）——挡住分片的只有**已经结束**的事务，一个还在解码的大事务挡不住别的分片。二者不冲突。
 
 **`auto` 档：流式激进程度必须按订阅端的模式区分。**
@@ -1523,8 +1538,26 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | 理由 | 说明 |
 | --- | --- |
 | **喂饱订阅端的并行 apply** | 事实 8b：`buffered` 档在正常负载下不产生流段 → 订阅端的 apply worker 无事可做 → 端到端并行度为 1，本特性的收益归零 |
-| **缩小挂起区，消除死锁风险面** | 未流式化的事务，其整事务字节必须等到自己的 cseq 放行才能发出（`PD_BLK_TXN` 受 barrier 门控，见 5.2.3）。挂起区因此可能装下整个事务的字节，与结果区争容量 → need.md §4.3 描述的死锁。流式化后挂起区里只剩几十字节的提交消息 |
+| **缩小挂起区，消除死锁风险面** | 未流式化的事务，其整事务字节必须等到自己的 cseq 放行才能发出（`PD_BLK_TXN` 受 barrier 门控，见 5.2.3）。挂起区因此可能装下整个事务的字节，与结果区争容量 → need.md §4.3 描述的死锁。流式化后挂起区里只剩几十字节的提交消息。**在 `immediate` 档 + `min_size = 0` 下这一条尤其成立**：每个事务都是流段，挂起区里只剩提交消息本身 |
 | **兑现"尽早发送"的产品目标** | 用户需求明确要求"事务 stream 的时候要尽快发送来提升性能"。`buffered` 档把发送时机交给内存压力，恰恰是最不该由它决定的事 |
+
+**`immediate` 档的实现：每个事务都是流段。** `immediate` 档把 `LogicalDecodingContext.stream_all_transactions` 打开（串行路径下它是 false，所以串行路径的行为不变）。它有两个效果：
+
+- 进行中攒够 `parallel_decode_stream_segment_size` 的事务照常切段下发；
+- **没攒够的事务在提交时作为一个流段发出**——`ReorderBufferReplay()` 在提交时判断该事务是否应当被流式化（`ReorderBufferStreamAtCommit()`），是则走 `ReorderBufferStreamCommit()`，把该事务的全部变更作为一个段发出去，订阅端收到的是一个完整的流段，可以并行 apply。
+
+**这解决了小事务负载下"一个流段都没有"的问题。** 段大小的默认值是 1MB，而 tpcc 的典型事务只有约 3KB（15.1 的测算）——旧语义下这些事务永远攒不到段大小，因此**一个流段都不会产生**，订阅端的 apply worker 无事可做。并行解码路径现在把"提交时发一个段"作为兜底：只要 `parallel_decode_stream_min_size = 0`（默认），**每个事务都是流段**。
+
+提交时流式化有四个前提，缺一不可：
+
+| 前提 | 检查 | 理由 |
+| --- | --- | --- |
+| 路径是并行解码路径，且会话被要求立即流式 | `ctx->stream_all_transactions` | 串行路径与 `buffered` 档的行为必须不变 |
+| 事务此前没有被流式化 | `rbtxn_is_streamed(txn)` | 已经发出去的事务不能重发 |
+| 快照是一致的 | `ReorderBufferCanStartStreaming(rb)` | 订阅端在快照一致之前无法 apply 变更 |
+| 事务不是两阶段提交的准备事务 | `rbtxn_prepared(txn)` | 两阶段提交路径保持自己的行为（`ReorderBufferPrepare()` 与 `ReorderBufferFinishPrepared()` 都在回放之前就置上了 `RBTXN_PREPARE`，所以这一条同时覆盖了 prepare 记录本身） |
+
+低于 `parallel_decode_stream_min_size` 的事务仍然以整事务块的形式下发（8.2）。
 
 **门槛的代价核算（这一条纠正了早期版本的错误结论）**：
 
@@ -1536,9 +1569,9 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | (a') **此前完全漏算的一项：`immediate` 档下 RELATION 消息按 top-xid 重发** | **成立，且是 `immediate` 档的主要代价**。pgoutput 在流式模式下按**顶层事务**追踪关系描述是否已发送：`maybe_send_schema()` 用 `get_schema_sent_in_streamed_txn(relentry, topxid)` 判断（`pgoutput.c:743`），发送后用 `set_schema_sent_in_streamed_txn()` 记录（`pgoutput.c:767`），事务提交时 `cleanup_rel_sync_cache()` 把该 xid 从 `entry->streamed_txns` 里删掉（`pgoutput.c:1887`）。因此**每个事务都要为它触及的每张表重发一次 RELATION**——tpcc NewOrder 触及约 5 张表，即每事务多出约 **5 帧 / 约 3KB**，**协议字节比非流式多 40%–60%，帧数多约 19%**。这与 2.4 的"事实 6"是同一件事，此前的核算把它漏掉了 |
 | (b) "订阅端每事务分配一个 apply worker 是开销" | **算反了**。这个 apply worker **正是订阅端并行的机制本身**（事实 8a/8b）：不分配它，订阅端就没有并行回放，本特性的端到端收益归零。它的真实成本只是每事务一个哈希项（`applyparallelworker.c:499`，事务结束时 `HASH_REMOVE`）与一次 `shm_mq` 传输，而 worker 进程本身是**从池里复用**的（`applyparallelworker.c:411-418`，池保留 `max_parallel_apply_workers_per_subscription / 2` 个） |
 
-**因此 `parallel_decode_stream_min_size` 的默认值必须是 0**（不设门槛）：门槛一旦大于典型事务大小（本设计的 15.1 测算里 tpcc 每事务约 **3KB** WAL），**所有事务都不会被流式化** → 订阅端永远收不到 STREAM START → `pa_allocate_worker()` 不会被调用 → **订阅端并行 apply 根本不启动**，70MB/s 目标与"并行解码 + 并行 apply"这个前提同时落空。门槛只应作为**给特定负载的调优旋钮**（例如大对象写入导致的超大事务需要内存整形时调高），不能作为默认值。
+**因此 `parallel_decode_stream_min_size` 的默认值必须是 0**（不设门槛）：门槛一旦大于典型事务大小（本设计的 15.1 测算里 tpcc 每事务约 **3KB** WAL），**低于门槛的事务完全不会被流式化** → 订阅端永远收不到 STREAM START → `pa_allocate_worker()` 不会被调用 → **订阅端并行 apply 根本不启动**，70MB/s 目标与"并行解码 + 并行 apply"这个前提同时落空。门槛只应作为**给特定负载的调优旋钮**（例如大对象写入导致的超大事务需要内存整形时调高），不能作为默认值。**注意这一条比旧语义更硬**：旧语义下 `min_size > 0` 只是"不在进行中流式化"，事务仍然可以在提交时以流段的形式发出；新语义下 `min_size > 0` 意味着"低于门槛的事务整个不流式化"。
 
-代价改由 `parallel_decode_stream_segment_size`（段字节上限）与 `parallel_decode_stream_min_size`（用户按需调高）共同控制：**大事务早流式（省内存、早送达），段有上限（O2 的独占时间有界）**。
+代价改由 `parallel_decode_stream_segment_size`（段字节上限）与 `parallel_decode_stream_min_size`（用户按需调高）共同控制：**大事务早流式（省内存、早送达），段有上限（O2 的独占时间有界）**。**两个尺寸不再互相抬高**：段大小只是分段点，最小大小是"能不能被流式化"的门槛（旧实现里的 `segment_size = max(segment_size, min_size)` 已删除）。
 
 **与订阅端 apply worker 池的耦合（必须写进实现）**：发布端的流式并发度**不能**超过订阅端能并行回放的并发度。订阅端的 apply worker 数有硬上限——`launcher.c:412` 在并发 worker 数达到 `max_parallel_apply_workers_per_subscription` 时**拒绝再启动**；此时该事务退化到 `TRANS_LEADER_SERIALIZE`（spool 慢路径，见上表）。因此：
 
@@ -1551,17 +1584,19 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 | 订阅方 | 发布方输出形态 | 说明 |
 | --- | --- | --- |
-| 请求流式（协议 v2+，`streaming='on'`/`'parallel'`，事实 11） | 分片下发：worker 按阈值切分，每片是一个完整的 `PD_BLK_SEG` 块 | 首选路径，尽早发送 |
-| 未请求流式 | 整事务输出：worker 不切分，事务数据是一个完整的 `PD_BLK_TXN` 块，在提交时整块写出 | 退化路径，保证整事务字节连续 |
+| 请求流式（协议 v2+，`streaming='on'`/`'parallel'`，事实 11） | 分片下发：worker 按阈值切分，每片是一个完整的 `PD_BLK_SEG` 块 | 首选路径，尽早发送。**并行解码路径的 `immediate` 档下每个事务都是流段**（8.1），没攒够段大小的事务在提交时作为一个段发出 |
+| 未请求流式 | 整事务输出：worker 不切分，事务的每一帧各自是一条消息（`PD_ENT_FRAME`），在提交时陆续写出 | 退化路径，保证整事务字节连续 |
 
 判定依据是订阅方在 `START_REPLICATION` 中传来的 `streaming` 选项，发布方在 `pgoutput.c:488-510` 解析，本方案沿用该机制，**不新增协议**。
+
+**并行解码路径的热路径只有分片一种**：所有事务都被流式化之后，`PD_BLK_TXN` 形态只在 `buffered` 档（`streaming='on'`）与串行路径上出现。
 
 **两种形态下的阻塞特性不同，代价也不同：**
 
 | 形态 | wire 被占用的时长 | 内存占用 | 主要风险 |
 | --- | --- | --- | --- |
 | 流式（`PD_BLK_SEG`） | 一个流段（**有字节上限**，8.1） | 每 worker `rb->size` 之和 | 段切得过小 → 协议消息数膨胀 |
-| 非流式（`PD_BLK_TXN`） | **整个事务**（无上限） | 整个事务的字节 | 大事务长时间独占 wire；且字节要整块挂在待提交区等 cseq（见 7.2 的死锁风险） |
+| 非流式（`PD_BLK_TXN`） | **整个事务**（无上限） | 整个事务的字节 | 大事务长时间独占 wire；且字节要整块挂在待提交区等 cseq（见 7.2 的死锁风险）。字节在 wire 上仍然是连续的，只是传输粒度是帧 |
 
 **非流式路径的整事务字节与待提交区的死锁**（必须避免）：若整事务字节与 worker 的结果区共享同一块容量，会形成循环等待——worker 想写自己的事务字节，但空间被别的 worker 的挂起事务占满；而挂起事务要等自己的 cseq，cseq 又等那个 worker 写出字节。修法有两条：（a）待提交区与结果区分离，且保证 cseq 队头事务的写入空间不被挤占；（b）cseq 队头事务的字节直通 socket，不进挂起区。**推荐 (b)**，因为非流式路径本来就退化，额外增加一份整事务缓冲不划算。
 
@@ -1587,6 +1622,9 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | 订阅端断开 / TCP 阻塞 | walsender | 现有 `WalSndKeepalive` 与反馈机制处理；阻塞压力自然反压 |
 | **订阅端 apply worker 崩溃** | 发布端 walsender | 订阅端 leader apply worker 同时承担 walreceiver 职责，崩溃即连接断开 → 发布端侧表现为"订阅端断开"，会话终止、槽释放；订阅端重启后从 `restart_lsn` 重放 |
 | **订阅端整库重启** | 发布端 walsender | 同上 |
+| **会话正常结束**（订阅端断开、表同步结束） | walsender | `ParallelDecodeSessionStop()`：置 shutdown 标志 → **先终止 walreader，再终止 decode worker** → 释放共享内存里的块。详见 17.5 的"会话的拆卸" |
+
+**会话的拆卸必须按"生产者先停"的顺序。** walreader 是唯一的 WAL 读取者，它把记录交给 worker；先停它，worker 才不会留下来等一条永远不会到达的记录。worker 是消费者，它们把帧交给 walsender；walsender 在等待它们的时候会把输出队列排空，因此一个正卡在"交出帧"上的 worker 能够把这次交接做完，然后看到 shutdown 标志。**拆卸期间不等待 worker 退出是不安全的**——共享内存段一旦释放，worker 往里写就会踩到别人的内存；因此终止之后必须逐个等待它们真的退出，再释放共享内存段。
 
 **订阅端侧故障在发布端的语义只有一条**：连接断开 → walsender 报错退出 → `ReplicationSlotRelease()`（`walsender.c:341`）释放槽（槽状态已落盘）→ 订阅端重连 → 新会话从 `restart_lsn` 重放。**发布端不需要为订阅端的故障做特殊处理**，但设计必须写明，因为它决定了"尽早流式"的风险边界——见 17.7 的"至少一次语义"与"会话重建后的订阅端状态复位"。
 
@@ -1622,8 +1660,8 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | --- | --- | --- |
 | `max_parallel_decode_workers` | 0（关闭，默认）/ N | 并行解码 worker 数量；0 表示回退到现有串行路径 |
 | `parallel_decode_streaming_mode` | `auto`（默认）/ `immediate` / `buffered` | 流式切分激进程度，语义沿用 `debug_logical_replication_streaming` 的两档（见 8.1），外加 `auto` 档。**默认取 `auto`**：按订阅端的流式模式解析——`streaming='parallel'` → `immediate`（订阅端的并行 apply 靠发布端产生流式分片才成立，事实 8b）；`streaming='on'` → `buffered`（保持现状行为；强制流式化会把非 parallel 订阅方的每个事务推到 spool 慢路径 `TRANS_LEADER_SERIALIZE`，是性能回归，8.1） |
-| `parallel_decode_stream_min_size` | `0`（默认，即不设门槛） | **小于此字节数的事务不流式化**，走整事务块（`PD_BLK_TXN`）。**默认必须为 0**：门槛若大于典型事务大小（15.1 的 tpcc 每事务约 3KB WAL），所有事务都不流式化 → 订阅端收不到 STREAM START → 并行 apply 根本不启动（8.1 的"门槛的代价核算"）。仅作为特定负载的调优旋钮 |
-| `parallel_decode_stream_segment_size` | 建议 1MB | **单个流段的字节上限**。O2 把 wire 的交错粒度钉死为"一个流段"，没有上限时段的独占时间无上界，并行解码的产出会被堵死（见 8.1） |
+| `parallel_decode_stream_min_size` | `0`（默认，即不设门槛） | **小于此字节数的事务完全不被流式化**，走整事务块（`PD_BLK_TXN`）。**0 的含义是"每个事务都被流式化"**——包括在进行中没有攒够段大小、在提交时才被流式化的那些事务（8.1）。**默认必须为 0**：门槛若大于典型事务大小（15.1 的 tpcc 每事务约 3KB WAL），低于门槛的事务都不流式化 → 订阅端收不到 STREAM START → 并行 apply 根本不启动（8.1 的"门槛的代价核算"）。仅作为特定负载的调优旋钮 |
+| `parallel_decode_stream_segment_size` | 建议 1MB | **单个流段的字节上限**。O2 把 wire 的交错粒度钉死为"一个流段"，没有上限时段的独占时间无上界，并行解码的产出会被堵死（见 8.1）。**它只是分段点**：没攒够这个大小的事务在 `immediate` 档下仍然会在**提交时**作为一个流段发出（8.1），因此它不决定"事务是否被流式化" |
 | `parallel_decode_work_mem` | 建议 `logical_decoding_work_mem` | **每 worker** 的解码内存上限（总量 = worker 数 × 该值）。它是 `logical_decoding_work_mem` 的覆盖值——后者语义不变，但首版不做跨进程总量配额（12.2） |
 | `parallel_decode_batch_size` | 建议 64KB | **跨进程唤醒的速率上限**：walreader 与 worker 各把写入队列的消息按字节合并成批，批满即刷新并唤醒对端（5.4 第 9 项）。承载进度的消息（位置心跳、事务结束事件、控制消息）不批量。0 关闭批处理，每条记录、每帧都单独唤醒。有效值被钳制在共享队列的 1/4 以内 |
 | `parallel_decode_barrier_timeout` | 60（秒，默认）/ 0 表示禁用 | **停滞检测的超时**：barrier 生效（有待放行的事务）且某个 worker 的解码位置落后于 walreader 的读取位置、且该 worker 在这段时间内没有送来任何消息时，判定该 worker 卡死并结束会话（17.8）。0 表示关闭该检测 |
@@ -1679,7 +1717,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 - 目标：tpcc 100 万 tpm 场景下**实际发出的协议字节速率** ≥ 70MB/s（口径见下）；
 - **度量口径必须修正**：`confirm_flush_lsn` 速率在并行模型下会**虚高**——订阅端用 `'w'` 帧的 LSN 推进 `last_received` 并回报 flush LSN，而事务数据允许乱序下发（7.4），于是 flush LSN 可能被后发的事务抬高，而前面事务的数据其实还在路上。因此 G1 的度量口径应为"发布端实际写出的协议字节速率"或"订阅端**确认的应用速率**"，不能直接用 `confirm_flush_lsn`；
-- **达成条件（"与"关系，缺一不可）**：订阅端 `streaming='parallel'` 且 `max_parallel_apply_workers_per_subscription` **达到按目标速率反推的下限**——下限 = `ceil(目标变更率 / 单 apply worker 可承接的变更率)`，目标变更率 = 16.7k 事务/秒 × 25 变更/事务 = **42 万变更/秒**（这是**需求值**，不是单 worker 的容量断言）；单 worker 容量 C 未知且**待实测**（15.2 第 4 项），按 C 在 1 万–10 万变更/秒量级估算，下限落在 **4–40**，**默认 2 大概率不足**。并发上限见 `launcher.c:412`，超出的事务在订阅端退化成 spool 慢路径 `TRANS_LEADER_SERIALIZE`；发布端**尽早流式**（`parallel_decode_streaming_mode = auto` 对 `streaming='parallel'` 订阅方解析为 `immediate`，且 `parallel_decode_stream_min_size = 0` 不设门槛——否则订阅端的 apply worker 无事可做，见事实 8b 与 8.1 的"门槛的代价核算"）；
+- **达成条件（"与"关系，缺一不可）**：订阅端 `streaming='parallel'` 且 `max_parallel_apply_workers_per_subscription` **达到按目标速率反推的下限**——下限 = `ceil(目标变更率 / 单 apply worker 可承接的变更率)`，目标变更率 = 16.7k 事务/秒 × 25 变更/事务 = **42 万变更/秒**（这是**需求值**，不是单 worker 的容量断言）；单 worker 容量 C 未知且**待实测**（15.2 第 4 项），按 C 在 1 万–10 万变更/秒量级估算，下限落在 **4–40**，**默认 2 大概率不足**。并发上限见 `launcher.c:412`，超出的事务在订阅端退化成 spool 慢路径 `TRANS_LEADER_SERIALIZE`；发布端**尽早流式**（`parallel_decode_streaming_mode = auto` 对 `streaming='parallel'` 订阅方解析为 `immediate`，且 `parallel_decode_stream_min_size = 0` 不设门槛——否则订阅端的 apply worker 无事可做，见事实 8b 与 8.1 的"门槛的代价核算"）。**注意 `parallel_decode_stream_segment_size` 的默认值 1MB 远大于 tpcc 的典型事务（约 3KB）**：这意味着每个事务都在**提交时**才被流式化，而不是在进行中切段；端到端时延因此接近整事务下发，收益只剩"订阅端能并行 apply"（见 15.2 的待实测项）；
 - 需同时测量：单核场景的劣化幅度（应接近 0）、小事务延迟（进程调度不应引入显著抖动）、**walsender 的输出帧率与 socket 写次数**（见 12.3）。
 
 ### 12.2 资源与内存
@@ -1699,11 +1737,11 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 | 风险点 | 说明 | 缓解 |
 | --- | --- | --- |
-| **协议帧率**（与系统调用率是两回事，见下一行） | output plugin 是**每条消息**一次 `OutputPluginWrite`（`pgoutput.c:1553/1574` 等），每个 INSERT/UPDATE/DELETE 都是一个独立的 CopyData 帧。100 万 tpm 场景约 50 万帧/秒（15.1）。**帧数不因并行化而减少**——并行化把"生成帧"的工作搬到了 worker，但"每条变更一帧"这个协议事实没变 | 帧数无法在协议层摊薄（订阅端 `apply_dispatch()` 一个 CopyData 只解析一条逻辑消息，`worker.c:3283-3300`）；只能让每一帧的处理足够便宜 |
+| **协议帧率**（与系统调用率是两回事，见下一行） | output plugin 是**每条消息**一次 `OutputPluginWrite`（`pgoutput.c:1553/1574` 等），每个 INSERT/UPDATE/DELETE 都是一个独立的 CopyData 帧。100 万 tpm 场景约 50 万帧/秒（15.1）。**帧数不因并行化而减少**——并行化把"生成帧"的工作搬到了 worker，但"每条变更一帧"这个协议事实没变 | 帧数无法在协议层摊薄（订阅端 `apply_dispatch()` 一个 CopyData 只解析一条逻辑消息，`worker.c:3283-3300`）；只能让每一帧的处理足够便宜。**已做到**：walsender 每帧的剩余工作只有**改帧头的发送时间戳 + FR-20 钳制 + 一次 `pq_putmessage_noblock`**，**没有额外的帧拷贝**——帧的字节直接指向它所在的块缓冲（块化之后），块本身又直接接管了 worker 消息的缓冲 |
 | **walsender 每帧一次 `write()` 系统调用** | `WalSndWriteData()` 在**每帧之后**调用 `pq_flush_if_writable()`（`walsender.c:1576-1598`），该函数会立刻把 `PqSendBuffer` 里的数据 `write()` 出去（`pqcomm.c:1432-1451`）。`PQ_SEND_BUFFER_SIZE` 只有 8192，缓冲复用挡不住这个粒度——**每帧一次 `write()` 系统调用**，单核开销约 0.5–1.5 核，且完全串行在 walsender 一个进程里 | 并行模式的 walsender 不沿用"每帧 `pq_flush_if_writable()`"的节奏，改为**按块 / 按 8KB 缓冲刷出**（**已实现**，见 16.1；批次大小实际由"此刻就绪的帧"决定，8KB 只是上限）。系统调用率可从"帧率"降到"字节率 / 8KB"，按 8192 字节缓冲估算降幅约 **47 倍**（静态估算，待实测——15.2 第 8 项）。**注意：批量刷出只降 syscall，不降帧数、不降订阅端每帧解析成本、不降 FR-20 的逐帧钳制成本** |
 | **段粒度串行下发** | O2 把 wire 的交错粒度钉死为"一个流段"；若段无字节上限（事实 5）→ 一个 1GB 的事务会占住 wire 直到整段发完，其它 worker 的产出全堵在结果区（8.1）。**注意：O2 限制的是交错粒度与时延，不构成吞吐上限**——wire 本就是单条 TCP 流，串行与并行下字节都要顺序过 socket | 给段设字节上限 GUC（`parallel_decode_stream_segment_size`） |
 | **walreader 的每条 WAL 记录成本** | 新架构里 walreader 是**唯一**的 WAL 读取者：每条记录都要 `XLogReadRecord` + CRC32C 校验（`xlogreader.c:1195-1206`）+ 记录分类 + 路由 + 拷进共享内存。tpcc 的 WAL 记录数（含索引记录）是解码变更数的 **2–4 倍**，所以这条路径的记录数远大于变更数 | 这一项是 walreader 单进程的硬成本，无法通过增加 decode worker 摊薄。缓解方向：记录分类只做一次、CRC 校验与解码分离（walreader 只做校验与路由，tuple 重建在 worker）；成本待实测（15.2 第 7 项） |
-| **walsender 的 FR-20 逐帧钳制** | FR-20 要求帧头 LSN **逐帧钳制**到放行前沿（7.4 的方案 c），不能整块只钳一次。因此 walsender 必须**逐帧定位帧边界**并改写每个 `'w'` 帧头的两个 int64。这是 O(changes) 的单进程工作量，**并行化不但没有消除，还新增了** | worker 随块携带每帧 LSN 元数据（5.2 的 `PD_BLK_TXN` 增加帧边界表），使 walsender 不必自己解析 CopyData 边界；或者由 worker 直接完成钳制、walsender 只转发。成本待实测（15.2 第 6 项） |
+| **walsender 的 FR-20 逐帧钳制** | FR-20 要求帧头 LSN **逐帧钳制**到放行前沿（7.4 的方案 c），不能整块只钳一次。因此 walsender 必须**逐帧定位帧边界**并改写每个 `'w'` 帧头的两个 int64。这是 O(changes) 的单进程工作量，**并行化不但没有消除，还新增了** | **已实现（前半句）**：worker 在流段里给每帧加了 `uint32` 长度前缀，walsender 据此定位帧边界，**不必自己解析 CopyData 协议**。块化之后帧也**不再从段里拷出来**——帧的字节直接指向段缓冲。剩下的是每帧改写帧头的两个 int64（发送时间戳 + FR-20 钳制）。**后半句（由 worker 直接钳制）未做**：钳制要按放行前沿逐帧判断，而放行前沿只有 walsender 知道。成本待实测（15.2 第 6 项） |
 | **订阅端 leader 的每帧派发** | 订阅端 leader 每次 `PQgetCopyData` 只取一条 CopyData（`libpqwalreceiver.c:913/924`），再 `apply_dispatch`（`worker.c:3283-3300`）；流式事务里**每条变更**都要一次 `pa_send_data` → `shm_mq_send`（`worker.c:617-618`）。这是订阅端 leader 上的 **O(changes) 串行工作量** | **本设计的边界是"只改发布端"（第 106 行），无法从发布端缓解**。要么接受它为已知限制，要么在 12.1 的达成条件里显式承认端到端上限由它决定；订阅端侧的缓解方案（批量 CopyData）需要改协议，不在本设计范围内。成本待实测（15.2 第 5 项） |
 | **小事务被过度流式化**（已按 8.1 重新核算） | 流式化**不改变"每条变更一帧"的事实**，只多出每事务 2 帧（STREAM_START + STREAM_STOP），约 7% 帧量；订阅端每事务一个 apply worker 是**并行的机制本身**而非开销。**但 `immediate` 档下 RELATION 消息按 top-xid 重发**（`pgoutput.c:743/767/1887`）——每事务为其触及的每张表重发一次 RELATION，tpcc NewOrder 约 5 张表即每事务多约 5 帧 / 约 3KB，**协议字节 +40%–60%、帧数 +19%** | 门槛 `parallel_decode_stream_min_size` **默认 0**（不设门槛），仅作调优旋钮；段字节上限 `parallel_decode_stream_segment_size` 才是硬约束。RELATION 重发的放大倍数待实测（15.2 第 3 项） |
 | **订阅端 apply worker 池成为端到端瓶颈** | 订阅端能并行回放的事务数 = `max_parallel_apply_workers_per_subscription`（默认 **2**，`launcher.c:412` 超限即拒绝启动）；超出的事务退化成 `TRANS_LEADER_SERIALIZE`——把变更 spool 到文件、提交时才 apply。发布端流式并发度高于这个数时，端到端**反而变慢** | 达成条件里 apply worker 数按目标速率反推下限（12.1）；监控订阅端 apply worker 的占用率与 spool 事务数 |
@@ -1844,7 +1882,7 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 
 ### 15.2 待实测确认清单
 
-以下十四项无法从源码静态推断，必须在实现期用实测数据确认。它们都直接影响上文的测算与参数取值。**本机开发只做功能与正确性验证，这些数值需要在性能环境实测后回填**；在回填之前，文档中的相关数字一律标注为"静态估算"或"待实测"，不得当作结论使用。
+以下十五项无法从源码静态推断，必须在实现期用实测数据确认。它们都直接影响上文的测算与参数取值。**本机开发只做功能与正确性验证，这些数值需要在性能环境实测后回填**；在回填之前，文档中的相关数字一律标注为"静态估算"或"待实测"，不得当作结论使用。
 
 | # | 事项 | 需要什么证据 | 影响的设计决策 |
 | --- | --- | --- | --- |
@@ -1862,6 +1900,7 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 | 12 | `catalog_xmin` 在多 worker 下实际会被推多旧 | 一个"worker 持有长事务"的实测，看 `pg_replication_slots.catalog_xmin` 的推进行为 | 6.6 的 xmin 聚合策略（已实现：walreader 用自己的 reorder buffer 算出，与串行路径同口径；仍需实测长事务下的推进行为） |
 | 13 | 关系描述去重在真实负载下省下多少协议字节 | 一个"多表 + 多 worker"的负载，统计去重前后 RELATION 消息的条数与字节数 | 6.7 的实际收益（本机已验证条数 4 → 1，字节收益待实测） |
 | 14 | **批处理后的跨进程唤醒速率**（下行 walreader → worker、上行 worker → walsender，各多少次/秒） | 性能机上对 `pg_parallel_decode_wakeups` 视图按时间采样做差分，负载为 tpcc 100 万 tpm | 5.4 第 9 项的收益是否兑现；`parallel_decode_batch_size` 的取值。本机已验证同一负载下关闭批处理与 64KB 的**唤醒次数**差异（上行 1338 → 417、下行 969 → 363），但那是次数不是速率 |
+| 15 | **`parallel_decode_stream_segment_size` 的默认值 1MB 对 tpcc 的含义**（每事务约 3KB） | 统计 tpcc 负载下"事务在提交时才被流式化"的比例（即事务大小 < 段大小的比例），以及这种情形下的端到端时延 | **段大小的默认值远大于典型事务大小**，因此每个事务都在**提交时**才被流式化（而不是在进行中切段），端到端时延因此接近整事务下发，收益只剩"订阅端能并行 apply"。段大小的默认值是否需要按负载调小，见 8.1 与 12.1 |
 ## 16. 实现计划
 
 按可独立验证的阶段推进，每个阶段结束时开关关闭的行为必须与现状完全一致（AC-8）。
@@ -1911,6 +1950,7 @@ P0–P7 已在 `pa_decode` 分支实现（含 P5 的**关系描述去重**与 6.
 | `monitoring_smoke.sh` | 4 worker × 8 并发会话 × 40 事务 | 监控指标（FR-13）：六个视图存在、会话与 worker 的计数非零、worker 的唤醒次数之和等于会话的上行唤醒次数、串行会话不出现在视图里 |
 | `subxact_abort_smoke.sh` | 事务内 `ROLLBACK TO SAVEPOINT`，子事务的变更已被流式下发 | 子事务 abort（AC-14）：并行路径发出 STREAM ABORT，被中止子事务的行不落地，其后子事务的行完整落地，且与串行路径逐行一致 |
 | `stream_order_smoke.sh` | 两个事务**同时**在途（铺开到两个 worker），第一个事务大且解码慢，第二个事务在第一个提交之后还在写 | 无 cseq 的帧的顺序（I-ORDER，7.4.1）：发布端**持有**了等待放行前沿的分片，且**没有**报出"分片越过了更早事务的提交"；结束事件按提交序到达订阅端；行数与内容一致 |
+| `stream_all_txn_smoke.sh` | 5 个小事务（每个一行），订阅端 `streaming = 'parallel'`；随后 3 个小事务，订阅端 `streaming = 'on'` | 小事务也被流式化（8.1）：并行流式模式下**每个**事务都产生一个流段（发布端的 trace 里 STREAM START / STREAM STOP / STREAM COMMIT 各 5 个）；不请求并行流式的订阅端**一个流段都没有**（只有 BEGIN / COMMIT），串行路径的行为不变 |
 
 实现过程中确定的规则与实测到的事实：
 
@@ -1932,6 +1972,8 @@ P0–P7 已在 `pa_decode` 分支实现（含 P5 的**关系描述去重**与 6.
 | 启动竞态：worker 尚未认领槽位时被判为"已死" | worker 在 `BackgroundWorkerInitializeConnectionByOid()` **之后**才写 `ctl->workers[i].pid` 与状态位（`parallel_decode_worker.c:441-443`），而 walsender 在会话建立后立刻进入取帧循环。旧代码用 `ctl->workers[i].pid`（未认领时为 0）判断存活，`ParallelDecodeProcessAlive(0)` 返回 false → 误报"worker 意外死亡"，并连带把整个会话打断。**必须用 walsender 自己从 `WaitForBackgroundWorkerStartup()` 拿到的 pid 判断存活**，并把"状态位仍为 `PD_WORKER_STATUS_UNUSED`"解释为"还在启动中" |
 | 未用的块引用必须跳过 | `XLogReaderState` 的解码缓冲（64KB）是**环形复用**的：每条记录都复用同一块 `DecodedXLogRecord`，`blocks[]` 是变长数组，其未使用槽位的 `data` / `data_len` / `has_data` 保留着**上一条记录**留下的值（只有 `in_use` 是准确的，`xlogreader.c:1744` 会把中间的块号标记为未使用）。因此 `PDRecordSerialize()` 不能把 `max_block_id` 以内的**所有**槽位都序列化出去：未使用的槽位必须置 `data_len = 0` 且不复制数据，否则会把上条记录的残留指针当成块数据传下去，导致 walreader 在 `appendBinaryStringInfo()` 里用野指针崩溃（实测 `data = 0x7878787878787878`）。这是 P1–P4 就存在的缺陷，P6 的负载把它暴露出来 |
 | 流式化的粒度 | 触发点在 `ReorderBufferCheckMemoryLimit()`：除了 `logical_decoding_work_mem` 阈值外，`rb->size` 达到 `parallel_decode_stream_segment_size` 且**当前事务可以流式**（快照已一致、`SnapBuildXactNeedsSkip()` 为假）时立即切一个分片。分片在 worker 侧收集（`STREAM START` → 若干变更 → `STREAM STOP`），整块通过 `PD_ENT_SEGMENT` 交给 walsender 发送，因此**一个分片的帧在 wire 上必然连续**——订阅端同时只接受一个流段（`worker.c` 的协议约束），分片交错会被拒绝 |
+| **提交时也要流式化，否则小事务负载下一个流段都没有** | 触发点有两个：`ReorderBufferCheckMemoryLimit()`（进行中切段）与 `ReorderBufferStreamAtCommit()`（提交时兜底，由 `ReorderBufferReplay()` 调用）。旧语义下段大小默认 1MB，tpcc 那种 3KB 的事务永远攒不到段大小 → **一个流段都不产生** → 订阅端看不到 STREAM START → 并行 apply 根本不启动。现在 `immediate` 档把 `LogicalDecodingContext.stream_all_transactions` 打开：**没攒够段大小的事务在提交时作为一个流段发出**。四个前提缺一不可：路径是并行解码路径且会话被要求立即流式、事务此前没有被流式化（`rbtxn_is_streamed()`）、快照一致（`ReorderBufferCanStartStreaming()`）、**不是两阶段提交的准备事务**（`rbtxn_prepared()`——`ReorderBufferPrepare()` 与 `ReorderBufferFinishPrepared()` 都在回放之前就置上了 `RBTXN_PREPARE`，所以这一条同时覆盖了 prepare 记录本身） |
+| **两个尺寸不再互相抬高** | `parallel_decode_stream_min_size` 现在是"能不能被流式化"的门槛（0 = 每个事务都被流式化），`parallel_decode_stream_segment_size` 只是分段点。旧的 `if (min_size > segment_size) segment_size = min_size;` 已删除——否则 `min_size > 0` 会把段大小也抬上去，让"低于门槛的事务整个不流式化"这条新语义无法成立 |
 | 分片帧的 LSN 必须钳制 | 提前送达的分片帧与 keepalive 都携带 LSN，订阅端把它并入 `last_received` → 发布端据此抬高 `confirmed_flush`。若不钳制，`confirmed_flush` 会越过尚未放行的事务的提交记录，重启后整个事务被跳过（不变式 S1 被破坏）。因此 `'w'` 帧头的两个 int64 与 `'k'` keepalive 的 `end_lsn` 都要钳到**放行前沿 F**（`ParallelDecodeClampFrame()` / `ParallelDecodeClampLSN()`）；COMMIT **载荷**里的 `end_lsn` 不钳 |
 | 放行前沿 F 的取值 | F = min{ 每个已分配但未放行的 cseq 的结束记录**起点** LSN }；集合为空时唯一合法取值是 **walreader 认证过的读取位置**（`PDCseqInfo.read_lsn`）。用终点会落在（起点, 终点] 区间内 → 重启后整个事务被跳过 |
 | 故障必须由**状态字**定性，不能只靠"进程没了" | worker 在捕获错误后先把原因写进共享内存的状态字（先写 `errmsg` / `error_lsn`，再 `pg_memory_barrier()`，最后写 `PD_WORKER_STATUS_FAILED`），再把错误通过 `PD_ENT_ERROR` 送给 walsender。walsender 侧 `parallel_decode_report_worker_failure()` **先看状态字**：状态已是 FAILED 就报出**带原因**的错（"the parallel decode worker failed: …"），否则报"参与者意外死亡"。只靠消息传递会有竞态——DETACHED 路径可能在错误消息被读出之前就判定进程已死，于是原因丢失，退化成笼统的"意外死亡" |
@@ -2049,6 +2091,16 @@ walsender 持有复制槽与 CopyBoth 连接。异常退出时：
 
 与现状一致，无需额外机制。
 
+**会话的拆卸。** 无论是订阅端断开还是正常的会话结束，walsender 都要把并行解码会话拆掉（`ParallelDecodeSessionStop()`）。拆卸的顺序是**生产者先停**：
+
+1. 置 shutdown 标志。它是"这个会话结束了"的唯一信号，所有进程都靠它退出循环；
+2. **先终止 walreader**。它是唯一的 WAL 读取者，也是记录的生产者；先停它，worker 才不会留下来等一条永远不会到达的记录；
+3. **再终止 decode worker**。它们是消费者，把帧交给 walsender；walsender 在等待它们的时候会把输出队列排空，因此一个正卡在"交出帧"上的 worker 能够把这次交接做完，然后看到 shutdown 标志；
+4. **逐个等待进程真的退出**。共享内存段一旦释放，worker 往里写就会踩到别人的内存，所以终止之后必须等它们真的没了，才能释放共享内存段；
+5. 释放会话期间积压的字节：待发送队列里的块、等待放行前沿的块（cseq == 0 的帧）、正在交接的那个块、以及放行前沿本身。它们都属于本会话的事务，会话结束就没有意义了。
+
+第 2 步与第 3 步的顺序**不能颠倒**：先停 worker 的话，walreader 还会往一个已经不再消费的队列里写记录，于是 walreader 卡在队列满上，session stop 卡在等 walreader 退出上。
+
 ### 17.6 数据库重启后的恢复
 
 数据库重启（正常重启或崩溃恢复）后的完整过程：
@@ -2160,3 +2212,4 @@ P7 已落实其中的 1、2、3、5、6、7 条：worker 的错误在循环内�
 | v0.21 | 2026-11-19 | **`parallel_decode_batch_size` 接线完成（5.4 第 9 项）**。(1) **批处理的实现**：发送方（`PDQueueSender`）记"上次刷新以来写了多少字节"，写消息时把字节数记进去，记满一批就把该消息的 `force_flush` 置真；批次未满但发送方要睡了，靠一条**长度为 0 的 `PD_ENT_FLUSH` 消息**显式刷新——`shm_mq` 没有 notify API（不存在 `shm_mq_notify`），接收方看不到尚未发布的数据，不显式刷新就会对着已经在环形缓冲里的数据空等。(2) **承载进度的消息不批量**：`PD_ENT_POSITION`（停滞检测依赖它）、`PD_ENT_EVENT`（事务结束事件）、walreader 的广播与定向控制消息每次都单独刷新，否则复制延迟与停滞检测的误报率会直接被抬高。(3) **批大小的上界**：有效批大小被钳制在共享队列的 1/4（`PARALLEL_DECODE_QUEUE_SIZE / 4`）以内——`shm_mq` 在累计写入量达到环的 1/4 时自己会发布并唤醒接收方，批更大则发送方会等待接收方腾不出空间，而接收方恰恰看不到未发布的数据，构成死锁。(4) **walreader 的批按跨队列计**：否则不持有任何事务、只收到 8 字节 marker 的 worker，其位置心跳要攒到 64KB 才刷新一次。(5) **唤醒计数器的口径改为"每次刷新"**：计数点下沉到发送方层，worker 的上行计数与 walreader 的下行计数都由刷新产生，`pg_parallel_decode_wakeups` 的上下行之和与 `pg_parallel_decode_workers.wakeups` 的和因此一致。`monitoring_smoke.sh` 改为跑两遍同一负载（一遍关闭批处理、一遍 64KB）并断言唤醒次数下降：上行 1338 → 417、下行 969 → 363（帧数同阶，874 / 850）。**本机只做功能与正确性验证，唤醒次数不是吞吐性能测试，12.3 与 15.2 的降幅倍数仍待性能环境实测回填** |
 | v0.23 | 2026-11-19 | **无 cseq 的帧（流式分片、子事务 abort 的 `STREAM ABORT`）不再越过已经结束的事务的结束事件——新增放行前沿的判门与 held 表**。(1) **缺陷**：并行路径把 cseq = 0 的帧一到就直接放进就绪队列，既不看待放行区也不看放行前沿，于是它们可以越过"在它们之前就已经结束"的事务的结束事件上 wire。发布端用行锁串行化的一对事务，在订阅端变成并发 apply → **订阅端报出发布端没有的 deadlock**（上游 parallel apply 本就有死锁风险，`applyparallelworker.c:60-130` 写明它检测而不避免；本条是发布端新增的并发窗口）。串行路径没有这个问题：它的输出顺序就是 WAL 记录的处理顺序。(2) **不变式 I-ORDER**：位置为 q 的无 cseq 帧，不得越过在 q 之前就已结束的事务的结束事件。(3) **判门**：无 cseq 帧可以放行，当且仅当放行前沿为空，或**前沿队首事务的结束记录起始 LSN ≥ 帧的位置**。两侧口径不同（队首取结束记录**起点**，帧取产生它的那条记录的**终点**），故判据是 `≥` 而非 `>`。**最后一个分片的位置取它的结束记录的起点**——它的变更都早于该事务的结束事件，这样它一定赶在自己的结束事件之前放行（协议要求如此），也顺带免掉了"按位置匹配去放行最后一个分片"这种脆弱做法（另一个事务的分片可能落在同一位置）。(4) **held 表**：不放行的帧按位置排序挂起，随放行前沿前移逐个放行；**帧永远不丢弃**（丢弃会让订阅端拿到不完整的数据）；held 表的字节计入待放行区。**判门之前必须先把控制通道读空**——前沿由 walreader's 消息算出，而控制通道与帧队列是两条通道，消息到达顺序不可比。(5) **新增 GUC `parallel_decode_held_max_bytes`**（默认 64MB，0 关闭）：等待放行前沿的帧占用发布端内存，超限时发一条 `WARNING`（每个 episode 只发一条）。同时把三个"每次检查时才读"的 GUC（`parallel_decode_barrier_timeout` / `parallel_decode_pending_max_bytes` / `parallel_decode_held_max_bytes`）的帮助文本从"下次复制会话生效"改为"reload 后立即生效"——它们不是会话建立时冻结的值。(6) **验证**：新增 `stream_order_smoke.sh`——两个事务**同时**跑（否则它们落在同一个 worker 上，一个 worker 内部天然串行，缺陷不会显现），第一个事务大（它的 worker 解码得慢，结束事件到得晚），第二个事务在第一个事务提交之后还在写，因此它产出的分片的位置在第一个事务的结束事件之后。断言：发布端**持有**了等待放行前沿的分片（告警出现）、发布端**没有**报出"分片越过了更早事务的提交"、结束事件按提交序到达订阅端、行数与内容一致。**负控制**（临时把判门改成恒真、重跑）必须失败：实测发布端报出 `the parallel decoding session sent a stream segment before the commit of an older transaction`（"分片位置 0/4D16A88 越过了在 0/4C40B00 结束的事务的提交"）。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
 | v0.22 | 2026-11-19 | **修复 `copy_data = true` 的表同步卡在 `srsubstate = 's'`；待放行区加字节上限与告警；停滞检测收窄到队头事务的拥有者**。(1) **卡死的根因是三处缺陷叠加**（分析见 `copy_data_hang.md`）：**D1**——walsender 的 `sentPtr` 在 `XLogSendLogical()` 里被冻结，发布端空闲时不再前进，订阅端的 `last_received` 因此永远越不过表的同步点（`SYNCDONE → READY` 的提升条件）；**D2**——承载“认证读取位置”的 `PD_ENT_READ_POS` 消息虽已存在，但只有两个下发点，发布端空闲时**一个都到不了**：walreader 阻塞在页读回调 `pd_walreader_read_page()` 里等新 WAL，“每 N 条记录一次”与“WAL 暂时读完”这两个上报点都在那之后；**D3**——追平 keepalive 的节流判据 `TimestampDifferenceExceeds()` 的两个参数**写反了**（第一个参数必须是较早的时间），于是 keepalive 永远不发。三处缺一不可：只修 D2 会让 keepalive 仍然不发，只修 D3 会让帧头 LSN 仍然被钳在一个常量上。(2) **修法**：walsender 的空闲回调 `pd_walsender_idle()` 刷新 `sentPtr = ParallelDecodePosition()`；新增 `pd_walreader_publish_position()`，在**页读回调的等待分支**也下发认证读取位置与 marker（marker 按位置去重，等待循环每 100ms 走一次，不去重会往每个 worker 的队列里灌重复 marker）；keepalive 的节流判据改正参数顺序。(3) **待放行区的字节上限与告警（8.2 的“至少加个上限”方案）**：新增 GUC `parallel_decode_pending_max_bytes`（默认 64MB，0 关闭），walsender 统计待放行帧的字节数，超过上限时发一条 `WARNING`（每个 episode 只发一次，待放行区缩回上限以下后才会再告警）；会话继续运行，数据不受影响。顺带修掉放行事务时丢弃关系定义帧的**内存泄漏**（丢弃时没有 `pfree()`）。(4) **停滞检测收窄**：`parallel_decode_check_stall()` 原先遍历**全部** worker，而空闲的 worker 天然落后于 walreader 的读取位置（落后量约一个 marker 的距离）且在发布端空闲时不再上报，因此“待放行事务 + 空闲发布端”会误报卡死；现在只检查**待放行队列队头事务的拥有者**——会话就是在等它，检测能力不变而误报消失。(5) **删掉一个死变量** `parallel_decode_certified_cseq`：它被赋值但从未被读取，认证读取位置由 `PD_ENT_READ_POS` 与 `parallel_decode_certified_lsn` 承载。(6) **验证**：新增 `pending_area_smoke.sh`——订阅端 `streaming = 'off'`（整事务形态），发布端 `parallel_decode_barrier_timeout = 5`、`parallel_decode_pending_max_bytes = 1MB`，写一个 20 万行的事务；断言**待放行区的告警出现**、**停滞检测没有误杀会话**、**事务耗时超过停滞检测的超时**（否则检测没有理由触发）、行数与校验和一致。本机 14 个冒烟脚本**全部通过**（含新增的这个）。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
+| v0.24 | 2026-11-19 | **并行解码路径把每个事务都流式化：小事务也在提交时作为一个流段发出**。(1) **问题**：`immediate` 档的流式触发点是 `ReorderBufferCheckMemoryLimit()`——事务要在**进行中**攒够 `parallel_decode_stream_segment_size`（默认 1MB）才被切段发出。tpcc 的典型事务约 3KB，**永远攒不到**→ 一个流段都不产生 → 订阅端收不到 STREAM START → **并行 apply 根本不启动**，端到端退化成串行 apply（`send_bottleneck.md` §6 记录了这次测量的现象）。(2) **修法**：新增 `LogicalDecodingContext.stream_all_transactions`（串行路径恒为 false，串行路径一行不改），由 worker 从会话的流式模式接过来（`PD_STREAMING_IMMEDIATE` 才打开）。reorder buffer 侧新增 `ReorderBufferStreamAtCommit()`：提交时若该事务应当被流式化，就走 `ReorderBufferStreamCommit()`，把它的全部变更**作为一个流段**发出去。(3) **四个前提**（缺一不可）：路径是并行解码路径且会话被要求立即流式；事务此前没有被流式化（`rbtxn_is_streamed()`）；快照一致（`ReorderBufferCanStartStreaming()`）；**不是两阶段提交的准备事务**（`rbtxn_prepared()`——`ReorderBufferPrepare()` 与 `ReorderBufferFinishPrepared()` 都在回放之前就置上了 `RBTXN_PREPARE`，所以这一条同时覆盖了 prepare 记录本身，两阶段提交的路径因此保持原样）。低于 `parallel_decode_stream_min_size` 的事务仍然以整事务块下发。(4) **两个尺寸的语义重新分开**：`parallel_decode_stream_segment_size` 只是**分段点**，`parallel_decode_stream_min_size` 是"能不能被流式化"的门槛（0 = 每个事务都被流式化）。旧的 `if (min_size > segment_size) segment_size = min_size;`（两者互相抬高）已删除——否则 `min_size > 0` 会把段大小也抬上去，新语义无法成立。GUC 的帮助文本随之改写。(5) **文档同步**：8.1 新增"`immediate` 档的实现：每个事务都是流段"一节与四个前提的表；5.2.3 补上"块边界由消息边界表达"与实际的条目类型；5.3 补上已达成的拷贝链路；8.2 补上"并行解码路径的热路径只有分片一种"；9 与 17.5 补上会话拆卸的次序（生产者先停：先 walreader 后 worker，然后逐个等待退出再释放共享内存）；11.1 / 12.1 / 12.3 / 15.2 按 peer 会话的 `design_changelist.md` 同步；`send_bottleneck.md` §6 改为"已解决"；`user_manual.md` 的两个 GUC 说明同步。(6) **验证**：新增 `stream_all_txn_smoke.sh`——订阅端 `streaming='parallel'`，5 个小事务，断言发布端的 trace 里 **STREAM START / STREAM STOP / STREAM COMMIT 各 5 个**且行数与内容正确；随后换一个订阅端 `streaming='on'`，断言**一个流段都没有**（只有 BEGIN / COMMIT 各 3 个）——串行路径的行为不变。本机 17 个冒烟脚本**全部通过**。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
