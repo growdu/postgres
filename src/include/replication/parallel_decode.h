@@ -910,30 +910,49 @@ typedef bool (*ParallelDecodeIdleCallback) (void);
 extern void ParallelDecodeSetIdleCallback(ParallelDecodeIdleCallback callback);
 
 /*
+ * A frame of the replication protocol.
+ *
+ * The frame is the 'w' frame of the replication protocol, byte for byte the
+ * frame the serial path produces.  The bytes point into the block the frame
+ * was taken from, so that the frame does not have to be copied out of it.
+ *
+ * The bytes belong to the block, so they must not be used after the next call
+ * of ParallelDecodeNextFrame() or ParallelDecodeNextFrameNoWait(): the block
+ * is released once its last frame has been handed out.
+ */
+typedef struct PDFrame
+{
+	char	   *data;			/* the bytes of the frame */
+	size_t		len;			/* the number of bytes in data */
+	XLogRecPtr	end_lsn;		/* the decoding position after the record */
+} PDFrame;
+
+/*
  * Wait for the next frame the decode worker produced.
  *
  * The frame is the 'w' frame of the replication protocol, byte for byte the
- * frame the serial path produces.  It is copied into buf, which the caller
- * owns, so that the caller can patch the send time into it and write it out.
+ * frame the serial path produces.  Its bytes point into the block it was
+ * taken from, so that the caller can patch the send time into it and write
+ * it out without copying it first.
  *
  * Returns false when no frame has arrived within the wait interval, which
  * is not an error: the caller is expected to return to its main loop and
  * come back later.  Returns false as well when the session is winding down.
  */
-extern bool ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn);
+extern bool ParallelDecodeNextFrame(PDFrame *frame);
 
 /*
  * Take the next frame that is ready to be sent, without waiting for one.
  *
- * The frame is copied into buf, in the same way ParallelDecodeNextFrame()
- * does it.  The function returns false when there is no frame at the moment,
- * which is not an error: the caller simply has nothing to write.
+ * The frame is handed out in the same way ParallelDecodeNextFrame() does it.
+ * The function returns false when there is no frame at the moment, which is
+ * not an error: the caller simply has nothing to write.
  *
  * The function is used to fill a batch of frames.  The first frame of a batch
  * is waited for, the frames that follow it are taken as they are there, so
  * that the batch can be written out to the client in one go.
  */
-extern bool ParallelDecodeNextFrameNoWait(StringInfo buf, XLogRecPtr *end_lsn);
+extern bool ParallelDecodeNextFrameNoWait(PDFrame *frame);
 
 /*
  * The WAL position the decoding has come to.
@@ -979,8 +998,10 @@ extern XLogRecPtr ParallelDecodeClampLSN(XLogRecPtr lsn);
  * two positions.  The positions of the frames of a transaction that has been
  * released are always within the frontier, so this only ever changes the
  * frames of a stream segment.
+ *
+ * The frame is patched in place, so the bytes have to be writable.
  */
-extern void ParallelDecodeClampFrame(StringInfo frame);
+extern void ParallelDecodeClampFrame(char *data, size_t len);
 
 /*
  * The 'prepare_write' callback of the logical decoding context.

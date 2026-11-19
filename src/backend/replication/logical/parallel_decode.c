@@ -23,6 +23,7 @@
 
 #include "access/xlogdefs.h"
 #include "catalog/pg_subscription.h"
+#include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
@@ -90,22 +91,33 @@ static XLogRecPtr parallel_decode_position = InvalidXLogRecPtr;
 static XLogRecPtr parallel_decode_walreader_pos = InvalidXLogRecPtr;
 
 /*
- * A frame that is waiting to be sent.
+ * A block of frames that is waiting to be sent.
+ *
+ * A block is either a single frame or a whole stream segment.  The frames of
+ * a stream segment have to reach the subscriber without the bytes of another
+ * transaction in between, because the subscriber accepts only one open stream
+ * segment at a time, so they are kept together until they are written out.
+ *
+ * Keeping the frames of a segment together is also what keeps the work of the
+ * walsender per frame small: the block is copied once, when it arrives, and
+ * the frames inside it are written out without being copied again.
  */
-typedef struct PDQueuedFrame
+typedef struct PDQueuedBlock
 {
-	char	   *data;			/* the frame */
-	size_t		len;			/* the length of the frame */
+	char	   *data;			/* the bytes of the block */
+	size_t		len;			/* the number of bytes in data */
+	uint32		nframes;		/* the number of frames in the block */
+	bool		segmented;		/* the frames are length prefixed in data */
 	XLogRecPtr	end_lsn;		/* the decoding position after the record */
-	Oid			relid;			/* the relation the frame defines, or
-									 * InvalidOid for the other frames */
+	Oid			relid;			/* the relation the block defines, or
+									 * InvalidOid for the other blocks */
 	uint64		epoch;			/* the epoch of the session the definition
 									 * was produced in */
-	bool		counted;		/* the bytes of the frame are counted in the
+	bool		counted;		/* the bytes of the block are counted in the
 								 * size of the pending area */
-	uint64		seq;			/* the number that tells the frames of the
-									 * held list apart */
-} PDQueuedFrame;
+	uint64		seq;			/* the number that tells the blocks of the
+									 * held heap apart */
+} PDQueuedBlock;
 
 /*
  * The frames of a transaction that are waiting for their turn.
@@ -196,12 +208,12 @@ static HTAB *parallel_decode_sent_relations = NULL;
 static uint64 parallel_decode_next_cseq = 1;
 
 /*
- * The frames that may be sent, in the order they have to be sent.
+ * The blocks that may be sent, in the order they have to be sent.
  */
 static List *parallel_decode_ready = NIL;
 
 /*
- * The frames that have no commit sequence number and wait for their turn.
+ * The blocks that have no commit sequence number and wait for their turn.
  *
  * The frames of a stream segment and the frames of a subtransaction abort
  * belong to a transaction that has not ended yet, so they have no commit
@@ -209,19 +221,38 @@ static List *parallel_decode_ready = NIL;
  * in the order of the positions they were produced at: a frame that comes
  * later in the WAL may not be applied before a frame that comes earlier.
  *
- * The list is ordered by the position of the frames, so that the frames leave
- * it in the order of their positions.
+ * The blocks are kept in a heap that is ordered by their position, so that the
+ * blocks leave it in the order of their positions.  A heap is used rather
+ * than a sorted list because the blocks are inserted one at a time: sorting
+ * the whole collection again for every block would make the cost of the
+ * insertions grow with the number of the blocks that wait.
  */
-static List *parallel_decode_held = NIL;
+static binaryheap *parallel_decode_held = NULL;
 
 /*
- * The number that tells the frames of the held list apart.
+ * The number that tells the blocks of the held heap apart.
  *
- * Two frames can have the same position: the frames of one segment do, for
- * example.  The number is the second key of the order of the held list, so
- * that the frames that were produced earlier leave it earlier.
+ * Two blocks can have the same position: the frames of one segment do, for
+ * example.  The number is the second key of the order of the held heap, so
+ * that the blocks that were produced earlier leave it earlier.
  */
 static uint64 parallel_decode_frame_seq = 0;
+
+/*
+ * The block whose frames are being handed out.
+ *
+ * The frames of a block are handed out one after the other, and the bytes of a
+ * frame point into the buffer of the block, so that the frame does not have to
+ * be copied out of it.  The block is released once its last frame has been
+ * handed out, which happens when the next block is taken.
+ */
+static PDQueuedBlock *parallel_decode_cur_block = NULL;
+
+/* The number of the frames of the current block that have been handed out. */
+static uint32		parallel_decode_cur_index = 0;
+
+/* The offset of the next frame of the current block in its buffer. */
+static size_t		parallel_decode_cur_off = 0;
 
 /*
  * The largest position of the frames that have no commit sequence number and
@@ -684,7 +715,7 @@ parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
 								   XLogRecPtr end_lsn, Oid relid, uint64 epoch)
 {
 	PDPendingTxn *pending;
-	PDQueuedFrame *frame;
+	PDQueuedBlock *block;
 	bool		found;
 
 	pending = (PDPendingTxn *) hash_search(parallel_decode_pending, &cseq,
@@ -711,16 +742,24 @@ parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
 						"the transaction was reported",
 						(unsigned long long) cseq)));
 
-	frame = palloc(sizeof(PDQueuedFrame));
-	frame->data = palloc(len > 0 ? len : 1);
-	memcpy(frame->data, data, len);
-	frame->len = len;
-	frame->end_lsn = end_lsn;
-	frame->relid = relid;
-	frame->epoch = epoch;
-	frame->counted = true;
+	/*
+	 * The frame is kept as a block of its own, so that the frames of a
+	 * transaction and the frames of a stream segment are held in the same
+	 * way.
+	 */
+	block = palloc(sizeof(PDQueuedBlock));
+	block->data = palloc(len > 0 ? len : 1);
+	memcpy(block->data, data, len);
+	block->len = len;
+	block->nframes = 1;
+	block->segmented = false;
+	block->end_lsn = end_lsn;
+	block->relid = relid;
+	block->epoch = epoch;
+	block->counted = true;
+	block->seq = 0;
 
-	pending->frames = lappend(pending->frames, frame);
+	pending->frames = lappend(pending->frames, block);
 
 	/*
 	 * The frames take the memory of the walsender until they have been sent.
@@ -782,16 +821,16 @@ typedef struct PDSentRelation
  * the relation as it is now.
  */
 static bool
-parallel_decode_relation_sent(PDQueuedFrame *frame)
+parallel_decode_relation_sent(PDQueuedBlock *block)
 {
 	PDSentRelation *entry;
 	bool		found;
 
 	entry = (PDSentRelation *) hash_search(parallel_decode_sent_relations,
-										   &frame->relid, HASH_ENTER, &found);
+										   &block->relid, HASH_ENTER, &found);
 	if (!found)
 	{
-		entry->relid = frame->relid;
+		entry->relid = block->relid;
 		entry->epoch = 0;
 		entry->sent = false;
 	}
@@ -799,16 +838,16 @@ parallel_decode_relation_sent(PDQueuedFrame *frame)
 	/*
 	 * The subscriber has the definition already.
 	 */
-	if (entry->sent && entry->epoch >= frame->epoch)
+	if (entry->sent && entry->epoch >= block->epoch)
 		return true;
 
 	/*
 	 * Remember the definition.  A definition of an older epoch does not
 	 * replace the one of a newer epoch.
 	 */
-	if (!entry->sent || frame->epoch > entry->epoch)
+	if (!entry->sent || block->epoch > entry->epoch)
 	{
-		entry->epoch = frame->epoch;
+		entry->epoch = block->epoch;
 		entry->sent = true;
 	}
 
@@ -816,29 +855,70 @@ parallel_decode_relation_sent(PDQueuedFrame *frame)
 }
 
 /*
- * Order the frames of the held list by their position.
+ * Order the blocks of the held heap by their position.
  *
- * The frames that come first in the WAL have to leave the list first, so that
+ * The blocks that come first in the WAL have to leave the heap first, so that
  * the subscriber applies them in the order the publisher serialized them.  The
- * number of the frame is the second key of the order, so that the frames that
- * were produced earlier leave the list earlier.
+ * number of the block is the second key of the order, so that the blocks that
+ * were produced earlier leave the heap earlier.
+ *
+ * The heap of the library keeps the largest element at the top, so the
+ * comparison is reversed: the block that comes first has to be at the top.
  */
 static int
-parallel_decode_frame_pos_cmp(const ListCell *a, const ListCell *b)
+parallel_decode_block_pos_cmp(Datum a, Datum b, void *arg)
 {
-	const PDQueuedFrame *fa = (const PDQueuedFrame *) lfirst(a);
-	const PDQueuedFrame *fb = (const PDQueuedFrame *) lfirst(b);
+	const PDQueuedBlock *ba = (const PDQueuedBlock *) DatumGetPointer(a);
+	const PDQueuedBlock *bb = (const PDQueuedBlock *) DatumGetPointer(b);
 
-	if (fa->end_lsn < fb->end_lsn)
-		return -1;
-	if (fa->end_lsn > fb->end_lsn)
+	(void) arg;
+
+	if (ba->end_lsn < bb->end_lsn)
 		return 1;
-	if (fa->seq < fb->seq)
+	if (ba->end_lsn > bb->end_lsn)
 		return -1;
-	if (fa->seq > fb->seq)
+	if (ba->seq < bb->seq)
 		return 1;
+	if (ba->seq > bb->seq)
+		return -1;
 
 	return 0;
+}
+
+/*
+ * The number of blocks the heap of the held blocks starts with.
+ *
+ * The heap grows when it is full, so this is only the size it starts with.
+ */
+#define PD_HELD_HEAP_INITIAL	64
+
+/*
+ * Add a block to the heap of the blocks that wait for their turn.
+ *
+ * The blocks are inserted one at a time and their number is not known in
+ * advance, so the heap has to grow when it is full.  Growing it is done by
+ * building a new heap that holds twice as many blocks.
+ */
+static void
+parallel_decode_held_add(PDQueuedBlock *block)
+{
+	if (parallel_decode_held->bh_size >= parallel_decode_held->bh_space)
+	{
+		binaryheap *old = parallel_decode_held;
+		binaryheap *grown;
+		int			i;
+
+		grown = binaryheap_allocate(old->bh_space * 2, old->bh_compare,
+									 old->bh_arg);
+		for (i = 0; i < old->bh_size; i++)
+			binaryheap_add_unordered(grown, binaryheap_get_node(old, i));
+		binaryheap_build(grown);
+		binaryheap_free(old);
+
+		parallel_decode_held = grown;
+	}
+
+	binaryheap_add(parallel_decode_held, PointerGetDatum(block));
 }
 
 /*
@@ -899,67 +979,54 @@ parallel_decode_note_stream_frame(XLogRecPtr end_lsn)
 }
 
 /*
- * Hold the frames that have no commit sequence number back.
+ * Hold the block that has no commit sequence number back.
  *
- * The frames wait in the held list until the frontier has moved past their
- * position.  The bytes of the frames are counted in the size of the pending
- * area: they wait for their turn just like the frames of a transaction do.
+ * The block waits in the heap of the held blocks until the frontier has moved
+ * past its position.  The bytes of the block are counted in the size of the
+ * pending area: they wait for their turn just like the frames of a transaction
+ * do.
  *
- * The frames of one segment are held together, so that they leave the list
- * one after the other: the subscriber accepts only one open stream segment
- * at a time.
+ * The frames of one segment are held together, so that they leave the heap one
+ * after the other: the subscriber accepts only one open stream segment at a
+ * time.
  */
 static void
-parallel_decode_hold_frames(List *frames)
+parallel_decode_hold_block(PDQueuedBlock *block)
 {
-	ListCell   *lc;
+	block->seq = ++parallel_decode_frame_seq;
+	block->counted = true;
 
-	foreach(lc, frames)
-	{
-		PDQueuedFrame *frame = (PDQueuedFrame *) lfirst(lc);
+	parallel_decode_account_pending_bytes(block->len);
+	parallel_decode_account_held_bytes(block->len);
 
-		frame->seq = ++parallel_decode_frame_seq;
-		frame->counted = true;
-
-		parallel_decode_account_pending_bytes(frame->len);
-		parallel_decode_account_held_bytes(frame->len);
-	}
-
-	parallel_decode_held = list_concat(parallel_decode_held, frames);
-	list_sort(parallel_decode_held, parallel_decode_frame_pos_cmp);
-
-	/*
-	 * The list of the frames has been copied into the held list, so its own
-	 * cells are not needed any more.  The frames themselves belong to the
-	 * held list now.
-	 */
-	list_free(frames);
+	parallel_decode_held_add(block);
 }
 
 /*
- * Let the frames of the held list that have their turn pass.
+ * Let the blocks of the held heap that have their turn pass.
  *
- * The list is ordered by the position of the frames, and the frames leave it
- * in that order: a frame that comes later in the WAL may not be sent before a
- * frame that comes earlier.  The frames stop at the first one that has to
- * wait, because the frames that come after it wait at least as long.
+ * The heap is ordered by the position of the blocks, and the blocks leave it
+ * in that order: a block that comes later in the WAL may not be sent before a
+ * block that comes earlier.  The blocks stop at the first one that has to
+ * wait, because the blocks that come after it wait at least as long.
  */
 static void
 parallel_decode_release_held_frames(void)
 {
-	while (parallel_decode_held != NIL)
+	while (!binaryheap_empty(parallel_decode_held))
 	{
-		PDQueuedFrame *frame;
+		PDQueuedBlock *block;
 
-		frame = (PDQueuedFrame *) lfirst(list_head(parallel_decode_held));
+		block = (PDQueuedBlock *) binaryheap_first(parallel_decode_held);
 
-		if (!parallel_decode_frame_may_go(frame->end_lsn))
+		if (!parallel_decode_frame_may_go(block->end_lsn))
 			break;
 
-		parallel_decode_held = list_delete_first(parallel_decode_held);
-		parallel_decode_release_held_bytes(frame->len);
-		parallel_decode_note_stream_frame(frame->end_lsn);
-		parallel_decode_ready = lappend(parallel_decode_ready, frame);
+		binaryheap_remove_first(parallel_decode_held);
+
+		parallel_decode_release_held_bytes(block->len);
+		parallel_decode_note_stream_frame(block->end_lsn);
+		parallel_decode_ready = lappend(parallel_decode_ready, block);
 	}
 }
 
@@ -1036,7 +1103,7 @@ parallel_decode_release_txns(void)
 
 		foreach(lc, pending->frames)
 		{
-			PDQueuedFrame *frame = (PDQueuedFrame *) lfirst(lc);
+			PDQueuedBlock *block = (PDQueuedBlock *) lfirst(lc);
 
 			/*
 			 * The definition of a relation is sent to the subscriber once.
@@ -1046,21 +1113,21 @@ parallel_decode_release_txns(void)
 			 * to be sent: the subscriber sees it before the changes of the
 			 * transactions that follow it.
 			 */
-			if (frame->relid != InvalidOid &&
-				parallel_decode_relation_sent(frame))
+			if (block->relid != InvalidOid &&
+				parallel_decode_relation_sent(block))
 			{
 				/*
-				 * The definition is not needed, so the frame is dropped.  Its
+				 * The definition is not needed, so the block is dropped.  Its
 				 * memory belongs to the pending area, so it has to be given
 				 * back to it.
 				 */
-				parallel_decode_pending_bytes -= frame->len;
-				pfree(frame->data);
-				pfree(frame);
+				parallel_decode_pending_bytes -= block->len;
+				pfree(block->data);
+				pfree(block);
 				continue;
 			}
 
-			parallel_decode_ready = lappend(parallel_decode_ready, frame);
+			parallel_decode_ready = lappend(parallel_decode_ready, block);
 		}
 
 		list_free(pending->frames);
@@ -1410,13 +1477,13 @@ ParallelDecodeClampLSN(XLogRecPtr lsn)
  * frames of a stream segment.
  */
 void
-ParallelDecodeClampFrame(StringInfo frame)
+ParallelDecodeClampFrame(char *data, size_t len)
 {
 	XLogRecPtr	frontier;
 	uint64		network;
 	int64		lsn;
 
-	if (frame->len < 1 + 2 * sizeof(int64))
+	if (len < 1 + 2 * sizeof(int64))
 		return;
 
 	frontier = ParallelDecodeFrontier();
@@ -1434,21 +1501,78 @@ ParallelDecodeClampFrame(StringInfo frame)
 	 * and the header is not aligned, so they are read and written with
 	 * memcpy().
 	 */
-	memcpy(&network, frame->data + 1, sizeof(network));
+	memcpy(&network, data + 1, sizeof(network));
 	lsn = (int64) pg_ntoh64(network);
 	if (lsn != 0 && (XLogRecPtr) lsn > frontier)
 	{
 		network = pg_hton64((uint64) frontier);
-		memcpy(frame->data + 1, &network, sizeof(network));
+		memcpy(data + 1, &network, sizeof(network));
 	}
 
-	memcpy(&network, frame->data + 1 + sizeof(uint64), sizeof(network));
+	memcpy(&network, data + 1 + sizeof(uint64), sizeof(network));
 	lsn = (int64) pg_ntoh64(network);
 	if (lsn != 0 && (XLogRecPtr) lsn > frontier)
 	{
 		network = pg_hton64((uint64) frontier);
-		memcpy(frame->data + 1 + sizeof(uint64), &network, sizeof(network));
+		memcpy(data + 1 + sizeof(uint64), &network, sizeof(network));
 	}
+}
+
+/*
+ * Release a block that has been handed out.
+ */
+static void
+parallel_decode_free_block(PDQueuedBlock *block)
+{
+	if (block == NULL)
+		return;
+
+	pfree(block->data);
+	pfree(block);
+}
+
+/*
+ * Hand out the next frame of the block that is being drained.
+ *
+ * The bytes of the frame point into the buffer of the block, so that the frame
+ * does not have to be copied out of it.  The frames of a stream segment are
+ * stored with their length in front of them, so that the boundaries of the
+ * frames can be found.
+ */
+static void
+parallel_decode_take_frame_of_block(PDQueuedBlock *block, PDFrame *out)
+{
+	size_t		framelen;
+
+	if (block->segmented)
+	{
+		uint32		len32;
+
+		if (parallel_decode_cur_off + sizeof(uint32) > block->len)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the parallel decode stream segment is truncated")));
+
+		memcpy(&len32, block->data + parallel_decode_cur_off,
+			   sizeof(uint32));
+		parallel_decode_cur_off += sizeof(uint32);
+
+		if (len32 > block->len - parallel_decode_cur_off)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the parallel decode stream segment is truncated")));
+
+		framelen = len32;
+	}
+	else
+		framelen = block->len;
+
+	out->data = block->data + parallel_decode_cur_off;
+	out->len = framelen;
+	out->end_lsn = block->end_lsn;
+
+	parallel_decode_cur_off += framelen;
+	parallel_decode_cur_index++;
 }
 
 /*
@@ -1457,35 +1581,57 @@ ParallelDecodeClampFrame(StringInfo frame)
  * Returns false when there is no such frame at the moment.
  */
 static bool
-parallel_decode_take_ready_frame(StringInfo buf, XLogRecPtr *end_lsn)
+parallel_decode_take_ready_frame(PDFrame *out)
 {
-	PDQueuedFrame *frame;
-	ListCell   *lc;
-
-	if (parallel_decode_ready == NIL)
-		return false;
-
-	lc = list_head(parallel_decode_ready);
-	frame = (PDQueuedFrame *) lfirst(lc);
-	parallel_decode_ready = list_delete_first(parallel_decode_ready);
-
-	resetStringInfo(buf);
-	appendBinaryStringInfo(buf, frame->data, frame->len);
-	*end_lsn = frame->end_lsn;
-
-	if (*end_lsn > parallel_decode_position)
-		parallel_decode_position = *end_lsn;
+	PDQueuedBlock *block;
 
 	/*
-	 * The frame leaves the memory of the walsender, so the bytes it takes
-	 * there are given back to the size of the pending area.  The frames that
-	 * never waited for their turn were not counted there.
+	 * The block whose last frame was handed out is released now: the caller
+	 * has used that frame already.
 	 */
-	if (frame->counted)
-		parallel_decode_pending_bytes -= frame->len;
+	if (parallel_decode_cur_block != NULL &&
+		parallel_decode_cur_index >= parallel_decode_cur_block->nframes)
+	{
+		parallel_decode_free_block(parallel_decode_cur_block);
+		parallel_decode_cur_block = NULL;
+	}
 
-	pfree(frame->data);
-	pfree(frame);
+	while (parallel_decode_cur_block == NULL)
+	{
+		if (parallel_decode_ready == NIL)
+			return false;
+
+		block = (PDQueuedBlock *) linitial(parallel_decode_ready);
+		parallel_decode_ready = list_delete_first(parallel_decode_ready);
+
+		/*
+		 * A block without frames carries nothing: it is dropped.
+		 */
+		if (block->nframes == 0)
+		{
+			parallel_decode_free_block(block);
+			continue;
+		}
+
+		parallel_decode_cur_block = block;
+		parallel_decode_cur_index = 0;
+		parallel_decode_cur_off = 0;
+	}
+
+	block = parallel_decode_cur_block;
+	parallel_decode_take_frame_of_block(block, out);
+
+	if (out->end_lsn > parallel_decode_position)
+		parallel_decode_position = out->end_lsn;
+
+	/*
+	 * The block leaves the memory of the walsender once its last frame has
+	 * been handed out, so the bytes it takes there are given back to the size
+	 * of the pending area then.  The blocks that never waited for their turn
+	 * were not counted there.
+	 */
+	if (block->counted && parallel_decode_cur_index >= block->nframes)
+		parallel_decode_pending_bytes -= block->len;
 
 	return true;
 }
@@ -1601,16 +1747,20 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					 * overtake the end event of a transaction that ended
 					 * before it.
 					 */
-					PDQueuedFrame *frame;
+					PDQueuedBlock *block;
 
-					frame = palloc(sizeof(PDQueuedFrame));
-					frame->data = palloc(fh.length > 0 ? fh.length : 1);
-					memcpy(frame->data, (const char *) payload + sizeof(fh),
+					block = palloc(sizeof(PDQueuedBlock));
+					block->data = palloc(fh.length > 0 ? fh.length : 1);
+					memcpy(block->data, (const char *) payload + sizeof(fh),
 						   fh.length);
-					frame->len = fh.length;
-					frame->end_lsn = (XLogRecPtr) fh.end_lsn;
-					frame->relid = InvalidOid;
-					frame->epoch = 0;
+					block->len = fh.length;
+					block->nframes = 1;
+					block->segmented = false;
+					block->end_lsn = (XLogRecPtr) fh.end_lsn;
+					block->relid = InvalidOid;
+					block->epoch = 0;
+					block->counted = false;
+					block->seq = 0;
 
 					/*
 					 * The frontier is computed from the messages of the
@@ -1619,7 +1769,7 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					 */
 					parallel_decode_drain_control();
 
-					parallel_decode_hold_frames(list_make1(frame));
+					parallel_decode_hold_block(block);
 					parallel_decode_release_held_frames();
 				}
 				else
@@ -1680,7 +1830,7 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 				const char *data;
 				size_t		remaining;
 				uint32		i;
-				List	   *frames;
+				PDQueuedBlock *block;
 
 				if (len < sizeof(sh))
 					ereport(ERROR,
@@ -1698,15 +1848,19 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 
 				/*
 				 * The frames of the segment are appended one after the other,
-				 * so that they reach the subscriber without the bytes of
-				 * another transaction in between.
+				 * each with its length in front of it, so that they reach the
+				 * subscriber without the bytes of another transaction in
+				 * between.
+				 *
+				 * The whole segment is kept as one block: the frames are
+				 * written out one after the other, and they do not have to be
+				 * copied out of the segment one by one.  The lengths are
+				 * checked here, so that a truncated segment is reported
+				 * before any of its frames is written out.
 				 */
-				frames = NIL;
-
 				for (i = 0; i < sh.nframes; i++)
 				{
 					uint32		frame_len;
-					PDQueuedFrame *frame;
 
 					if (remaining < sizeof(uint32))
 						ereport(ERROR,
@@ -1722,20 +1876,22 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 								(errcode(ERRCODE_DATA_CORRUPTED),
 								 errmsg("parallel decode segment message is truncated")));
 
-					frame = palloc(sizeof(PDQueuedFrame));
-					frame->data = palloc(frame_len > 0 ? frame_len : 1);
-					memcpy(frame->data, data, frame_len);
-					frame->len = frame_len;
-					frame->end_lsn = (XLogRecPtr) sh.end_lsn;
-					frame->relid = InvalidOid;
-					frame->epoch = 0;
-					frame->counted = false;
-
-					frames = lappend(frames, frame);
-
 					data += frame_len;
 					remaining -= frame_len;
 				}
+
+				block = palloc(sizeof(PDQueuedBlock));
+				block->len = len - sizeof(sh);
+				block->data = palloc(block->len > 0 ? block->len : 1);
+				memcpy(block->data, (const char *) payload + sizeof(sh),
+					   block->len);
+				block->nframes = sh.nframes;
+				block->segmented = true;
+				block->end_lsn = (XLogRecPtr) sh.end_lsn;
+				block->relid = InvalidOid;
+				block->epoch = 0;
+				block->counted = false;
+				block->seq = 0;
 
 				/*
 				 * A segment has no commit sequence number, so its frames have
@@ -1748,7 +1904,7 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 				 */
 				parallel_decode_drain_control();
 
-				parallel_decode_hold_frames(frames);
+				parallel_decode_hold_block(block);
 				parallel_decode_release_held_frames();
 
 				break;
@@ -1920,8 +2076,11 @@ parallel_decode_check_stall(void)
 /*
  * Wait for the next frame the decode workers produced.
  *
- * The frame is copied into buf, so that the caller can patch the send time
- * into it and write it out to the network.
+ * The bytes of the frame point into the block the frame was taken from, so
+ * that the caller can patch the send time into it and write it out to the
+ * network without copying it first.  The bytes belong to the block, so they
+ * must not be used after the next call of this function or of
+ * ParallelDecodeNextFrameNoWait().
  *
  * The frames of a transaction are held back until the transaction has its
  * turn, so that the transactions reach the subscriber in the order they were
@@ -1932,7 +2091,7 @@ parallel_decode_check_stall(void)
  * function also returns false when the session is winding down.
  */
 bool
-ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
+ParallelDecodeNextFrame(PDFrame *frame)
 {
 	ParallelDecodeControl *ctl = parallel_decode_ctl;
 	int			worker;
@@ -1962,7 +2121,7 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 		 * A frame that has its turn is sent first.  The frames of a
 		 * transaction that does not have its turn yet are still waiting.
 		 */
-		if (parallel_decode_take_ready_frame(buf, end_lsn))
+		if (parallel_decode_take_ready_frame(frame))
 			return true;
 
 		/*
@@ -2090,16 +2249,16 @@ ParallelDecodeNextFrame(StringInfo buf, XLogRecPtr *end_lsn)
 /*
  * Take the next frame that is ready to be sent, without waiting for one.
  *
- * The frame is copied into buf, in the same way ParallelDecodeNextFrame()
- * does it.  The function returns false when there is no frame at the moment,
- * which is not an error: the caller simply has nothing to write.
+ * The frame is handed out in the same way ParallelDecodeNextFrame() does it.
+ * The function returns false when there is no frame at the moment, which is
+ * not an error: the caller simply has nothing to write.
  *
  * The function is used to fill a batch of frames.  The first frame of a batch
  * is waited for, the frames that follow it are taken as they are there, so
  * that the batch can be written out to the client in one go.
  */
 bool
-ParallelDecodeNextFrameNoWait(StringInfo buf, XLogRecPtr *end_lsn)
+ParallelDecodeNextFrameNoWait(PDFrame *frame)
 {
 	ParallelDecodeControl *ctl = parallel_decode_ctl;
 	int			worker;
@@ -2127,7 +2286,7 @@ ParallelDecodeNextFrameNoWait(StringInfo buf, XLogRecPtr *end_lsn)
 		 * A frame that has its turn is sent first.  The frames of a
 		 * transaction that does not have its turn yet are still waiting.
 		 */
-		if (parallel_decode_take_ready_frame(buf, end_lsn))
+		if (parallel_decode_take_ready_frame(frame))
 			return true;
 
 		/*
@@ -2533,8 +2692,13 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 	}
 	parallel_decode_next_cseq = 1;
 	parallel_decode_ready = NIL;
-	parallel_decode_held = NIL;
+	parallel_decode_held = binaryheap_allocate(PD_HELD_HEAP_INITIAL,
+												parallel_decode_block_pos_cmp,
+												NULL);
 	parallel_decode_frame_seq = 0;
+	parallel_decode_cur_block = NULL;
+	parallel_decode_cur_index = 0;
+	parallel_decode_cur_off = 0;
 	parallel_decode_sent_stream_max = InvalidXLogRecPtr;
 	parallel_decode_held_bytes = 0;
 	parallel_decode_held_warned = false;
@@ -2740,20 +2904,44 @@ ParallelDecodeSessionStop(void)
 	parallel_decode_idle_cb = NULL;
 	parallel_decode_position = InvalidXLogRecPtr;
 	parallel_decode_next_cseq = 1;
-	parallel_decode_ready = NIL;
+
+	/*
+	 * The blocks that are waiting to be sent go away with the session: they
+	 * belong to the transactions of this session.
+	 */
+	while (parallel_decode_ready != NIL)
+	{
+		PDQueuedBlock *block = (PDQueuedBlock *) linitial(parallel_decode_ready);
+
+		parallel_decode_ready = list_delete_first(parallel_decode_ready);
+		parallel_decode_free_block(block);
+	}
 
 	/*
 	 * The frames that wait for the frontier go away with the session: they
 	 * belong to the transactions of this session.
 	 */
-	while (parallel_decode_held != NIL)
+	if (parallel_decode_held != NULL)
 	{
-		PDQueuedFrame *frame = (PDQueuedFrame *) linitial(parallel_decode_held);
+		while (!binaryheap_empty(parallel_decode_held))
+		{
+			PDQueuedBlock *block;
 
-		parallel_decode_held = list_delete_first(parallel_decode_held);
-		pfree(frame->data);
-		pfree(frame);
+			block = (PDQueuedBlock *) binaryheap_remove_first(parallel_decode_held);
+			parallel_decode_free_block(block);
+		}
+		binaryheap_free(parallel_decode_held);
+		parallel_decode_held = NULL;
 	}
+
+	/*
+	 * The block whose frames are being handed out goes away with the session
+	 * as well.
+	 */
+	parallel_decode_free_block(parallel_decode_cur_block);
+	parallel_decode_cur_block = NULL;
+	parallel_decode_cur_index = 0;
+	parallel_decode_cur_off = 0;
 	parallel_decode_frame_seq = 0;
 	parallel_decode_sent_stream_max = InvalidXLogRecPtr;
 	parallel_decode_held_bytes = 0;

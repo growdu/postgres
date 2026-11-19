@@ -174,12 +174,6 @@ static StringInfoData output_message;
 static StringInfoData reply_message;
 static StringInfoData tmpbuf;
 
-/*
- * The buffer the frames of the decode workers are received into.  It is only
- * used by the parallel decoding path.
- */
-static StringInfoData pd_frame_buf;
-
 /* Timestamp of last ProcessRepliesIfAny(). */
 static TimestampTz last_processing = 0;
 
@@ -2204,7 +2198,6 @@ exec_replication_command(const char *cmd_string)
 	initStringInfo(&output_message);
 	initStringInfo(&reply_message);
 	initStringInfo(&tmpbuf);
-	initStringInfo(&pd_frame_buf);
 
 	switch (cmd_node->type)
 	{
@@ -3597,7 +3590,7 @@ pd_walsender_idle(void)
  * of frames at once.
  */
 static void
-pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
+pd_walsender_write_frame(PDFrame *frame)
 {
 	TimestampTz now;
 
@@ -3620,7 +3613,7 @@ pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
 	 * beyond the frontier would make it skip a transaction that has not been
 	 * delivered yet.
 	 */
-	ParallelDecodeClampFrame(frame);
+	ParallelDecodeClampFrame(frame->data, frame->len);
 
 	/* output previously gathered data in a CopyData packet */
 	PDTraceWrite(frame->data, frame->len);
@@ -3632,7 +3625,7 @@ pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
 	CHECK_FOR_INTERRUPTS();
 
 	/* Track how far the session has come. */
-	LagTrackerWrite(end_lsn, now);
+	LagTrackerWrite(frame->end_lsn, now);
 }
 
 /*
@@ -3657,10 +3650,10 @@ pd_walsender_write_frame(StringInfo frame, XLogRecPtr end_lsn)
 static void
 pd_walsender_write_frames(void)
 {
-	XLogRecPtr end_lsn;
+	PDFrame		frame;
 	int64		batch_bytes = 0;
 
-	if (!ParallelDecodeNextFrame(&pd_frame_buf, &end_lsn))
+	if (!ParallelDecodeNextFrame(&frame))
 	{
 		/*
 		 * There is nothing to write at the moment.  Publish the statistics
@@ -3671,17 +3664,17 @@ pd_walsender_write_frames(void)
 		return;
 	}
 
-	pd_walsender_write_frame(&pd_frame_buf, end_lsn);
-	batch_bytes = pd_frame_buf.len;
+	pd_walsender_write_frame(&frame);
+	batch_bytes = frame.len;
 
 	/*
 	 * Take the frames that are ready as well, without waiting for them.
 	 */
 	while (batch_bytes < PD_FRAME_BATCH_SIZE &&
-		   ParallelDecodeNextFrameNoWait(&pd_frame_buf, &end_lsn))
+		   ParallelDecodeNextFrameNoWait(&frame))
 	{
-		pd_walsender_write_frame(&pd_frame_buf, end_lsn);
-		batch_bytes += pd_frame_buf.len;
+		pd_walsender_write_frame(&frame);
+		batch_bytes += frame.len;
 	}
 
 	/* Write the batch out to the client. */
