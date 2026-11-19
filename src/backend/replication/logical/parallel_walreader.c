@@ -35,6 +35,7 @@
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"
+#include "replication/walsender_private.h"
 #include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -420,12 +421,66 @@ pd_walreader_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 
 			pd_walreader_flush_queues();
 
-			rc = WaitLatch(MyLatch,
-						   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						   100L,
-						   pd_wait_event);
-			if (rc & WL_LATCH_SET)
-				ResetLatch(MyLatch);
+			/*
+			 * Sleep until the WAL has been flushed.
+			 *
+			 * The walreader sleeps on the same condition variable that the
+			 * logical walsenders sleep on.  The WAL flush broadcasts it (see
+			 * WalSndWakeup()), so the walreader learns about the new WAL as
+			 * soon as it has been flushed, the same way the serial path
+			 * learns about it.  Nothing else sets the walreader's latch, so
+			 * without this the new WAL would only be found by the timeout
+			 * below, and the session would advance in waves of the timeout
+			 * instead of continuously.
+			 *
+			 * The timeout is the fallback: it bounds the delay if a
+			 * broadcast is missed.
+			 */
+			if (WalSndCtl != NULL)
+			{
+				/*
+				 * Prepare to sleep before the last check of the flush
+				 * position, so that a flush that happens right now cannot be
+				 * missed.
+				 */
+				ConditionVariablePrepareToSleep(&WalSndCtl->wal_replay_cv);
+
+				/*
+				 * The same position the loop above uses: the flush position
+				 * on a primary, the replay position on a standby.
+				 */
+				if (RecoveryInProgress())
+					read_upto = GetXLogReplayRecPtr(&currTLI);
+				else
+					read_upto = GetFlushRecPtr(&currTLI);
+				if (targetPagePtr + reqLen <= read_upto)
+				{
+					ConditionVariableCancelSleep();
+					continue;
+				}
+
+				(void) ConditionVariableTimedSleep(&WalSndCtl->wal_replay_cv,
+													100L, pd_wait_event);
+
+				/*
+				 * ConditionVariableTimedSleep() leaves us on the wait list
+				 * of the condition variable, whether we were signaled or
+				 * the timeout expired.  We have to take ourselves off it
+				 * before we do anything else: the next check of the flush
+				 * position, and the exit from the wait altogether, must
+				 * not be done while we are still registered as a sleeper.
+				 */
+				ConditionVariableCancelSleep();
+			}
+			else
+			{
+				rc = WaitLatch(MyLatch,
+							   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							   100L,
+							   pd_wait_event);
+				if (rc & WL_LATCH_SET)
+					ResetLatch(MyLatch);
+			}
 
 			continue;
 		}
