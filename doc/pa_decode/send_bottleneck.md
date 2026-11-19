@@ -374,3 +374,52 @@ select commit_lag, pending_commit_age_us from pg_parallel_decode_pending_commit_
 4. **最可能的两个瓶颈都不在发布端的发送路径上**：订阅端 leader 的每帧派发（协议问题，本设计管不到）
    与订阅端 apply worker 容量（配置可改，最便宜）。
 
+### 9.7 用 WAL 写速率给"缺口"重新定标
+
+用户报告：**发布端 WAL 写速率 130MB/s**，同期协议字节率 50MB/s。这两个数字必须先对账，否则
+"50 → 70" 这个目标本身就可能是错的。
+
+`design.md` §15.1 的换算是 **协议字节率 = B/W × WAL 字节率**，其中 B（每事务协议字节）≈ 8KB、
+W（每事务 WAL 字节）≈ 3KB ⇒ **B/W ≈ 2.6**。于是：
+
+> 若 130MB/s 的 WAL **全部属于被发布的事务**，则发布端应写出 **约 340MB/s** 的协议字节。
+> 实测 50MB/s ⇒ 只有预期的 **约 15%**。**发布端不是"离 70 还差 40%"，而是远远跟不上 WAL 的产生速度。**
+
+但 130MB/s 这个数本身有两个水分，必须先拆开：
+
+| 水分 | 说明 | 怎么拆 |
+| --- | --- | --- |
+| **非发布的 WAL** | 发布集之外的表、其它库、catalog WAL、checkpoint 后的全页镜像（FPI） | FPI 单独占多少：`pg_stat_wal.wal_fpi`；发布集只含 tpcc 的 9 张表时，订阅端的 WAL 速率才是对应的那个数 |
+| **发布端跟不上的部分** | 复制槽没能及时消化、还挂在槽上的 WAL | **槽的推进速率** vs **WAL 的产生速率**（见下） |
+
+**决定性的一次测量（发布端，间隔 10s 采两次）：**
+
+```sql
+select now(),
+       pg_current_wal_lsn(),
+       sent_lsn, write_lsn, flush_lsn,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) as lag_to_sent
+from pg_stat_replication;
+```
+
+再取 `pg_stat_wal` 的 `wal_bytes` 差分。两种结果对应完全不同的结论：
+
+| 槽的推进速率 | 结论 |
+| --- | --- |
+| **≈ WAL 产生速率（130MB/s）** | 发布端**跟得上** WAL。那么协议字节率只有 50MB/s 说明 **B/W 对被发布的那部分事务远小于 2.6**（大部分 WAL 不在发布集里，或 FPI 占比高）。此时"70MB/s 协议字节"这个目标应当**按被发布的事务率重新推导**，而不是按总 WAL 率推导 |
+| **≪ WAL 产生速率** | 发布端**在落后**，且落后量在持续增长。此时真正的问题不是"离 70MB/s 还差 20MB"，而是**复制槽在囤 WAL**：磁盘会被吃光，`max_slot_wal_keep_size` 到了就会断开复制。整改目标是"跟上 WAL 的产生速度"，50MB/s 就是当前的能力上限 |
+
+**磁盘风险要一并查**（本机根分区 70G）：
+
+```sql
+select slot_name, active, wal_status, safe_wal_size
+from pg_replication_slots;
+```
+
+`wal_status` 不是 `reserved`/`extended` 就说明槽已经保不住 WAL 了；配合 `df -h` 看剩余空间。
+
+**结论**：在把"70MB/s"当成目标之前，先做 9.7 的这一次测量。它决定这件事是
+(a) 发布端吞吐不足（缺口分析见 §9.3–§9.5），
+(b) 指标口径不对（协议字节率 vs 有效数据率，见 §9.2），
+还是 (c) **发布端正在被 WAL 的产生速度拖着走，真正的目标是"跟上"而不是"到 70"**。
+
