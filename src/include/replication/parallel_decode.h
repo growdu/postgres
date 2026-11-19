@@ -401,7 +401,8 @@ typedef enum ParallelDecodeEntryType
 	PD_ENT_SEGMENT = 14,		/* worker -> walsender */
 	PD_ENT_MARKER = 15,		/* walreader -> worker */
 	PD_ENT_WATERMARK = 16,		/* walreader -> walsender */
-	PD_ENT_RELATION = 17		/* worker -> walsender */
+	PD_ENT_RELATION = 17,		/* worker -> walsender */
+	PD_ENT_FLUSH = 18			/* walreader -> worker, worker -> walsender */
 } ParallelDecodeEntryType;
 
 /*
@@ -757,6 +758,48 @@ extern bool PDQueueSendChunked(shm_mq_handle *mqh, uint16 type,
 							   bool nowait, bool force_flush);
 
 /*
+ * The sender of a queue that batches its messages.
+ *
+ * The queue publishes what the sender has written only when the sender asks
+ * for it, so a sender that batches its messages has to keep track of the
+ * bytes it has written since the last flush: the count decides when the
+ * receiver has to be woken up.
+ *
+ * Every queue has exactly one sender, so the counter needs no lock.
+ */
+typedef struct PDQueueSender
+{
+	shm_mq_handle *mqh;		/* the queue */
+	size_t		pending;		/* bytes written since the last flush */
+	volatile uint64 *wakeups;	/* the counter of the flushes, may be NULL */
+} PDQueueSender;
+
+/* The batch size that is in effect, in bytes.  Zero means "no batching". */
+extern size_t PDQueueBatchSize(void);
+
+extern void PDQueueSenderInit(PDQueueSender *sender, shm_mq_handle *mqh,
+							   volatile uint64 *wakeups);
+
+/*
+ * Write a chunked message to the queue of the sender, without batching it.
+ *
+ * The message is flushed on its own, so the receiver sees it right away.  The
+ * messages that carry the progress of the session are written this way.
+ */
+extern bool PDQueueSendUnbatched(PDQueueSender *sender, uint16 type,
+								 const void *payload, size_t len);
+
+/*
+ * Publish the data that was written to the queue but not flushed yet.
+ *
+ * The queue has no notify call of its own, so the flush is a message of its
+ * own: an empty message that the receiver ignores.  The sender calls this
+ * before it goes to sleep, so that the receiver does not wait for data that
+ * is already in the ring buffer.
+ */
+extern void PDQueueSenderFlush(PDQueueSender *sender);
+
+/*
  * Send a replication frame to the walsender.
  *
  * The frame is preceded by a PDFrameHeader and split into chunks, because a
@@ -765,7 +808,7 @@ extern bool PDQueueSendChunked(shm_mq_handle *mqh, uint16 type,
  * cseq is the commit sequence number of the transaction the frame belongs to.
  * It is zero for the frames that are not part of a transaction.
  */
-extern void PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
+extern void PDQueueSendFrame(PDQueueSender *sender, uint64 end_lsn, uint64 cseq,
 							  const char *frame, size_t len);
 
 /*
@@ -776,8 +819,8 @@ extern void PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
  * it was produced.  The walsender uses that information to send the
  * definition of a relation to the subscriber once.
  */
-extern void PDQueueSendRelation(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
-								uint64 epoch, Oid relid,
+extern void PDQueueSendRelation(PDQueueSender *sender, uint64 end_lsn,
+								uint64 cseq, uint64 epoch, Oid relid,
 								const char *frame, size_t len);
 
 /*
@@ -786,7 +829,7 @@ extern void PDQueueSendRelation(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
  * The frames of the segment follow each other, each of them preceded by its
  * length, so that the walsender can find the boundaries of the frames.
  */
-extern void PDQueueSendSegment(shm_mq_handle *mqh, uint64 end_lsn,
+extern void PDQueueSendSegment(PDQueueSender *sender, uint64 end_lsn,
 							   uint32 nframes, const char *payload, size_t len);
 
 /*
@@ -795,7 +838,7 @@ extern void PDQueueSendSegment(shm_mq_handle *mqh, uint64 end_lsn,
  * The message uses the chunked framing, because the receiver of a queue uses
  * a single chunk receiver for all of its messages.
  */
-extern void PDQueueSendEvent(shm_mq_handle *mqh, uint64 cseq, uint32 event);
+extern void PDQueueSendEvent(PDQueueSender *sender, uint64 cseq, uint32 event);
 
 /*
  * Report the decoding position to the walsender.
@@ -805,8 +848,7 @@ extern void PDQueueSendEvent(shm_mq_handle *mqh, uint64 cseq, uint32 event);
  * the chunked framing, because the receiver of a queue uses a single chunk
  * receiver for all of its messages.
  */
-extern void PDQueueSendPosition(shm_mq_handle *mqh, uint64 end_lsn);
-extern void PDQueueSendMarker(shm_mq_handle *mqh, uint64 position);
+extern void PDQueueSendPosition(PDQueueSender *sender, uint64 end_lsn);
 
 /*
  * The output plugin options, in the serialized form.

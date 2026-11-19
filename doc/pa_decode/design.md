@@ -742,6 +742,7 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | `PD_ENT_TXN_END` | 读到**顶层**事务结束记录 / 检测到 cancel | xid、结束类型、**cseq**、**结束记录的 LSN 与载荷**（见下） |
 | `PD_ENT_SUBXACT_ABORT` | 读到**子事务**的 abort 记录 | 顶层 xid、**子 xid**、abort 记录的起始 LSN、abort 时间（见下） |
 | `PD_ENT_MARKER` | walreader 每读满 `PD_POSITION_MARK_RECORDS` 条记录、或 WAL 暂时读完时 | walreader 的读取位置。记录按事务拥有者路由后，不拥有任何事务的 worker 看不到任何记录，这个位置是它"没有落下任何记录"的唯一凭据（见 16.1 的实现事实） |
+| `PD_ENT_FLUSH` | 发送方在挂起之前 | **无载荷**（长度为 0）。显式刷新队列：批次未满时数据已经躺在环形缓冲里但**尚未发布**，接收方看不到它（5.4 第 9 项）。`shm_mq` 没有 notify API，刷新只能表达为一条消息，接收方读到后忽略 |
 
 **`PD_ENT_SESSION_INIT` 必须排在所有其它条目之前。** worker 的 output plugin 实例（6.1）在实例化时就要确定两件事：**是否允许流式**（`ctx->streaming`，bool；参与 `ReorderBufferCanStartStreaming()`，`reorderbuffer.c:4028-4047`）与**`STREAM ABORT` 的载荷格式**（由 `PGOutputData.streaming` 的**模式值**决定，事实 8c）。这两项都只由订阅端的 `START_REPLICATION` 选项决定，worker 自己无从得知，因此必须由 walsender 在会话建立时统一下发，且早于任何 `PD_ENT_WAL`（否则 worker 可能已经按错误的模式产出了字节）。
 
@@ -835,6 +836,7 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | `PD_ENT_EVENT` | cseq、结束类型、字节（**可为空**）、xid | O3 的载体：事务结束事件 |
 | `PD_ENT_ERROR` | 错误信息 | worker 内部错误（FR-11） |
 | `PD_ENT_RELATION` | 关系描述帧（relid、cseq、epoch、字节） | 携带关系描述的帧，walsender 据此做去重（6.7）。**单独一种条目类型**，因此普通帧不必为它额外付出头部开销 |
+| `PD_ENT_FLUSH` | **无载荷**（长度为 0） | 显式刷新队列，同 5.2.2。worker 在挂起之前发它，walsender 读到后忽略 |
 
 **块类型**有两种，对应订阅端的两条独立约束：
 
@@ -997,6 +999,17 @@ WAL 页缓冲 --memcpy--> decode_buffer --memcpy--> shm_mq 环（memcpy）
    | 延迟唤醒 | 依赖 1/4 环的默认门槛 | 唤醒次数少，但延迟可达 1/4 环的字节量 |
 
    首版取**按字节阈值合并批次 + 批次满即 force_flush** 的折中：批次大小由 `parallel_decode_batch_size` 控制，批满时强制刷新并唤醒，批未满时允许合并后续批次。这样唤醒次数上界为"字节数 / 批大小"，而不是"事务数"。另需注意：`shm_mq` 没有单独的 notify API（不存在 `shm_mq_notify`），通知语义只能由 `force_flush` 参数表达。
+
+   **已实现（v0.21）**。`parallel_decode_batch_size` 已接线，实现要点：
+
+   | 要点 | 实现 |
+   | --- | --- |
+   | 批的大小 | `parallel_decode_batch_size`（默认 64KB），并**钳制在队列的 1/4** 以内（`PARALLEL_DECODE_QUEUE_SIZE / 4`）。理由：`shm_mq` 在累计写入量达到环的 1/4 时自己会发布并唤醒接收方；批大于这个值时发送方会等待"接收方腾不出空间"，而接收方恰恰看不到尚未发布的数据，构成死锁 |
+   | 发送方记账 | 每个发送方（`PDQueueSender`）记"上次刷新以来写了多少字节"。写消息时先把字节数记进去，记满一批就把这条消息的 `force_flush` 置真，于是这一批的数据连同这条消息一起被发布，接收方被唤醒**一次** |
+   | 显式刷新 | `shm_mq` 没有 notify API，刷新只能表达为**一条消息**：新增 `PD_ENT_FLUSH`，一条长度为 0 的分块消息，接收方读到后忽略。发送方在挂起前发它——否则接收方会对着一条已经躺在环形缓冲里、却尚未发布的数据空等 |
+   | 批量的是"数据"，不是"进度" | 承载进度的消息**不批量**，每次单独刷新：`PD_ENT_POSITION`（停滞检测依赖它）、`PD_ENT_EVENT`（事务结束事件，walsender 等它才能放行后续事务）、walreader 的广播与定向控制消息（快照、失效、水位）。这些是"多久"的信号，延迟它们会直接抬高复制延迟与停滞检测的误报率 |
+   | walreader 的批是**跨队列**的 | walreader 的批次按**所有 worker 队列的字节总和**计。否则一个不持有任何事务、只收到 marker 的 worker，它的 8 字节 marker 要攒到 64KB 才被刷新一次，位置心跳会变得很稀疏 |
+   | 关闭开关 | `parallel_decode_batch_size = 0` 关闭批处理：每条记录、每帧都单独刷新，行为与接线前完全一致（AC-8） |
 
 10. **信号速率必须有预算。** 按 tpcc 100 万 tpm（约 16.7k 事务/秒）与每事务一批估算，跨进程 `kill()` 的速率为 1.3 万～6.7 万次/秒。这是"小事务场景劣化"风险（need.md 风险表）的定量来源，必须纳入监控（见 11.3 的唤醒速率指标）。
 
@@ -1583,7 +1596,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | `parallel_decode_stream_min_size` | `0`（默认，即不设门槛） | **小于此字节数的事务不流式化**，走整事务块（`PD_BLK_TXN`）。**默认必须为 0**：门槛若大于典型事务大小（15.1 的 tpcc 每事务约 3KB WAL），所有事务都不流式化 → 订阅端收不到 STREAM START → 并行 apply 根本不启动（8.1 的"门槛的代价核算"）。仅作为特定负载的调优旋钮 |
 | `parallel_decode_stream_segment_size` | 建议 1MB | **单个流段的字节上限**。O2 把 wire 的交错粒度钉死为"一个流段"，没有上限时段的独占时间无上界，并行解码的产出会被堵死（见 8.1） |
 | `parallel_decode_work_mem` | 建议 `logical_decoding_work_mem` | **每 worker** 的解码内存上限（总量 = worker 数 × 该值）。它是 `logical_decoding_work_mem` 的覆盖值——后者语义不变，但首版不做跨进程总量配额（12.2） |
-| `parallel_decode_batch_size` | 建议 64KB | WAL 批次与流式分片的切分粒度；同时是**跨进程唤醒的速率上限**（批次满即 force_flush，5.4） |
+| `parallel_decode_batch_size` | 建议 64KB | **跨进程唤醒的速率上限**：walreader 与 worker 各把写入队列的消息按字节合并成批，批满即刷新并唤醒对端（5.4 第 9 项）。承载进度的消息（位置心跳、事务结束事件、控制消息）不批量。0 关闭批处理，每条记录、每帧都单独唤醒。有效值被钳制在共享队列的 1/4 以内 |
 | `parallel_decode_barrier_timeout` | 60（秒，默认）/ 0 表示禁用 | **停滞检测的超时**：barrier 生效（有待放行的事务）且某个 worker 的解码位置落后于 walreader 的读取位置、且该 worker 在这段时间内没有送来任何消息时，判定该 worker 卡死并结束会话（17.8）。0 表示关闭该检测 |
 | `parallel_decode_fault_inject` | 0（默认，即不注入） | **故障注入开关**，仅用于验证故障路径：`1` = decode worker 启动后立刻失败，`2` = walreader 启动后立刻失败（17.8）。生产环境必须保持 0 |
 
@@ -1624,7 +1637,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 - **计数器是单调累计值，不是速率**。视图给出的是会话启动以来的总量（帧数、字节数、socket 写次数、事务数、唤醒次数）与两个瞬时量（当前积压的 cseq 数、最长挂起提交的年龄）。速率要由采样者自己做差分——15.2 的唤醒速率与帧率两项因此可以在性能机上直接从视图采样得到。
 - **`in_flight_txns` 只有 walreader 一个写者**。worker 侧只更新 `records_consumed` / `decoded_txns` / `wakeups`；在途事务数由 walreader 在**分配**与**结束**两处增减，避免两个进程写同一个计数器造成的数据竞争。
-- **唤醒次数的上下行不对称是设计使然**：下行（walreader → worker）是**每条 WAL 记录**一次唤醒，上行（worker → walsender）是**每帧**一次唤醒。5.4 第 9 项设想的"按字节阈值合并批次"目前**尚未接线**（`parallel_decode_batch_size` 已声明但没有消费者），所以上行唤醒的次数与帧数同阶——这正是 15.2 要在性能机上实测的那一项。
+- **唤醒次数的上下行不对称是设计使然**：下行（walreader → worker）传的是 WAL 记录，上行（worker → walsender）传的是帧。两侧都按字节合并批次（5.4 第 9 项，`parallel_decode_batch_size`），因此**唤醒次数与"字节数 / 批大小"同阶，而不是与记录数 / 帧数同阶**。计数器的口径是"**刷新次数**"——刷新才真的唤醒了对端；承载进度的消息不批量，每次都刷新，因此各计一次。批处理关闭时（`parallel_decode_batch_size = 0`）计数退回"每条记录 / 每帧一次"。**唤醒速率的具体数值待实测**（15.2）
 - **没有走 pgstat 的新框架**。本树没有 `shmem_request_hook` 扩展点，引入新框架的改动面远大于收益，因此直接复用 `WalSndCtl` 这套已存在于主共享内存的结构。
 - **会话不活跃时视图为空**。`pd_stats.active` 只在并行路径的会话建立之后为真，因此**串行路径的复制会话不会出现在这六个视图里**（`monitoring_smoke.sh` 对此有专门断言）。
 
@@ -1668,7 +1681,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | **catcache miss 的扫描** | catcache miss 时的索引扫描在 historic snapshot 下进行（`genam.c:408-413`），N 个 worker 各自独立 miss、各自独立扫描，每次都要做可见性判断 | 同上，共享目录缓存 |
 | 协议格式化仍单线程 | 若最终退化为方案 B，walsender 成为新瓶颈 | 方案 A 已把格式化移入 worker |
 | 共享内存带宽 | 每条数据变更要过共享内存两次（下行 WAL、上行字节），且 `shm_mq` 的载荷本身是 memcpy（`shm_mq.c:1043`） | 批量提交；必要时评估固定槽 + 引用计数的自研队列（真正的零拷贝） |
-| **跨进程信号速率** | 跨进程 `SetLatch()` 的实现是 `kill(pid, SIGURG)`（`latch.c:695`），本分支的 `Latch` 没有 futex 语义（`latch.h:112-121`）。按每事务一批、16.7k 事务/秒估算，信号速率约 1.3 万～6.7 万次/秒；`shm_mq` 的接收方每读一次还会反向唤醒发送方（`shm_mq.c:1296`），信号总数翻倍 | 批次按**字节阈值**（`parallel_decode_batch_size`）而非按事务切；显式选择 `force_flush` 策略（5.4）；把唤醒速率纳入监控 |
+| **跨进程信号速率** | 跨进程 `SetLatch()` 的实现是 `kill(pid, SIGURG)`（`latch.c:695`），本分支的 `Latch` 没有 futex 语义（`latch.h:112-121`）。按每事务一批、16.7k 事务/秒估算，信号速率约 1.3 万～6.7 万次/秒；`shm_mq` 的接收方每读一次还会反向唤醒发送方（`shm_mq.c:1296`），信号总数翻倍 | **已实现**：批次按**字节阈值**（`parallel_decode_batch_size`）而非按事务切，唤醒次数与"字节数 / 批大小"同阶（5.4 第 9 项）；显式选择 `force_flush` 策略；唤醒速率已纳入监控（`pg_parallel_decode_wakeups`）。**具体的信号速率待实测**（15.2 第 14 项） |
 | 关系缓存重复 | RELATION 消息按 worker 重复 | **已解决**（6.7）：worker 标记、walsender 按放行序去重，同一关系每个 epoch 恰好发一条 |
 | worker 负载不均 | 事务大小分布不均 | **按在途字节数**优先分配（4.5.1）+ 队列水位反馈 |
 
@@ -1799,7 +1812,7 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 
 ### 15.2 待实测确认清单
 
-以下十项无法从源码静态推断，必须在实现期用实测数据确认。它们都直接影响上文的测算与参数取值。**本机开发只做功能与正确性验证，这些数值需要在性能环境实测后回填**；在回填之前，文档中的相关数字一律标注为"静态估算"或"待实测"，不得当作结论使用。
+以下十四项无法从源码静态推断，必须在实现期用实测数据确认。它们都直接影响上文的测算与参数取值。**本机开发只做功能与正确性验证，这些数值需要在性能环境实测后回填**；在回填之前，文档中的相关数字一律标注为"静态估算"或"待实测"，不得当作结论使用。
 
 | # | 事项 | 需要什么证据 | 影响的设计决策 |
 | --- | --- | --- | --- |
@@ -1816,6 +1829,7 @@ B 的静态估算（文本格式，`pgoutput.c:294` `data->binary = false`）：
 | 11 | `SnapBuildSerialize` 是否在每个 `XLOG_RUNNING_XACTS` 上真的重写 | 实测 `pg_logical/snapshots` 目录的写入频率，或读其 body 的"是否需要重写"判据 | walreader 的磁盘 I/O 是否会成为新的瓶颈 |
 | 12 | `catalog_xmin` 在多 worker 下实际会被推多旧 | 一个"worker 持有长事务"的实测，看 `pg_replication_slots.catalog_xmin` 的推进行为 | 6.6 的 xmin 聚合策略（已实现：walreader 用自己的 reorder buffer 算出，与串行路径同口径；仍需实测长事务下的推进行为） |
 | 13 | 关系描述去重在真实负载下省下多少协议字节 | 一个"多表 + 多 worker"的负载，统计去重前后 RELATION 消息的条数与字节数 | 6.7 的实际收益（本机已验证条数 4 → 1，字节收益待实测） |
+| 14 | **批处理后的跨进程唤醒速率**（下行 walreader → worker、上行 worker → walsender，各多少次/秒） | 性能机上对 `pg_parallel_decode_wakeups` 视图按时间采样做差分，负载为 tpcc 100 万 tpm | 5.4 第 9 项的收益是否兑现；`parallel_decode_batch_size` 的取值。本机已验证同一负载下关闭批处理与 64KB 的**唤醒次数**差异（上行 1338 → 417、下行 969 → 363），但那是次数不是速率 |
 ## 16. 实现计划
 
 按可独立验证的阶段推进，每个阶段结束时开关关闭的行为必须与现状完全一致（AC-8）。
@@ -1908,7 +1922,9 @@ P0–P7 已在 `pa_decode` 分支实现（含 P5 的**关系描述去重**与 6.
 | 监控计数只能有**一个**写者 | 早期实现里 worker 在事务结束时也递减 `in_flight_txns`，而 walreader 在同一处也在改它——两个进程写同一个共享计数器是数据竞争。改为：**在途事务数只由 walreader 写**（分配时加、事务结束时减），worker 只写自己那侧的 `records_consumed` / `decoded_txns` / `wakeups`。这条规则适用于所有跨进程计数器 |
 | 监控指标必须走**主共享内存** | 计数器都在 dsa 里，SQL 进程读不到。本树没有 `shmem_request_hook` 扩展点，把 pgstat 框架搬一套进来改动面过大；改为复用已存在于主共享内存的 `WalSndCtl`：walsender 侧节流（100ms）把 dsa 里的值拷进 `WalSnd.pd_stats`，SRF 在 `walsnd->mutex` 下读。这样**不新增共享内存段**，也不动 `pgstat.c` 的新框架 |
 | 视图里的计数是**累计量**，不是速率 | 帧数、字节数、socket 写次数、事务数、唤醒次数都是会话启动以来的累计值；速率由采样者做差分。15.2 的帧率与唤醒速率两项因此可以在性能机上直接对视图采样 |
-| `parallel_decode_batch_size` 尚未接线 | 5.4 第 9 项设想的是"按字节阈值合并批次、批次满即 force_flush"，但当前实现里 WAL 下行是**每条记录**一次 `force_flush`、帧上行是**每帧**一次 `force_flush`，因此**跨进程唤醒的次数与记录数 / 帧数同阶**，没有被批大小限制住。GUC 已声明但**没有消费者**——接线之前调它不会有任何效果 |
+| `parallel_decode_batch_size` 已接线 | 5.4 第 9 项的"按字节阈值合并批次、批次满即 force_flush"已实现：发送方（`PDQueueSender`）记"上次刷新以来写了多少字节"，写消息时记进去，记满一批就把该消息的 `force_flush` 置真。**批次未满但发送方要睡了**靠一条长度为 0 的 `PD_ENT_FLUSH` 消息表达——`shm_mq` 没有 notify API，接收方看不到尚未发布的数据，不显式刷新就会对着已经在环形缓冲里的数据空等。承载进度的消息（`PD_ENT_POSITION` / `PD_ENT_EVENT` / walreader 的控制消息）**不批量**，每次单独刷新。walreader 的批次按**跨队列**的字节总和计，否则只收到 marker 的 worker 的位置心跳会被拖到 64KB 才刷新一次。有效批大小被钳制在队列的 1/4 以内（`shm_mq` 在累计写入量达到环的 1/4 时自己发布并唤醒，批更大则发送方会等待接收方腾不出空间，而接收方恰恰看不到未发布的数据，构成死锁）。`parallel_decode_batch_size = 0` 关闭批处理，行为与接线前完全一致 |
+| 唤醒次数的口径从"每条记录 / 每帧"改为"每次刷新" | 刷新才真的唤醒了对端，因此计数必须记在刷新上。计数点下沉到发送方层（`PDQueueSender` 持有一个指向共享内存计数器的指针），worker 的上行计数与 walreader 的下行计数都由此产生，`pg_parallel_decode_wakeups` 的上下行之和因此与 `pg_parallel_decode_workers.wakeups` 的和一致 |
+| 批处理确实降低了唤醒次数（本机计数，非吞吐性能测试） | 同一负载（4 worker × 8 并发会话 × 40 事务）跑两遍：一遍 `parallel_decode_batch_size = 0`（关闭批处理），一遍 64KB。**上行唤醒（worker → walsender）从 1338 次降到 417 次，下行唤醒（walreader → worker）从 969 次降到 363 次**，两次的帧数同阶（874 与 850）。断言写在 `monitoring_smoke.sh` 里。**这只是唤醒次数计数，不是吞吐性能测试**；12.3 与 15.2 的降幅倍数仍待性能环境实测回填 |
 | 子事务 abort 走的是 reorder buffer 的既有机制 | 设计上曾打算为子事务 abort 单开一条通道（`PD_ENT_SUBXACT_ABORT` / `PD_BLK_ABORT`），但 worker 用的是**真实的 reorder buffer**，`ReorderBufferAbort()` 在事务已被流式下发时会调用 `rb->stream_abort()`，STREAM ABORT 由插件按正常路径产出。因此那条独立通道**没有实现，也没有必要实现**——`PD_ENT_SUBXACT_ABORT` 只是枚举里一个未使用的值。实测（`subxact_abort_smoke.sh`）：并行路径发出 1 条 STREAM ABORT，被中止子事务的行没有落地，其后子事务的行完整落地，与串行路径逐行一致 |
 
 P5 的**关系描述去重**（6.7）与 6.6 的**槽水位跨进程聚合**均已实现：关系描述由 **worker 标记、walsender 按放行序判定**去重（判定规则见 6.7，标记机制见 `LogicalDecodingContext.rel_definition_hook` 与消息类型 `PD_ENT_RELATION`），槽水位由 walreader 用自己的 reorder buffer 算出、经 `PD_ENT_WATERMARK` 交给 walsender 应用（见 6.6）。两者的验证脚本分别是 `rel_dedup_smoke.sh` 与 `slot_watermark_smoke.sh`。
@@ -2108,3 +2124,4 @@ P7 已落实其中的 1、2、3、5、6、7 条：worker 的错误在循环内�
 | v0.18 | 2026-11-18 | **RELATION 去重的方案重做：由"共享表 + worker 自行判定"改为"worker 标记 + walsender 按放行序判定"**。(1) **旧方案不成立**：v0.17 把去重表放在 dsa 控制块里、让 worker 在发关系描述前查表。问题在于**判定依据不成立**——worker 之间没有 cseq 序的先后关系，持有更大 cseq 的 worker 完全可能先到达并发出定义；此时一个更小 cseq 的事务若按"表里已有就跳过"处理，订阅端会先应用这个小 cseq 的事务，而它**还没有**那份定义。旧规则在语义上安全（最坏是多发一条，绝不会少发），但**不是重复消除**：实测出现 2 条 RELATION 而非 1 条，取决于哪个 worker 先到达。(2) **新方案**：判定移到 walsender——它是唯一掌握 cseq 放行序的进程。实现分三步：pgoutput 在写关系消息**之前**调用解码上下文上的标记钩子 `rel_definition_hook(ctx, relid)`（pgoutput 侧新增 `send_relation_and_attrs()` 的 `announce` 参数，只在非流式时调用）；worker 记下待标记的 relid 与 epoch，把该帧用**新消息类型 `PD_ENT_RELATION`**（头部多带 `{end_lsn, cseq, epoch, relid, length}`）而非 `PD_ENT_FRAME` 发出——因此普通帧的头部与原来完全一样，不为去重付额外代价；walsender 放行事务的帧时，若该帧是关系描述且该关系在**同一或更新的 epoch** 里已发过，就丢弃该帧。由于放行序就是 cseq 序，最早碰到该表的事务的定义一定最先送达，此后全部丢弃 ⇒ 同一关系每个 epoch **恰好发一条**。(3) **共享内存里不再有关系表**：`PDSharedRelation` / `PD_SHARED_REL_SLOTS` / `rel_lock` 全部删除，walsender 侧改为进程内的 `HTAB`（`parallel_decode_sent_relations`，`relid → {epoch, sent}`），无锁、无共享。(4) **epoch 语义保持**：条目带 epoch（目录代次），已发过的 epoch ≥ 本帧 epoch 则丢弃，更大的 epoch 则发送并更新条目——DDL 之后的新定义必达，旧定义被丢弃。流式事务不触发标记钩子（pgoutput 本来就每个流式事务重发一次关系描述，且流式分片绕开 cseq 序），分区表的祖先定义与自身定义分别标记、分别去重，类型消息仍然重复（无害：订阅端类型缓存被覆盖）。(5) **钩子语义是"标记"而非"是否发送"**：为 NULL 表示不标记、总是按普通帧发送——串行路径即此语义，**串行路径一行不改**。(6) **验证**：`rel_dedup_smoke.sh`（8 并发会话 × 40 事务、事务保持重叠以铺开到 4 个 worker）实测并行路径 **4 条 → 1 条**，连跑 3 次结果一致；旧构建（`/tmp/pdoldpg/bin`）作 A/B 基线为 4 条。`ddl_diff_smoke.sh` 并行路径发 5 条 RELATION，与串行路径**逐消息一致**，说明 DDL 之后的新定义确实被重新送达。原有七个冒烟脚本加新加的两个**全部通过**。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
 | v0.19 | 2026-11-19 | **FR-13 监控指标实现完成**。(1) **六个视图**：`pg_parallel_decode_workers` / `pg_parallel_decode_commit_lag` / `pg_parallel_decode_txn_latency` / `pg_parallel_decode_pending_commit_age` / `pg_parallel_decode_walsender_frames` / `pg_parallel_decode_wakeups`，对应 11.3 的六项指标。(2) **取值路径**：并行路径的计数器都在 dsa 里、SQL 进程读不到；本树没有 `shmem_request_hook` 扩展点，引入 pgstat 新框架的改动面过大，因此**复用已存在于主共享内存的 `WalSndCtl`**——walsender 侧把 dsa 控制块里的计数**节流（100ms）拷贝**进 `struct WalSnd` 新增的 `pd_stats` 字段，拷贝在 `walsnd->mutex` 自旋锁下进行；两个新 SRF（`pg_stat_get_parallel_decode_session()` / `pg_stat_get_parallel_decode_workers()`）遍历 `WalSndCtl->walsnds[]`，跳过 `pid == 0` 或 `pd_stats.active` 为假的槽位；视图再与 `pg_stat_activity` / `pg_authid` 联结补上用户名与应用名。没有 `ROLE_PG_READ_ALL_STATS` 的用户只能看到自己那一行的 pid，其余列置空（与 `pg_stat_get_wal_senders()` 口径一致）。**不新增共享内存段，不动 pgstat 框架**。(3) **新增计数器**：帧数、帧字节数、socket 写次数、事务数、事务延迟（累计值与最大值）、cseq 已分配 / 已放行数、最长挂起提交年龄、上下行唤醒次数、每个 worker 的在途事务数 / 在途字节数 / 已解码事务数 / 已收发记录数。(4) **一处数据竞争被修掉**：早期实现里 worker 与 walreader 都写 `in_flight_txns`——跨进程计数器必须**只有一个写者**，改为该计数只由 walreader 在分配与事务结束两处增减，worker 只写自己那侧的 `records_consumed` / `decoded_txns` / `wakeups`。(5) **两处精度问题被修掉**：事务延迟原先被除以 `USECS_PER_SEC`，而 `TimestampTz` 本来就是微秒；且 `parallel_decode_record_cseq()` 原先在「已放行事务」的提前返回**之前**就建待放行条目，会给早已放行的事务留下永不回收的条目——条目创建移到提前返回**之后**。(6) **验证**：新增 `monitoring_smoke.sh`（4 worker × 8 并发会话 × 40 事务），检查六个视图存在、会话与 worker 的计数非零、**worker 的唤醒次数之和等于会话的上行唤醒次数**、以及「串行会话不出现在视图里」（`pd_stats.active` 只在并行路径会话建立后为真）。本机 11 个冒烟脚本全部通过。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
 | v0.20 | 2026-11-19 | **AC-14（子事务 abort）验证通过，并补上上游回归测试**。(1) **AC-14 的缺口查清**：`PD_ENT_SUBXACT_ABORT` / `PD_BLK_ABORT` 这条独立通道**没有实现，也不需要实现**——worker 用的是真实的 reorder buffer，`ReorderBufferAbort()` 在事务已被流式下发时会调用 `rb->stream_abort()`，STREAM ABORT 由插件按正常路径产出。新增 `subxact_abort_smoke.sh`：事务内先写入 2000 行（足以切出 17 个流段）、`SAVEPOINT` 后再写入 800 行、`ROLLBACK TO SAVEPOINT`、之后再写入 500 行；订阅端 `streaming='parallel'`。实测并行路径发出 **1 条 STREAM ABORT**，被中止子事务的行没有落地，其后子事务的 500 行完整落地，最终行集与**串行路径逐行一致**（AC-14 的核心判据"并行路径与串行路径的 apply 结果一致"成立）。(2) **上游回归测试**：`publication` 与 `subscription` 两个 pg_regress 用例通过；`src/test/subscription/t/` 的 34 个 TAP 用例（015_stream / 016_stream_subxact / 018_stream_subxact_abort / 019_stream_subxact_ddl_abort 等流式与子事务用例，共 457 个断言）全部通过——串行路径未受影响（AC-7）。(3) **冒烟脚本的运行环境**：所有脚本现在把 `PDTEST_ROOT` 与端口**导出**给 `setup_env.sh`，此前它们只是 shell 变量，导致脚本与被调用的 harness 用了不同的端口——本机曾因此出现"端口已被占用"的假失败。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
+| v0.21 | 2026-11-19 | **`parallel_decode_batch_size` 接线完成（5.4 第 9 项）**。(1) **批处理的实现**：发送方（`PDQueueSender`）记"上次刷新以来写了多少字节"，写消息时把字节数记进去，记满一批就把该消息的 `force_flush` 置真；批次未满但发送方要睡了，靠一条**长度为 0 的 `PD_ENT_FLUSH` 消息**显式刷新——`shm_mq` 没有 notify API（不存在 `shm_mq_notify`），接收方看不到尚未发布的数据，不显式刷新就会对着已经在环形缓冲里的数据空等。(2) **承载进度的消息不批量**：`PD_ENT_POSITION`（停滞检测依赖它）、`PD_ENT_EVENT`（事务结束事件）、walreader 的广播与定向控制消息每次都单独刷新，否则复制延迟与停滞检测的误报率会直接被抬高。(3) **批大小的上界**：有效批大小被钳制在共享队列的 1/4（`PARALLEL_DECODE_QUEUE_SIZE / 4`）以内——`shm_mq` 在累计写入量达到环的 1/4 时自己会发布并唤醒接收方，批更大则发送方会等待接收方腾不出空间，而接收方恰恰看不到未发布的数据，构成死锁。(4) **walreader 的批按跨队列计**：否则不持有任何事务、只收到 8 字节 marker 的 worker，其位置心跳要攒到 64KB 才刷新一次。(5) **唤醒计数器的口径改为"每次刷新"**：计数点下沉到发送方层，worker 的上行计数与 walreader 的下行计数都由刷新产生，`pg_parallel_decode_wakeups` 的上下行之和与 `pg_parallel_decode_workers.wakeups` 的和因此一致。`monitoring_smoke.sh` 改为跑两遍同一负载（一遍关闭批处理、一遍 64KB）并断言唤醒次数下降：上行 1338 → 417、下行 969 → 363（帧数同阶，874 / 850）。**本机只做功能与正确性验证，唤醒次数不是吞吐性能测试，12.3 与 15.2 的降幅倍数仍待性能环境实测回填** |

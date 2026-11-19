@@ -372,6 +372,162 @@ PDQueueSendChunked(shm_mq_handle *mqh, uint16 type, const void *payload,
 }
 
 /*
+ * The batch size that is in effect, in bytes.
+ *
+ * The size is capped at a quarter of the queue.  The queue publishes what the
+ * sender has written when a quarter of the ring is full, so a larger batch
+ * would not hold the data back any longer.  A batch that is larger than the
+ * ring would be worse than that: the sender would wait for room that the
+ * receiver cannot free, because the receiver cannot read the data that was
+ * not published yet.
+ *
+ * A size of zero means that the messages are not batched: every one of them
+ * is flushed on its own.
+ */
+size_t
+PDQueueBatchSize(void)
+{
+	int			batch = parallel_decode_batch_size;
+
+	if (batch <= 0)
+		return 0;
+
+	return (size_t) Min(batch, PARALLEL_DECODE_QUEUE_SIZE / 4);
+}
+
+void
+PDQueueSenderInit(PDQueueSender *sender, shm_mq_handle *mqh,
+				   volatile uint64 *wakeups)
+{
+	sender->mqh = mqh;
+	sender->pending = 0;
+	sender->wakeups = wakeups;
+}
+
+/*
+ * Note that the receiver of the queue has been woken up.
+ *
+ * A flush publishes what the sender has written and sets the latch of the
+ * receiver, so the number of the flushes is the number of the wakeups of the
+ * receiver.  The counter is part of the statistics of the monitoring views
+ * (11.3).
+ */
+static void
+pd_queue_count_wakeup(PDQueueSender *sender)
+{
+	if (sender->wakeups)
+		(*sender->wakeups)++;
+}
+
+/*
+ * Account for the bytes of a message that was written to the queue.
+ *
+ * Returns true when the message has to be flushed, which is the case when
+ * the batch is full.  The count is the number of bytes that were written
+ * since the last flush: the receiver is woken up once per batch instead of
+ * once per message.
+ */
+static bool
+PDQueueSenderAccount(PDQueueSender *sender, size_t len)
+{
+	size_t		batch = PDQueueBatchSize();
+
+	if (batch == 0)
+	{
+		/* The messages are not batched, so every one of them is flushed. */
+		sender->pending = 0;
+		return true;
+	}
+
+	sender->pending += len;
+
+	if (sender->pending >= batch)
+	{
+		sender->pending = 0;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Publish the data that was written to the queue but not flushed yet.
+ *
+ * The queue has no notify call of its own, so the flush is a message of its
+ * own: an empty message that the receiver ignores.  The sender calls this
+ * before it goes to sleep, so that the receiver does not wait for data that
+ * is already in the ring buffer.
+ */
+void
+PDQueueSenderFlush(PDQueueSender *sender)
+{
+	if (sender->pending == 0)
+		return;
+
+	pd_queue_send_chunked(sender->mqh, PD_ENT_FLUSH, NULL, 0, NULL, 0,
+						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+
+	sender->pending = 0;
+
+	/* The receiver has been woken up. */
+	pd_queue_count_wakeup(sender);
+}
+
+/*
+ * Write a chunked message to the queue of the sender.
+ *
+ * The message is batched: the receiver is woken up when the batch is full,
+ * not for every message.  The bytes of the message are added to the pending
+ * counter of the sender, which is what decides when the batch is full.
+ *
+ * The payload is preceded by a prefix, which is the header that tells the
+ * receiver what the message is about.
+ */
+static bool
+pd_queue_send_batched(PDQueueSender *sender, uint16 type,
+					   const void *prefix, size_t prefixlen,
+					   const void *payload, size_t len)
+{
+	bool		flush = PDQueueSenderAccount(sender, prefixlen + len);
+
+	if (!pd_queue_send_chunked(sender->mqh, type, prefix, prefixlen,
+							   payload, len, PARALLEL_DECODE_CHUNK_SIZE,
+							   false, flush))
+		return false;
+
+	if (flush)
+	{
+		/* The receiver has been woken up. */
+		pd_queue_count_wakeup(sender);
+	}
+
+	return true;
+}
+
+/*
+ * Write a chunked message to the queue of the sender, without batching it.
+ *
+ * The messages that carry the progress of the session are written this way:
+ * the receiver has to see them right away, because they are what tells it
+ * how far the session has come.
+ */
+bool
+PDQueueSendUnbatched(PDQueueSender *sender, uint16 type,
+					 const void *payload, size_t len)
+{
+	sender->pending = 0;
+
+	if (!pd_queue_send_chunked(sender->mqh, type, NULL, 0, payload, len,
+							   PARALLEL_DECODE_CHUNK_SIZE, false, true))
+		return false;
+
+	/* The receiver has been woken up. */
+	pd_queue_count_wakeup(sender);
+
+	return true;
+}
+
+/*
  * Send a replication frame to the walsender.
  *
  * The frame is preceded by a PDFrameHeader, which tells the walsender how far
@@ -379,7 +535,7 @@ PDQueueSendChunked(shm_mq_handle *mqh, uint16 type, const void *payload,
  * can be larger than one queue entry, so the transfer is chunked.
  */
 void
-PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
+PDQueueSendFrame(PDQueueSender *sender, uint64 end_lsn, uint64 cseq,
 				 const char *frame, size_t len)
 {
 	PDFrameHeader fh;
@@ -388,8 +544,7 @@ PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
 	fh.cseq = cseq;
 	fh.length = (uint32) len;
 
-	pd_queue_send_chunked(mqh, PD_ENT_FRAME, &fh, sizeof(fh), frame, len,
-						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+	pd_queue_send_batched(sender, PD_ENT_FRAME, &fh, sizeof(fh), frame, len);
 }
 
 /*
@@ -401,7 +556,7 @@ PDQueueSendFrame(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
  * definition of a relation to the subscriber once.
  */
 void
-PDQueueSendRelation(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
+PDQueueSendRelation(PDQueueSender *sender, uint64 end_lsn, uint64 cseq,
 					uint64 epoch, Oid relid,
 					const char *frame, size_t len)
 {
@@ -413,15 +568,14 @@ PDQueueSendRelation(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
 	rh.relid = relid;
 	rh.length = (uint32) len;
 
-	pd_queue_send_chunked(mqh, PD_ENT_RELATION, &rh, sizeof(rh), frame, len,
-						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+	pd_queue_send_batched(sender, PD_ENT_RELATION, &rh, sizeof(rh), frame, len);
 }
 
 /*
  * Send a stream segment to the walsender.
  *
- * The segment is preceded by a PDSegmentHeader, which tells the walsender how
- * far the decoding has come and how many frames the segment holds.  The
+ * The segment is preceded by a PDSegmentHeader, which tells the walsender
+ * how far the decoding has come and how many frames the segment holds.  The
  * frames follow the header, each of them preceded by its length.
  *
  * The whole segment goes into a single message, so that the walsender can put
@@ -429,7 +583,7 @@ PDQueueSendRelation(shm_mq_handle *mqh, uint64 end_lsn, uint64 cseq,
  * stream segment at a time.
  */
 void
-PDQueueSendSegment(shm_mq_handle *mqh, uint64 end_lsn, uint32 nframes,
+PDQueueSendSegment(PDQueueSender *sender, uint64 end_lsn, uint32 nframes,
 				   const char *payload, size_t len)
 {
 	PDSegmentHeader sh;
@@ -437,8 +591,7 @@ PDQueueSendSegment(shm_mq_handle *mqh, uint64 end_lsn, uint32 nframes,
 	sh.end_lsn = end_lsn;
 	sh.nframes = nframes;
 
-	pd_queue_send_chunked(mqh, PD_ENT_SEGMENT, &sh, sizeof(sh), payload, len,
-						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+	pd_queue_send_batched(sender, PD_ENT_SEGMENT, &sh, sizeof(sh), payload, len);
 }
 
 /*
@@ -446,47 +599,38 @@ PDQueueSendSegment(shm_mq_handle *mqh, uint64 end_lsn, uint32 nframes,
  *
  * The message uses the chunked framing, because the receiver of the queue
  * uses a single chunk receiver for all of its messages.
+ *
+ * The event is not batched: it tells the walsender that a transaction has
+ * been decoded, and the walsender holds the frames of that transaction back
+ * until the event arrives.  Batching it would delay the transaction itself.
  */
 void
-PDQueueSendEvent(shm_mq_handle *mqh, uint64 cseq, uint32 event)
+PDQueueSendEvent(PDQueueSender *sender, uint64 cseq, uint32 event)
 {
 	PDEventHeader eh;
 
 	eh.cseq = cseq;
 	eh.event = event;
 
-	pd_queue_send_chunked(mqh, PD_ENT_EVENT, NULL, 0, &eh, sizeof(eh),
-						  PARALLEL_DECODE_CHUNK_SIZE, false, true);
+	PDQueueSendUnbatched(sender, PD_ENT_EVENT, &eh, sizeof(eh));
 }
 
 /*
  * Report the decoding position to the walsender.
  *
- * The message uses the chunked framing, because the receiver of the queue
- * uses a single chunk receiver for all of its messages.
- */
-void
-PDQueueSendPosition(shm_mq_handle *mqh, uint64 end_lsn)
-{
-	pd_queue_send_chunked(mqh, PD_ENT_POSITION, NULL, 0, &end_lsn,
-						  sizeof(end_lsn), PARALLEL_DECODE_CHUNK_SIZE, false,
-						  true);
-}
-
-/*
- * Tell a decode worker how far the walreader has read.
+ * The position tells the walsender how far the decoding has come, even when
+ * the records that were decoded produced no output at all.  The message uses
+ * the chunked framing, because the receiver of a queue uses a single chunk
+ * receiver for all of its messages.
  *
- * The records of a transaction are only handed to the worker that owns it,
- * so a worker that owns no transaction does not see the records the walreader
- * reads.  The marker tells it how far the walreader has come, so that the
- * worker can report that it has decoded everything that was meant for it.
+ * The position is not batched: it is what tells the walsender that the worker
+ * is still making progress, and the stall detection depends on it.
  */
 void
-PDQueueSendMarker(shm_mq_handle *mqh, uint64 position)
+PDQueueSendPosition(PDQueueSender *sender, uint64 end_lsn)
 {
-	pd_queue_send_chunked(mqh, PD_ENT_MARKER, NULL, 0, &position,
-						  sizeof(position), PARALLEL_DECODE_CHUNK_SIZE, false,
-						  true);
+	PDQueueSendUnbatched(sender, PD_ENT_POSITION, &end_lsn,
+						  sizeof(end_lsn));
 }
 
 /*

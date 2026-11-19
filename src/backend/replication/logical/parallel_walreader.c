@@ -65,8 +65,19 @@ static volatile sig_atomic_t got_sigterm = false;
  * others.
  */
 static ParallelDecodeControl *pd_ctl = NULL;
-static shm_mq_handle *pd_wal_mqh[MAX_PARALLEL_DECODE_WORKERS];
+static PDQueueSender pd_wal_sender[MAX_PARALLEL_DECODE_WORKERS];
 static int	pd_num_workers = 0;
+
+/*
+ * The number of bytes that were written to the queues of the decode workers
+ * since the last flush.
+ *
+ * The counter is shared by all the queues of the session: a worker that owns
+ * no transaction receives only the markers, and a counter per queue would let
+ * those markers pile up for a long time before the worker learns how far the
+ * walreader has come.
+ */
+static size_t pd_wal_pending = 0;
 
 /*
  * The control channel the walreader reports on.
@@ -79,6 +90,9 @@ static shm_mq_handle *pd_control_mqh = NULL;
 
 /* The wait event the walreader reports while it waits for new WAL. */
 static uint32 pd_wait_event = PG_WAIT_EXTENSION;
+
+/* Publish the records that were written to the queues of the workers. */
+static void pd_walreader_flush_queues(void);
 
 /*
  * The information the walreader keeps about the transactions it has seen.
@@ -319,7 +333,13 @@ pd_walreader_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 				break;
 			}
 
-			/* The WAL is not there yet, so wait for it. */
+			/*
+			 * The WAL is not there yet, so wait for it.  The records that
+			 * were read so far are published first: the workers cannot
+			 * decode a record that they cannot see.
+			 */
+			pd_walreader_flush_queues();
+
 			rc = WaitLatch(MyLatch,
 						   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						   100L,
@@ -1018,11 +1038,42 @@ pd_walreader_setup_shadow(ParallelDecodeControl *ctl)
 }
 
 /*
+ * Publish the records that were written to the queues of the decode workers.
+ *
+ * The queue publishes what the sender has written only when the sender asks
+ * for it, so the walreader has to publish the records before it goes to sleep
+ * for the next WAL.  The flush is a message of its own, which the workers
+ * ignore.
+ */
+static void
+pd_walreader_flush_queues(void)
+{
+	int			i;
+
+	for (i = 0; i < pd_num_workers; i++)
+	{
+		if (pd_wal_sender[i].pending == 0)
+			continue;
+
+		/*
+		 * The flush counts the wakeup of the worker, so the counter of the
+		 * session does not have to be touched here.
+		 */
+		PDQueueSenderFlush(&pd_wal_sender[i]);
+	}
+
+	pd_wal_pending = 0;
+}
+
+/*
  * Send a message to every decode worker.
  *
  * The message is appended to the queue of every worker, so that it reaches
  * them in the order of the WAL: the position of an event in the WAL is the
  * position of the message in the queue.
+ *
+ * The message is flushed right away: it is not a part of the data of a
+ * transaction, and the workers have to see it before they go on.
  */
 static void
 pd_walreader_broadcast(uint16 type, const void *payload, size_t len)
@@ -1031,11 +1082,15 @@ pd_walreader_broadcast(uint16 type, const void *payload, size_t len)
 
 	for (i = 0; i < pd_num_workers; i++)
 	{
-		if (!PDQueueSendChunked(pd_wal_mqh[i], type, payload, len,
-								 PARALLEL_DECODE_CHUNK_SIZE, false, true))
+		size_t		pending = pd_wal_sender[i].pending;
+
+		if (!PDQueueSendUnbatched(&pd_wal_sender[i], type, payload, len))
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("could not hand a message to the parallel decoding session")));
+
+		/* The message was flushed, so the queue holds nothing pending. */
+		pd_wal_pending -= pending;
 	}
 }
 
@@ -1045,15 +1100,55 @@ pd_walreader_broadcast(uint16 type, const void *payload, size_t len)
 static void
 pd_walreader_send_to(int worker, uint16 type, const void *payload, size_t len)
 {
-	if (!PDQueueSendChunked(pd_wal_mqh[worker], type, payload, len,
-							 PARALLEL_DECODE_CHUNK_SIZE, false, true))
+	size_t		pending = pd_wal_sender[worker].pending;
+
+	if (!PDQueueSendUnbatched(&pd_wal_sender[worker], type, payload, len))
 		ereport(ERROR,
 				(errcode(ERRCODE_IO_ERROR),
 				 errmsg("could not hand a message to the parallel decoding session")));
+
+	/* The message was flushed, so the queue holds nothing pending. */
+	pd_wal_pending -= pending;
+}
+
+/*
+ * Write a message to the queue of a decode worker.
+ *
+ * The message is batched: the queue publishes what the walreader has written
+ * only when the walreader asks for it, and the receiver is woken up once per
+ * batch instead of once per message.
+ *
+ * The batch is counted over all the queues of the session, so that a worker
+ * that receives only the markers learns how far the walreader has come as
+ * often as the workers that receive the records.
+ */
+static void
+pd_walreader_send_worker(int worker, uint16 type, const void *payload, size_t len)
+{
+	PDQueueSender *sender = &pd_wal_sender[worker];
+
+	if (!PDQueueSendChunked(sender->mqh, type, payload, len,
+							 PARALLEL_DECODE_CHUNK_SIZE, false, false))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("could not hand a message to the parallel decoding session")));
+
+	/*
+	 * The message was written but not published: the receiver learns about
+	 * it when the batch is flushed.
+	 */
+	sender->pending += len;
+	pd_wal_pending += len;
+
+	if (pd_wal_pending >= PDQueueBatchSize())
+		pd_walreader_flush_queues();
 }
 
 /*
  * Tell the decode workers how far the walreader has read.
+ *
+ * The marker is batched: it is a message about the progress of the WAL, not
+ * about the data of a transaction.
  */
 static void
 pd_walreader_send_marker(XLogRecPtr position)
@@ -1062,7 +1157,7 @@ pd_walreader_send_marker(XLogRecPtr position)
 	int			i;
 
 	for (i = 0; i < pd_num_workers; i++)
-		PDQueueSendMarker(pd_wal_mqh[i], pos);
+		pd_walreader_send_worker(i, PD_ENT_MARKER, &pos, sizeof(pos));
 }
 
 /*
@@ -1929,6 +2024,12 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 			pd_walreader_send_marker(pd_read_lsn);
 
 			/*
+			 * There is no more WAL at the moment, so publish the records
+			 * that were read: the workers are waiting for them.
+			 */
+			pd_walreader_flush_queues();
+
+			/*
 			 * There is no more WAL at the moment.  Wait a little and try
 			 * again; the page read callback normally blocks instead of
 			 * getting us here.
@@ -2013,32 +2114,20 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 			{
 				for (i = 0; i < pd_num_workers; i++)
 				{
-					if (!PDQueueSendChunked(pd_wal_mqh[i], PD_ENT_WAL, buf->data,
-											 buf->len, PARALLEL_DECODE_CHUNK_SIZE, false,
-											 true))
-						ereport(ERROR,
-									(errcode(ERRCODE_IO_ERROR),
-									 errmsg("could not hand a WAL record to the parallel decoding session")));
-
 					/*
-					 * The record has been handed over, and the queue has been
-					 * flushed, so the worker has been woken up.
+					 * The record has been handed over.  The worker is woken
+					 * up when the batch is flushed, not for every record.
 					 */
+					pd_walreader_send_worker(i, PD_ENT_WAL, buf->data, buf->len);
+
 					pd_ctl->workers[i].records_sent++;
-					pd_ctl->walreader_wakeups++;
 				}
 			}
 			else
 			{
-				if (!PDQueueSendChunked(pd_wal_mqh[target], PD_ENT_WAL,
-										 buf->data, buf->len,
-										 PARALLEL_DECODE_CHUNK_SIZE, false, true))
-					ereport(ERROR,
-							(errcode(ERRCODE_IO_ERROR),
-							 errmsg("could not hand a WAL record to the parallel decoding session")));
+				pd_walreader_send_worker(target, PD_ENT_WAL, buf->data, buf->len);
 
 				pd_ctl->workers[target].records_sent++;
-				pd_ctl->walreader_wakeups++;
 			}
 
 			pd_ctl->wal_records++;
@@ -2167,7 +2256,8 @@ ParallelWalreaderMain(Datum main_arg)
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("could not find the parallel decoding WAL channel")));
 		shm_mq_set_sender(wal_mq, MyProc);
-		pd_wal_mqh[i] = shm_mq_attach(wal_mq, seg, NULL);
+		PDQueueSenderInit(&pd_wal_sender[i], shm_mq_attach(wal_mq, seg, NULL),
+						   &pd_ctl->walreader_wakeups);
 	}
 
 	/*

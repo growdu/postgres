@@ -1281,6 +1281,13 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 
 			break;
 
+		case PD_ENT_FLUSH:
+			/*
+			 * The worker published the frames it produced before it went to
+			 * sleep.  The message carries no data.
+			 */
+			break;
+
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),

@@ -56,7 +56,7 @@ static volatile sig_atomic_t got_sigterm = false;
  */
 static ParallelDecodeControl *pd_ctl = NULL;
 static shm_mq_handle *pd_wal_mqh = NULL;
-static shm_mq_handle *pd_out_mqh = NULL;
+static PDQueueSender pd_out_sender;
 static PDChunkReceiver pd_wal_rcv;
 static LogicalDecodingContext *pd_ctx = NULL;
 
@@ -226,21 +226,6 @@ pd_worker_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 }
 
 /*
- * Note that the worker has woken the walsender up.
- *
- * Every message the worker sends flushes the queue, which wakes the walsender
- * up.  The counter is part of the statistics of the monitoring views (11.3).
- */
-static void
-pd_worker_count_wakeup(void)
-{
-	if (pd_ctl == NULL || pd_worker_index < 0)
-		return;
-
-	pd_ctl->workers[pd_worker_index].wakeups++;
-}
-
-/*
  * The 'write' callback of the decoding context.
  *
  * The frame is complete at this point, so it is handed over to the walsender,
@@ -289,16 +274,14 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		 * message of its own type, so that the walsender can tell it apart
 		 * from the other frames and decide whether the subscriber needs it.
 		 */
-		PDQueueSendRelation(pd_out_mqh, (uint64) pd_end_lsn, pd_current_cseq,
+		PDQueueSendRelation(&pd_out_sender, (uint64) pd_end_lsn, pd_current_cseq,
 							epoch, relid, ctx->out->data, ctx->out->len);
-		pd_worker_count_wakeup();
 
 		return;
 	}
 
-	PDQueueSendFrame(pd_out_mqh, (uint64) pd_end_lsn, pd_current_cseq,
+	PDQueueSendFrame(&pd_out_sender, (uint64) pd_end_lsn, pd_current_cseq,
 					 ctx->out->data, ctx->out->len);
-	pd_worker_count_wakeup();
 }
 
 /*
@@ -317,9 +300,8 @@ pd_worker_send_segment(void)
 		return;
 	}
 
-	PDQueueSendSegment(pd_out_mqh, (uint64) pd_end_lsn, pd_segment_frames,
+	PDQueueSendSegment(&pd_out_sender, (uint64) pd_end_lsn, pd_segment_frames,
 					   pd_segment->data, pd_segment->len);
-	pd_worker_count_wakeup();
 
 	resetStringInfo(pd_segment);
 	pd_segment_frames = 0;
@@ -392,7 +374,7 @@ pd_worker_send_position(XLogRecPtr position, bool force)
 	if (position < pd_reported_lsn)
 		position = pd_reported_lsn;
 
-	PDQueueSendPosition(pd_out_mqh, (uint64) position);
+	PDQueueSendPosition(&pd_out_sender, (uint64) position);
 	pd_reported_lsn = position;
 }
 
@@ -703,7 +685,7 @@ pd_worker_report_error(const char *message)
 	 * The message is sent with the chunked framing, because the walsender
 	 * reads every message of this queue with a single chunk receiver.
 	 */
-	PDQueueSendChunked(pd_out_mqh, PD_ENT_ERROR, &eh, sizeof(eh),
+	PDQueueSendChunked(pd_out_sender.mqh, PD_ENT_ERROR, &eh, sizeof(eh),
 						PARALLEL_DECODE_CHUNK_SIZE, false, true);
 }
 
@@ -779,6 +761,13 @@ pd_worker_recv_record(DecodedXLogRecord **record, bool nowait)
 
 				case PD_ENT_MARKER:
 					pd_worker_handle_marker(payload, len);
+					break;
+
+				case PD_ENT_FLUSH:
+					/*
+					 * The walreader published the records that were written
+					 * before it went to sleep.  The message carries no data.
+					 */
 					break;
 
 				default:
@@ -873,6 +862,14 @@ pd_worker_decode_loop(void)
 		if (res == PD_RECV_EMPTY)
 		{
 			pd_worker_send_position(pd_end_lsn, false);
+
+			/*
+			 * The worker has no more records to decode, so the frames it
+			 * produced are published: the walsender cannot write them to
+			 * the subscriber before it sees them.
+			 */
+			PDQueueSenderFlush(&pd_out_sender);
+
 			res = pd_worker_recv_record(&record, false);
 		}
 		if (res != PD_RECV_RECORD)
@@ -922,8 +919,7 @@ pd_worker_decode_loop(void)
 		 */
 		if (pd_current_cseq != 0 && pd_wal_header.owner == pd_worker_index)
 		{
-			PDQueueSendEvent(pd_out_mqh, pd_current_cseq, PD_EVENT_END_ACK);
-			pd_worker_count_wakeup();
+			PDQueueSendEvent(&pd_out_sender, pd_current_cseq, PD_EVENT_END_ACK);
 
 			/*
 			 * The number of the transactions that are in flight is kept by
@@ -995,6 +991,21 @@ pd_worker_build_slot_copy(ParallelDecodeControl *ctl)
 }
 
 /*
+ * The counter of the wakeups of this worker.
+ *
+ * The counter is in the shared memory of the session, so it is only available
+ * after the worker has been attached to the session.
+ */
+static volatile uint64 *
+pd_worker_wakeup_counter(void)
+{
+	if (pd_ctl == NULL || pd_worker_index < 0)
+		return NULL;
+
+	return &pd_ctl->workers[pd_worker_index].wakeups;
+}
+
+/*
  * Main entry point of a decode worker.
  *
  * The worker attaches to the shared segment created by the walsender, claims
@@ -1047,6 +1058,15 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	ctl->workers[slot_index].slot_index = slot_index;
 
 	pd_ctl = ctl;
+
+	/*
+	 * Tell the decoding path which worker this is, so that it can tell the
+	 * transactions of the other workers apart from its own.  The index is
+	 * needed before the queues are attached, because the counter of the
+	 * wakeups of the worker is part of the shared memory.
+	 */
+	pd_worker_index = slot_index;
+
 	pd_wait_event = WaitEventExtensionNew("paralleldecodedecodeworker");
 
 	/*
@@ -1072,7 +1092,8 @@ ParallelDecodeWorkerMain(Datum main_arg)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("could not find the parallel decoding output channel")));
 	shm_mq_set_sender(out_mq, MyProc);
-	pd_out_mqh = shm_mq_attach(out_mq, seg, NULL);
+	PDQueueSenderInit(&pd_out_sender, shm_mq_attach(out_mq, seg, NULL),
+					   pd_worker_wakeup_counter());
 
 	/*
 	 * Build the decoding context.  The output plugin options and the name of
@@ -1109,7 +1130,6 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	 * Tell the decoding path which worker this is, so that it can tell the
 	 * transactions of the other workers apart from its own.
 	 */
-	pd_worker_index = slot_index;
 	pd_ctx->worker_index = slot_index;
 
 	/*

@@ -3031,9 +3031,20 @@ struct config_int ConfigureNamesInt[] =
 
 	{
 		{"parallel_decode_batch_size", PGC_SIGHUP, REPLICATION_SENDING,
-			gettext_noop("Sets the granularity in bytes of the WAL batches and stream "
-						 "segments handled by the parallel decode workers."),
-			gettext_noop("The change takes effect in the next replication session.")
+			gettext_noop("Sets the number of bytes the parallel decoding session "
+						 "batches before it wakes a participant up."),
+			gettext_noop("The publisher hands the WAL records over to the decode "
+						 "workers, and the decode workers hand the frames over to "
+						 "the writer, in batches: the participant on the other side "
+						 "of a queue is woken up once per batch instead of once "
+						 "per record or per frame.  A larger batch means fewer "
+						 "wakeups and a higher latency, a smaller one means the "
+						 "opposite.  Zero turns the batching off, so that every "
+						 "record and every frame wakes the other side up.  The "
+						 "effective size is capped at a quarter of the shared "
+						 "message queue, because the queue publishes what the "
+						 "sender has written when a quarter of it is full.  The "
+						 "change takes effect in the next replication session.")
 		},
 		&parallel_decode_batch_size,
 		64 * 1024, 0, INT_MAX,
