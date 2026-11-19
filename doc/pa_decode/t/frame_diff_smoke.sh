@@ -13,12 +13,14 @@
 #
 # The comparison is allowed to differ in two ways, both intentional:
 #
-#   * the order of the frames, because the parallel path may send a stream
-#     segment before the commit message of an older transaction;
+#   * the way the frames group the messages, because the parallel path sends
+#     the frames of a transaction as they become ready;
 #   * the frame header LSNs, because the parallel path clamps them to the
 #     release frontier.
 #
-# Any other difference is a defect.
+# Any other difference is a defect.  The order of the transactions is not an
+# allowed difference: the parallel path has to send the end event of a
+# transaction before the stream segments of a transaction that ended later.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)

@@ -77,6 +77,7 @@ extern PGDLLIMPORT int	parallel_decode_work_mem;
 extern PGDLLIMPORT int	parallel_decode_batch_size;
 extern PGDLLIMPORT int	parallel_decode_barrier_timeout;
 extern PGDLLIMPORT int	parallel_decode_pending_max_bytes;
+extern PGDLLIMPORT int	parallel_decode_held_max_bytes;
 extern PGDLLIMPORT int	parallel_decode_fault_inject;
 extern PGDLLIMPORT char *parallel_decode_trace_file;
 

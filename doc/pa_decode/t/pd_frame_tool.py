@@ -9,14 +9,20 @@ The comparison answers the question the parallel path has to pass: does it
 produce the same bytes as the serial path?  Two differences are allowed and
 are reported separately, because they are intentional:
 
-  * the order of the frames may differ, because the parallel path may send a
-    stream segment before the commit message of an older transaction;
+  * the frames may group the pgoutput messages differently, because the
+    parallel path sends the frames of a transaction as they become ready;
   * the frame header LSNs may differ, because the parallel path clamps them
     to the release frontier.
 
 Everything else is a defect.  The tool compares the pgoutput messages, not
 just the frames, because the parallel path may group the messages into
 frames differently.
+
+The order of the transactions is not one of the allowed differences: the
+parallel path has to send the end event of a transaction before the stream
+segments of a transaction that ended later, so that the subscriber does not
+apply two transactions at the same time that the publisher serialized with
+row locks.
 
 Usage:
     pd_frame_tool.py dump <tracefile> [--messages]

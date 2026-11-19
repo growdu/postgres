@@ -64,6 +64,7 @@
   - [7.2 commit barrier 的实现](#72-commit-barrier-的实现)
   - [7.3 FIFO 方案的实现（备选/退化路径）](#73-fifo-方案的实现备选退化路径)
   - [7.4 顺序保证的边界](#74-顺序保证的边界)
+    - [7.4.1 没有 cseq 的帧与放行前沿](#741-没有-cseq-的帧与放行前沿)
 - [8. 流式发送](#8-流式发送)
   - [8.1 尽早流式](#81-尽早流式)
   - [8.2 分片与整事务两种输出形态](#82-分片与整事务两种输出形态)
@@ -555,7 +556,7 @@ walreader            worker#0            walsender           订阅端
 
 - walreader 按 WAL 顺序为每个事务结束事件（commit / abort / cancel）分配单调递增的提交序号 `cseq`；
 - walsender 维护 `next_commit_seq` 水位。收到 `cseq = k` 的结束事件确认时，若 `k != next_commit_seq`，说明前面还有未发出的结束事件，将其挂入有序待提交表；只有当待提交表中 `next_commit_seq` 连续可取时，才依次写出并推进水位；
-- **流式分片不受 barrier 约束，随时可发**（分片属于事务内部，见 7.4）；但**非流式事务的整事务字节与其提交消息一起按 cseq 放行**——否则 `'w'` 帧的 LSN 会倒退，`confirmed_flush` 的语义被破坏（见 7.4 末段）。
+- **没有 cseq 的帧不占提交序号，但仍要过放行前沿**：流式分片与子事务 abort 的 `STREAM ABORT` 都属于事务内部，它们不占 cseq，但**不得越过"在它们之前就已经结束"的事务的结束事件**——否则订阅端会把两个在发布端被行锁串行化的事务并发 apply，报出发布端没有的 deadlock（见 7.4.1、7.1）；**非流式事务的整事务字节与其提交消息一起按 cseq 放行**——否则 `'w'` 帧的 LSN 会倒退，`confirmed_flush` 的语义被破坏（见 7.4 末段）。
 
 **方案 2：FIFO 队列（按 WAL 读到的提交顺序排队）**
 
@@ -567,7 +568,7 @@ walreader            worker#0            walsender           订阅端
 | 维度 | commit barrier | FIFO 队列 |
 | --- | --- | --- |
 | 顺序保证强度 | 强：commit/abort/cancel 严格按 cseq | 强：且事务数据也严格按 cseq，强度更高 |
-| 对“尽早流式”的影响 | **无影响**：流式分片可随时发出，只有提交消息被挂起 | **有影响**：队头事务未解码完成时，队头阻塞，其后已解码的数据全部不能发 |
+| 对“尽早流式”的影响 | **近乎无影响**：流式分片只被**已经结束**的事务挡住（7.4.1），不被尚未结束的事务挡住 | **有影响**：队头事务未解码完成时，队头阻塞，其后已解码的数据全部不能发 |
 | 队头阻塞（数据路径） | 无 | 有：长事务会拖住其后的所有事务 |
 | 队头阻塞（提交路径） | **有，与现状相同**：cseq = 1 的事务慢，cseq = 2 的提交消息必须等。现状的串行实现本来就有同样的提交路径队头阻塞 | 有 |
 | 内存占用 | 小：仅缓存被挂起的结束事件（每条几十字节）+ 已解码待发的数据块 | 大：需缓存乱序完成事务的全部字节，量级与乱序窗口成正比 |
@@ -580,7 +581,7 @@ walreader            worker#0            walsender           订阅端
 **结论：采用 commit barrier 为主方案。**
 
 1. 事实 4 已经表明 PG 现有的流式实现本身就不保证事务数据有序，只保证提交有序。barrier 精确复刻了这个语义，是“与现状行为等价”的最小变更；FIFO 反而引入了 PG 现状没有的更强约束。
-2. 用户需求明确要求“事务 stream 的时候要尽快发送来提升性能”。barrier 完全不阻碍**流式分片**提前下发；FIFO 与该要求直接冲突——只要有一个事务解码慢，FIFO 就会把后面所有已解码的数据一起堵住。
+2. 用户需求明确要求“事务 stream 的时候要尽快发送来提升性能”。barrier 几乎不阻碍**流式分片**提前下发——分片只被**已经结束**的事务挡住（7.4.1），一个还在解码的大事务挡不住别的分片；FIFO 与该要求直接冲突——只要有一个事务解码慢，FIFO 就会把后面所有已解码的数据一起堵住。
 3. 内存开销差距显著。barrier 只需缓存挂起的结束事件；FIFO 需要缓存乱序窗口内所有已解码字节，在高吞吐场景下这个量级不可控。
 4. FIFO 的唯一优势（非流式订阅方的整事务连续性）可以用一个退化配置实现：**当订阅方未请求流式时，切换为“整事务缓冲”模式**——此时 worker 不切分分片，walsender 在收到该事务的提交消息时才把整块字节写出。这本质上就是 FIFO 的语义，但只在低并行收益的场景下启用，不影响主路径。
 
@@ -764,12 +765,12 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 
 因此子事务 abort 的下发规则是：
 
-1. **不分配 cseq、不受 barrier 门控**——它属于一个尚未提交的事务，没有提交序可言；
+1. **不分配 cseq**——它属于一个尚未提交的事务，没有提交序可言；**但它仍要过放行前沿**：它的位置不得越过"在它之前就已经结束"的事务的结束事件（见 7.4.1）。这一点与"即时下发"不冲突：放行前沿只会挡住它很短一段时间，而挡住它的时间不会影响"在后续子事务的变更到达订阅端之前"这一条；
 2. **必须由持有该事务的 worker 在 WAL 顺序位置即时产出**，即在后续子事务的变更到达订阅端**之前**；
 3. **独占一块**（新增块类型 `PD_BLK_ABORT`，见 5.2.3），**wire 上连续**；
 4. 载荷：`toplevel_xid` / `subxid` / `abort_lsn` / `abort_time`，与 pgoutput 的 `logicalrep_write_stream_abort()`（`proto.c:1166-1184`）的字段一一对应——**worker 必须自己构造这段协议字节**，因为它不在任何一条 `PD_ENT_WAL` 记录里（结束记录按 5.2.2 的筛选规则被排除在 `PD_ENT_WAL` 之外）。
 
-**顶层 abort 可能连带产出多条 `STREAM ABORT`。** 顶层 abort 记录里的每个子 xact 都可能被中止，且每个被中止的子 xact 若已流式化就会产出自己的 `STREAM ABORT`（`reorderbuffer.c:2945-2951` 的 `rbtxn_is_streamed(txn)`），最后才是顶层自己的那条。**这 N+1 条都属于同一个顶层 abort 的收尾**，但它们的门控归属不同：子 xact 的那些**不占 cseq、不受门控**（即时下发），顶层那一条**占该顶层 abort 的 cseq、受门控**（随 barrier 放行）。
+**顶层 abort 可能连带产出多条 `STREAM ABORT`。** 顶层 abort 记录里的每个子 xact 都可能被中止，且每个被中止的子 xact 若已流式化就会产出自己的 `STREAM ABORT`（`reorderbuffer.c:2945-2951` 的 `rbtxn_is_streamed(txn)`），最后才是顶层自己的那条。**这 N+1 条都属于同一个顶层 abort 的收尾**，但它们的门控归属不同：子 xact 的那些**不占 cseq、只过放行前沿**（即时产出，放行前沿放行后即下发），顶层那一条**占该顶层 abort 的 cseq、受 cseq 门控**（随 barrier 放行）。
 
 **`PD_ENT_TXN_END` 必须携带结束记录本身的数据。** 事务结束记录（COMMIT / ABORT / PREPARE / COMMIT PREPARED）按 5.2.2 的筛选规则**不进入 `PD_ENT_WAL`**，worker 永远看不到它们。而 worker 侧的收尾工作需要这些字段：
 
@@ -859,15 +860,15 @@ O1 的四条不变式（4.1.1）要求 worker 能**原样重建**事务内的全
 | 被流式（分段下发） | 若干 `PD_BLK_SEG`，解码过程中陆续产出，**不带 cseq**——此时事务尚未提交，cseq 还不存在 | `PD_ENT_EVENT`，携带 cseq，载荷是 `STREAM_COMMIT` / `STREAM_ABORT` 字节；另有一条 `END_ACK` |
 | 未被流式（整事务下发） | 一个 `PD_BLK_TXN`，在 `PD_ENT_TXN_END` 到达时一次性产出，**携带该 cseq** | 同样有 `END_ACK`（字节可为空） |
 
-**只有携带 cseq 的条目受 barrier 门控**：
+**携带 cseq 的条目受 cseq 门控；不携带 cseq 的条目受放行前沿约束**（见 7.4.1）：
 
-| 条目 | 是否受 cseq 门控 | 说明 |
-| --- | --- | --- |
-| `PD_BLK_SEG` | 否 | 流段内部连续即可，可以随时下发；C9 只约束它携带的帧 LSN（见 7.4） |
-| `PD_BLK_TXN` | **是** | 块内的 `COMMIT` 必须与更早的 cseq 保持相对顺序 |
-| `PD_ENT_EVENT`（STREAM_COMMIT / STREAM_ABORT） | **是** | 同上 |
-| `PD_ENT_EVENT{END_ACK}` | **是** | 它本身就是 barrier 的推进凭据 |
-| `PD_BLK_ABORT`（子事务 abort） | **否** | 它属于一个**尚未提交**的事务，没有提交序可言；**必须即时下发**，否则订阅端的 spool 截断会连带丢弃其后子事务的有效变更（见 5.2.2） |
+| 条目 | 是否受 cseq 门控 | 是否受放行前沿约束 | 说明 |
+| --- | --- | --- | --- |
+| `PD_BLK_SEG` | 否 | **是** | 流段内部连续即可，但它**不得越过已经结束的事务的结束事件**——否则订阅端会并发 apply 两个本该被串行化的事务（7.4.1）；C9 只约束它携带的帧 LSN（见 7.4） |
+| `PD_BLK_TXN` | **是** | 否（随 cseq 放行即自动满足） | 块内的 `COMMIT` 必须与更早的 cseq 保持相对顺序 |
+| `PD_ENT_EVENT`（STREAM_COMMIT / STREAM_ABORT） | **是** | 否（同上） | 同上 |
+| `PD_ENT_EVENT{END_ACK}` | **是** | 否 | 它本身就是 barrier 的推进凭据 |
+| `PD_BLK_ABORT`（子事务 abort） | 否 | **是** | 它属于一个**尚未提交**的事务，没有提交序可言；但同样不得越过已经结束的事务的结束事件。**必须及时下发**，否则订阅端的 spool 截断会连带丢弃其后子事务的有效变更（见 5.2.2） |
 
 因此 `PD_BLK_TXN` 必须**自带 cseq**（C11）。walsender 不能靠 `PMSG_COMMIT_SEQ` 来关联它——那是 walreader → walsender 的另一条通道，与 worker 的输出队列之间没有先后关系，两条通道的消息到达顺序不可比。
 
@@ -1296,7 +1297,7 @@ if (wm.restart_lsn != 0)
 | 已发过，且表里的 epoch **≥** 本帧的 epoch | **丢弃** | 订阅端已有的定义不比本帧旧（同一个 epoch = 同一份结构；更大的 epoch = 更新鲜的结构，本帧是过时的那份） |
 | 已发过，且表里的 epoch **<** 本帧的 epoch | **发**，并把表里的 epoch 更新为本帧的 | 本帧是 DDL 之后的新定义，必须送达 |
 
-**流式事务一律照发。** pgoutput 在流式模式下按 (relation, top-xid) 追踪关系描述的发送，本来就是**每个流式事务重发一次**；且流式分片绕开 cseq 顺序（cseq = 0 的条目直接进就绪队列），订阅端应用流式事务的顺序不由此处掌握，不能假设它先到。流式事务**不会触发标记钩子**，因此不会进入去重路径。
+**流式事务一律照发。** pgoutput 在流式模式下按 (relation, top-xid) 追踪关系描述的发送，本来就是**每个流式事务重发一次**；且流式分片不受 cseq 顺序约束（它没有 cseq，只受放行前沿约束，见 7.4.1），订阅端应用流式事务的顺序不由此处掌握，不能假设它先到。流式事务**不会触发标记钩子**，因此不会进入去重路径。
 
 **分区表。** `publish_via_partition_root` 场景下，祖先表的关系描述与分区表自身的关系描述**分别标记、分别去重**（各用各的 relid 作键）。
 
@@ -1338,7 +1339,7 @@ walreader 是 WAL 的唯一读取者，因此 WAL 顺序即提交顺序。walrea
 | PREPARE | 读到 `XLOG_XACT_PREPARE` 时 | 分配 | 是（`PREPARE` 消息） |
 | COMMIT PREPARED / ROLLBACK PREPARED | 读到对应记录时 | 分配 | 是 |
 | CANCEL | 由 `XLOG_RUNNING_XACTS` 清理游离事务时 | 分配 | **取决于是否流式**：流式事务发 `STREAM ABORT`，非流式事务不发任何消息（现状 `reorderbuffer.c:2946` 的 `ReorderBufferAbort()` 只在 `rbtxn_is_streamed(txn)` 时才调 `rb->stream_abort()`） |
-| **子事务 abort**（`ROLLBACK TO SAVEPOINT`） | 读到 `xl_xid` 为**子 xid** 的 `XLOG_XACT_ABORT` 记录时 | **不分配** | 是（`STREAM ABORT`，xid = 顶层、subxid = 子 xid）。**不受 barrier 门控，必须即时下发**（见 5.2.2） |
+| **子事务 abort**（`ROLLBACK TO SAVEPOINT`） | 读到 `xl_xid` 为**子 xid** 的 `XLOG_XACT_ABORT` 记录时 | **不分配** | 是（`STREAM ABORT`，xid = 顶层、subxid = 子 xid）。**不受 cseq 门控，但受放行前沿约束**（不得越过已经结束的事务的结束事件，见 7.4.1），必须及时下发（见 5.2.2） |
 
 **CANCEL 的收尾与其它结束事件不同，必须在 worker 侧分叉。** 事务被取消时，worker 侧的本地 `ReorderBufferTXN` 仍在（它从未提交），收尾动作是 `ReorderBufferAbort()`：
 
@@ -1347,7 +1348,7 @@ walreader 是 WAL 的唯一读取者，因此 WAL 顺序即提交顺序。walrea
 
 两种情况的 `END_ACK` 都必须发出。
 
-cseq 单调递增且连续分配（每个**顶层**事务结束事件占一个序号），因此“空洞检测”退化为简单的“水位 + 计数”，无需复杂的乱位图。**子事务 abort 不占 cseq**——它不是提交事件，且必须即时下发（5.2.2）。
+cseq 单调递增且连续分配（每个**顶层**事务结束事件占一个序号），因此“空洞检测”退化为简单的“水位 + 计数”，无需复杂的乱位图。**子事务 abort 不占 cseq**——它不是提交事件；它只受放行前沿约束，且必须及时下发（5.2.2、7.4.1）。
 
 **walreader 必须能区分顶层 abort 与子事务 abort**：判据是 abort 记录的 `xl_xid` 是否命中自己的事务绑定表——命中即为顶层 abort（占一个 cseq），否则是子 xid（不占 cseq）。
 
@@ -1454,7 +1455,32 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 对流式事务，事务的最后一个分片与它的 `STREAM COMMIT` 之间隔着一个 cseq 屏障，会略微推迟提交可见性；这是可接受的代价，现状的串行实现本就有同样的提交路径队头阻塞。
 
+**无 cseq 的帧与放行前沿的关系（7.4.1）**：最后一个分片的位置取**它的结束记录的起点**，因此它不会被"自己的"结束事件挡住——它赶在自己的 `STREAM COMMIT` 之前放行（协议要求如此），而挡它的是**别的、更早结束的事务**。换句话说：一个流式事务的最后一个分片至多被"在它之前就结束、且尚未放行"的事务挡住，不会被自己的结束事件挡住。
+
 另外，§12.1 中 G1 的度量口径必须相应调整：`confirm_flush_lsn` 速率在乱序模型下会虚高，应改为**实际发出的协议字节速率**或**订阅端确认的应用速率**。
+
+### 7.4.1 没有 cseq 的帧与放行前沿
+
+**问题**：流式分片与子事务 abort 的 `STREAM ABORT` 没有 cseq，无法挂到 barrier 上。若它们一到就进就绪队列，就可以越过"在它们之前就已经结束"的事务的结束事件——发布端用行锁串行化的一对事务，在订阅端变成了并发 apply → 订阅端报出**发布端没有的 deadlock**（上游的 parallel apply 本来就有死锁风险，`applyparallelworker.c:60-130` 写明它是用 lmgr 的锁把死锁**检测**出来而不是**避免**；本条缺陷是**在发布端新增了一个本不该有的并发窗口**）。
+
+**不变式（I-ORDER）**：
+
+> 位置为 q 的无 cseq 帧，**不得越过**在 q 之前就已结束的事务的结束事件（COMMIT / ABORT / PREPARE）。
+
+串行路径天然满足它：串行路径的输出顺序就是 WAL 记录的处理顺序，结束记录在位置 p 被输出、帧在位置 q 被输出，`p < q` ⇒ 结束记录一定在帧之前。并行路径不满足它，因为帧的产出时刻由"哪个 worker 先解码完"决定，与 WAL 顺序无关。
+
+**实现（walsender 侧）**：
+
+- **判门**：一个无 cseq 帧可以放行，当且仅当**放行前沿为空**（没有"已结束但未放行"的事务），或者**前沿队首事务的结束记录起始 LSN ≥ 该帧的位置**。
+  - **两侧的位置口径不同**：队首事务的结束事件的位置是**结束记录的起点**，帧的位置是**产生它的那条记录的终点**。因此判据是 `≥` 而不是 `>`——一条记录的终点恰好等于下一条记录的起点时，两个位置相等是正常的。
+  - **最后一个分片的位置另有约定**：一个事务的最后一个分片是在**它的结束记录被处理时**产出的，它的变更都早于该事务的结束事件，因此它的位置取**结束记录的起点**——这样它一定能赶在自己的结束事件之前放行（它必须先于自己的结束事件到达订阅端）。
+- **held 表**：不放行的帧放进一张按位置排序的表（位置相同时按到达顺序），随放行前沿的前移逐个放行。**帧永远不丢弃**——丢弃会让订阅端拿到不完整的数据。held 表的字节数计入待放行区。
+- **放行时机**：放行前沿前移（某个事务被放行）时重算一次；收到新的帧时也重算一次。
+- **判门之前必须先读控制通道**：前沿是由 walreader 的消息算出来的，而控制通道与帧队列是两条通道，消息到达顺序不可比——**必须先把控制通道读空，再判门**，否则会把一个已经结束的事务漏掉。
+
+**与"尽早流式"的关系**：挡住分片的只有**已经结束**的事务。一个还在解码的大事务不挡别的分片，因此流式的早发特性基本保留；被挡住的时间上界是"最早那个已结束事务的解码时间"。
+
+**自检**：发布端自己检查"已经发出的分片的位置是否越过了正在放行的事务的结束位置"，越界则发一条 `WARNING`。它是**事后检测**，只报警不阻止；真正的保证来自判门。
 
 ## 8. 流式发送
 
@@ -1482,7 +1508,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 - **新增 GUC 控制流式激进程度**，取值沿用现有调试选项 `debug_logical_replication_streaming` 的两档语义（`reorderbuffer.c:3645-3661`）：`buffered`（按内存阈值）与 `immediate`（达到批次粒度即输出），**外加一档 `auto`**。`auto` 是本设计的默认值，它**按订阅端的流式模式决定实际档位**（见下）；
 - **必须给段设置字节上限**（新增 GUC `parallel_decode_stream_segment_size`）。没有上限时，O2 会把并行解码的产出全部堵死，段的独占时间无上界。`immediate` 档的批次粒度即为这个上限的一种取值；
 - **流式门槛 `parallel_decode_stream_min_size` 默认取 0（不设门槛）**——理由见下"门槛的代价核算"，它与发布端的收益目标直接冲突；
-- 与 barrier 的关系：尽早流式与 commit barrier 正交——**分片提前发，提交仍按 cseq 放行**（分片属于事务内部，不受 cseq 约束）。二者不冲突。
+- 与 barrier 的关系：尽早流式与 commit barrier 基本正交——**分片提前发，提交仍按 cseq 放行**（分片属于事务内部，没有 cseq）。唯一的耦合是：**分片不得越过已经结束的事务的结束事件**（见 7.4.1）——挡住分片的只有**已经结束**的事务，一个还在解码的大事务挡不住别的分片。二者不冲突。
 
 **`auto` 档：流式激进程度必须按订阅端的模式区分。**
 
@@ -1601,6 +1627,8 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | `parallel_decode_work_mem` | 建议 `logical_decoding_work_mem` | **每 worker** 的解码内存上限（总量 = worker 数 × 该值）。它是 `logical_decoding_work_mem` 的覆盖值——后者语义不变，但首版不做跨进程总量配额（12.2） |
 | `parallel_decode_batch_size` | 建议 64KB | **跨进程唤醒的速率上限**：walreader 与 worker 各把写入队列的消息按字节合并成批，批满即刷新并唤醒对端（5.4 第 9 项）。承载进度的消息（位置心跳、事务结束事件、控制消息）不批量。0 关闭批处理，每条记录、每帧都单独唤醒。有效值被钳制在共享队列的 1/4 以内 |
 | `parallel_decode_barrier_timeout` | 60（秒，默认）/ 0 表示禁用 | **停滞检测的超时**：barrier 生效（有待放行的事务）且某个 worker 的解码位置落后于 walreader 的读取位置、且该 worker 在这段时间内没有送来任何消息时，判定该 worker 卡死并结束会话（17.8）。0 表示关闭该检测 |
+| `parallel_decode_pending_max_bytes` | 64MB（默认）/ 0 关闭 | **待放行区（事务帧）的字节上限**：待放行区装的是"已解码但还没轮到"的事务帧。一个事务解码得慢，其后所有事务的帧都堆在发布端的内存里；超过上限时发一条 `WARNING`（每个 episode 只发一条，待放行区缩回上限以下后才会再告警）。会话继续运行，数据不受影响。0 关闭该告警 |
+| `parallel_decode_held_max_bytes` | 64MB（默认）/ 0 关闭 | **无 cseq 的帧（流式分片、子事务 abort 的 `STREAM ABORT`）等待放行前沿时的字节上限**：这些帧没有 cseq，只能等"在它们之前就结束的事务"放行之后才能下发（7.4.1）。等待的帧占用发布端的内存，超过上限时发一条 `WARNING`（同样每个 episode 只发一条）。**帧永远不丢弃**——丢弃会让订阅端拿到不完整的数据。0 关闭该告警 |
 | `parallel_decode_fault_inject` | 0（默认，即不注入） | **故障注入开关**，仅用于验证故障路径：`1` = decode worker 启动后立刻失败，`2` = walreader 启动后立刻失败（17.8）。生产环境必须保持 0 |
 
 所有 GUC 均需提供 `sighup` 或 `user` 级可调性，并保证关闭时行为与现状完全一致（AC-8）。
@@ -1612,6 +1640,7 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 | `max_parallel_decode_workers` | **下次会话**（新 walsender 会话按新值建池） | worker 数决定了共享内存的队列条数（2N 条 `shm_mq`，§5.1）与绑定表规模，在会话中途增删会改变这些结构；且正在解码的事务不能迁移（4.5） |
 | `parallel_decode_work_mem` / `parallel_decode_batch_size` | `sighup` 后**下次会话** | 同上：`ReorderBufferCheckMemoryLimit()` 只读**本进程**的 GUC 值（12.2），worker 进程必须重启才能看到新值 |
 | `parallel_decode_streaming_mode` / `parallel_decode_stream_min_size` / `parallel_decode_stream_segment_size` | `sighup` 后**下次会话** | 这三个值在**会话建立时**被解析并冻结（`auto` 档要按订阅端的流式模式解析，见 8.1；`min_size` 与 `segment_size` 要参与流段切分），会话中途改值会与已切出的流段不一致 |
+| `parallel_decode_barrier_timeout` / `parallel_decode_pending_max_bytes` / `parallel_decode_held_max_bytes` | `sighup` 后**立即** | 这三个值在**每次检查时**才读，reload 之后当前会话即按新值判定（它们只影响判定阈值，不改变已经切出的流段或已经解码的帧） |
 
 因此这些 GUC 虽然在 `sighup` 级可调，但**变更只在下一次复制会话生效**，不应给出"立即生效"的预期。这一点必须在 GUC 的说明里写清楚，否则运维会在会话中途改值并观察到不一致的行为。首版可只提供 `user` / `session` 级可调，把"会话中途变更"这个问题彻底消掉。
 
@@ -2128,4 +2157,5 @@ P7 已落实其中的 1、2、3、5、6、7 条：worker 的错误在循环内�
 | v0.19 | 2026-11-19 | **FR-13 监控指标实现完成**。(1) **六个视图**：`pg_parallel_decode_workers` / `pg_parallel_decode_commit_lag` / `pg_parallel_decode_txn_latency` / `pg_parallel_decode_pending_commit_age` / `pg_parallel_decode_walsender_frames` / `pg_parallel_decode_wakeups`，对应 11.3 的六项指标。(2) **取值路径**：并行路径的计数器都在 dsa 里、SQL 进程读不到；本树没有 `shmem_request_hook` 扩展点，引入 pgstat 新框架的改动面过大，因此**复用已存在于主共享内存的 `WalSndCtl`**——walsender 侧把 dsa 控制块里的计数**节流（100ms）拷贝**进 `struct WalSnd` 新增的 `pd_stats` 字段，拷贝在 `walsnd->mutex` 自旋锁下进行；两个新 SRF（`pg_stat_get_parallel_decode_session()` / `pg_stat_get_parallel_decode_workers()`）遍历 `WalSndCtl->walsnds[]`，跳过 `pid == 0` 或 `pd_stats.active` 为假的槽位；视图再与 `pg_stat_activity` / `pg_authid` 联结补上用户名与应用名。没有 `ROLE_PG_READ_ALL_STATS` 的用户只能看到自己那一行的 pid，其余列置空（与 `pg_stat_get_wal_senders()` 口径一致）。**不新增共享内存段，不动 pgstat 框架**。(3) **新增计数器**：帧数、帧字节数、socket 写次数、事务数、事务延迟（累计值与最大值）、cseq 已分配 / 已放行数、最长挂起提交年龄、上下行唤醒次数、每个 worker 的在途事务数 / 在途字节数 / 已解码事务数 / 已收发记录数。(4) **一处数据竞争被修掉**：早期实现里 worker 与 walreader 都写 `in_flight_txns`——跨进程计数器必须**只有一个写者**，改为该计数只由 walreader 在分配与事务结束两处增减，worker 只写自己那侧的 `records_consumed` / `decoded_txns` / `wakeups`。(5) **两处精度问题被修掉**：事务延迟原先被除以 `USECS_PER_SEC`，而 `TimestampTz` 本来就是微秒；且 `parallel_decode_record_cseq()` 原先在「已放行事务」的提前返回**之前**就建待放行条目，会给早已放行的事务留下永不回收的条目——条目创建移到提前返回**之后**。(6) **验证**：新增 `monitoring_smoke.sh`（4 worker × 8 并发会话 × 40 事务），检查六个视图存在、会话与 worker 的计数非零、**worker 的唤醒次数之和等于会话的上行唤醒次数**、以及「串行会话不出现在视图里」（`pd_stats.active` 只在并行路径会话建立后为真）。本机 11 个冒烟脚本全部通过。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
 | v0.20 | 2026-11-19 | **AC-14（子事务 abort）验证通过，并补上上游回归测试**。(1) **AC-14 的缺口查清**：`PD_ENT_SUBXACT_ABORT` / `PD_BLK_ABORT` 这条独立通道**没有实现，也不需要实现**——worker 用的是真实的 reorder buffer，`ReorderBufferAbort()` 在事务已被流式下发时会调用 `rb->stream_abort()`，STREAM ABORT 由插件按正常路径产出。新增 `subxact_abort_smoke.sh`：事务内先写入 2000 行（足以切出 17 个流段）、`SAVEPOINT` 后再写入 800 行、`ROLLBACK TO SAVEPOINT`、之后再写入 500 行；订阅端 `streaming='parallel'`。实测并行路径发出 **1 条 STREAM ABORT**，被中止子事务的行没有落地，其后子事务的 500 行完整落地，最终行集与**串行路径逐行一致**（AC-14 的核心判据"并行路径与串行路径的 apply 结果一致"成立）。(2) **上游回归测试**：`publication` 与 `subscription` 两个 pg_regress 用例通过；`src/test/subscription/t/` 的 34 个 TAP 用例（015_stream / 016_stream_subxact / 018_stream_subxact_abort / 019_stream_subxact_ddl_abort 等流式与子事务用例，共 457 个断言）全部通过——串行路径未受影响（AC-7）。(3) **冒烟脚本的运行环境**：所有脚本现在把 `PDTEST_ROOT` 与端口**导出**给 `setup_env.sh`，此前它们只是 shell 变量，导致脚本与被调用的 harness 用了不同的端口——本机曾因此出现"端口已被占用"的假失败。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
 | v0.21 | 2026-11-19 | **`parallel_decode_batch_size` 接线完成（5.4 第 9 项）**。(1) **批处理的实现**：发送方（`PDQueueSender`）记"上次刷新以来写了多少字节"，写消息时把字节数记进去，记满一批就把该消息的 `force_flush` 置真；批次未满但发送方要睡了，靠一条**长度为 0 的 `PD_ENT_FLUSH` 消息**显式刷新——`shm_mq` 没有 notify API（不存在 `shm_mq_notify`），接收方看不到尚未发布的数据，不显式刷新就会对着已经在环形缓冲里的数据空等。(2) **承载进度的消息不批量**：`PD_ENT_POSITION`（停滞检测依赖它）、`PD_ENT_EVENT`（事务结束事件）、walreader 的广播与定向控制消息每次都单独刷新，否则复制延迟与停滞检测的误报率会直接被抬高。(3) **批大小的上界**：有效批大小被钳制在共享队列的 1/4（`PARALLEL_DECODE_QUEUE_SIZE / 4`）以内——`shm_mq` 在累计写入量达到环的 1/4 时自己会发布并唤醒接收方，批更大则发送方会等待接收方腾不出空间，而接收方恰恰看不到未发布的数据，构成死锁。(4) **walreader 的批按跨队列计**：否则不持有任何事务、只收到 8 字节 marker 的 worker，其位置心跳要攒到 64KB 才刷新一次。(5) **唤醒计数器的口径改为"每次刷新"**：计数点下沉到发送方层，worker 的上行计数与 walreader 的下行计数都由刷新产生，`pg_parallel_decode_wakeups` 的上下行之和与 `pg_parallel_decode_workers.wakeups` 的和因此一致。`monitoring_smoke.sh` 改为跑两遍同一负载（一遍关闭批处理、一遍 64KB）并断言唤醒次数下降：上行 1338 → 417、下行 969 → 363（帧数同阶，874 / 850）。**本机只做功能与正确性验证，唤醒次数不是吞吐性能测试，12.3 与 15.2 的降幅倍数仍待性能环境实测回填** |
+| v0.23 | 2026-11-19 | **无 cseq 的帧（流式分片、子事务 abort 的 `STREAM ABORT`）不再越过已经结束的事务的结束事件——新增放行前沿的判门与 held 表**。(1) **缺陷**：并行路径把 cseq = 0 的帧一到就直接放进就绪队列，既不看待放行区也不看放行前沿，于是它们可以越过"在它们之前就已经结束"的事务的结束事件上 wire。发布端用行锁串行化的一对事务，在订阅端变成并发 apply → **订阅端报出发布端没有的 deadlock**（上游 parallel apply 本就有死锁风险，`applyparallelworker.c:60-130` 写明它检测而不避免；本条是发布端新增的并发窗口）。串行路径没有这个问题：它的输出顺序就是 WAL 记录的处理顺序。(2) **不变式 I-ORDER**：位置为 q 的无 cseq 帧，不得越过在 q 之前就已结束的事务的结束事件。(3) **判门**：无 cseq 帧可以放行，当且仅当放行前沿为空，或**前沿队首事务的结束记录起始 LSN ≥ 帧的位置**。两侧口径不同（队首取结束记录**起点**，帧取产生它的那条记录的**终点**），故判据是 `≥` 而非 `>`。**最后一个分片的位置取它的结束记录的起点**——它的变更都早于该事务的结束事件，这样它一定赶在自己的结束事件之前放行（协议要求如此），也顺带免掉了"按位置匹配去放行最后一个分片"这种脆弱做法（另一个事务的分片可能落在同一位置）。(4) **held 表**：不放行的帧按位置排序挂起，随放行前沿前移逐个放行；**帧永远不丢弃**（丢弃会让订阅端拿到不完整的数据）；held 表的字节计入待放行区。**判门之前必须先把控制通道读空**——前沿由 walreader's 消息算出，而控制通道与帧队列是两条通道，消息到达顺序不可比。(5) **新增 GUC `parallel_decode_held_max_bytes`**（默认 64MB，0 关闭）：等待放行前沿的帧占用发布端内存，超限时发一条 `WARNING`（每个 episode 只发一条）。同时把三个"每次检查时才读"的 GUC（`parallel_decode_barrier_timeout` / `parallel_decode_pending_max_bytes` / `parallel_decode_held_max_bytes`）的帮助文本从"下次复制会话生效"改为"reload 后立即生效"——它们不是会话建立时冻结的值。(6) **验证**：新增 `stream_order_smoke.sh`——两个事务**同时**跑（否则它们落在同一个 worker 上，一个 worker 内部天然串行，缺陷不会显现），第一个事务大（它的 worker 解码得慢，结束事件到得晚），第二个事务在第一个事务提交之后还在写，因此它产出的分片的位置在第一个事务的结束事件之后。断言：发布端**持有**了等待放行前沿的分片（告警出现）、发布端**没有**报出"分片越过了更早事务的提交"、结束事件按提交序到达订阅端、行数与内容一致。**负控制**（临时把判门改成恒真、重跑）必须失败：实测发布端报出 `the parallel decoding session sent a stream segment before the commit of an older transaction`（"分片位置 0/4D16A88 越过了在 0/4C40B00 结束的事务的提交"）。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
 | v0.22 | 2026-11-19 | **修复 `copy_data = true` 的表同步卡在 `srsubstate = 's'`；待放行区加字节上限与告警；停滞检测收窄到队头事务的拥有者**。(1) **卡死的根因是三处缺陷叠加**（分析见 `copy_data_hang.md`）：**D1**——walsender 的 `sentPtr` 在 `XLogSendLogical()` 里被冻结，发布端空闲时不再前进，订阅端的 `last_received` 因此永远越不过表的同步点（`SYNCDONE → READY` 的提升条件）；**D2**——承载“认证读取位置”的 `PD_ENT_READ_POS` 消息虽已存在，但只有两个下发点，发布端空闲时**一个都到不了**：walreader 阻塞在页读回调 `pd_walreader_read_page()` 里等新 WAL，“每 N 条记录一次”与“WAL 暂时读完”这两个上报点都在那之后；**D3**——追平 keepalive 的节流判据 `TimestampDifferenceExceeds()` 的两个参数**写反了**（第一个参数必须是较早的时间），于是 keepalive 永远不发。三处缺一不可：只修 D2 会让 keepalive 仍然不发，只修 D3 会让帧头 LSN 仍然被钳在一个常量上。(2) **修法**：walsender 的空闲回调 `pd_walsender_idle()` 刷新 `sentPtr = ParallelDecodePosition()`；新增 `pd_walreader_publish_position()`，在**页读回调的等待分支**也下发认证读取位置与 marker（marker 按位置去重，等待循环每 100ms 走一次，不去重会往每个 worker 的队列里灌重复 marker）；keepalive 的节流判据改正参数顺序。(3) **待放行区的字节上限与告警（8.2 的“至少加个上限”方案）**：新增 GUC `parallel_decode_pending_max_bytes`（默认 64MB，0 关闭），walsender 统计待放行帧的字节数，超过上限时发一条 `WARNING`（每个 episode 只发一次，待放行区缩回上限以下后才会再告警）；会话继续运行，数据不受影响。顺带修掉放行事务时丢弃关系定义帧的**内存泄漏**（丢弃时没有 `pfree()`）。(4) **停滞检测收窄**：`parallel_decode_check_stall()` 原先遍历**全部** worker，而空闲的 worker 天然落后于 walreader 的读取位置（落后量约一个 marker 的距离）且在发布端空闲时不再上报，因此“待放行事务 + 空闲发布端”会误报卡死；现在只检查**待放行队列队头事务的拥有者**——会话就是在等它，检测能力不变而误报消失。(5) **删掉一个死变量** `parallel_decode_certified_cseq`：它被赋值但从未被读取，认证读取位置由 `PD_ENT_READ_POS` 与 `parallel_decode_certified_lsn` 承载。(6) **验证**：新增 `pending_area_smoke.sh`——订阅端 `streaming = 'off'`（整事务形态），发布端 `parallel_decode_barrier_timeout = 5`、`parallel_decode_pending_max_bytes = 1MB`，写一个 20 万行的事务；断言**待放行区的告警出现**、**停滞检测没有误杀会话**、**事务耗时超过停滞检测的超时**（否则检测没有理由触发）、行数与校验和一致。本机 14 个冒烟脚本**全部通过**（含新增的这个）。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |

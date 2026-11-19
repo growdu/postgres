@@ -68,6 +68,15 @@ static LogicalDecodingContext *pd_ctx = NULL;
 static XLogRecPtr pd_end_lsn = InvalidXLogRecPtr;
 
 /*
+ * The position of the record that is being processed.
+ *
+ * The last segment of a transaction is produced while the record that ends the
+ * transaction is processed, and it carries this position: the changes of the
+ * segment are before the end event of the transaction.
+ */
+static XLogRecPtr pd_record_lsn = InvalidXLogRecPtr;
+
+/*
  * The index of this worker among the decode workers of the session.
  */
 static int	pd_worker_index = -1;
@@ -304,6 +313,8 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 static void
 pd_worker_send_segment(void)
 {
+	XLogRecPtr	position;
+
 	if (pd_segment_frames == 0)
 	{
 		resetStringInfo(pd_segment);
@@ -311,7 +322,20 @@ pd_worker_send_segment(void)
 		return;
 	}
 
-	PDQueueSendSegment(&pd_out_sender, (uint64) pd_end_lsn, pd_segment_frames,
+	/*
+	 * The last segment of a transaction is produced while the record that ends
+	 * the transaction is processed.  Its changes are before the end event of the
+	 * transaction, so its position is the position of the end event: the start
+	 * of that record.  The walsender orders the frames that have no commit
+	 * sequence number by their position, and the last segment has to reach the
+	 * subscriber before the end event of its transaction.
+	 *
+	 * The record that ends a transaction is the only one that has a commit
+	 * sequence number, so the number tells the two kinds of segments apart.
+	 */
+	position = (pd_current_cseq != 0) ? pd_record_lsn : pd_end_lsn;
+
+	PDQueueSendSegment(&pd_out_sender, (uint64) position, pd_segment_frames,
 					   pd_segment->data, pd_segment->len);
 
 	resetStringInfo(pd_segment);
@@ -901,6 +925,7 @@ pd_worker_decode_loop(void)
 		pd_ctx->reader->ReadRecPtr = record->lsn;
 		pd_ctx->reader->EndRecPtr = record->next_lsn;
 		pd_end_lsn = record->next_lsn;
+		pd_record_lsn = record->lsn;
 
 		LogicalDecodingProcessRecord(pd_ctx, pd_ctx->reader);
 

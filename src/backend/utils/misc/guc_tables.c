@@ -3060,8 +3060,8 @@ struct config_int ConfigureNamesInt[] =
 						 "worker that decodes it.  A worker that stops making progress "
 						 "while it still has records to decode ends the session with "
 						 "an error, so that the replication does not stall silently. "
-						 "Zero disables the check.  The change takes effect in the next "
-						 "replication session.")
+						 "Zero disables the check.  The change takes effect as soon "
+						 "as the configuration is reloaded.")
 		},
 		&parallel_decode_barrier_timeout,
 		60, 0, INT_MAX,
@@ -3081,10 +3081,30 @@ struct config_int ConfigureNamesInt[] =
 						 "all the transactions that end in the meantime pile up "
 						 "in the memory of the publisher.  The publisher warns "
 						 "when that happens; the session keeps running.  Zero "
-						 "turns the warning off.  The change takes effect in the "
-						 "next replication session.")
+						 "turns the warning off.  The change takes effect as soon "
+						 "as the configuration is reloaded.")
 		},
 		&parallel_decode_pending_max_bytes,
+		64 * 1024 * 1024, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_decode_held_max_bytes", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the number of bytes the stream segments that wait "
+						 "for the release frontier may take before the publisher "
+						 "warns about it."),
+			gettext_noop("A stream segment has no commit sequence number, so it "
+						 "waits for the transactions that ended before it.  The "
+						 "segments that wait take the memory of the publisher, and "
+						 "the publisher warns when they take more than this "
+						 "limit; the session keeps running.  The segments are "
+						 "never dropped, because the subscriber would end up with "
+						 "incomplete data.  Zero turns the warning off.  The "
+						 "change takes effect as soon as the configuration is "
+						 "reloaded.")
+		},
+		&parallel_decode_held_max_bytes,
 		64 * 1024 * 1024, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
