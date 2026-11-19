@@ -52,6 +52,7 @@ int			parallel_decode_stream_segment_size = 1024 * 1024;
 int			parallel_decode_work_mem = 0;	/* 0 means: use the PG default */
 int			parallel_decode_batch_size = 64 * 1024;
 int			parallel_decode_barrier_timeout = 60;	/* seconds, 0 disables it */
+int			parallel_decode_pending_max_bytes = 64 * 1024 * 1024;	/* 0 disables the warning */
 int			parallel_decode_fault_inject = PD_FAULT_NONE;
 
 /* Session state, only touched by the walsender. */
@@ -76,6 +77,17 @@ static bool parallel_decode_session_active = false;
 static XLogRecPtr parallel_decode_position = InvalidXLogRecPtr;
 
 /*
+ * The position the walreader has certified as read.
+ *
+ * The walreader is the only process that sees every transaction of the
+ * session, so it is the one that may say that every transaction that ends
+ * before a position has been reported.  The position arrives over the control
+ * channel, so it is read after the messages about the transactions that end
+ * before it.
+ */
+static XLogRecPtr parallel_decode_walreader_pos = InvalidXLogRecPtr;
+
+/*
  * A frame that is waiting to be sent.
  */
 typedef struct PDQueuedFrame
@@ -87,6 +99,8 @@ typedef struct PDQueuedFrame
 									 * InvalidOid for the other frames */
 	uint64		epoch;			/* the epoch of the session the definition
 									 * was produced in */
+	bool		counted;		/* the bytes of the frame are counted in the
+								 * size of the pending area */
 } PDQueuedFrame;
 
 /*
@@ -112,6 +126,25 @@ typedef struct PDPendingTxn
  * commit sequence number.
  */
 static HTAB *parallel_decode_pending = NULL;
+
+/*
+ * The number of bytes the frames of the session take in the memory of the
+ * walsender.
+ *
+ * The frames of a transaction are held back until the transaction has its
+ * turn.  A transaction that takes long to decode therefore holds the queue
+ * back, and the frames of all the transactions that end in the meantime pile
+ * up in the memory of the walsender.  The counter is what the warning about
+ * that is based on.
+ */
+static int64 parallel_decode_pending_bytes = 0;
+
+/*
+ * Whether the warning about the size of the pending area has been given for
+ * the current episode.  The warning is given again once the pending area has
+ * shrunk below the limit.
+ */
+static bool parallel_decode_pending_warned = false;
 
 /*
  * The relations whose definition the session has sent to the subscriber.
@@ -154,16 +187,15 @@ static List *parallel_decode_ready = NIL;
 static List *parallel_decode_frontier = NIL;
 
 /*
- * The position the walreader has read up to, and the commit sequence number
- * it had given out at that point.
+ * The position the walreader has read up to when it reported the transaction
+ * that ended last.
  *
  * The position may only be used as the release frontier when every
- * transaction that ended before it has been released: the walreader reports
- * the position together with the sequence number, so the two together say
- * which transactions the position covers.
+ * transaction that ended before it has been released.  That is the case when
+ * the set of the transactions that wait for their turn is empty, which is the
+ * normal case whenever the publisher has nothing to decode.
  */
 static XLogRecPtr parallel_decode_certified_lsn = InvalidXLogRecPtr;
-static uint64 parallel_decode_certified_cseq = 0;
 
 /*
  * The decoding position of every worker, and the time of the last message of
@@ -513,8 +545,40 @@ parallel_decode_add_pending_frame(uint64 cseq, const char *data, size_t len,
 	frame->end_lsn = end_lsn;
 	frame->relid = relid;
 	frame->epoch = epoch;
+	frame->counted = true;
 
 	pending->frames = lappend(pending->frames, frame);
+
+	/*
+	 * The frames take the memory of the walsender until they have been sent.
+	 * Warn when they take more than the limit: the session keeps working, but
+	 * the memory it uses is worth knowing about.
+	 */
+	parallel_decode_pending_bytes += len;
+
+	if (parallel_decode_pending_max_bytes > 0 &&
+		parallel_decode_pending_bytes > parallel_decode_pending_max_bytes)
+	{
+		if (!parallel_decode_pending_warned)
+		{
+			parallel_decode_pending_warned = true;
+
+			ereport(WARNING,
+					(errmsg("the parallel decoding session holds %lld bytes of "
+							"frames that wait for their turn",
+							(long long) parallel_decode_pending_bytes),
+					 errdetail("The frames of a transaction are held back until "
+							   "the transaction has its turn, so that the "
+							   "transactions reach the subscriber in the order "
+							   "they were committed in.  A transaction that takes "
+							   "long to decode holds the queue back."),
+					 errhint("The limit is parallel_decode_pending_max_bytes. "
+							 "The warning is given once until the pending area "
+							 "shrinks below the limit.")));
+		}
+	}
+	else if (parallel_decode_pending_warned)
+		parallel_decode_pending_warned = false;
 }
 
 /*
@@ -640,7 +704,17 @@ parallel_decode_release_txns(void)
 			 */
 			if (frame->relid != InvalidOid &&
 				parallel_decode_relation_sent(frame))
+			{
+				/*
+				 * The definition is not needed, so the frame is dropped.  Its
+				 * memory belongs to the pending area, so it has to be given
+				 * back to it.
+				 */
+				parallel_decode_pending_bytes -= frame->len;
+				pfree(frame->data);
+				pfree(frame);
 				continue;
+			}
 
 			parallel_decode_ready = lappend(parallel_decode_ready, frame);
 		}
@@ -723,10 +797,7 @@ parallel_decode_record_cseq(const PDCseqInfo *info)
 	 * which transactions the position covers.
 	 */
 	if ((XLogRecPtr) info->read_lsn > parallel_decode_certified_lsn)
-	{
 		parallel_decode_certified_lsn = (XLogRecPtr) info->read_lsn;
-		parallel_decode_certified_cseq = info->cseq;
-	}
 
 	/*
 	 * The transaction has been released already, so it does not hold the
@@ -801,6 +872,27 @@ parallel_decode_drain_control(void)
 			memcpy(&info, payload, sizeof(info));
 
 			parallel_decode_record_cseq(&info);
+		}
+		else if (type == PD_ENT_READ_POS)
+		{
+			uint64		position;
+
+			if (len < sizeof(position))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("parallel decode read position message is too short "
+								"(%zu bytes)", (size_t) len)));
+
+			memcpy(&position, payload, sizeof(position));
+
+			/*
+			 * The walreader certifies that every transaction that ends
+			 * before this position has been reported.  The certification
+			 * holds, because the message is read after the messages about
+			 * those transactions: the control channel keeps the order.
+			 */
+			if ((XLogRecPtr) position > parallel_decode_walreader_pos)
+				parallel_decode_walreader_pos = (XLogRecPtr) position;
 		}
 		else if (type == PD_ENT_WATERMARK)
 		{
@@ -886,10 +978,30 @@ ParallelDecodeFrontier(void)
 	/*
 	 * Every transaction the walreader has reported has been released, so the
 	 * position the walreader has read up to is the frontier.  The walreader
-	 * reports the position together with the commit sequence number it had
-	 * given out at that point, so the position covers exactly the
-	 * transactions that have been released.
+	 * reports that position over the control channel, which keeps the order of
+	 * the messages: every transaction that ends before the position has been
+	 * reported before the position is read, so the position is a certified one
+	 * and covers exactly the transactions that have been released.
+	 *
+	 * This is not a corner case: the set of transactions that wait for their
+	 * turn is empty whenever the publisher has no transaction in flight, and
+	 * then the frontier is the only thing that lets the position of the
+	 * session advance.
 	 */
+	if (!XLogRecPtrIsInvalid(parallel_decode_walreader_pos))
+	{
+		/*
+		 * The position of the last transaction the walreader reported is
+		 * covered by the position above, but the two do not have to be sent
+		 * at the same time, so the larger of the two is used.
+		 */
+		if (!XLogRecPtrIsInvalid(parallel_decode_certified_lsn) &&
+			parallel_decode_certified_lsn > parallel_decode_walreader_pos)
+			return parallel_decode_certified_lsn;
+
+		return parallel_decode_walreader_pos;
+	}
+
 	if (!XLogRecPtrIsInvalid(parallel_decode_certified_lsn))
 		return parallel_decode_certified_lsn;
 
@@ -1005,6 +1117,14 @@ parallel_decode_take_ready_frame(StringInfo buf, XLogRecPtr *end_lsn)
 
 	if (*end_lsn > parallel_decode_position)
 		parallel_decode_position = *end_lsn;
+
+	/*
+	 * The frame leaves the memory of the walsender, so the bytes it takes
+	 * there are given back to the size of the pending area.  The frames that
+	 * never waited for their turn were not counted there.
+	 */
+	if (frame->counted)
+		parallel_decode_pending_bytes -= frame->len;
 
 	pfree(frame->data);
 	pfree(frame);
@@ -1131,6 +1251,12 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					frame->relid = InvalidOid;
 					frame->epoch = 0;
 
+					/*
+					 * The frame does not wait for its turn, so its bytes are
+					 * not counted in the size of the pending area.
+					 */
+					frame->counted = false;
+
 					parallel_decode_ready = lappend(parallel_decode_ready, frame);
 				}
 				else
@@ -1237,6 +1363,13 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					frame->end_lsn = (XLogRecPtr) sh.end_lsn;
 					frame->relid = InvalidOid;
 					frame->epoch = 0;
+
+					/*
+					 * The frames of a segment do not wait for their turn, so
+					 * their bytes are not counted in the size of the pending
+					 * area.
+					 */
+					frame->counted = false;
 
 					parallel_decode_ready = lappend(parallel_decode_ready, frame);
 
@@ -1345,16 +1478,21 @@ parallel_decode_report_worker_failure(int worker)
  * stuck is not: the session would wait for it forever, and the replication
  * would look like it had simply caught up.
  *
- * The timeout is the backstop for that case.  It only applies to a worker
- * that still has records to decode: a worker that has decoded everything the
- * walreader has read is waiting for new WAL, which is not a stall.
+ * The timeout is the backstop for that case.  It only applies to the worker
+ * that owns the transaction the session is waiting for: that is the worker
+ * the session is stuck behind.  The other workers may well be waiting for new
+ * WAL, which is not a stall -- their position trails the position of the
+ * walreader by the distance of one marker, and they do not report anything
+ * while the publisher is idle.
  */
 static void
 parallel_decode_check_stall(void)
 {
 	instr_time	now;
 	XLogRecPtr	walreader_pos;
+	PDCseqInfo *info;
 	int			worker;
+	double		idle;
 
 	if (parallel_decode_barrier_timeout <= 0)
 		return;
@@ -1366,35 +1504,43 @@ parallel_decode_check_stall(void)
 	if (parallel_decode_pending == NULL)
 		return;
 
+	/*
+	 * The transaction at the head of the queue is the one the session waits
+	 * for, so its owner is the worker the session can be stuck behind.
+	 */
+	if (parallel_decode_frontier == NIL)
+		return;
+
+	info = (PDCseqInfo *) linitial(parallel_decode_frontier);
+	worker = info->owner;
+
+	if (worker < 0 || worker >= parallel_decode_num_workers)
+		return;
+
 	walreader_pos = (XLogRecPtr) parallel_decode_ctl->walreader_end_lsn;
+
+	/*
+	 * The worker has decoded everything the walreader has read, so it is
+	 * waiting for new WAL rather than working on something.
+	 */
+	if (parallel_decode_worker_position[worker] >= walreader_pos)
+		return;
 
 	INSTR_TIME_SET_CURRENT(now);
 
-	for (worker = 0; worker < parallel_decode_num_workers; worker++)
-	{
-		double		idle;
+	idle = INSTR_TIME_GET_DOUBLE(now) -
+		INSTR_TIME_GET_DOUBLE(parallel_decode_worker_progress[worker]);
 
-		/*
-		 * The worker has decoded everything the walreader has read, so it is
-		 * waiting for new WAL rather than working on something.
-		 */
-		if (parallel_decode_worker_position[worker] >= walreader_pos)
-			continue;
+	if (idle < parallel_decode_barrier_timeout)
+		return;
 
-		idle = INSTR_TIME_GET_DOUBLE(now) -
-			INSTR_TIME_GET_DOUBLE(parallel_decode_worker_progress[worker]);
-
-		if (idle < parallel_decode_barrier_timeout)
-			continue;
-
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("the parallel decode session stalled"),
-				 errdetail("Decode worker %d made no progress for %.0f seconds.",
-						   worker, idle),
-				 errhint("The session was waiting for a transaction to be released "
-						 "to the subscriber.")));
-	}
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("the parallel decode session stalled"),
+			 errdetail("Decode worker %d made no progress for %.0f seconds.",
+					   worker, idle),
+			 errhint("The session was waiting for a transaction to be released "
+					 "to the subscriber.")));
 }
 
 /*
@@ -2189,7 +2335,9 @@ ParallelDecodeSessionStop(void)
 		pfree(info);
 	}
 	parallel_decode_certified_lsn = InvalidXLogRecPtr;
-	parallel_decode_certified_cseq = 0;
+	parallel_decode_pending_bytes = 0;
+	parallel_decode_pending_warned = false;
+	parallel_decode_walreader_pos = InvalidXLogRecPtr;
 
 	if (parallel_decode_pending)
 	{

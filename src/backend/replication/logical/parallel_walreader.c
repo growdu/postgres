@@ -94,6 +94,9 @@ static uint32 pd_wait_event = PG_WAIT_EXTENSION;
 /* Publish the records that were written to the queues of the workers. */
 static void pd_walreader_flush_queues(void);
 
+/* Tell the workers and the walsender how far the walreader has read. */
+static void pd_walreader_publish_position(XLogRecPtr lsn);
+
 /*
  * The information the walreader keeps about the transactions it has seen.
  *
@@ -276,13 +279,24 @@ static bool
 pd_walreader_stopped(void)
 {
 	if (got_sigterm)
+	{
 		return true;
+	}
 	if (pd_ctl == NULL)
+	{
 		return true;
+	}
 	if (pd_ctl->shutdown)
+	{
 		return true;
+	}
 
-	return !ParallelDecodeProcessAlive(pd_ctl->walsender_pid);
+	if (!ParallelDecodeProcessAlive(pd_ctl->walsender_pid))
+	{
+		return true;
+	}
+
+	return false;
 }
 
 /*
@@ -337,7 +351,22 @@ pd_walreader_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 			 * The WAL is not there yet, so wait for it.  The records that
 			 * were read so far are published first: the workers cannot
 			 * decode a record that they cannot see.
+			 *
+			 * The position the walreader has read up to is published as
+			 * well.  The walsender may only report a position that is
+			 * covered by the transactions that have been released, and with
+			 * no WAL to decode there is nothing that would move that
+			 * position forward: the session would stay where it started,
+			 * and the subscriber would never learn that the session has
+			 * made progress.  That matters for the table synchronization
+			 * of the subscriber, which only ends once the position of the
+			 * session has passed the point the table was synchronized at.
+			 *
+			 * This is the parallel equivalent of the keepalive the serial
+			 * path sends while it waits for the WAL.
 			 */
+			pd_walreader_publish_position(pd_read_lsn);
+
 			pd_walreader_flush_queues();
 
 			rc = WaitLatch(MyLatch,
@@ -805,6 +834,46 @@ pd_walreader_send_cseq(uint64 cseq, XLogRecPtr end_lsn, XLogRecPtr read_lsn,
 }
 
 /*
+ * Tell the walsender how far the walreader has read.
+ *
+ * The walsender needs a position it may report to the subscriber: the
+ * position of the subscriber may not pass a transaction that has not been
+ * delivered yet.  When every transaction the walreader has seen ending has
+ * been released, the position the walreader has read up to is the release
+ * frontier.
+ *
+ * The message goes over the control channel, which keeps the order of the
+ * messages: every transaction that ends before the position has been reported
+ * before the message is sent, so the walsender knows about all of them when
+ * it reads the message.  That is what makes the position a certified one, and
+ * not a guess.
+ */
+static void
+pd_walreader_send_read_pos(XLogRecPtr lsn)
+{
+	static XLogRecPtr last_sent = InvalidXLogRecPtr;
+	uint64		pos = (uint64) lsn;
+
+	/*
+	 * The walsender keeps the last position it was told about, so there is
+	 * nothing to gain from sending the same position twice.  The walreader
+	 * repeats the report whenever it runs out of WAL, so this keeps the
+	 * control channel quiet while the publisher is idle.
+	 */
+	if (last_sent == lsn)
+		return;
+
+	if (!PDQueueSend(pd_control_mqh, PD_ENT_READ_POS, &pos, sizeof(pos),
+					 false, true))
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("could not hand the read position to the parallel "
+						"decoding session")));
+
+	last_sent = lsn;
+}
+
+/*
  * Hand the watermarks of the slot over to the walsender.
  *
  * The slot of the session has two watermarks that depend on the transactions
@@ -1149,15 +1218,48 @@ pd_walreader_send_worker(int worker, uint16 type, const void *payload, size_t le
  *
  * The marker is batched: it is a message about the progress of the WAL, not
  * about the data of a transaction.
+ *
+ * The same position is not sent twice: the marker only says how far the
+ * walreader has come, so a second marker with the same position tells the
+ * workers nothing they do not know already.  The wait for new WAL would
+ * otherwise send a marker to every worker every now and then.
  */
 static void
 pd_walreader_send_marker(XLogRecPtr position)
 {
+	static XLogRecPtr last_sent = InvalidXLogRecPtr;
 	uint64		pos = (uint64) position;
 	int			i;
 
+	if (last_sent == position)
+		return;
+
 	for (i = 0; i < pd_num_workers; i++)
 		pd_walreader_send_worker(i, PD_ENT_MARKER, &pos, sizeof(pos));
+
+	last_sent = position;
+}
+
+/*
+ * Tell the workers and the walsender how far the walreader has read.
+ *
+ * The workers need the marker to know that they have decoded everything the
+ * walreader has read, and the walsender needs the position to know how far it
+ * may report to the subscriber.
+ *
+ * The position is a certified one: the walreader sends the messages about the
+ * transactions that end before it before it sends the position, and the
+ * control channel keeps the order of the messages.  So the walsender knows
+ * about every transaction that ends before the position when it reads it.
+ */
+static void
+pd_walreader_publish_position(XLogRecPtr lsn)
+{
+	if (XLogRecPtrIsInvalid(lsn))
+		return;
+
+	pd_walreader_send_marker(lsn);
+	pd_walreader_send_read_pos(lsn);
 }
 
 /*
@@ -2018,10 +2120,13 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		{
 			/*
 			 * There is no more WAL at the moment.  Tell the workers how far the
-			 * walreader has come, so that they can report that they have
-			 * decoded everything that was meant for them.
+			 * walreader has come, so that they can report that they have decoded
+			 * everything that was meant for them, and tell the walsender how far
+			 * the walreader has read, so that it may report the position to the
+			 * subscriber: with no WAL to decode, the position of the session would
+			 * otherwise stay where it was.
 			 */
-			pd_walreader_send_marker(pd_read_lsn);
+			pd_walreader_publish_position(pd_read_lsn);
 
 			/*
 			 * There is no more WAL at the moment, so publish the records
@@ -2158,7 +2263,15 @@ pd_walreader_read_loop(XLogRecPtr start_lsn)
 		if (++marked >= PD_POSITION_MARK_RECORDS)
 		{
 			marked = 0;
-			pd_walreader_send_marker(reader->record->next_lsn);
+
+			/*
+			 * Tell the workers how far the walreader has come, and tell the
+			 * walsender as well, so that it may report the position to the
+			 * subscriber.  The message about the position goes out after the
+			 * messages about the transactions that ended before this position, so
+			 * the walsender knows about all of them when it reads it.
+			 */
+			pd_walreader_publish_position(reader->record->next_lsn);
 		}
 
 		/* Tell the walsender how far we have come. */

@@ -76,6 +76,7 @@ extern PGDLLIMPORT int	parallel_decode_stream_segment_size;
 extern PGDLLIMPORT int	parallel_decode_work_mem;
 extern PGDLLIMPORT int	parallel_decode_batch_size;
 extern PGDLLIMPORT int	parallel_decode_barrier_timeout;
+extern PGDLLIMPORT int	parallel_decode_pending_max_bytes;
 extern PGDLLIMPORT int	parallel_decode_fault_inject;
 extern PGDLLIMPORT char *parallel_decode_trace_file;
 
@@ -402,7 +403,8 @@ typedef enum ParallelDecodeEntryType
 	PD_ENT_MARKER = 15,		/* walreader -> worker */
 	PD_ENT_WATERMARK = 16,		/* walreader -> walsender */
 	PD_ENT_RELATION = 17,		/* worker -> walsender */
-	PD_ENT_FLUSH = 18			/* walreader -> worker, worker -> walsender */
+	PD_ENT_FLUSH = 18,			/* walreader -> worker, worker -> walsender */
+	PD_ENT_READ_POS = 19		/* walreader -> walsender */
 } ParallelDecodeEntryType;
 
 /*

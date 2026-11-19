@@ -4,7 +4,7 @@
 | --- | --- |
 | 特性名称 | 逻辑复制发布端并行解码（parallel decoding） |
 | 目标版本 | PostgreSQL 17（本仓库分支 `pa_decode`） |
-| 关联文档 | `design.md`（概要设计说明书） |
+| 关联文档 | `design.md`（概要设计说明书）、`user_manual.md`（用户手册） |
 | 文档状态 | 草稿 |
 
 ## 1. 背景

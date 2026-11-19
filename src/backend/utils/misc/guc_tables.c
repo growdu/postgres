@@ -3069,6 +3069,27 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"parallel_decode_pending_max_bytes", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the number of bytes the frames of the transactions "
+						 "that wait for their turn may take before the publisher "
+						 "warns about it."),
+			gettext_noop("The publisher holds the frames of a transaction back "
+						 "until the transaction has its turn, so that the "
+						 "transactions reach the subscriber in the order they "
+						 "were committed in.  A transaction that takes long to "
+						 "decode holds the queue back, and then the frames of "
+						 "all the transactions that end in the meantime pile up "
+						 "in the memory of the publisher.  The publisher warns "
+						 "when that happens; the session keeps running.  Zero "
+						 "turns the warning off.  The change takes effect in the "
+						 "next replication session.")
+		},
+		&parallel_decode_pending_max_bytes,
+		64 * 1024 * 1024, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"parallel_decode_fault_inject", PGC_SIGHUP, REPLICATION_SENDING,
 			gettext_noop("Sets the failure the parallel decoding session produces on "
 						 "purpose."),

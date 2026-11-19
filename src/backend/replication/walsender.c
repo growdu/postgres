@@ -3505,6 +3505,21 @@ retry:
 }
 
 /*
+ * The time between two catch-up keepalives of the parallel decoding path.
+ *
+ * The callback that waits for the decode workers runs every now and then, so
+ * the keepalives it sends have to be throttled.  The subscriber only has to
+ * learn about the new position every now and then, and a keepalive per
+ * callback would flood the connection.
+ */
+#define PD_CATCHUP_KEEPALIVE_INTERVAL_MS	1000
+
+/*
+ * When the last catch-up keepalive was sent.
+ */
+static TimestampTz pd_last_catchup_keepalive = 0;
+
+/*
  * Called while the walsender waits for the decode worker to hand over the
  * next frame.
  *
@@ -3525,6 +3540,38 @@ pd_walsender_idle(void)
 
 	/* die if timeout was reached */
 	WalSndCheckTimeOut();
+
+	/*
+	 * How far the session has come is decided by the decoding, so the
+	 * position has to be refreshed while the session waits for the decode
+	 * workers.  Without it the position of the session stays where it was
+	 * when the session started, and the subscriber never learns that the
+	 * publisher has made progress.  That matters for the table
+	 * synchronization of the subscriber: it only ends once the position of
+	 * the session has passed the point the table was synchronized at.
+	 */
+	sentPtr = ParallelDecodePosition();
+
+	/* Report the position in the shared memory status, as well. */
+	SpinLockAcquire(&MyWalSnd->mutex);
+	MyWalSnd->sentPtr = sentPtr;
+	SpinLockRelease(&MyWalSnd->mutex);
+
+	/*
+	 * The subscriber has not confirmed the position yet: tell it where the
+	 * session has come to, so that it can advance the flush position of the
+	 * slot.  This is what the serial path does while it waits for the WAL.
+	 */
+	if (MyWalSnd->flush < sentPtr &&
+		MyWalSnd->write < sentPtr &&
+		!waiting_for_ping_response &&
+		TimestampDifferenceExceeds(pd_last_catchup_keepalive,
+								   GetCurrentTimestamp(),
+								   PD_CATCHUP_KEEPALIVE_INTERVAL_MS))
+	{
+		pd_last_catchup_keepalive = GetCurrentTimestamp();
+		WalSndKeepalive(false, InvalidXLogRecPtr);
+	}
 
 	/* Send keepalive if the time has come */
 	WalSndKeepaliveIfNecessary();

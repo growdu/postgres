@@ -199,13 +199,24 @@ static bool
 pd_worker_stopped(void)
 {
 	if (got_sigterm)
+	{
 		return true;
+	}
 	if (pd_ctl == NULL)
+	{
 		return true;
+	}
 	if (pd_ctl->shutdown)
+	{
 		return true;
+	}
 
-	return !ParallelDecodeProcessAlive(pd_ctl->walsender_pid);
+	if (!ParallelDecodeProcessAlive(pd_ctl->walsender_pid))
+	{
+		return true;
+	}
+
+	return false;
 }
 
 /*
