@@ -6,7 +6,7 @@ parallel_decode_trace_file GUC) and either dumps them or compares two of
 them.
 
 The comparison answers the question the parallel path has to pass: does it
-produce the same data as the serial path?  Three differences are allowed and
+produce the same data as the serial path?  Four differences are allowed and
 are reported separately, because they are intentional:
 
   * the frames may group the pgoutput messages differently, because the
@@ -16,7 +16,11 @@ are reported separately, because they are intentional:
   * the framing of a transaction differs, because the parallel path streams
     the transactions: it sends stream segments where the serial path sends a
     block of messages, and the messages of a streamed transaction carry the
-    transaction id in band.
+    transaction id in band;
+  * a transaction that changes nothing is empty: the serial path skips it,
+    the parallel path streams it, the way the upstream streaming protocol
+    does it.  An empty transaction carries no data, so the comparison ignores
+    it.
 
 The last difference is the reason why the tool does not compare the bytes of
 the messages as they are.  The transaction id in band is stripped from the
@@ -480,9 +484,11 @@ def message_multiset(frames):
 def split_transactions(frames):
     """Split the messages of the frames into the transactions they belong to.
 
-    Returns a list of transactions, in the order the transactions ended.  A
-    transaction is a list of (tag, digest, length) triples of the messages
-    that carry data.
+    Returns a list of (tag, messages) pairs, in the order the transactions
+    ended.  The tag is the message that ended the transaction: a commit
+    message for a transaction that is not streamed, a stream commit message
+    for a transaction that is streamed.  The messages are the (tag, digest,
+    length) triples of the messages that carry data.
 
     A transaction that is not streamed is delimited by a begin and a commit
     message.  A transaction that is streamed is spread over the stream
@@ -494,6 +500,13 @@ def split_transactions(frames):
     The messages that delimit a transaction are not part of it, and neither
     are the relation messages: the two paths send the definition of a
     relation at different times, so they are compared on their own.
+
+    A transaction that carries no data is empty.  The serial path does not
+    send one: pgoutput skips the transactions that change nothing.  The
+    parallel path streams every transaction, so the stream of an empty
+    transaction reaches the subscriber as well, the way the upstream
+    streaming protocol does it.  The empty transactions carry no information,
+    so the comparison ignores them.
     """
     transactions = []
     #
@@ -514,7 +527,7 @@ def split_transactions(frames):
                 continue
             if tag == MSG_COMMIT:
                 if plain is not None:
-                    transactions.append(plain)
+                    transactions.append((MSG_COMMIT, plain))
                 plain = None
                 continue
             if tag == MSG_STREAM_START:
@@ -525,7 +538,7 @@ def split_transactions(frames):
                 in_stream = False
                 continue
             if tag == MSG_STREAM_COMMIT:
-                transactions.append(streamed.pop(xid, []))
+                transactions.append((MSG_STREAM_COMMIT, streamed.pop(xid, [])))
                 continue
             if tag == MSG_RELATION:
                 continue
@@ -579,20 +592,6 @@ def message_lsn_map(frames):
     for key in result:
         result[key].sort()
     return result
-
-
-def transaction_order(frames):
-    """The ordered list of the transaction delimiters."""
-    order = []
-    streaming = False
-    for frame in frames:
-        if frame.type != "w":
-            continue
-        messages, streaming = parse_messages(frame.payload, streaming)
-        for tag, raw, desc, xid in messages:
-            if tag in TXN_BOUNDARY:
-                order.append(tag)
-    return order
 
 
 def cmd_dump(args):
@@ -662,6 +661,21 @@ def cmd_diff(args):
     txns_a = split_transactions(data_a)
     txns_b = split_transactions(data_b)
 
+    #
+    # The empty transactions are ignored: they carry no data, so they cannot
+    # tell the two paths apart.  The serial path does not send them at all,
+    # the parallel path streams them.
+    #
+    empty_a = [t for t in txns_a if not t[1]]
+    empty_b = [t for t in txns_b if not t[1]]
+    if empty_a or empty_b:
+        print("note: %d empty transaction(s) ignored (A=%d, B=%d): they carry "
+              "no data, the serial path skips them and the parallel path "
+              "streams them" %
+              (len(empty_a) + len(empty_b), len(empty_a), len(empty_b)))
+    txns_a = [t for t in txns_a if t[1]]
+    txns_b = [t for t in txns_b if t[1]]
+
     if len(txns_a) != len(txns_b):
         print("the number of the transactions differs: A=%d B=%d" %
               (len(txns_a), len(txns_b)))
@@ -669,18 +683,18 @@ def cmd_diff(args):
     else:
         mismatch = None
         for i, (txn_a, txn_b) in enumerate(zip(txns_a, txns_b)):
-            if txn_a != txn_b:
-                mismatch = (i, txn_a, txn_b)
+            if txn_a[1] != txn_b[1]:
+                mismatch = (i, txn_a[1], txn_b[1])
                 break
         if mismatch is None:
             print("the transactions match (%d transaction(s), %d change(s))" %
-                  (len(txns_a), sum(len(t) for t in txns_a)))
+                  (len(txns_a), sum(len(t[1]) for t in txns_a)))
         else:
-            i, txn_a, txn_b = mismatch
+            i, msgs_a_, msgs_b_ = mismatch
             print("the transaction %d differs: A=%d change(s), B=%d change(s)" %
-                  (i, len(txn_a), len(txn_b)))
-            for line in _describe_multiset_diff(Counter(txn_a),
-                                                Counter(txn_b))[:20]:
+                  (i, len(msgs_a_), len(msgs_b_)))
+            for line in _describe_multiset_diff(Counter(msgs_a_),
+                                                Counter(msgs_b_))[:20]:
                 print(line)
             errors.append("the transaction %d differs" % i)
 
@@ -720,10 +734,8 @@ def cmd_diff(args):
     # by a begin and a commit message, so only the end of a transaction is
     # compared.
     #
-    order_a = [tag for tag in transaction_order(data_a)
-               if tag in (MSG_COMMIT, MSG_STREAM_COMMIT)]
-    order_b = [tag for tag in transaction_order(data_b)
-               if tag in (MSG_COMMIT, MSG_STREAM_COMMIT)]
+    order_a = [tag for tag, msgs in txns_a]
+    order_b = [tag for tag, msgs in txns_b]
 
     if len(order_a) == len(order_b):
         print("the transactions end in the same order (%d transaction(s))" %
