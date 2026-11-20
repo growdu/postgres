@@ -151,3 +151,73 @@ walsender:  环 --memcpy--> 接收缓冲 --(接管，不拷贝)--> 块缓冲 --m
 需要在 §15.2 的待实测清单里加一项：**`parallel_decode_stream_segment_size` 的默认值 1MB
 对 tpcc（每事务约 3KB）意味着"每个事务都在提交时才被流式化"**，端到端时延因此接近整事务下发，
 收益只剩"订阅端能并行 apply"。
+
+---
+
+## H. §11.3 唤醒计数的口径：下行要加上 walreader → walsender 的控制流
+
+实现已落地：控制队列上的唤醒现在**逐条计数**，控制消息仍然**不批量**。
+
+### H.1 为什么要修
+
+`PDQueueSend()`（控制队列用的发送函数）不经过 `PDQueueSender`，因此**控制队列的刷新从来没被计过**。
+而 walreader → walsender 的控制流（`PD_ENT_CSEQ` / `PD_ENT_READ_POS` / `PD_ENT_WATERMARK` /
+`PD_ENT_READY`）走的正是 `PDQueueSend()`。⇒ `wakeups_down` **每提交少算约 1 次**，
+报出来的下行唤醒速率只是**下界**。
+
+### H.2 实现方式
+
+- 新增 `PDQueueSetWakeupCounter(shm_mq_handle *mqh, volatile uint64 *wakeups)`：
+  给一条"用 `PDQueueSend()` 写、没有自己的发送方"的队列注册唤醒计数器。
+  注册表是进程内的小数组（每条队列恰好一个发送者，无需加锁）。
+- `PDQueueSend()` 在**刷新成功**时给该队列的计数器加一。计数口径仍是"**刷新次数**"，
+  与 `PDQueueSender` 那条路径一致（`SetLatch` 若因 latch 已置而早退，flush 次数是 SIGURG 次数的上界，
+  这个 caveat 不变）。
+- walreader 在挂上控制队列后注册自己的计数器（`parallel_walreader.c`），计数写进
+  `pd_ctl->walreader_wakeups`，也就是 `pg_parallel_decode_wakeups.wakeups_down` 的来源。
+
+### H.3 §11.3 表格第 1702 行
+
+> `| pg_parallel_decode_wakeups | 跨进程唤醒（信号）的速率，区分上下行（5.4） |`
+
+建议改成：
+
+> `| pg_parallel_decode_wakeups | 跨进程唤醒（信号）的速率，区分上下行（5.4）。下行 = walreader 造成的**全部**唤醒：→ worker 的队列刷新 **加上** → walsender 的控制队列刷新 |`
+
+### H.4 §11.3 实现要点第 1710 行那条 bullet
+
+现有的措辞是"**唤醒次数的上下行不对称是设计使然**：下行（walreader → worker）传的是 WAL 记录，
+上行（worker → walsender）传的是帧。两侧都按字节合并批次……"。这条现在**只覆盖了一半**：
+下行其实有两条通路，**控制队列那条不批量**。建议改成：
+
+> - **唤醒次数的上下行不对称是设计使然**：下行（walreader → worker）传的是 WAL 记录，上行（worker → walsender）传的是帧。两侧都按字节合并批次（5.4 第 9 项，`parallel_decode_batch_size`），因此**唤醒次数与"字节数 / 批大小"同阶，而不是与记录数 / 帧数同阶**。计数器的口径是"**刷新次数**"——刷新才真的唤醒了对端；承载进度的消息不批量，每次都刷新，因此各计一次。批处理关闭时（`parallel_decode_batch_size = 0`）计数退回"每条记录 / 每帧一次"。**唤醒速率的具体数值待实测**（15.2）
+> - **下行有两条通路，控制队列那条不批量**：`wakeups_down` 是 walreader 造成的**全部**唤醒——(a) walreader → worker 的队列刷新，按字节合批；(b) walreader → walsender 的**控制队列**刷新（CSEQ / READ_POS / WATERMARK / READY），**逐条刷新、逐条唤醒**，因此这条通路的刷新次数**至少等于 walreader 已分配的提交序号数**。⇒ 恒有 `wakeups_down ≥ pg_parallel_decode_commit_lag.cseq_allocated`；这条不等式可以用来核对控制队列的唤醒是否被计入。
+
+### H.5 §16 变更记录里"唤醒次数的口径从'每条记录 / 每帧'改为'每次刷新'"那条（第 2005 行）
+
+那条写的是"计数点下沉到发送方层（`PDQueueSender` 持有一个指向共享内存计数器的指针）"——
+现在多了一条通路，建议在末尾补一句：
+
+> 控制队列不走 `PDQueueSender`，它的刷新由 `PDQueueSetWakeupCounter()` 注册的计数器单独计；
+> 因此"下行"= walreader → worker **加上** walreader → walsender 的控制流。
+
+### H.6 §15.2 第 14 项（待实测清单，第 1902 行）
+
+那一条写的是"**批处理后的跨进程唤醒速率**（下行 walreader → worker、上行 worker → walsender）"。
+下行的口径变宽了，建议把括号里的说明改成：
+
+> （下行 walreader → worker **加上 walreader → walsender 的控制队列**，上行 worker → walsender）
+
+同一行的实测记录"下行 969 → 363"是**旧口径**的数字（不含控制队列），建议注明"旧口径"，
+或者按新口径重测后再回填。
+
+### H.7 本机验证（只是计数，不是吞吐性能测试）
+
+`monitoring_smoke.sh` 增加了一条断言：**`wakeups_down ≥ cseq_allocated`**（每个被编号的提交
+都至少经控制队列唤醒过 walsender 一次）。本机同一负载（4 worker × 8 并发 × 40 事务 + 500 事务的
+突发）下：批量关闭时下行 3569、批量 64KB 时下行 1782，同一负载的 `cseq_allocated` 是 820。
+
+> ⚠️ **这条断言在当前负载下不能单独区分"控制队列被计入"与"没被计入"**：把控制队列的注册临时去掉
+> 重测，下行是 904 —— worker 队列的刷新次数本身就与提交数同阶（本机实测 1 worker 时 839、
+> 4 worker 时 904），所以 `904 ≥ 820` 仍然成立。**本机只做功能与正确性验证**，
+> 上述数字是唤醒**次数**，不是速率；唤醒**速率**仍待性能环境实测回填。

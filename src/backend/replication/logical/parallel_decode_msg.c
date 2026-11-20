@@ -68,6 +68,81 @@ PDQueueDetached(void)
 }
 
 /*
+ * The counters of the wakeups of the queues that are written with
+ * PDQueueSend().
+ *
+ * The queues that carry the payload of the session have a sender of their own
+ * (PDQueueSender), which counts the wakeups it causes.  The control queue is
+ * written with PDQueueSend(), which has no sender, so the counter of that
+ * queue is registered here.
+ *
+ * Every queue has exactly one sender, so the counters need no lock.
+ */
+#define PD_WAKEUP_COUNTERS_MAX	4
+
+static struct
+{
+	shm_mq_handle *mqh;			/* the queue */
+	volatile uint64 *wakeups;	/* the counter of the wakeups, may be NULL */
+} pd_wakeup_counters[PD_WAKEUP_COUNTERS_MAX];
+
+static int pd_wakeup_counters_used = 0;
+
+/*
+ * Register the counter of the wakeups of a queue.
+ *
+ * The counter counts the times the receiver of the queue is woken up.  A
+ * queue that is registered twice keeps its counter.
+ */
+void
+PDQueueSetWakeupCounter(shm_mq_handle *mqh, volatile uint64 *wakeups)
+{
+	int			i;
+
+	for (i = 0; i < pd_wakeup_counters_used; i++)
+	{
+		if (pd_wakeup_counters[i].mqh == mqh)
+		{
+			pd_wakeup_counters[i].wakeups = wakeups;
+			return;
+		}
+	}
+
+	if (pd_wakeup_counters_used >= PD_WAKEUP_COUNTERS_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("too many parallel decode queues with a wakeup counter")));
+
+	pd_wakeup_counters[pd_wakeup_counters_used].mqh = mqh;
+	pd_wakeup_counters[pd_wakeup_counters_used].wakeups = wakeups;
+	pd_wakeup_counters_used++;
+}
+
+/*
+ * Note that the receiver of a queue has been woken up.
+ *
+ * A flush publishes what the sender has written and sets the latch of the
+ * receiver, so the number of the flushes is the number of the wakeups of the
+ * receiver.  The counter is part of the statistics of the monitoring views
+ * (11.3).
+ */
+static void
+pd_queue_count_queue_wakeup(shm_mq_handle *mqh)
+{
+	int			i;
+
+	for (i = 0; i < pd_wakeup_counters_used; i++)
+	{
+		if (pd_wakeup_counters[i].mqh == mqh)
+		{
+			if (pd_wakeup_counters[i].wakeups)
+				(*pd_wakeup_counters[i].wakeups)++;
+			return;
+		}
+	}
+}
+
+/*
  * Send one entry.
  *
  * Returns true when the entry was handed over to the queue, and false when
@@ -109,7 +184,23 @@ PDQueueSend(shm_mq_handle *mqh, uint16 type, const void *payload, size_t len,
 	res = shm_mq_sendv(mqh, iov, iovcnt, nowait, force_flush);
 
 	if (res == SHM_MQ_SUCCESS)
+	{
+		/*
+		 * A flush publishes what the sender has written and sets the latch of
+		 * the receiver, so the number of the flushes is the number of the
+		 * wakeups of the receiver.  The queues that count their wakeups have
+		 * registered their counter.
+		 *
+		 * A send without a flush does not wake the receiver up right away:
+		 * the queue publishes what the sender has written when the sender has
+		 * written more than a quarter of the ring.  Such a send is not
+		 * counted here, because the wakeup happens somewhere else.
+		 */
+		if (force_flush)
+			pd_queue_count_queue_wakeup(mqh);
+
 		return true;
+	}
 
 	if (res == SHM_MQ_WOULD_BLOCK)
 		return false;

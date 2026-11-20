@@ -2545,6 +2545,16 @@ ParallelWalreaderMain(Datum main_arg)
 	control_mqh = shm_mq_attach(control_mq, seg, NULL);
 	pd_control_mqh = control_mqh;
 
+	/*
+	 * The control queue is flushed for every message, so every message wakes
+	 * the walsender up.  Count the wakeups, so that the monitoring views show
+	 * how often the walreader wakes the walsender up.  Without the counter
+	 * these wakeups are invisible: the counter of the wakeups of the worker
+	 * queues counts the wakeups of the walreader down to the workers, and
+	 * the control queue does not go through a sender of its own.
+	 */
+	PDQueueSetWakeupCounter(pd_control_mqh, &pd_ctl->walreader_wakeups);
+
 	ready_payload[0] = (int64) MyProcPid;
 	ready_payload[1] = 0;
 	if (!PDQueueSend(control_mqh, PD_ENT_READY, ready_payload,

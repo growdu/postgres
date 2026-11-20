@@ -432,11 +432,18 @@ WARNING:  the parallel decoding session holds 73400320 bytes of frames that wait
 
 | 列 | 含义 |
 | --- | --- |
-| `wakeups_down` | walreader → worker 的唤醒次数（下行） |
+| `wakeups_down` | walreader 造成的唤醒次数（下行）：walreader → worker 的队列刷新，**加上 walreader 经控制队列 → walsender 的唤醒** |
 | `wakeups_up` | worker → walsender 的唤醒次数（上行） |
 | `wakeups_total` | 两者之和 |
 
 **计数口径是"刷新次数"**，不是"消息条数"。刷新才真的唤醒了对端。承载进度的消息（位置心跳、事务结束事件）不批量，每次都刷新，因此各计一次。
+
+下行包含两条通路，因为两条都是 walreader 主动唤醒对端的：
+
+- **walreader → worker**：WAL 记录交给 worker 的队列上的刷新。批量开启时一次刷新可携带多条记录，所以这条通路的刷新次数远小于记录条数。
+- **walreader → walsender**：控制队列上的刷新。控制队列上的消息（提交序号 CSEQ、读取位置 READ_POS、水位 WATERMARK、就绪 READY）**一律不批量**，每条消息都单独刷新、单独唤醒 walsender 一次，因此这条通路的刷新次数至少等于 walreader 已分配的提交序号数。
+
+因为 CSEQ 是每个提交一条，`wakeups_down` 必然不小于 `pg_parallel_decode_commit_lag.cseq_allocated`：每个被编号的提交都至少唤醒过 walsender 一次。这条不等式可以用来核对下行计数是否把控制队列算进去了——若 `wakeups_down` 明显小于 `cseq_allocated`，说明控制队列的唤醒没有被计入。
 
 `pg_parallel_decode_wakeups.wakeups_up` 等于 `pg_parallel_decode_workers.wakeups` 的和。
 
@@ -571,10 +578,10 @@ SELECT wakeups_down, wakeups_up FROM pg_parallel_decode_wakeups;
 
 | 项目 | 结果 |
 | --- | --- |
-| `doc/pa_decode/t/` 的 13 个冒烟脚本 | 全部通过 |
+| `doc/pa_decode/t/` 的 18 个冒烟脚本 | 全部通过 |
 | 上游 `publication` / `subscription` 回归测试 | 全部通过 |
 | `src/test/subscription/t/` 的 34 个 TAP 用例（459 个断言） | 全部通过 |
-| 同一负载下关闭/开启合并批次的唤醒次数对比 | 上行 1338 → 417，下行 969 → 363（帧数同阶） |
+| 同一负载下关闭/开启合并批次的唤醒次数对比（4 worker × 8 并发 × 40 事务 + 500 事务的突发） | 上行 3567 → 1067，下行 3569 → 1782（帧数同阶，2452 / 2461）。**下行含控制队列**，见 §5.2 |
 
 ---
 

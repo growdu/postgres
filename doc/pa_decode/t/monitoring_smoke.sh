@@ -13,8 +13,11 @@
 #   pg_parallel_decode_wakeups	the signals between the participants
 #
 # The test writes a workload, checks that the views exist and that they
-# report the activity of the session, and checks that the counters of the
-# workers add up to the counters of the session.
+# report the activity of the session, checks that the counters of the workers
+# add up to the counters of the session, and checks that the wakeups of the
+# walreader cover the commits it has numbered: every commit is announced to
+# the walsender over the control queue, and every such message wakes the
+# walsender up.
 #
 # The workload is run twice, once with the batching of the queues turned off
 # and once with it turned on.  The batching has to reduce the number of the
@@ -33,6 +36,12 @@ WORKERS=${WORKERS:-4}
 export PDTEST_ROOT="$ROOT" PORT_PUB PORT_SUB
 TXNS=${TXNS:-40}
 CONC=${CONC:-8}
+#
+# The number of the transactions of the burst.  The burst is written by one
+# session, so the transactions are committed one after the other without a
+# pause.  It gives the session many commits in a short time, so that the
+# invariant of the wakeups is checked over many of them.
+BURST=${BURST:-500}
 #
 # The size of the batch that the second run uses.  It has to be large enough
 # to hold several frames, and small enough to fit into the queue.
@@ -113,6 +122,42 @@ EOF
 		wait "$p"
 	done
 
+	echo "-- writing the burst"
+	#
+	# One session commits the transactions of the burst one after the other,
+	# without a pause.  The walreader numbers the commits of the burst in a
+	# few rounds, so the session gets a lot of commits in a short time.
+	{
+		for i in $(seq 1 "$BURST"); do
+			echo "begin; insert into pd_t (v) values ('burst'); commit;"
+		done
+	} >"$ROOT/burst.sql"
+	pub -f "$ROOT/burst.sql" >/dev/null
+
+	echo "-- waiting for the commits of the burst to be numbered"
+	#
+	# The commits are numbered by the walreader as it reads them, which does
+	# not depend on the subscriber: the test waits for the numbers, so that
+	# the counters it reads afterwards cover the whole burst.
+	#
+	# The pipeline may stall before every commit is numbered, because the
+	# subscriber applies the transactions one after the other, and the
+	# publisher cannot get ahead of it.  That is not what the test is about,
+	# so the wait ends when the numbers stop coming.
+	total=$((TXNS * CONC + BURST))
+	cseq=0
+	for i in $(seq 1 60); do
+		cseq=$(pub -At -c "select sum(cseq_allocated) from pg_parallel_decode_commit_lag")
+		cseq=${cseq:-0}
+		[ "$cseq" -ge "$total" ] && break
+		sleep 1
+	done
+	if [ "$cseq" -lt "$total" ]; then
+		echo "   the walreader numbered $cseq of $total commit(s)"
+	else
+		echo "   the walreader numbered $cseq commit(s)"
+	fi
+
 	echo "-- checking that the views exist"
 	for view in pg_parallel_decode_workers \
 		pg_parallel_decode_commit_lag \
@@ -139,9 +184,20 @@ EOF
 	[ -n "$txns" ] && [ "$txns" != "0" ] || fail "the session reported no transactions"
 	echo "   the session decoded $txns transaction(s)"
 
+	#
+	# The commits are read before the wakeups: every commit the walreader
+	# numbers is announced to the walsender over the control queue, and every
+	# such message wakes the walsender up, so the number of the wakeups of the
+	# walreader has to be at least the number of the commits.
+	cseq=$(pub -At -c "select sum(cseq_allocated) from pg_parallel_decode_commit_lag")
+	[ -n "$cseq" ] && [ "$cseq" != "0" ] ||
+		fail "the session reported no commit sequence numbers"
+
 	down=$(wait_for "select sum(wakeups_down) from pg_parallel_decode_wakeups")
 	[ -n "$down" ] && [ "$down" != "0" ] || fail "the session reported no wakeups"
-	echo "   the walreader sent $down signal(s) to the workers"
+	[ "$down" -ge "$cseq" ] ||
+		fail "the walreader caused $down wakeup(s) for $cseq commit(s)"
+	echo "   the walreader caused $down wakeup(s) for $cseq commit(s)"
 
 	up=$(wait_for "select sum(wakeups_up) from pg_parallel_decode_wakeups")
 	[ -n "$up" ] && [ "$up" != "0" ] || fail "the session reported no wakeups"

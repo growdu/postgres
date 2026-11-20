@@ -310,7 +310,8 @@ typedef struct ParallelDecodeControl
 	volatile uint64 cseq_released;		/* the highest commit sequence number
 										 * the walsender has released */
 	volatile uint64 walreader_wakeups;	/* signals the walreader sent to the
-										 * workers */
+										 * workers and over the control
+										 * queue to the walsender */
 	volatile uint64 wal_records;			/* WAL records handed to the
 										 * workers */
 
@@ -721,6 +722,17 @@ typedef struct ParallelDecodeMessageHeader
  */
 extern bool PDQueueSend(shm_mq_handle *mqh, uint16 type, const void *payload,
 						size_t len, bool nowait, bool force_flush);
+
+/*
+ * Register the counter of the wakeups of a queue.
+ *
+ * The queues that carry the payload of the session have a sender of their own
+ * (PDQueueSender), which counts the wakeups it causes.  A queue that is
+ * written with PDQueueSend() has no sender, so its counter is registered
+ * here.  The counter counts the times the receiver of the queue is woken up.
+ */
+extern void PDQueueSetWakeupCounter(shm_mq_handle *mqh,
+									volatile uint64 *wakeups);
 
 /*
  * Did the last send fail because the queue was detached?
