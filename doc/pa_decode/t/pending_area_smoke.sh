@@ -57,6 +57,14 @@
 # Without the big row the pile-up is a coin flip: the walreader blocks when it
 # hands the end of the transaction over, and it only reads the records of the
 # second transaction once the big transaction has been released.
+#
+# The big row is also bigger than the entry of the queue that carries the
+# changes of a transaction (256 KB), so the segment that holds it is
+# transferred in chunks.  The walsender does not have all the chunks when it
+# looks for the frame, so it has to pick the transfer up again later, and it
+# has to remember what it is putting together.  A row that is lost on the way
+# does not make the session fail: the subscriber simply does not have the
+# row, and the publisher does not know that it is gone.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
