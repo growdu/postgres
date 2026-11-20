@@ -32,10 +32,31 @@
 #      pile up in the pending area of the walsender while the big transaction
 #      is waiting for its turn.
 #
-# The frames of the big transaction itself do not pile up.  They are before the
-# end event of their own transaction, so they may go as soon as they arrive.
-# That is why the size of the second transaction is what decides whether the
-# publisher warns: it has to be bigger than parallel_decode_pending_max_bytes.
+# The frames of the big transaction itself do not pile up, except for the last
+# segment of it: the last segment is produced while the record that ends the
+# transaction is processed, and it waits for the transaction to have its turn.
+# The frames of the second transaction have no commit sequence number either,
+# so they wait for the release frontier: they pile up in the pending area of
+# the walsender while the big transaction is waiting for its turn.
+#
+# The big transaction ends with a row that is much bigger than the others.  The
+# worker of the big transaction is busy with that row when the walreader hands
+# it the end of the transaction, so two things follow:
+#
+#   * the walreader does not block when it hands the end of the transaction
+#     over, because the queue of the worker is empty at that point.  It reads
+#     the records of the second transaction right away, and the worker of the
+#     second transaction decodes them while the big transaction waits for its
+#     turn.
+#
+#   * the last segment of the big transaction holds the big row, and it waits
+#     for the big transaction to have its turn.  The pending area therefore
+#     grows by the size of the row, which is more than the limit of the
+#     pending area, so the publisher warns about it.
+#
+# Without the big row the pile-up is a coin flip: the walreader blocks when it
+# hands the end of the transaction over, and it only reads the records of the
+# second transaction once the big transaction has been released.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -54,6 +75,19 @@ WORKERS=${WORKERS:-4}
 ROWS=${ROWS:-1000000}
 PAYLOAD=${PAYLOAD:-200}
 #
+# The size of the last row of the big transaction, in bytes.  The row is the
+# last record of the transaction before its commit, so the worker of the big
+# transaction is busy with it when the end of the transaction is handed over.
+# The size is chosen so that the decoding of the row takes a good deal longer
+# than the decoding of the rows around it.
+#
+# The row ends up in the last segment of the big transaction, and the segment
+# reaches the subscriber as one message.  The size therefore has to stay well
+# below the limit of a single transfer of the publisher (512 MB), and well
+# below the size of the queue that the parallel apply worker of the subscriber
+# uses to receive the changes (16 MB).
+BIGPAYLOAD=${BIGPAYLOAD:-8388608}
+#
 # The size of the second transaction, in rows and in bytes of payload per row.
 # Its frames are the ones that pile up in the pending area, so it has to be
 # bigger than the limit of the pending area.
@@ -66,12 +100,15 @@ PAYLOAD2=${PAYLOAD2:-200}
 BARRIER_TIMEOUT=${BARRIER_TIMEOUT:-2}
 #
 # The number of bytes the frames that wait for their turn may take before the
-# publisher warns about them.
-PENDING_MAX_BYTES=${PENDING_MAX_BYTES:-65536}
+# publisher warns about them.  The frames pile up to a few tens of kilobytes
+# with the workload below, so the limit is well below that: the warning is
+# about the frames that wait, and the test wants to see it without depending
+# on the exact size of the pile-up.
+PENDING_MAX_BYTES=${PENDING_MAX_BYTES:-16384}
 #
 # The number of bytes the stream segments that wait for their turn may take
 # before the publisher warns about them.
-HELD_MAX_BYTES=${HELD_MAX_BYTES:-65536}
+HELD_MAX_BYTES=${HELD_MAX_BYTES:-16384}
 #
 # How long the test waits for the transactions to arrive.
 WAIT=${WAIT:-300}
@@ -79,7 +116,15 @@ WAIT=${WAIT:-300}
 # How long the second transaction waits for the big one to end.  The wait is
 # done in the session of the second transaction, and every statement of it
 # takes a new snapshot, so the transaction sees the rows of the big one as
-# soon as they are committed.
+# soon as they are committed.  The step is the time between two looks: the
+# rows of the second transaction have to be written before the big transaction
+# is released, so the step must be short.
+#
+# The sleep of a step only happens while the big transaction has not been
+# committed: the statement that waits returns no row once the rows of the big
+# transaction are there, and a statement without rows does not sleep.  The
+# loop therefore ends as soon as the big transaction is committed, and the
+# steps that are left cost nothing.
 WAIT_STEPS=${WAIT_STEPS:-600}
 WAIT_STEP=${WAIT_STEP:-0.1}
 
@@ -178,6 +223,7 @@ start=$(date +%s)
 	pub -c "begin" \
 		-c "insert into pd_t select g, repeat('x', $PAYLOAD)
 			 from generate_series(1, $ROWS) g" \
+		-c "insert into pd_t select 0, repeat('h', $BIGPAYLOAD)" \
 		-c "commit"
 ) &
 big_pid=$!
@@ -203,7 +249,7 @@ echo "   the second transaction is written"
 echo "== waiting for the transactions to arrive"
 i=0
 n=""
-total=$((ROWS + 10 + ROWS2))
+total=$((ROWS + 1 + 10 + ROWS2))
 while [ "$i" -lt "$WAIT" ]; do
 	sleep 1
 	i=$((i + 1))
