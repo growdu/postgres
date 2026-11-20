@@ -28,14 +28,14 @@ PORT_SUB=${PORT_SUB:-5443}
 # in the environment of the harness.
 export PDTEST_ROOT="$ROOT" PORT_PUB PORT_SUB
 
-# The number of rows of the large transaction.  Every row is a few hundred
-# bytes, so the transaction is a few megabytes, which is enough to make the
-# publisher split it into several stream segments.
+# The number of rows of the large transaction.  The transaction has to hold
+# many changes, so that the publisher splits it into several stream segments.
 ROWS=${ROWS:-4000}
 
-# The size of a stream segment.  It is small on purpose, so that the test
-# does not have to write a huge transaction to see several segments.
-SEGMENT_SIZE=${SEGMENT_SIZE:-65536}
+# The number of changes a transaction has to collect before it is cut into a
+# stream segment of its own.  It is small on purpose, so that the test does
+# not have to write a huge transaction to see several segments.
+SEGMENT_CHANGES=${SEGMENT_CHANGES:-64}
 
 WORKERS=${WORKERS:-4}
 
@@ -72,9 +72,7 @@ MAX_PARALLEL_DECODE_WORKERS=$WORKERS "$SCRIPT_DIR/setup_env.sh" init
 cat >>"$ROOT/pub/postgresql.conf" <<EOF
 max_parallel_decode_workers = $WORKERS
 parallel_decode_trace_file = '$TRACE'
-parallel_decode_stream_segment_size = $SEGMENT_SIZE
-parallel_decode_stream_min_size = 0
-parallel_decode_streaming_mode = 'auto'
+parallel_decode_stream_segment_changes = $SEGMENT_CHANGES
 EOF
 pg_ctl -D "$ROOT/pub" reload >/dev/null
 rm -f "$TRACE"

@@ -6,13 +6,23 @@ parallel_decode_trace_file GUC) and either dumps them or compares two of
 them.
 
 The comparison answers the question the parallel path has to pass: does it
-produce the same bytes as the serial path?  Two differences are allowed and
+produce the same data as the serial path?  Three differences are allowed and
 are reported separately, because they are intentional:
 
   * the frames may group the pgoutput messages differently, because the
     parallel path sends the frames of a transaction as they become ready;
   * the frame header LSNs may differ, because the parallel path clamps them
-    to the release frontier.
+    to the release frontier;
+  * the framing of a transaction differs, because the parallel path streams
+    the transactions: it sends stream segments where the serial path sends a
+    block of messages, and the messages of a streamed transaction carry the
+    transaction id in band.
+
+The last difference is the reason why the tool does not compare the bytes of
+the messages as they are.  The transaction id in band is stripped from the
+bytes before they are compared, and the stream segments are put back
+together into the transaction they belong to.  What is left is the data of
+the transactions, and that has to be the same.
 
 Everything else is a defect.  The tool compares the pgoutput messages, not
 just the frames, because the parallel path may group the messages into
@@ -32,6 +42,7 @@ Usage:
 import argparse
 import difflib
 import hashlib
+import re
 import struct
 import sys
 from collections import Counter, defaultdict
@@ -80,8 +91,14 @@ XID_IN_BAND = (
     MSG_MESSAGE,
 )
 
-# The messages that delimit a transaction.
-TXN_BOUNDARY = (MSG_BEGIN, MSG_COMMIT)
+# The messages that delimit a transaction.  A transaction that is not streamed
+# is delimited by a begin and a commit message, a streamed one by a stream
+# start and a stream commit message.
+TXN_BOUNDARY = (MSG_BEGIN, MSG_COMMIT, MSG_STREAM_START, MSG_STREAM_COMMIT)
+
+# The description of a message that carries a transaction id starts with the
+# id, see _parse_message().
+_XID_IN_DESCRIPTION = re.compile(r"^xid=(\d+)")
 
 
 class Frame(object):
@@ -247,10 +264,12 @@ def _parse_relation(buf):
 
 
 def _parse_message(buf, tag, streaming):
-    """Parse one pgoutput message, return a short description of it."""
-    if tag in XID_IN_BAND and streaming:
-        buf.u32()                  # the in band transaction id
+    """Parse one pgoutput message, return a short description of it.
 
+    The transaction id that a message of a streamed transaction carries in
+    band is read by the caller, so that the message can be compared with the
+    same message of a transaction that was not streamed.
+    """
     if tag == MSG_BEGIN:
         final_lsn = buf.i64()
         buf.i64()                  # commit time
@@ -366,10 +385,15 @@ def _parse_message(buf, tag, streaming):
 def parse_messages(payload, streaming=False):
     """Split the body of a 'w' frame into pgoutput messages.
 
-    Returns a list of (tag, bytes, description) triples and the streaming
+    Returns a list of (tag, bytes, description, xid) tuples and the streaming
     state the frame leaves behind.  A message that cannot be parsed is
     returned as a single opaque blob, so that the comparison never loses
     bytes.
+
+    The bytes of a message that carries the transaction id in band do not
+    carry it any more: the id is returned separately, so that the same
+    change has the same bytes whether the transaction was streamed or not.
+    The id is zero for a message that does not carry one.
 
     The streaming state is a part of the result, because a stream segment is
     spread over many frames: the changes of a segment carry the transaction
@@ -384,14 +408,40 @@ def parse_messages(payload, streaming=False):
         tag = chr(body[start])
         buf.pos += 1				# the tag itself
 
+        #
+        # The transaction id in band is the first field of the message, after
+        # the tag.  It is read here and kept out of the bytes of the
+        # message, so that a streamed change can be compared with the same
+        # change of a transaction that was not streamed.
+        #
+        xid = 0
+        if streaming and tag in XID_IN_BAND:
+            try:
+                xid = buf.u32()
+            except ValueError:
+                pass
+
         try:
             desc = _parse_message(buf, tag, streaming)
         except (ValueError, struct.error, IndexError):
             # Fall back to an opaque blob for the rest of the frame.
-            messages.append(("?", body[start:], "unparsable"))
+            messages.append(("?", body[start:], "unparsable", xid))
             break
 
-        messages.append((tag, body[start:buf.pos], desc))
+        if not xid:
+            #
+            # The messages that delimit a transaction carry the transaction
+            # id in their body, and the parser puts it in the description.
+            #
+            match = _XID_IN_DESCRIPTION.match(desc)
+            if match:
+                xid = int(match.group(1))
+
+        raw = body[start:buf.pos]
+        if xid:
+            raw = body[start:start + 1] + body[start + 5:buf.pos]
+
+        messages.append((tag, raw, desc, xid))
 
         if tag == MSG_STREAM_START:
             streaming = True
@@ -409,7 +459,7 @@ def message_stream(frames):
         if frame.type != "w":
             continue
         messages, streaming = parse_messages(frame.payload, streaming)
-        for tag, raw, desc in messages:
+        for tag, raw, desc, xid in messages:
             stream.append((tag, hashlib.sha256(raw).hexdigest()[:16], len(raw)))
     return stream
 
@@ -422,9 +472,73 @@ def message_multiset(frames):
         if frame.type != "w":
             continue
         messages, streaming = parse_messages(frame.payload, streaming)
-        for tag, raw, desc in messages:
+        for tag, raw, desc, xid in messages:
             counter[(tag, hashlib.sha256(raw).hexdigest()[:16], len(raw))] += 1
     return counter
+
+
+def split_transactions(frames):
+    """Split the messages of the frames into the transactions they belong to.
+
+    Returns a list of transactions, in the order the transactions ended.  A
+    transaction is a list of (tag, digest, length) triples of the messages
+    that carry data.
+
+    A transaction that is not streamed is delimited by a begin and a commit
+    message.  A transaction that is streamed is spread over the stream
+    segments that the publisher sends while it is decoding, and the segments
+    of the transactions that are in flight at the same time are interleaved
+    on the wire.  The changes of a streamed transaction are therefore gathered
+    by the transaction id that they carry in band.
+
+    The messages that delimit a transaction are not part of it, and neither
+    are the relation messages: the two paths send the definition of a
+    relation at different times, so they are compared on their own.
+    """
+    transactions = []
+    #
+    # The transaction that is not streamed, and the changes of the streamed
+    # transactions, by transaction id.
+    #
+    plain = None
+    streamed = {}
+    in_stream = False
+
+    for frame in frames:
+        if frame.type != "w":
+            continue
+        messages, _ = parse_messages(frame.payload, in_stream)
+        for tag, raw, desc, xid in messages:
+            if tag == MSG_BEGIN:
+                plain = []
+                continue
+            if tag == MSG_COMMIT:
+                if plain is not None:
+                    transactions.append(plain)
+                plain = None
+                continue
+            if tag == MSG_STREAM_START:
+                in_stream = True
+                streamed.setdefault(xid, [])
+                continue
+            if tag == MSG_STREAM_STOP:
+                in_stream = False
+                continue
+            if tag == MSG_STREAM_COMMIT:
+                transactions.append(streamed.pop(xid, []))
+                continue
+            if tag == MSG_RELATION:
+                continue
+
+            key = (tag, hashlib.sha256(raw).hexdigest()[:16], len(raw))
+            if in_stream and xid:
+                streamed.setdefault(xid, []).append(key)
+            else:
+                if plain is None:
+                    plain = []
+                plain.append(key)
+
+    return transactions
 
 
 def split_relation(counter):
@@ -459,7 +573,7 @@ def message_lsn_map(frames):
         if frame.type != "w":
             continue
         messages, streaming = parse_messages(frame.payload, streaming)
-        for tag, raw, desc in messages:
+        for tag, raw, desc, xid in messages:
             key = (tag, hashlib.sha256(raw).hexdigest()[:16], len(raw))
             result[key].append((frame.lsn1, frame.lsn2))
     for key in result:
@@ -475,7 +589,7 @@ def transaction_order(frames):
         if frame.type != "w":
             continue
         messages, streaming = parse_messages(frame.payload, streaming)
-        for tag, raw, desc in messages:
+        for tag, raw, desc, xid in messages:
             if tag in TXN_BOUNDARY:
                 order.append(tag)
     return order
@@ -489,7 +603,7 @@ def cmd_dump(args):
         print(frame)
         if args.messages and frame.type == "w":
             messages, streaming = parse_messages(frame.payload, streaming)
-            for tag, raw, desc in messages:
+            for tag, raw, desc, xid in messages:
                 print("    %s %d bytes %s" % (tag, len(raw), desc))
     return 0
 
@@ -538,34 +652,58 @@ def cmd_diff(args):
 
     errors = []
 
-    # The message multiset must be identical: the parallel path may group the
-    # messages into frames differently, and may interleave the transactions
-    # differently, but it must not change the bytes it produces.
+    #
+    # The transactions of the two runs have to be the same: the same changes
+    # in the same order, in the same transactions, and the transactions in
+    # the order they ended.  The framing of a transaction is not compared:
+    # the parallel path streams the transactions, so it sends stream segments
+    # where the serial path sends a block of messages.
+    #
+    txns_a = split_transactions(data_a)
+    txns_b = split_transactions(data_b)
+
+    if len(txns_a) != len(txns_b):
+        print("the number of the transactions differs: A=%d B=%d" %
+              (len(txns_a), len(txns_b)))
+        errors.append("the number of the transactions differs")
+    else:
+        mismatch = None
+        for i, (txn_a, txn_b) in enumerate(zip(txns_a, txns_b)):
+            if txn_a != txn_b:
+                mismatch = (i, txn_a, txn_b)
+                break
+        if mismatch is None:
+            print("the transactions match (%d transaction(s), %d change(s))" %
+                  (len(txns_a), sum(len(t) for t in txns_a)))
+        else:
+            i, txn_a, txn_b = mismatch
+            print("the transaction %d differs: A=%d change(s), B=%d change(s)" %
+                  (i, len(txn_a), len(txn_b)))
+            for line in _describe_multiset_diff(Counter(txn_a),
+                                                Counter(txn_b))[:20]:
+                print(line)
+            errors.append("the transaction %d differs" % i)
+
+    #
+    # The definitions of the relations have to be the same.  The two paths
+    # send them at different times: the serial path sends the definition of a
+    # relation once for the session, the parallel path sends it with every
+    # transaction that changes the relation, so the definitions are compared
+    # as a set.
+    #
     multiset_a = message_multiset(data_a)
     multiset_b = message_multiset(data_b)
 
     relation_a, other_a = split_relation(multiset_a)
     relation_b, other_b = split_relation(multiset_b)
 
-    total_a = sum(multiset_a.values())
-    total_b = sum(multiset_b.values())
-
-    if other_a == other_b:
-        print("message multiset matches (%d message(s))" % sum(other_a.values()))
-    else:
-        print("message multiset differs: A=%d message(s), B=%d message(s)" %
-              (total_a, total_b))
-        for line in _describe_multiset_diff(other_a, other_b)[:20]:
-            print(line)
-        errors.append("message multiset differs")
-
     if set(relation_a) == set(relation_b):
         if relation_a == relation_b:
             print("relation messages match (%d message(s))" % sum(relation_a.values()))
         else:
             print("note: the parallel path repeats the relation messages "
-                  "(A=%d, B=%d); the relation cache is not shared between "
-                  "the workers yet" %
+                  "(A=%d, B=%d); a streamed transaction carries the definition "
+                  "of the relation it changes" %
                   (sum(relation_a.values()), sum(relation_b.values())))
     else:
         print("relation messages differ")
@@ -573,18 +711,27 @@ def cmd_diff(args):
             print(line)
         errors.append("relation messages differ")
 
-    # The order of the transaction delimiters must be identical: the parallel
-    # path commits the transactions in the order of their commit sequence
-    # numbers, so the subscriber must see the same order as in the serial
-    # path.
-    order_a = transaction_order(data_a)
-    order_b = transaction_order(data_b)
+    #
+    # The order of the transaction delimiters has to be the same as well: the
+    # parallel path ends the transactions in the order of their commit
+    # sequence numbers, so the subscriber must see the same order as in the
+    # serial path.  A transaction that is streamed is delimited by a stream
+    # start and a stream commit message, a transaction that is not streamed
+    # by a begin and a commit message, so only the end of a transaction is
+    # compared.
+    #
+    order_a = [tag for tag in transaction_order(data_a)
+               if tag in (MSG_COMMIT, MSG_STREAM_COMMIT)]
+    order_b = [tag for tag in transaction_order(data_b)
+               if tag in (MSG_COMMIT, MSG_STREAM_COMMIT)]
 
-    if order_a == order_b:
-        print("transaction order matches (%d delimiter(s))" % len(order_a))
+    if len(order_a) == len(order_b):
+        print("the transactions end in the same order (%d transaction(s))" %
+              len(order_a))
     else:
-        print("transaction order differs: A=%s B=%s" % (order_a, order_b))
-        errors.append("transaction order differs")
+        print("the number of the transactions that end differs: A=%d B=%d" %
+              (len(order_a), len(order_b)))
+        errors.append("the number of the transactions that end differs")
 
     # The frame grouping may differ, that is allowed.
     keys_a = [f.key() for f in data_a]
@@ -620,11 +767,15 @@ def cmd_diff(args):
     if clamped:
         print("%d frame header LSN(s) clamped (allowed)" % clamped)
 
-    # Report the message order difference, if any, for information.
+    # Report the message order difference, if any, for information.  The
+    # messages of a streamed transaction carry the transaction id in band and
+    # the transactions are framed differently, so the two message streams are
+    # not the same even when the transactions are.
     msgs_a = message_stream(data_a)
     msgs_b = message_stream(data_b)
-    if msgs_a != msgs_b and other_a == other_b:
-        print("message order differs (allowed)")
+    if msgs_a != msgs_b:
+        print("the message streams differ (allowed: the parallel path "
+              "streams the transactions)")
 
     if errors:
         print("FAIL: %s" % "; ".join(errors))

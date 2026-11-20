@@ -132,7 +132,7 @@ sub -c "create table pd_t (id int primary key, v text)"
 echo "== run 1: parallel decoding path ($WORKERS worker(s)), live workload"
 rm -f "$TRACE_PARALLEL"
 set_trace "$TRACE_PARALLEL" "$WORKERS"
-sub -c "create subscription pd_slot_b connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'on', copy_data = false)"
+sub -c "create subscription pd_slot_b connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'parallel', copy_data = false)"
 
 # Give the walsender the time to start the session and to build the
 # snapshot, so that the workload really arrives while it is streaming.
@@ -163,7 +163,7 @@ echo "== run 2: serial decoding path, same transactions"
 rm -f "$TRACE_SERIAL"
 sub -c "truncate pd_t"
 set_trace "$TRACE_SERIAL" 0
-sub -c "create subscription pd_slot_a connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'on', copy_data = false)"
+sub -c "create subscription pd_slot_a connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'parallel', copy_data = false)"
 wait_for_rows "$ROWS"
 sub -c "drop subscription pd_slot_a"
 sleep 2

@@ -117,7 +117,7 @@ sub -c "create table pd_t (id int primary key, v text)"
 echo "== run 1: serial decoding path"
 rm -f "$TRACE_SERIAL"
 set_trace "$TRACE_SERIAL" 0
-sub -c "create subscription pd_slot_a connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'on', copy_data = false)"
+sub -c "create subscription pd_slot_a connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'parallel', copy_data = false)"
 wait_for_rows "$ROWS"
 sub -c "drop subscription pd_slot_a"
 sleep 2
@@ -130,7 +130,7 @@ echo "== run 2: parallel decoding path ($WORKERS worker(s))"
 rm -f "$TRACE_PARALLEL"
 sub -c "truncate pd_t"
 set_trace "$TRACE_PARALLEL" "$WORKERS"
-sub -c "create subscription pd_slot_b connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'on', copy_data = false)"
+sub -c "create subscription pd_slot_b connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'parallel', copy_data = false)"
 wait_for_rows "$ROWS"
 sub -c "drop subscription pd_slot_b"
 sleep 2

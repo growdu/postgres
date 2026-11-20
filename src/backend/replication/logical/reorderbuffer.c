@@ -101,6 +101,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/logical.h"
+#include "replication/parallel_decode.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"	/* just for SnapBuildSnapDecRefcount */
@@ -278,6 +279,7 @@ static inline bool ReorderBufferCanStream(ReorderBuffer *rb);
 static inline bool ReorderBufferCanStartStreaming(ReorderBuffer *rb);
 static void ReorderBufferStreamTXN(ReorderBuffer *rb, ReorderBufferTXN *txn);
 static void ReorderBufferStreamCommit(ReorderBuffer *rb, ReorderBufferTXN *txn);
+static void ReorderBufferStreamSegment(ReorderBuffer *rb, ReorderBufferTXN *txn);
 
 /* ---------------------------------------
  * toast reassembly support
@@ -839,8 +841,18 @@ ReorderBufferQueueChange(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
 	/* process partial change */
 	ReorderBufferProcessPartialChange(rb, txn, change, toast_insert);
 
-	/* check the memory limits and evict something if needed */
-	ReorderBufferCheckMemoryLimit(rb);
+	/*
+	 * The decode workers of the parallel decoding path cut the stream
+	 * segments of a transaction themselves, by the number of changes the
+	 * transaction has collected.  The serial path leaves the decision to the
+	 * memory limit of the reorder buffer, which the parallel path cannot
+	 * use: its reorder buffer cannot spill to disk.
+	 */
+	if (am_decode_worker)
+		ReorderBufferStreamSegment(rb, txn);
+	else
+		/* check the memory limits and evict something if needed */
+		ReorderBufferCheckMemoryLimit(rb);
 }
 
 /*
@@ -2672,9 +2684,9 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 /*
  * Should the transaction be streamed now that it commits?
  *
- * The publisher-side parallel decoding path can be asked to stream every
- * transaction: the subscriber applies the transactions in parallel, and a
- * transaction that is not streamed gives its apply worker nothing to do.  A
+ * The decode workers of the publisher-side parallel decoding path stream
+ * every transaction: the subscriber applies the transactions in parallel, and
+ * a transaction that is not streamed gives its apply worker nothing to do.  A
  * transaction that was streamed while it was in progress has been sent
  * already, so only the transactions that are still whole when they commit are
  * streamed here.
@@ -2685,10 +2697,11 @@ ReorderBufferProcessTXN(ReorderBuffer *rb, ReorderBufferTXN *txn,
 static bool
 ReorderBufferStreamAtCommit(ReorderBuffer *rb, ReorderBufferTXN *txn)
 {
-	LogicalDecodingContext *ctx = rb->private_data;
-
-	/* The serial path never streams a transaction that was not streamed. */
-	if (ctx == NULL || !ctx->stream_all_transactions)
+	/*
+	 * Only the decode workers produce the output of the transactions: the
+	 * serial decoding path and the walreader do not.
+	 */
+	if (!am_decode_worker)
 		return false;
 
 	/* A transaction that was streamed already has been sent. */
@@ -2717,13 +2730,6 @@ ReorderBufferStreamAtCommit(ReorderBuffer *rb, ReorderBufferTXN *txn)
 	 * covers the prepare record itself.
 	 */
 	if (rbtxn_prepared(txn))
-		return false;
-
-	/*
-	 * A transaction below the minimum size is not streamed at all: it reaches
-	 * the subscriber as a whole transaction block.
-	 */
-	if (ctx->stream_min_size > 0 && txn->total_size < ctx->stream_min_size)
 		return false;
 
 	return true;
@@ -3774,35 +3780,82 @@ ReorderBufferLargestStreamableTopTXN(ReorderBuffer *rb)
 }
 
 /*
- * Has a transaction accumulated enough changes to be streamed?
+ * Cut a stream segment for a transaction that has collected enough changes.
  *
- * The publisher-side parallel decoding path asks for the changes of a
- * transaction to be streamed once they reach a certain size, so that a large
- * transaction reaches the subscriber before it is complete.  The size of the
- * whole reorder buffer is checked by the caller first, because it is the sum
- * of the sizes of the transactions the buffer holds: if it is below the
- * threshold, no transaction in it can be above it.
+ * The publisher-side parallel decoding path sends the changes of a transaction
+ * to the subscriber before the transaction is complete.  The changes are sent
+ * as stream segments, and the subscriber applies the segments of the
+ * transactions that are in flight at the same time, so the segments of the
+ * different transactions have to overlap in time.  A transaction that is
+ * streamed in a single segment when it commits does not overlap with anything:
+ * its changes reach the subscriber at the same moment as its commit.
  *
- * A transaction that is below the minimum size is not streamed at all: it
- * reaches the subscriber as a whole transaction block.
+ * The segments are therefore cut by the number of changes a transaction has
+ * collected.  The number of the changes that are still in memory is what
+ * ReorderBufferTXN.nentries_mem counts, so no additional counter is needed.
+ * When the segment is sent, ReorderBufferTruncateTXN() empties the counter
+ * again, and the next segment of the transaction starts counting from zero.
+ *
+ * The serial decoding path leaves the decisions to the memory limit of the
+ * reorder buffer (ReorderBufferCheckMemoryLimit()).  That path cannot be used
+ * here: the reorder buffer of the parallel path cannot spill to disk, and the
+ * aggregate size of the buffer says nothing about the size of a single
+ * transaction, which is what has to be cut.
  */
-static bool
-ReorderBufferStreamableTxnReached(ReorderBuffer *rb, Size segment_size,
-								  Size min_size)
+static void
+ReorderBufferStreamSegment(ReorderBuffer *rb, ReorderBufferTXN *txn)
 {
-	ReorderBufferTXN *txn;
+	LogicalDecodingContext *ctx = rb->private_data;
+	ReorderBufferTXN *toptxn;
 
+	/*
+	 * The threshold is not set: the changes of a transaction are not cut.
+	 */
+	if (ctx == NULL || ctx->stream_segment_changes == 0)
+		return;
+
+	/*
+	 * The transaction has not collected enough changes yet.
+	 */
+	if (txn->nentries_mem < ctx->stream_segment_changes)
+		return;
+
+	/*
+	 * The changes of a transaction can only be sent when the snapshot is
+	 * consistent: the subscriber cannot apply them before that.
+	 */
 	if (!ReorderBufferCanStartStreaming(rb))
-		return false;
+		return;
 
-	txn = ReorderBufferLargestStreamableTopTXN(rb);
-	if (txn == NULL)
-		return false;
+	/*
+	 * The segment is the segment of the top level transaction: the changes of
+	 * the subtransactions belong to it, and only the top level transaction can
+	 * be streamed.
+	 */
+	toptxn = rbtxn_get_toptxn(txn);
 
-	if (min_size > 0 && txn->total_size < min_size)
-		return false;
+	/*
+	 * A prepared transaction is not committed yet: the two-phase commit path
+	 * keeps its own behavior, so the transaction is not streamed here.
+	 */
+	if (rbtxn_prepared(toptxn))
+		return;
 
-	return txn->total_size >= segment_size;
+	/*
+	 * The changes of the transaction are not complete: a speculative insert
+	 * is still waiting for its confirmation.  Sending them now would send a
+	 * change set that is not the one the transaction commits.
+	 */
+	if (rbtxn_has_partial_change(toptxn))
+		return;
+
+	/*
+	 * A transaction without streamable changes has nothing to send.
+	 */
+	if (!rbtxn_has_streamable_change(toptxn))
+		return;
+
+	ReorderBufferStreamTXN(rb, toptxn);
 }
 
 /*
@@ -3813,12 +3866,6 @@ ReorderBufferStreamableTxnReached(ReorderBuffer *rb, Size segment_size,
  * If debug_logical_replication_streaming is set to "immediate", stream or
  * serialize the changes immediately.
  *
- * The publisher-side parallel decoding path asks for the changes of a
- * transaction to be streamed once they reach the size it wants a stream
- * segment to have, so that a large transaction reaches the subscriber before
- * it is complete.  That is a separate trigger: it does not depend on the
- * memory the reorder buffer holds.
- *
  * XXX At this point we select the transactions until we reach under the memory
  * limit, but we might also adapt a more elaborate eviction strategy - for example
  * evicting enough transactions to free certain fraction (e.g. 50%) of the memory
@@ -3828,33 +3875,13 @@ static void
 ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 {
 	ReorderBufferTXN *txn;
-	LogicalDecodingContext *ctx = rb->private_data;
-	Size		segment_size = 0;
-	Size		min_size = 0;
-
-	/*
-	 * The parallel decoding path decides on its own how eagerly the changes
-	 * of a transaction are streamed.  The serial path leaves these at zero,
-	 * which keeps its behavior unchanged.
-	 *
-	 * The two sizes have different meanings: the segment size is the size a
-	 * transaction has to reach before it is streamed in a segment of its own,
-	 * and the minimum size is the size a transaction has to reach before it
-	 * may be streamed at all.
-	 */
-	if (ctx != NULL)
-	{
-		segment_size = ctx->stream_segment_size;
-		min_size = ctx->stream_min_size;
-	}
 
 	/*
 	 * Bail out if debug_logical_replication_streaming is buffered and we
 	 * haven't exceeded the memory limit.
 	 */
 	if (debug_logical_replication_streaming == DEBUG_LOGICAL_REP_STREAMING_BUFFERED &&
-		rb->size < logical_decoding_work_mem * 1024L &&
-		segment_size == 0)
+		rb->size < logical_decoding_work_mem * 1024L)
 		return;
 
 	/*
@@ -3869,10 +3896,7 @@ ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 	 */
 	while (rb->size >= logical_decoding_work_mem * 1024L ||
 		   (debug_logical_replication_streaming == DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE &&
-			rb->size > 0) ||
-		   (segment_size > 0 &&
-			rb->size >= segment_size &&
-			ReorderBufferStreamableTxnReached(rb, segment_size, min_size)))
+			rb->size > 0))
 	{
 		/*
 		 * Pick the largest transaction and evict it from memory by streaming,
@@ -3913,12 +3937,9 @@ ReorderBufferCheckMemoryLimit(ReorderBuffer *rb)
 	}
 
 	/*
-	 * We must be under the memory limit now.  The parallel decoding path
-	 * streams the changes of a transaction for its own sake, so it may stop
-	 * while the reorder buffer still holds more than the memory limit.
+	 * We must be under the memory limit now.
 	 */
-	if (segment_size == 0)
-		Assert(rb->size < logical_decoding_work_mem * 1024L);
+	Assert(rb->size < logical_decoding_work_mem * 1024L);
 
 }
 

@@ -11,7 +11,7 @@
 #
 #   * every committed transaction produces a stream segment in the parallel
 #     streaming mode (one STREAM START and one STREAM STOP each), even when
-#     the transaction is far below the size of a stream segment;
+#     the transaction is far below the number of changes that cuts a segment;
 #   * the subscriber receives all the rows of those transactions;
 #   * a subscriber that does not ask for the parallel streaming mode still
 #     receives the transactions as whole blocks (a BEGIN and a COMMIT each,
@@ -34,10 +34,11 @@ NTXN=${NTXN:-5}
 # The number of transactions of the mode that does not stream.
 NTXN_PLAIN=${NTXN_PLAIN:-3}
 
-# The size of a stream segment.  It is large on purpose: the transactions of
-# the test stay far below it, so every stream segment of the trace comes from
-# a transaction that was streamed when it committed.
-SEGMENT_SIZE=${SEGMENT_SIZE:-1048576}
+# The number of changes a transaction has to collect before it is cut into a
+# stream segment of its own.  It is large on purpose: the transactions of the
+# test stay far below it, so every stream segment of the trace comes from a
+# transaction that was streamed when it committed.
+SEGMENT_CHANGES=${SEGMENT_CHANGES:-1000}
 
 WORKERS=${WORKERS:-4}
 
@@ -80,9 +81,7 @@ MAX_PARALLEL_DECODE_WORKERS=$WORKERS "$SCRIPT_DIR/setup_env.sh" init
 cat >>"$ROOT/pub/postgresql.conf" <<EOF
 max_parallel_decode_workers = $WORKERS
 parallel_decode_trace_file = '$TRACE_PARALLEL'
-parallel_decode_stream_segment_size = $SEGMENT_SIZE
-parallel_decode_stream_min_size = 0
-parallel_decode_streaming_mode = 'auto'
+parallel_decode_stream_segment_changes = $SEGMENT_CHANGES
 EOF
 pg_ctl -D "$ROOT/pub" reload >/dev/null
 rm -f "$TRACE_PARALLEL"

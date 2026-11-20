@@ -1461,7 +1461,8 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	QueryCompletion qc;
 	char		pd_plugin_options[PD_MAX_PLUGIN_OPTIONS];
 	uint32		pd_plugin_options_len = 0;
-	int			pd_streaming_mode = PD_STREAMING_OFF;
+	bool		pd_parallel = false;
+	bool		pd_parallel_subscriber = false;
 
 	/* make sure that our requirements are still fulfilled */
 	CheckLogicalDecodingRequirements();
@@ -1490,6 +1491,22 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	}
 
 	/*
+	 * Parallel decoding and streaming are bound together: the parallel path
+	 * ships the changes of a transaction as stream segments, and only a
+	 * subscriber that applies them in parallel is served that way.  A
+	 * subscriber that asked for streaming='on', or that did not ask for
+	 * streaming at all, takes the serial path.
+	 *
+	 * The decision is made before the decoding context is created, because
+	 * the startup callback of the output plugin may modify the option values
+	 * in place.
+	 */
+	pd_parallel_subscriber = ParallelDecodeSubscriberAppliesInParallel(cmd->options);
+
+	if (ParallelDecodeEnabled() && pd_parallel_subscriber)
+		pd_parallel = true;
+
+	/*
 	 * Serialize the options of the output plugin before the decoding context is
 	 * created.  The startup callback of an output plugin may modify the option
 	 * values in place: pgoutput splits the list of publication names with
@@ -1497,23 +1514,11 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	 * decode workers need the original values, so they are serialized before
 	 * the context exists.
 	 */
-	if (ParallelDecodeEnabled())
+	if (pd_parallel)
 	{
 		PDSerializePluginOptions(cmd->options, pd_plugin_options,
 								  sizeof(pd_plugin_options),
 								  &pd_plugin_options_len);
-
-		/*
-		 * How eagerly the changes of a transaction are streamed depends on
-		 * what the subscriber asked for: a subscriber that applies the
-		 * transactions in parallel needs the changes to arrive early, while a
-		 * subscriber that applies them on its own does not.
-		 *
-		 * The mode is resolved before the decoding context is created,
-		 * because the startup callback of the output plugin may modify the
-		 * option values in place.
-		 */
-		pd_streaming_mode = ParallelDecodeResolveStreamingMode(cmd->options);
 	}
 
 	/*
@@ -1540,7 +1545,7 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	 * which tells us whether two-phase decoding is possible, and it marks the
 	 * slot accordingly.
 	 */
-	if (ParallelDecodeEnabled())
+	if (pd_parallel)
 	{
 		XLogRecPtr start_lsn = cmd->startpoint;
 
@@ -1553,8 +1558,7 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 			start_lsn = MyReplicationSlot->data.confirmed_flush;
 
 		ParallelDecodeSessionStart(MyReplicationSlot, pd_plugin_options,
-									pd_plugin_options_len, pd_streaming_mode,
-									start_lsn);
+									pd_plugin_options_len, start_lsn);
 
 		/*
 		 * While the session waits for the decode worker to hand over the
@@ -3720,7 +3724,7 @@ XLogSendLogical(void)
 	 */
 	WalSndCaughtUp = false;
 
-	if (ParallelDecodeEnabled())
+	if (ParallelDecodeActive())
 	{
 		/*
 		 * The decode workers produce the replication frames, so the walsender
@@ -4540,7 +4544,7 @@ WalSndKeepalive(bool requestReply, XLogRecPtr writePtr)
 	 * before the transaction is complete, so the position of the session can
 	 * be ahead of the transactions that have not been delivered yet.
 	 */
-	if (ParallelDecodeEnabled())
+	if (ParallelDecodeActive())
 		pos = ParallelDecodeClampLSN(pos);
 
 	/* construct the message... */

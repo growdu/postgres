@@ -48,10 +48,8 @@
 
 /* GUCs */
 int			max_parallel_decode_workers = 0;
-int			parallel_decode_streaming_mode = PARALLEL_DECODE_STREAMING_AUTO;
-int			parallel_decode_stream_min_size = 0;
-int			parallel_decode_stream_segment_size = 1024 * 1024;
-int			parallel_decode_work_mem = 0;	/* 0 means: use the PG default */
+int			parallel_decode_work_mem = 0;	/* -1 means: use logical_decoding_work_mem */
+int			parallel_decode_stream_segment_changes = 8;
 int			parallel_decode_batch_size = 64 * 1024;
 int			parallel_decode_barrier_timeout = 60;	/* seconds, 0 disables it */
 int			parallel_decode_pending_max_bytes = 64 * 1024 * 1024;	/* 0 disables the warning */
@@ -375,11 +373,24 @@ ParallelDecodeProcessAlive(pid_t pid)
 
 /*
  * Returns true when the publisher-side parallel decoding path was requested.
+ *
+ * The parallel path is available when the decode workers are configured.  It
+ * is only taken for a subscriber that asked for streaming='parallel', see
+ * ParallelDecodeSubscriberAppliesInParallel().
  */
 bool
 ParallelDecodeEnabled(void)
 {
 	return max_parallel_decode_workers > 0;
+}
+
+/*
+ * Returns true when the session is running on the parallel decoding path.
+ */
+bool
+ParallelDecodeActive(void)
+{
+	return parallel_decode_ctl != NULL;
 }
 
 /*
@@ -433,46 +444,24 @@ parallel_decode_subscriber_streaming_mode(List *plugin_options)
 }
 
 /*
- * Resolve the streaming mode of a session.
+ * Tell whether the subscriber of a session applies the changes in parallel.
  *
- * The mode is the combination of the GUC with the mode the subscriber asked
- * for.  A subscriber that did not ask for streaming never gets a stream
- * segment: the output plugin of the publisher decides whether it produces
- * them, and it does so based on the mode the subscriber asked for.
+ * The subscriber says so with the "streaming" option of the output plugin:
+ * streaming='parallel' means it has a parallel apply worker, streaming='on'
+ * means it applies the stream segments on its own, and streaming='off' means
+ * it does not want any stream segment at all.
+ *
+ * Parallel decoding and streaming are bound together: the parallel path can
+ * only ship the changes of a transaction as stream segments, and the parallel
+ * apply of the subscriber is what makes the segments worth producing.  Only
+ * streaming='parallel' therefore takes the parallel path; the other two modes
+ * take the serial path.
  */
-int
-ParallelDecodeResolveStreamingMode(List *plugin_options)
+bool
+ParallelDecodeSubscriberAppliesInParallel(List *plugin_options)
 {
-	char		subscriber_mode;
-
-	subscriber_mode = parallel_decode_subscriber_streaming_mode(plugin_options);
-
-	if (subscriber_mode == LOGICALREP_STREAM_OFF)
-		return PD_STREAMING_OFF;
-
-	switch (parallel_decode_streaming_mode)
-	{
-		case PARALLEL_DECODE_STREAMING_IMMEDIATE:
-			return PD_STREAMING_IMMEDIATE;
-
-		case PARALLEL_DECODE_STREAMING_BUFFERED:
-			return PD_STREAMING_BUFFERED;
-
-		case PARALLEL_DECODE_STREAMING_AUTO:
-		default:
-			/*
-			 * A subscriber that applies the transactions in parallel needs the
-			 * publisher to produce the stream segments early: without them the
-			 * parallel apply workers have nothing to do.  A subscriber that
-			 * applies the transactions on its own has no parallel apply
-			 * worker, so streaming its transactions early would only push
-			 * them onto the spool path of the subscriber.
-			 */
-			if (subscriber_mode == LOGICALREP_STREAM_PARALLEL)
-				return PD_STREAMING_IMMEDIATE;
-
-			return PD_STREAMING_BUFFERED;
-	}
+	return parallel_decode_subscriber_streaming_mode(plugin_options) ==
+		LOGICALREP_STREAM_PARALLEL;
 }
 
 /*
@@ -2522,7 +2511,6 @@ void
 ParallelDecodeSessionStart(ReplicationSlot *slot,
 							const char *plugin_options,
 							uint32 plugin_options_len,
-							int streaming_mode,
 							XLogRecPtr start_lsn)
 {
 	shm_toc_estimator e;
@@ -2591,7 +2579,6 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 		SpinLockRelease(&MyWalSnd->mutex);
 	}
 	parallel_decode_stats_published = 0;
-	parallel_decode_ctl->streaming_mode = streaming_mode;
 	parallel_decode_ctl->start_lsn = start_lsn;
 	parallel_decode_ctl->database = slot->data.database;
 	parallel_decode_ctl->two_phase = slot->data.two_phase;
@@ -2609,39 +2596,16 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 	parallel_decode_ctl->plugin_options_len = plugin_options_len;
 
 	/*
-	 * The size of the stream segments the workers produce, and the smallest
-	 * size a transaction may have before it is streamed at all.
-	 *
-	 * A session that does not stream leaves both at zero: the changes of a
-	 * transaction are then only streamed when the decoding path runs out of
-	 * memory, which is the behavior of the serial path.
-	 */
-	if (streaming_mode == PD_STREAMING_IMMEDIATE)
-	{
-		parallel_decode_ctl->stream_segment_size = parallel_decode_stream_segment_size;
-		parallel_decode_ctl->stream_min_size = parallel_decode_stream_min_size;
-	}
-	else if (streaming_mode == PD_STREAMING_BUFFERED)
-	{
-		/*
-		 * The session streams the changes of a transaction when the worker
-		 * runs out of memory, like the serial path does.  The size of the
-		 * stream segments is then not limited, so the segment size is zero.
-		 */
-		parallel_decode_ctl->stream_segment_size = 0;
-		parallel_decode_ctl->stream_min_size = 0;
-	}
-	else
-	{
-		parallel_decode_ctl->stream_segment_size = 0;
-		parallel_decode_ctl->stream_min_size = 0;
-	}
-
-	/*
 	 * The amount of memory each worker may use for the changes it has
 	 * accumulated.
 	 */
 	parallel_decode_ctl->work_mem_kb = parallel_decode_work_mem;
+
+	/*
+	 * The number of changes a transaction has to accumulate before the
+	 * workers send them as a stream segment of their own.
+	 */
+	parallel_decode_ctl->stream_segment_changes = parallel_decode_stream_segment_changes;
 
 	/*
 	 * Control channel, walreader -> walsender.  The walreader sets itself as

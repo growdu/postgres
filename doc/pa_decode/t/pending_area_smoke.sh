@@ -16,9 +16,8 @@
 #      longer than parallel_decode_barrier_timeout and the publisher has
 #      nothing more to send in the meantime.
 #
-# The subscriber does not ask for streaming, so the publisher sends the
-# transaction as one block, and the block waits for its turn in the pending
-# area of the walsender.
+# The publisher sends the transaction as one stream segment, and the segment
+# waits for its turn in the pending area of the walsender.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -30,8 +29,11 @@ PORT_SUB=${PORT_SUB:-5443}
 # The number of decode workers of the publisher.
 WORKERS=${WORKERS:-4}
 #
-# The size of the transaction, in rows and in bytes of payload per row.
-ROWS=${ROWS:-200000}
+# The size of the transaction, in rows and in bytes of payload per row.  The
+# transaction has to take longer than the barrier timeout below, otherwise
+# the stall detection has no reason to fire and the test proves nothing.  The
+# size is chosen so that the transaction takes about twice the timeout.
+ROWS=${ROWS:-500000}
 PAYLOAD=${PAYLOAD:-200}
 #
 # The number of seconds the publisher waits for a worker to make progress
@@ -102,12 +104,12 @@ echo "== creating the schema"
 pub -c "create table pd_t (id int primary key, v text)"
 pub -c "create publication pd_pub for all tables"
 
-echo "== creating the subscription (streaming = off, copy_data = false)"
+echo "== creating the subscription (streaming = parallel, copy_data = false)"
 sub -c "create table pd_t (id int primary key, v text)"
 sub -c "create subscription pd_sub
 		connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres'
 		publication pd_pub
-		with (streaming = 'off', copy_data = false)"
+		with (streaming = 'parallel', copy_data = false)"
 
 echo "== writing a transaction of $ROWS rows"
 start=$(date +%s)

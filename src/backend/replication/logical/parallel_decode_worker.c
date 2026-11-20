@@ -82,6 +82,16 @@ static XLogRecPtr pd_record_lsn = InvalidXLogRecPtr;
 static int	pd_worker_index = -1;
 
 /*
+ * Am I a decode worker of the parallel decoding path?
+ *
+ * The flag is the identity of the process: the decode worker produces the
+ * output of the transactions, the walreader and the walsender do not.  The
+ * code that runs in all three processes uses it to tell them apart, in the
+ * same way am_walsender tells the walsender apart from the other processes.
+ */
+bool		am_decode_worker = false;
+
+/*
  * The header of the record that is being processed.
  *
  * It tells the worker which worker owns the transaction of the record, and
@@ -1147,6 +1157,12 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	pqsignal(SIGTERM, parallel_decode_worker_sigterm);
 	BackgroundWorkerUnblockSignals();
 
+	/*
+	 * This process is a decode worker of the parallel decoding path: it is
+	 * the one that produces the output of the transactions.
+	 */
+	am_decode_worker = true;
+
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(ParallelDecodeWorkerArg));
 
 	ctl = ParallelDecodeWorkerAttach(&arg, &slot_index, &seg, &toc);
@@ -1257,29 +1273,12 @@ ParallelDecodeWorkerMain(Datum main_arg)
 						PGC_USERSET, PGC_S_SESSION);
 
 	/*
-	 * How eagerly the changes of a transaction are streamed.  A session that
-	 * does not stream leaves the sizes at zero, which keeps the behavior of
-	 * the serial path: the changes are streamed only when the decoding path
-	 * runs out of memory.
+	 * The number of changes a transaction has to accumulate before the worker
+	 * sends them as a stream segment of their own.  The segments of the
+	 * transactions that are in flight have to overlap in time, because that is
+	 * what the parallel apply of the subscriber works on.
 	 */
-	pd_ctx->stream_segment_size = (Size) ctl->stream_segment_size;
-	pd_ctx->stream_min_size = (Size) ctl->stream_min_size;
-
-	/*
-	 * The parallel decoding path streams every transaction, so that the
-	 * subscriber can apply the transactions in parallel.  A transaction that
-	 * was not streamed while it was in progress is streamed when it commits.
-	 *
-	 * The transactions below the minimum size are the exception: they reach
-	 * the subscriber as a whole transaction block.  The decision about them is
-	 * made by the reorder buffer, which knows the size of the transaction.
-	 *
-	 * The plugin has to support streaming, and the subscriber has to have
-	 * asked for it: the streaming callbacks of the plugin fail when the
-	 * subscriber did not ask for streaming.
-	 */
-	pd_ctx->stream_all_transactions =
-		(ctl->streaming_mode == PD_STREAMING_IMMEDIATE && pd_ctx->streaming);
+	pd_ctx->stream_segment_changes = ctl->stream_segment_changes;
 
 	/*
 	 * The worker tells the walsender which frames carry the definition of a

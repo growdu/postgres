@@ -25,9 +25,10 @@ export PDTEST_ROOT="$ROOT" PORT_PUB PORT_SUB
 
 WORKERS=${WORKERS:-4}
 
-# The size of a stream segment.  It is small on purpose, so that the changes
-# of the subtransaction are streamed before it is aborted.
-SEGMENT_SIZE=${SEGMENT_SIZE:-65536}
+# The number of changes a transaction has to collect before it is cut into a
+# stream segment of its own.  It is small on purpose, so that the changes of
+# the subtransaction are streamed before it is aborted.
+SEGMENT_CHANGES=${SEGMENT_CHANGES:-64}
 
 # The number of the rows of the three parts of the transaction.
 ROWS_BEFORE=${ROWS_BEFORE:-2000}
@@ -60,9 +61,7 @@ run_workload() {
 	cat >>"$ROOT/pub/postgresql.conf" <<EOF
 max_parallel_decode_workers = $workers
 parallel_decode_trace_file = '$TRACE'
-parallel_decode_stream_segment_size = $SEGMENT_SIZE
-parallel_decode_stream_min_size = 0
-parallel_decode_streaming_mode = 'auto'
+parallel_decode_stream_segment_changes = $SEGMENT_CHANGES
 EOF
 	pg_ctl -D "$ROOT/pub" reload >/dev/null
 	rm -f "$TRACE"

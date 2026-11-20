@@ -104,7 +104,7 @@ EOF
 	# The slot has to carry the name of the subscription, because that is the
 	# name the apply worker asks the publisher for.
 	pub -c "select pg_create_logical_replication_slot('pd_sub', 'pgoutput')" >/dev/null
-	sub -c "create subscription pd_sub connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'on', copy_data = false)"
+	sub -c "create subscription pd_sub connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'parallel', copy_data = false)"
 
 	echo "-- writing the workload"
 	workload_client() {

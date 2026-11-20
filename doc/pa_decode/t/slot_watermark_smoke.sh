@@ -60,7 +60,7 @@ pub -c "create publication pd_pub for all tables"
 
 echo "== creating the subscription ($WORKERS decode worker(s))"
 sub -c "create table pd_t (id int primary key, v text)"
-sub -c "create subscription pd_sub connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (streaming = 'on', copy_data = false)"
+sub -c "create subscription pd_sub connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (streaming = 'parallel', copy_data = false)"
 
 echo "== writing the workload"
 pub -c "insert into pd_t select g, 'v' || g from generate_series(1, $ROWS) g"

@@ -221,3 +221,64 @@ walsender:  环 --memcpy--> 接收缓冲 --(接管，不拷贝)--> 块缓冲 --m
 > 重测，下行是 904 —— worker 队列的刷新次数本身就与提交数同阶（本机实测 1 worker 时 839、
 > 4 worker 时 904），所以 `904 ≥ 820` 仍然成立。**本机只做功能与正确性验证**，
 > 上述数字是唤醒**次数**，不是速率；唤醒**速率**仍待性能环境实测回填。
+
+---
+
+## I. 流段切分改为"按变更条数"，并删除三个尺寸类 GUC
+
+这一轮把流段的切分从**字节**改成**变更条数**，并把"事务是否被流式化"的选择权从发布端的
+GUC 收回到"订阅端是否要并行 apply"这件事上。
+
+### I.1 删掉的参数
+
+| GUC | 去向 |
+| --- | --- |
+| `parallel_decode_streaming_mode`（enum） | 删除。取而代之的是一条硬规则：**只有 `streaming = 'parallel'` 的订阅端走并行路径**，其余（`on` / `off`）走串行路径 |
+| `parallel_decode_stream_min_size`（字节） | 删除。"低于门槛的事务整个不流式化"这个语义没有了：并行路径的事务**一定**被流式化 |
+| `parallel_decode_stream_segment_size`（字节） | 删除。切分点改成按**变更条数**：`parallel_decode_stream_segment_changes`（默认 8） |
+
+新的参数：
+
+| GUC | 语义 | 0 的含义 |
+| --- | --- | --- |
+| `parallel_decode_stream_segment_changes` | 一个事务攒够这么多条变更就切一个流段发出去 | 0 = 不切段，事务在提交时整块发出（并行 apply 退化成串行 apply） |
+
+### I.2 "是不是 decode worker"由进程身份决定
+
+新增 `am_decode_worker`（`src/include/replication/parallel_decode.h`，在
+`ParallelDecodeWorkerMain()` 里置真），core 的 `reorderbuffer.c` 用它判断自己跑在哪个进程里：
+
+- `ReorderBufferQueueChange()`：worker 走 `ReorderBufferStreamSegment()`（按条数切段），
+  串行路径照旧走 `ReorderBufferCheckMemoryLimit()`（**一个字没改**）；
+- `ReorderBufferStreamAtCommit()`：只有 worker 会把"提交时还没攒够条数的事务"作为一段发出去。
+
+`ctx->worker_index` 的职责没变（它是"我是几号 worker"，用于区分事务归属），
+"我是不是 worker"由 `am_decode_worker` 回答——见 `src/include/replication/logical.h` 的注释。
+
+### I.3 两条路径的字节不再相同
+
+并行路径**一律**以流段下发事务（`STREAM START` / `STREAM STOP` / `STREAM COMMIT`，段内消息带
+in-band xid），串行路径仍按整事务块下发（`BEGIN` / `COMMIT`）。⇒ 设计文档 4.1 里"两条路径
+产出的 wire 字节逐消息一致"这条**不再成立**，成立的是"**事务内容一致**"。
+
+比对工具（`t/pd_frame_tool.py`）相应改成**按事务内容**比对：把流段按 xid 重新拼回事务、
+把 in-band xid 从消息字节里摘掉，再逐事务比较变更；关系描述单独按集合比较。
+`rel_dedup_smoke.sh` 的期望也随之改成：串行路径整个会话 1 条关系描述，并行路径**每个事务 1 条**。
+
+### I.4 两个已知缺口（本轮不补）
+
+1. **worker 的内存没有上界。** 并行路径的 decode worker 不走 reorder buffer 的内存上限检查
+   （`ReorderBufferCheckMemoryLimit()`），它的 reorder buffer 也不会落盘——worker 侧的记忆兜底
+   （超限时把最大的可流式事务发出去）还没有实现。**后果**：`parallel_decode_work_mem` 目前
+   **无效**（GUC 的说明文字与 `user_manual.md` 4.2.3 都已注明），一个足够大的事务可以把 worker
+   的内存吃光。
+2. **流段没有字节上限。** 段是按变更条数切的，一条变更可以很大，所以单个流段可以很大。
+   串行路径靠 `logical_decoding_work_mem` 间接限制流段大小，并行路径目前没有等价手段。
+
+### I.5 建议在设计文档里同步的几处
+
+- §8.2（分片与整事务两种输出形态）：并行路径**只有分片一种形态**，"整事务输出"只在串行路径上出现。
+- §11.1 的 GUC 表：换成 I.1 的新表。
+- §12.1 达成条件里"`parallel_decode_stream_min_size = 0` 不设门槛"那一类表述：参数已不存在，
+  换成"并行路径的事务一定被流式化"。
+- §15.2 的待实测清单：段大小从字节变成条数之后，"段粒度 vs 端到端时延"的实测项要重写。

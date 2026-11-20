@@ -32,36 +32,6 @@
 #include "storage/shm_toc.h"
 
 /*
- * Streaming aggressiveness of the publisher.
- *
- * AUTO resolves per subscriber at session start: a subscriber using
- * streaming='parallel' gets IMMEDIATE (its parallel apply only makes sense
- * when the publisher actually produces stream segments), a subscriber using
- * streaming='on' gets BUFFERED (it has no parallel apply worker, so forcing
- * streaming would push every one of its transactions onto the subscriber's
- * spool slow path).
- */
-typedef enum ParallelDecodeStreamingMode
-{
-	PARALLEL_DECODE_STREAMING_AUTO = 0,
-	PARALLEL_DECODE_STREAMING_IMMEDIATE,
-	PARALLEL_DECODE_STREAMING_BUFFERED
-} ParallelDecodeStreamingMode;
-
-/*
- * The streaming mode of a session, after the GUC and the mode the subscriber
- * asked for have been combined.
- *
- * A subscriber that did not ask for streaming never gets a stream segment,
- * no matter what the GUC says: the output plugin of the publisher decides
- * whether it streams at all, and it does so based on the mode the subscriber
- * asked for.
- */
-#define PD_STREAMING_OFF			0
-#define PD_STREAMING_BUFFERED		1
-#define PD_STREAMING_IMMEDIATE		2
-
-/*
  * The largest size of the serialized output plugin options in the control
  * block.  The options of the output plugin are a handful of short strings,
  * so this is generous.
@@ -70,16 +40,23 @@ typedef enum ParallelDecodeStreamingMode
 
 /* GUCs */
 extern PGDLLIMPORT int	max_parallel_decode_workers;
-extern PGDLLIMPORT int	parallel_decode_streaming_mode;
-extern PGDLLIMPORT int	parallel_decode_stream_min_size;
-extern PGDLLIMPORT int	parallel_decode_stream_segment_size;
 extern PGDLLIMPORT int	parallel_decode_work_mem;
+extern PGDLLIMPORT int	parallel_decode_stream_segment_changes;
 extern PGDLLIMPORT int	parallel_decode_batch_size;
 extern PGDLLIMPORT int	parallel_decode_barrier_timeout;
 extern PGDLLIMPORT int	parallel_decode_pending_max_bytes;
 extern PGDLLIMPORT int	parallel_decode_held_max_bytes;
 extern PGDLLIMPORT int	parallel_decode_fault_inject;
 extern PGDLLIMPORT char *parallel_decode_trace_file;
+
+/*
+ * Am I a decode worker of the parallel decoding path?
+ *
+ * The flag follows the model of am_walsender: it tells the code that runs in
+ * the processes of a session which one it runs in.  Only the decode worker
+ * produces the output of the transactions.
+ */
+extern PGDLLIMPORT bool am_decode_worker;
 
 /*
  * The failures the fault injection knob can produce.
@@ -92,20 +69,29 @@ extern PGDLLIMPORT char *parallel_decode_trace_file;
 #define PD_FAULT_WORKER			1	/* the decode workers fail when they start */
 #define PD_FAULT_WALREADER		2	/* the walreader fails when it starts */
 
-/* True when the publisher-side parallel path is requested. */
+/* True when the publisher-side parallel path is available. */
 extern bool ParallelDecodeEnabled(void);
 
+/* True when the session is running on the parallel decoding path. */
+extern bool ParallelDecodeActive(void);
+
 /*
- * Resolve the streaming mode of a session.
+ * Tell whether the subscriber of a session applies the changes in parallel.
  *
- * The mode is the combination of the GUC with the mode the subscriber asked
- * for with the "streaming" option of the output plugin.  A subscriber that
- * did not ask for streaming never gets a stream segment, so the result is
- * PD_STREAMING_OFF for it, whatever the GUC says.
+ * The subscriber says so with the "streaming" option of the output plugin:
+ * streaming='parallel' means it has a parallel apply worker, streaming='on'
+ * means it applies the stream segments itself, and streaming='off' means it
+ * does not want any stream segment at all.
+ *
+ * Parallel decoding and streaming are bound together: the parallel path can
+ * only ship the changes of a transaction as stream segments, and the parallel
+ * apply of the subscriber is what makes the segments worth producing.  Only
+ * streaming='parallel' therefore takes the parallel path; the other two modes
+ * take the serial path.
  *
  * plugin_options are the options the client gave for the output plugin.
  */
-extern int ParallelDecodeResolveStreamingMode(List *plugin_options);
+extern bool ParallelDecodeSubscriberAppliesInParallel(List *plugin_options);
 
 /*
  * Wire trace facility.
@@ -146,7 +132,6 @@ extern void PDTraceShutdown(void);
 extern void ParallelDecodeSessionStart(ReplicationSlot *slot,
 									   const char *plugin_options,
 									   uint32 plugin_options_len,
-									   int streaming_mode,
 									   XLogRecPtr start_lsn);
 extern void ParallelDecodeSessionStop(void);
 
@@ -245,20 +230,8 @@ typedef struct ParallelDecodeControl
 	volatile uint64 walreader_end_lsn;
 
 	/* Set by the walsender once the slot and the plugin are known. */
-	int			streaming_mode;	/* ParallelDecodeStreamingMode */
 	int			proto_version;
 	char		plugin_name[NAMEDATALEN];
-
-	/*
-	 * The size of the stream segments the decode workers produce, and the
-	 * smallest size a transaction may have before it is streamed at all.
-	 *
-	 * Both are zero when the session does not stream: the changes of a
-	 * transaction are then only streamed when the decoding path runs out of
-	 * memory, which is the behavior of the serial path.
-	 */
-	uint64		stream_segment_size;
-	uint64		stream_min_size;
 
 	/*
 	 * The amount of memory each decode worker may use for the changes it has
@@ -266,6 +239,14 @@ typedef struct ParallelDecodeControl
 	 * path.
 	 */
 	int			work_mem_kb;
+
+	/*
+	 * The number of changes a transaction has to accumulate before the
+	 * workers send them as a stream segment of their own.  Zero means that
+	 * the changes of a transaction are not cut: the transaction is streamed
+	 * in a single segment when it commits.
+	 */
+	uint64		stream_segment_changes;
 
 	/*
 	 * The parameters of the session, as the decode workers need them.

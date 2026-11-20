@@ -66,8 +66,9 @@ ROWS2=${ROWS2:-40000}
 # has ended.
 VAL2=${VAL2:-1000}
 #
-# The size of a stream segment.
-SEGMENT_SIZE=${SEGMENT_SIZE:-8192}
+# The number of changes a transaction has to collect before it is cut into a
+# stream segment of its own.
+SEGMENT_CHANGES=${SEGMENT_CHANGES:-64}
 #
 # The time between the start of the first transaction and the start of the
 # second one.  The second transaction has to be running when the first one
@@ -102,9 +103,7 @@ MAX_PARALLEL_DECODE_WORKERS=$WORKERS "$SCRIPT_DIR/setup_env.sh" init
 
 cat >>"$ROOT/pub/postgresql.conf" <<EOF
 parallel_decode_trace_file = '$TRACE'
-parallel_decode_stream_segment_size = $SEGMENT_SIZE
-parallel_decode_stream_min_size = 0
-parallel_decode_streaming_mode = 'auto'
+parallel_decode_stream_segment_changes = $SEGMENT_CHANGES
 parallel_decode_held_max_bytes = 1
 EOF
 pg_ctl -D "$ROOT/pub" reload >/dev/null

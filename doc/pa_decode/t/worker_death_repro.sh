@@ -42,7 +42,7 @@ EOF
 "$PGBIN/pg_ctl" -D "$ROOT/pub" reload >/dev/null
 
 echo "== starting the parallel subscription"
-sub -c "create subscription pd_slot_a connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'on', copy_data = false)"
+sub -c "create subscription pd_slot_a connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'parallel', copy_data = false)"
 
 sleep 2
 

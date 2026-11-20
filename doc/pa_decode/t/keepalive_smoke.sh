@@ -54,7 +54,7 @@ sub -c "create table pd_t (id int primary key, v text)"
 rm -f "$TRACE"
 
 echo "== subscribing with the parallel decoding path"
-sub -c "create subscription pd_sub connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (streaming = 'on', copy_data = false)"
+sub -c "create subscription pd_sub connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (streaming = 'parallel', copy_data = false)"
 
 # The parallel path has to be in use, otherwise the test proves nothing.
 for i in $(seq 1 60); do

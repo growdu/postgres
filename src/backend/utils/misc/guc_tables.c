@@ -433,13 +433,6 @@ static const struct config_enum_entry debug_logical_replication_streaming_option
 	{NULL, 0, false}
 };
 
-static const struct config_enum_entry parallel_decode_streaming_mode_options[] = {
-	{"auto", PARALLEL_DECODE_STREAMING_AUTO, false},
-	{"immediate", PARALLEL_DECODE_STREAMING_IMMEDIATE, false},
-	{"buffered", PARALLEL_DECODE_STREAMING_BUFFERED, false},
-	{NULL, 0, false}
-};
-
 StaticAssertDecl(lengthof(ssl_protocol_versions_info) == (PG_TLS1_3_VERSION + 2),
 				 "array length mismatch");
 
@@ -2989,38 +2982,23 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"parallel_decode_stream_min_size", PGC_SIGHUP, REPLICATION_SENDING,
-			gettext_noop("Sets the minimum size in bytes of a transaction that is "
-						 "streamed by the publisher."),
-			gettext_noop("A transaction below this size is not streamed: it reaches "
-						 "the subscriber as a whole transaction block. Zero means "
-						 "that every transaction is streamed, so that the "
-						 "subscriber can apply the transactions in parallel. A "
-						 "threshold larger than the typical transaction size stops "
-						 "the subscriber from receiving STREAM START messages, "
-						 "which prevents parallel apply from starting at all. The "
-						 "change takes effect in the next replication session.")
+		{"parallel_decode_stream_segment_changes", PGC_SIGHUP, REPLICATION_SENDING,
+			gettext_noop("Sets the number of changes a transaction has to accumulate "
+						 "before the publisher sends them as a stream segment of "
+						 "their own."),
+			gettext_noop("The changes of a transaction that reaches this number are "
+						 "sent before the transaction is complete, so that the "
+						 "segments of the transactions that are in flight overlap in "
+						 "time: that is what the parallel apply of the subscriber "
+						 "works on.  Zero means that the changes of a transaction "
+						 "are not cut, and that the transaction is streamed in a "
+						 "single segment when it commits.  A smaller number sends "
+						 "the changes earlier and lets more transactions be applied "
+						 "at the same time, at the cost of more stream segments.  "
+						 "The change takes effect in the next replication session.")
 		},
-		&parallel_decode_stream_min_size,
-		0, 0, INT_MAX,
-		NULL, NULL, NULL
-	},
-
-	{
-		{"parallel_decode_stream_segment_size", PGC_SIGHUP, REPLICATION_SENDING,
-			gettext_noop("Sets the size in bytes of a single stream segment "
-						 "produced by the publisher."),
-			gettext_noop("A transaction that has accumulated this many bytes is "
-						 "streamed in a segment of this size, so that it reaches "
-						 "the subscriber before it is complete; a transaction that "
-						 "stays below it is streamed in a single segment when it "
-						 "commits. Only one stream segment may be open on the wire "
-						 "at a time, so this bounds the time a segment can block "
-						 "the others. The change takes effect in the next "
-						 "replication session.")
-		},
-		&parallel_decode_stream_segment_size,
-		1024 * 1024, 0, INT_MAX,
+		&parallel_decode_stream_segment_changes,
+		8, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
 
@@ -3030,7 +3008,10 @@ struct config_int ConfigureNamesInt[] =
 						 "decode worker."),
 			gettext_noop("Minus one means to use logical_decoding_work_mem. The total "
 						 "memory used is the number of workers times this value. "
-						 "The change takes effect in the next replication session.")
+						 "This parameter currently has no effect: the decode workers "
+						 "do not limit the memory of their reorder buffer yet, so "
+						 "a worker can use more memory than this value. The change "
+						 "takes effect in the next replication session.")
 		},
 		&parallel_decode_work_mem,
 		-1, -1, INT_MAX,
@@ -4913,19 +4894,6 @@ struct config_string ConfigureNamesString[] =
 
 struct config_enum ConfigureNamesEnum[] =
 {
-	{
-		{"parallel_decode_streaming_mode", PGC_SIGHUP, REPLICATION_SENDING,
-			gettext_noop("Sets how aggressively the publisher streams transactions."),
-			gettext_noop("In auto mode the actual setting is derived from the "
-						 "subscriber: immediate for streaming='parallel' subscribers, "
-						 "buffered otherwise. The change takes effect in the next "
-						 "replication session.")
-		},
-		&parallel_decode_streaming_mode,
-		PARALLEL_DECODE_STREAMING_AUTO, parallel_decode_streaming_mode_options,
-		NULL, NULL, NULL
-	},
-
 	{
 		{"backslash_quote", PGC_USERSET, COMPAT_OPTIONS_PREVIOUS,
 			gettext_noop("Sets whether \"\\'\" is allowed in string literals."),

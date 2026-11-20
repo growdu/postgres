@@ -126,6 +126,13 @@ typedef struct LogicalDecodingContext
 	 *
 	 * txn_owner is -1 when the process decodes the transactions of every
 	 * owner, which is the case of the serial decoding path.
+	 *
+	 * worker_index is -1 when the process is not a decode worker: that is the
+	 * case of the serial decoding path and of the walreader, which decodes
+	 * the records for the sake of its snapshot builder.  It says which worker
+	 * the process is, so that the decoding path can tell the transactions of
+	 * the workers apart.  Whether the process is a decode worker at all is
+	 * told by the flag am_decode_worker, see parallel_decode.h.
 	 */
 	int			txn_owner;
 	int			worker_index;
@@ -153,38 +160,19 @@ typedef struct LogicalDecodingContext
 	void (*rel_definition_hook) (struct LogicalDecodingContext *ctx, Oid relid);
 
 	/*
-	 * The publisher-side parallel decoding path streams the changes of a
-	 * transaction before the transaction is complete, so that they reach the
-	 * subscriber early.  These three fields say how eagerly that happens.
+	 * The number of changes a transaction has to accumulate before the
+	 * parallel decoding path sends them as a stream segment of their own.
 	 *
-	 * stream_segment_size is the size of a stream segment.  A transaction
-	 * that has accumulated that many bytes is streamed in a segment of that
-	 * size, so that it reaches the subscriber before it is complete; a
-	 * transaction that stays below it is streamed in a single segment when it
-	 * commits.  Zero means that the changes are only streamed when the
-	 * decoding path runs out of memory, which is the behavior of the serial
-	 * decoding path.
+	 * The changes of a transaction that reaches this number are sent before
+	 * the transaction is complete, so that the segments of the transactions
+	 * that are in flight overlap in time: that is what the parallel apply of
+	 * the subscriber works on.
 	 *
-	 * stream_min_size is the number of bytes a transaction has to have
-	 * accumulated before it may be streamed at all.  A transaction below the
-	 * threshold reaches the subscriber as a whole transaction block.  A
-	 * threshold larger than the size of the typical transaction keeps the
-	 * subscriber from receiving any stream segment.  Zero means that every
-	 * transaction is streamed.
-	 *
-	 * stream_all_transactions tells the decoding path to stream every
-	 * transaction, including the transactions that were not streamed while
-	 * they were in progress: those are streamed when they commit.  The
-	 * subscriber applies the transactions in parallel, and a transaction that
-	 * is not streamed gives its apply worker nothing to do.  It is false in
-	 * the serial decoding path.
-	 *
-	 * The first two are zero in the serial decoding path, so its behavior is
-	 * unchanged.
+	 * Zero means that the changes of a transaction are not cut: the
+	 * transaction is streamed in a single segment when it commits.  The serial
+	 * decoding path leaves this at zero.
 	 */
-	Size		stream_segment_size;
-	Size		stream_min_size;
-	bool		stream_all_transactions;
+	uint64		stream_segment_changes;
 } LogicalDecodingContext;
 
 

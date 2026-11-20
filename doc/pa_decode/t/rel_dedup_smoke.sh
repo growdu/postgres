@@ -1,11 +1,21 @@
 #!/bin/bash
 # Verify that the publisher-side parallel decoding path sends the definition
-# of a relation once, like the serial decoding path does.
+# of a relation once per transaction, and not once per worker.
+#
+# The subscriber applies the transactions in parallel, and its apply workers
+# take the definition of a relation from the stream of the transaction that
+# needs it.  So the definition has to be in the stream of every transaction
+# that changes the relation: the publisher cannot drop it, because the
+# subscriber would have no definition to work with.  This is the rule of
+# pgoutput, which sends the definition of a relation with every streamed
+# transaction.
 #
 # Every decode worker of the parallel path has its own relation cache, so
-# without a shared table of the relations that the session has sent already,
-# every worker that touches a relation sends the definition of that relation
-# and the subscriber receives it as many times as there are workers.
+# the parallel path has to be careful not to send the definition more often
+# than that: without a shared table of the relations that the session has
+# sent already, every worker that touches a relation sends the definition of
+# that relation, and the subscriber receives it as many times as there are
+# workers.
 #
 # The workload of this test is a number of separate transactions that all
 # change the same table, so that the transactions are spread over the
@@ -13,8 +23,20 @@
 # flight, and the transactions of the workload are of the same size.
 #
 # The test runs the workload twice, once with the serial decoding path and
-# once with the parallel one, and compares the number of the relation
-# messages in the two trace files.  Both numbers have to be one.
+# once with the parallel one, and counts the relation messages in the two
+# trace files.
+#
+# The two numbers are not the same, and they are not supposed to be.  The
+# serial path does not stream the transactions, so it sends the definition of
+# the table once for the whole session, like pgoutput does for a session that
+# does not stream.  The parallel path streams the transactions, so it sends
+# the definition with every transaction that changes the table, like pgoutput
+# does for a streamed transaction.
+#
+# What the parallel path must not do is send the definition more often than
+# that: the decode workers have their own relation caches, so a definition
+# that every worker sends again would reach the subscriber once per worker
+# and per transaction.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -109,7 +131,7 @@ run() {
 	sub -c "truncate pd_t"
 	rm -f "$trace"
 	set_trace "$trace" "$workers"
-	sub -c "create subscription $slot connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'on', copy_data = false)"
+	sub -c "create subscription $slot connection 'host=$ROOT port=$PORT_PUB user=postgres dbname=postgres' publication pd_pub with (create_slot = false, streaming = 'parallel', copy_data = false)"
 	for i in $(seq 1 60); do
 		n=$(sub -At -c "select count(*) from pd_t" 2>/dev/null || echo 0)
 		[ "$n" = "$EXPECTED" ] && break
@@ -136,7 +158,7 @@ count_relations() {
 	    if frame.type != "w":
 	        continue
 	    messages, streaming = mod.parse_messages(frame.payload, streaming)
-	    for tag, raw, desc in messages:
+	    for tag, raw, desc, xid in messages:
 	        if tag == mod.MSG_RELATION:
 	            count += 1
 	print(count)
@@ -153,11 +175,19 @@ run pd_slot_b "$TRACE_PARALLEL" "$WORKERS"
 parallel_count=$(count_relations "$TRACE_PARALLEL")
 echo "   the parallel path sent $parallel_count relation message(s)"
 
+#
+# The serial path does not stream the transactions, so it sends the definition
+# of the table once for the whole session.
+#
 if [ "$serial_count" != "1" ]; then
 	fail "the serial path sent $serial_count relation messages instead of one"
 fi
-if [ "$parallel_count" != "1" ]; then
-	fail "the parallel path sent $parallel_count relation messages instead of one"
+#
+# The parallel path streams the transactions, so it sends the definition with
+# every transaction of the workload, but not more often than that.
+#
+if [ "$parallel_count" != "$EXPECTED" ]; then
+	fail "the parallel path sent $parallel_count relation messages instead of $EXPECTED"
 fi
 
 echo "== OK"

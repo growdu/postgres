@@ -49,9 +49,9 @@
 
 本特性是**发布端路径的替换**，不是新协议、不是新插件：
 
-- **语义等价**：同一批 WAL，串行路径与并行路径产出的 wire 字节**逐消息一致**。允许的差异只有两类，且都是有意为之（见 `design.md` 4.1）：帧的**顺序**（并行路径可以提前发流段），以及帧头 **LSN 的钳制值**（并行路径把流段帧的 LSN 钳到"放行前沿"，防止订阅端把 `confirmed_flush` 抬过尚未放行的事务）。
+- **数据等价**：同一批 WAL，串行路径与并行路径解码出的**事务内容一致**（同样的变更、同样的顺序、同样的事务划分）。但两条路径的 **wire 字节不再逐消息一致**：并行路径**一律以流段下发**事务（`STREAM START` / `STREAM STOP` / `STREAM COMMIT`，段内消息带 in-band xid），串行路径仍按整事务块下发（`BEGIN` / `COMMIT`）。允许的差异有三类，且都是有意为之（见 `design.md` 4.1）：**事务的分帧方式**、帧的**顺序**（并行路径可以提前发流段），以及帧头 **LSN 的钳制值**（并行路径把流段帧的 LSN 钳到"放行前沿"，防止订阅端把 `confirmed_flush` 抬过尚未放行的事务）。
 - **开关关闭即完全等同现状**：`max_parallel_decode_workers = 0`（默认）时，走的是原有的进程内串行解码路径，一个字节都不变。
-- **订阅端零改动**：订阅端不需要知道发布端用了哪条路径。协议字节相同，订阅端的行为也就相同。
+- **订阅端零改动**：订阅端不需要知道发布端用了哪条路径。流段是 pgoutput 已有的协议，订阅端照常解析。
 
 ### 1.3 什么时候该用
 
@@ -59,7 +59,7 @@
 
 - 发布端 CPU 是瓶颈（发布端单核跑满，订阅端 apply worker 在等数据）；
 - 负载是**大量小事务**（并行收益最明显，因为事务之间可以真正并行）；
-- 订阅端已经用 `streaming = 'parallel'`（这时"尽早流式"才有意义，见 `parallel_decode_streaming_mode`）。
+- 订阅端已经用 `streaming = 'parallel'`（并行路径**只**对这类订阅端启用，见 4.2.2）。
 
 不适合：
 
@@ -111,7 +111,7 @@ CREATE SUBSCRIPTION my_sub
 max_parallel_apply_workers_per_subscription = 4
 ```
 
-发布端的 `parallel_decode_streaming_mode = auto`（默认）会**自动**按订阅端请求的流式模式选择策略：订阅端要 `parallel` 就尽早流式，订阅端只要 `on` 就保持现状行为（见 4.2.2）。
+并行解码与流式是绑在一起的：**只有** `streaming = 'parallel'` 的订阅端走并行路径，其余（`on` / `off`）走串行路径。并行路径以流段下发事务，订阅端的并行 apply 靠的就是这些流段（见 4.2.2）。
 
 ### 2.3 确认并行路径已生效
 
@@ -172,10 +172,8 @@ FROM pg_parallel_decode_wakeups;
 | 参数 | 类型 | 默认值 | 范围 | 一句话说明 |
 | --- | --- | --- | --- | --- |
 | `max_parallel_decode_workers` | int | `0` | 0 – 64 | 并行解码 worker 的数量；0 = 关闭并行路径 |
-| `parallel_decode_streaming_mode` | enum | `auto` | `auto` / `immediate` / `buffered` | 事务流式化的激进程度 |
-| `parallel_decode_stream_min_size` | int | `0` | 0 – INT_MAX | 小于这个字节数的事务**完全不被**流式化（0 = 每个事务都被流式化） |
-| `parallel_decode_stream_segment_size` | int | `1MB` | 0 – INT_MAX | 单个流段的字节上限（只是分段点，不决定事务是否被流式化） |
-| `parallel_decode_work_mem` | int | `-1` | -1 – INT_MAX | 每个 decode worker 的解码内存上限；-1 = 用 `logical_decoding_work_mem` |
+| `parallel_decode_stream_segment_changes` | int | `8` | 0 – INT_MAX | 一个事务攒够多少条变更就切一个流段；0 = 不切，提交时整事务一个流段 |
+| `parallel_decode_work_mem` | int | `-1` | -1 – INT_MAX | 每个 decode worker 的解码内存上限；**当前无效**（见 4.2.3）；-1 = 用 `logical_decoding_work_mem` |
 | `parallel_decode_batch_size` | int | `64KB` | 0 – INT_MAX | 队列消息的合并批次大小；0 = 不合并 |
 | `parallel_decode_barrier_timeout` | int | `60` | 0 – INT_MAX | 停滞检测的超时（秒）；0 = 关闭检测 |
 | `parallel_decode_pending_max_bytes` | int | `64MB` | 0 – INT_MAX | 待放行帧的字节上限，超过时发布端告警；0 = 关闭告警 |
@@ -196,58 +194,37 @@ FROM pg_parallel_decode_wakeups;
 
 **注意**：`max_worker_processes` 必须留够 N+1 × 并发会话数的名额。
 
-#### 4.2.2 `parallel_decode_streaming_mode`
+#### 4.2.2 `parallel_decode_stream_segment_changes`
 
-控制事务被**流式化**的激进程度。有三个取值：
+**一个事务攒够多少条变更就被切成一个流段**，默认 8。
 
-| 取值 | 行为 |
+并行路径**一律**把事务以流段下发。事务在解码过程中攒够这个数量的变更，就把这些变更作为一段发出去，此时事务本身还没有提交。这样，**同时在飞行的事务的流段在时间上就有重叠**——订阅端的并行 apply 靠的正是这种重叠。
+
+- 事务在提交时若还没攒够这个数量，它**仍然会被流式化**，只是整事务作为**一个**流段在提交时发出；
+- `0` = 不切段：每个事务在提交时整块发出（此时并行 apply 退化成串行 apply）。
+
+**它只是分段点，不决定"事务是否被流式化"**：并行路径没有"不流式化"这个选项，事务一定会被流式化。
+
+**取值权衡**：
+
+| 方向 | 效果 |
 | --- | --- |
-| `auto`（默认） | 按订阅端请求的流式模式自动选择：订阅端要 `parallel` → `immediate`；订阅端只要 `on` → `buffered`；订阅端不要流式 → 关闭流式 |
-| `immediate` | 一律尽早流式。事务的变更在解码完成之前就分片下发给订阅端 |
-| `buffered` | 一律等整个事务解码完再下发（保持现有行为） |
+| 调大 | 流段更少、`STREAM START` / `STREAM STOP` 更少，但变更到得更晚，重叠窗口更窄 |
+| 调小 | 变更到得更早、重叠更多，但协议消息更多（每事务多 2 帧） |
 
-**为什么 `auto` 要分档**：
-
-- 订阅端用 `streaming = 'parallel'` 时，它的并行 apply worker 需要**提前拿到变更**才有事可做。没有流段，并行 apply 根本启动不了。
-- 订阅端用 `streaming = 'on'` 时，它只有一个 apply worker，没有并行 apply worker。此时提前流式只会把订阅端的每个事务推到 spool 慢路径（`TRANS_LEADER_SERIALIZE`），是**性能回归**。
-
-**流式的含义**：事务被切成若干"流段"，每个流段是 `STREAM START` + 若干变更 + `STREAM STOP`。同一时刻 wire 上只能有一个打开的流段（订阅端的协议约束），流段之间不能交织。
-
-**生效时机**：**下一次复制会话**。模式在会话建立时按订阅端的 `streaming` 选项解析并冻结，会话中途改值会与已经切出的流段不一致。
-
-#### 4.2.3 `parallel_decode_stream_min_size`
-
-**小于这个字节数的事务完全不被流式化**，走整事务下发（整个事务的字节作为一个块发出去）。
-
-**`0` 的含义是"每个事务都被流式化"**——包括在进行中没有攒够段大小、**在提交时才被流式化**的那些事务。
-
-**默认必须是 `0`**（不设门槛）。门槛若大于典型事务大小，低于门槛的事务都不流式化 → 订阅端收不到 `STREAM START` → **并行 apply 根本不启动**。这是一个很容易踩的坑：调大这个参数看起来像"减少开销"，实际上会让订阅端的并行 apply 整个失效。
-
-只有当"整事务下发"和"流式下发"之间的差异对某些特定负载有实际意义时才动它。
+**注意**：段是按**变更条数**切的，不是按字节切的。一条变更可以很大（一条 `UPDATE` 带几 MB 的新元组），所以**单个流段没有字节上限**——这是当前的已知限制，见 9. 已知限制。
 
 **生效时机**：**下一次复制会话**（值在会话建立时拷进共享内存）。
 
-#### 4.2.4 `parallel_decode_stream_segment_size`
-
-**单个流段的字节上限**，默认 1MB。
-
-它决定了"一个流段最长能独占 wire 多久"。由于 wire 上同时只能有一个打开的流段，一个卡住的流段会把其它 worker 的产出一起堵住——这是并行路径的固有代价，只能靠限制段的粒度来限制单块时长。
-
-**它只是分段点，不决定"事务是否被流式化"**：没攒够这个大小的事务，在 `immediate` 档下仍然会在**提交时**作为一个流段发出（订阅端一样能并行 apply）。因此它影响的是**时延**而不是功能——段大小远大于典型事务大小时，每个事务都在提交时才被流式化。
-
-调小的代价是：流段更碎，`STREAM START` / `STREAM STOP` 的协议消息更多（每事务多 2 帧）。
-
-**生效时机**：**下一次复制会话**。
-
-#### 4.2.5 `parallel_decode_work_mem`
+#### 4.2.3 `parallel_decode_work_mem`
 
 **每个 decode worker** 的解码内存上限。`-1`（默认）表示沿用 `logical_decoding_work_mem` 的值。
 
-总内存上界 ≈ **worker 数 × 本值**。这是并行走起来之后最容易踩的资源限制：一个事务如果大到单个 worker 的内存装不下，会走 reorder buffer 的落盘路径。
+> **当前这个参数无效。** 并行路径的 decode worker 不再走 reorder buffer 的内存上限检查（`ReorderBufferCheckMemoryLimit()`），它的 reorder buffer 也不会落盘，所以 worker 的内存**没有上界**：一个足够大的事务可以把 worker 的内存吃光。worker 侧的内存兜底还没有实现，见 9. 已知限制。这个参数保留，是为了给兜底实现留好接口。
 
-**生效时机**：**下一次复制会话**。`ReorderBufferCheckMemoryLimit()` 只读本进程的 GUC 值，worker 进程必须重启才能看到新值。
+**生效时机**：**下一次复制会话**。worker 进程必须重启才能看到新值。
 
-#### 4.2.6 `parallel_decode_batch_size`
+#### 4.2.4 `parallel_decode_batch_size`
 
 **队列消息的合并批次大小**，默认 64KB。这是**跨进程唤醒的速率上限**。
 
@@ -271,7 +248,7 @@ walreader 把 WAL 记录交给 worker、worker 把协议帧交给 walsender，�
 
 > 注：GUC 自带的说明文字写的是"下次复制会话生效"，那是保守说法；实际实现每次发送都重新读这个值。
 
-#### 4.2.7 `parallel_decode_barrier_timeout`
+#### 4.2.5 `parallel_decode_barrier_timeout`
 
 **停滞检测的超时**，默认 60 秒。
 
@@ -295,7 +272,7 @@ walreader 把 WAL 记录交给 worker、worker 把协议帧交给 walsender，�
 
 **生效时机**：`sighup` 后**立即**生效（检测时读的是当前值）。
 
-#### 4.2.8 `parallel_decode_pending_max_bytes`
+#### 4.2.6 `parallel_decode_pending_max_bytes`
 
 **待放行帧的字节上限**，默认 64MB（`67108864`）。
 
@@ -315,7 +292,7 @@ WARNING:  the parallel decoding session holds 73400320 bytes of frames that wait
 
 **生效时机**：`sighup` 后**立即**生效（每次加帧时读当前值）。
 
-#### 4.2.9 `parallel_decode_trace_file`
+#### 4.2.7 `parallel_decode_trace_file`
 
 帧级追踪文件，默认为空（关闭）。
 
@@ -327,7 +304,7 @@ WARNING:  the parallel decoding session holds 73400320 bytes of frames that wait
 
 **注意**：文件用裸 fd 打开，整个会话期间保持打开。文件按 `O_APPEND` 打开，多次运行会追加而不是覆盖。
 
-#### 4.2.10 `parallel_decode_fault_inject`
+#### 4.2.8 `parallel_decode_fault_inject`
 
 **调试设施**，默认 `0`（不注入）。
 
@@ -346,10 +323,8 @@ WARNING:  the parallel decoding session holds 73400320 bytes of frames that wait
 | 参数 | 生效时机 | 原因 |
 | --- | --- | --- |
 | `max_parallel_decode_workers` | 下次会话 | worker 池是会话级的；会话中途增删会改变共享内存的队列条数，且正在解码的事务不能迁移 |
-| `parallel_decode_streaming_mode` | 下次会话 | 会话建立时按订阅端的模式解析并冻结；中途改值会与已切出的流段不一致 |
-| `parallel_decode_stream_min_size` | 下次会话 | 参与流段切分判定 |
-| `parallel_decode_stream_segment_size` | 下次会话 | 参与流段切分 |
-| `parallel_decode_work_mem` | 下次会话 | worker 必须重启才能看到新值 |
+| `parallel_decode_stream_segment_changes` | 下次会话 | 参与流段切分判定 |
+| `parallel_decode_work_mem` | 下次会话 | worker 必须重启才能看到新值（当前无效，见 4.2.3） |
 | `parallel_decode_batch_size` | **sighup 后立即** | 每次发送消息时读当前值 |
 | `parallel_decode_barrier_timeout` | **sighup 后立即** | 每次检测时读当前值 |
 | `parallel_decode_pending_max_bytes` | **sighup 后立即** | 每次加帧时读当前值 |
@@ -390,7 +365,7 @@ WARNING:  the parallel decoding session holds 73400320 bytes of frames that wait
 | `decoded_txns` | 该 worker 已解码的事务数 |
 | `in_flight_bytes` | 该 worker 在途事务占用的字节数 |
 | `queue_depth` | 输出队列的深度 |
-| `wakeups` | 该 worker 唤醒 walsender 的次数（= 刷新次数，见 4.2.6） |
+| `wakeups` | 该 worker 唤醒 walsender 的次数（= 刷新次数，见 4.2.4） |
 
 #### `pg_parallel_decode_commit_lag`
 
@@ -475,7 +450,7 @@ CROSS JOIN pg_parallel_decode_wakeups;
 
 ## 6. 帧级追踪与比对
 
-`t/pd_frame_tool.py` 是一个帧级 dump / diff 工具，用来回答"并行路径产出的字节和串行路径一样吗"。
+`t/pd_frame_tool.py` 是一个帧级 dump / diff 工具，用来回答"并行路径和串行路径解码出的事务内容一样吗"。
 
 ### 6.1 开启追踪
 
@@ -505,10 +480,13 @@ python3 doc/pa_decode/t/pd_frame_tool.py diff /tmp/serial.trace /tmp/parallel.tr
 
 工具比较的是 **pgoutput 消息**而不是裸帧，因为并行路径可能把消息分到不同的帧里。
 
-**允许两类差异**，工具会分开报告：
+**比较的是"事务的内容"**：两条路径的分帧方式不同（并行路径一律发流段，串行路径发整事务块），流段内的消息还带 in-band xid，所以工具会**把流段按 xid 重新拼回事务**、**把 in-band xid 从消息字节里摘掉**，再逐个事务比较里面的变更（同样的变更、同样的顺序、同样的事务划分）。关系描述单独按集合比较——两条路径发送它们的时机不同。
 
-1. **帧的顺序**——并行路径可能把流段发在更早的事务的提交消息之前；
-2. **帧头 LSN**——并行路径把流段帧的 LSN 钳到放行前沿。
+**允许三类差异**，工具会分开报告：
+
+1. **事务的分帧方式**——并行路径以流段下发，串行路径以整事务块下发；
+2. **帧的顺序**——并行路径可能把流段发在更早的事务的提交消息之前；
+3. **帧头 LSN**——并行路径把流段帧的 LSN 钳到放行前沿。
 
 **其它任何差异都是缺陷。**
 
@@ -546,8 +524,8 @@ max_parallel_decode_workers = 4
 | 负载 | 现象 | 对策 |
 | --- | --- | --- |
 | 大量小事务 | 唤醒次数多，进程间信号成为开销 | 调大 `parallel_decode_batch_size`；确认 worker 数与核数匹配 |
-| 少量超大事务 | 并行收益有限（一个事务不能拆） | 调大 `parallel_decode_work_mem` 避免落盘；流式化让订阅端早点开始 apply |
-| 延迟敏感 | 批合并让数据晚到 | 调小 `parallel_decode_batch_size`；`parallel_decode_streaming_mode = immediate` |
+| 少量超大事务 | 并行收益有限（一个事务不能拆） | 流式化让订阅端早点开始 apply；注意 worker 侧目前没有内存兜底（见 9. 已知限制） |
+| 延迟敏感 | 批合并让数据晚到 | 调小 `parallel_decode_batch_size`；调小 `parallel_decode_stream_segment_changes` 让变更更早到达 |
 | 订阅端 apply 慢 | 发布端积压 | 调大订阅端的 `max_parallel_apply_workers_per_subscription` |
 
 ### 7.3 观测建议
@@ -620,19 +598,19 @@ A：先确认走的是并行路径。视图只显示走并行路径的会话。�
 
 **Q：订阅端没有并行 apply 生效。**
 
-A：并行 apply 需要订阅端 `streaming = 'parallel'`。另外注意 `parallel_decode_stream_min_size` **默认必须是 0**——门槛设大了会让所有事务都不流式化，订阅端收不到 `STREAM START`，并行 apply 根本不会启动。
+A：并行 apply 需要订阅端 `streaming = 'parallel'`。并行路径只对这类订阅端启用；订阅端用 `on` 或 `off` 时发布端走串行路径，订阅端收不到 `STREAM START`，并行 apply 根本不会启动。
 
 **Q：改了 `parallel_decode_batch_size` 没反应。**
 
 A：这个参数 `sighup` 后**立即**生效，不需要重连。如果没反应，确认改的是**发布端**的配置，并且 `pg_ctl reload` 执行过。
 
-**Q：改了 `max_parallel_decode_workers` 或 `parallel_decode_streaming_mode` 没反应。**
+**Q：改了 `max_parallel_decode_workers` 或 `parallel_decode_stream_segment_changes` 没反应。**
 
 A：这两个（以及其它大部分参数）**只在下一次复制会话生效**。要让订阅端用上新值，需要断开重连该订阅。
 
 **Q：内存占用比预期高。**
 
-A：总解码内存上界 ≈ worker 数 × `parallel_decode_work_mem`（或 `logical_decoding_work_mem`）。另外每个会话还有约 `256KB × (1 + 2N)` 的共享内存。
+A：每个会话还有约 `256KB × (1 + 2N)` 的共享内存。另外注意**并行路径的 worker 目前没有内存上界**（`parallel_decode_work_mem` 无效，见 4.2.3）：worker 的 reorder buffer 既不检查上限也不落盘，超大事务会直接吃内存。
 
 ---
 
@@ -644,7 +622,9 @@ A：总解码内存上界 ≈ worker 数 × `parallel_decode_work_mem`（或 `lo
 | **DDL 不被复制** | PostgreSQL 不复制 DDL。订阅端的表必须事先存在 |
 | **订阅端的表清单在 `CREATE SUBSCRIPTION` 时固定** | 之后发布端新建的表不在清单里，订阅端会**静默丢弃**它的变更。官方手段是 `ALTER SUBSCRIPTION ... REFRESH PUBLICATION` |
 | **会话中途不能改 worker 数** | `max_parallel_decode_workers` 只在下次会话生效 |
-| **流段不能交织** | wire 上同时只能有一个打开的流段。一个卡住的流段会阻塞其它 worker 的产出——这是并行模型的固有代价，只能靠 `parallel_decode_stream_segment_size` 限制单块时长 |
+| **流段不能交织** | wire 上同时只能有一个打开的流段。一个卡住的流段会阻塞其它 worker 的产出——这是并行模型的固有代价，只能靠限制单个流段的时长来限制单块时长 |
+| **流段没有字节上限** | 流段是按**变更条数**切的（`parallel_decode_stream_segment_changes`），不是按字节切的。一条变更可以很大，所以单个流段可以很大。串行路径靠 `logical_decoding_work_mem` 限制流段大小，并行路径目前没有等价的手段 |
+| **worker 的内存没有上界** | 并行路径的 decode worker 不走 reorder buffer 的内存上限检查，它的 reorder buffer 也不会落盘。一个足够大的事务可以把 worker 的内存吃光。`parallel_decode_work_mem` 因此**当前无效**（见 4.2.3）。worker 侧的内存兜底还没有实现 |
 | **性能数据待实测** | 本特性只在本机做了功能与正确性验证。所有吞吐数字必须在性能机上实测后回填（`design.md` 15.2） |
 
 ---
@@ -659,11 +639,11 @@ A：总解码内存上界 ≈ worker 数 × `parallel_decode_work_mem`（或 `lo
 | --- | --- |
 | `setup_env.sh` | 测试脚手架：建发布端/订阅端两个集群 |
 | `repl_smoke.sh` | 基本的逻辑复制 |
-| `frame_diff_smoke.sh` | 并行路径与串行路径**逐帧**比对 |
-| `concurrent_diff_smoke.sh` | 并发会话下的逐帧比对 |
-| `live_diff_smoke.sh` | 订阅正在流式时写入负载的逐帧比对 |
-| `ddl_diff_smoke.sh` | 混合 DDL/DML 负载的逐帧比对 |
-| `rel_dedup_smoke.sh` | 关系描述只发一次 |
+| `frame_diff_smoke.sh` | 并行路径与串行路径的**事务内容**比对 |
+| `concurrent_diff_smoke.sh` | 并发会话下的事务内容比对 |
+| `live_diff_smoke.sh` | 订阅正在流式时写入负载的事务内容比对 |
+| `ddl_diff_smoke.sh` | 混合 DDL/DML 负载的事务内容比对 |
+| `rel_dedup_smoke.sh` | 关系描述的去重：串行路径整个会话一次，并行路径每个事务一次 |
 | `slot_watermark_smoke.sh` | 槽水位（`restart_lsn` / `catalog_xmin`）正常推进 |
 | `streaming_smoke.sh` | 尽早流式：分片提前到达、不交错、重启不丢数据 |
 | `keepalive_smoke.sh` | 空闲期的 keepalive |

@@ -52,9 +52,6 @@ cat >>"$ROOT/pub/postgresql.conf" <<EOF
 max_parallel_decode_workers = $WORKERS
 max_prepared_transactions = 10
 parallel_decode_trace_file = '$TRACE'
-parallel_decode_stream_segment_size = 65536
-parallel_decode_stream_min_size = 0
-parallel_decode_streaming_mode = 'auto'
 EOF
 cat >>"$ROOT/sub/postgresql.conf" <<EOF
 max_prepared_transactions = 10
