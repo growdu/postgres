@@ -1196,11 +1196,13 @@ pd_walreader_setup_shadow(ParallelDecodeControl *ctl)
 	 * same value the decode workers use for their own stand-in.  The walreader
 	 * reads the WAL from an earlier position, so that it sees the records that
 	 * bring the builder to a consistent state.
+	 *
+	 * The walreader drives the builder: it recognizes it from the type it
+	 * was registered with, see AmDecodeWalreaderProcess().
 	 */
 	pd_builder = AllocateSnapshotBuilder(pd_rb, InvalidTransactionId,
 										 ctl->start_lsn, false, false,
 										 ctl->two_phase_at);
-	SnapBuildSetRole(pd_builder, SNAPBUILD_ROLE_WALREADER);
 
 	ctx_context = AllocSetContextCreate(CurrentMemoryContext,
 										"parallel decode walreader shadow context",
@@ -2465,6 +2467,13 @@ ParallelWalreaderMain(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(ParallelDecodeWorkerArg));
+
+	/*
+	 * The walsender tells the walreader what it is when it registers it.  The
+	 * walreader does not get to choose, so this is a property of the way the
+	 * process was started.
+	 */
+	Assert(arg.type == PD_WORKERTYPE_WALREADER);
 
 	ctl = ParallelDecodeWorkerAttach(&arg, &slot_index, &seg, &toc);
 	if (ctl == NULL)

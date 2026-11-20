@@ -245,15 +245,26 @@ GUC 收回到"订阅端是否要并行 apply"这件事上。
 
 ### I.2 "是不是 decode worker"由进程身份决定
 
-新增 `am_decode_worker`（`src/include/replication/parallel_decode.h`，在
-`ParallelDecodeWorkerMain()` 里置真），core 的 `reorderbuffer.c` 用它判断自己跑在哪个进程里：
+`AmDecodeWorkerProcess()`（`src/include/replication/parallel_decode.h` 里的 `static inline`）
+判断自己跑在哪个进程里。判据是**框架分配的类型** `ParallelDecodeWorkerType`
+（`NONE` / `WALREADER` / `WORKER`）：walsender 在注册 bgworker 时把类型写进参数块
+`ParallelDecodeWorkerArg`（连同一个 magic 数，用来把我们的块和别人的 bgworker 负载区分开），
+参数块随 `bgw_extra` 交给 worker 进程；判断函数再从本进程自己的
+`MyBgworkerEntry->bgw_extra` 读回来。walsender 不是 bgworker（`MyBgworkerEntry` 为 NULL），
+别人的 bgworker 参数块没有 magic 数，两者都得到 `NONE`。
+
+这与 upstream 订阅端的 `am_parallel_apply_worker()`（`worker_internal.h`：类型由 launcher
+分配到共享结构里，worker 进程只读不写）同构，也与 `AmWalSenderProcess()` 同一个思路——
+**进程的身份由它的启动方式决定，不需要自己记住并宣布**。
+
+core 的 `reorderbuffer.c` 用它判断自己跑在哪个进程里：
 
 - `ReorderBufferQueueChange()`：worker 走 `ReorderBufferStreamSegment()`（按条数切段），
   串行路径照旧走 `ReorderBufferCheckMemoryLimit()`（**一个字没改**）；
 - `ReorderBufferStreamAtCommit()`：只有 worker 会把"提交时还没攒够条数的事务"作为一段发出去。
 
 `ctx->worker_index` 的职责没变（它是"我是几号 worker"，用于区分事务归属），
-"我是不是 worker"由 `am_decode_worker` 回答——见 `src/include/replication/logical.h` 的注释。
+"我是不是 worker"由 `AmDecodeWorkerProcess()` 回答——见 `src/include/replication/logical.h` 的注释。
 
 ### I.3 两条路径的字节不再相同
 

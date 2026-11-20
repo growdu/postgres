@@ -132,6 +132,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/logical.h"
+#include "replication/parallel_decode.h"
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
 #include "storage/fd.h"
@@ -281,16 +282,6 @@ struct SnapBuild
 		/* This array must be sorted in xidComparator order */
 		TransactionId *xip;
 	}			catchange;
-
-	/*
-	 * The role of this builder.
-	 *
-	 * The builders of the serial path and of the walreader are driven by the
-	 * process that reads the WAL.  The builder of a decode worker is a
-	 * stand-in: it is told about the state of the builder of the walreader and
-	 * it never builds a snapshot of its own.
-	 */
-	SnapBuildRole role;
 };
 
 /*
@@ -353,7 +344,6 @@ AllocateSnapshotBuilder(ReorderBuffer *reorder,
 	builder->state = SNAPBUILD_START;
 	builder->context = context;
 	builder->reorder = reorder;
-	builder->role = SNAPBUILD_ROLE_SERIAL;
 	/* Other struct members initialized by zeroing via palloc0 above */
 
 	builder->committed.xcnt = 0;
@@ -430,20 +420,6 @@ SnapBuildCurrentState(SnapBuild *builder)
 }
 
 /*
- * Turn the builder into the stand-in of a decode worker, or into the builder
- * of the walreader.
- *
- * The stand-in does not build snapshots of its own: it is told about the
- * state of the builder of the walreader and about the snapshots the
- * transactions are decoded with.
- */
-void
-SnapBuildSetRole(SnapBuild *builder, SnapBuildRole role)
-{
-	builder->role = role;
-}
-
-/*
  * Hand the state of the builder down to a decode worker.
  *
  * The state of the builder is advanced by the walreader, which is the only
@@ -479,7 +455,7 @@ SnapBuildGetSnapshot(SnapBuild *builder)
 void
 SnapBuildSetSnapshot(SnapBuild *builder, Snapshot snap)
 {
-	Assert(builder->role == SNAPBUILD_ROLE_STANDIN);
+	Assert(AmDecodeWorkerProcess());
 	Assert(snap != NULL);
 
 	if (builder->snapshot != NULL)
@@ -814,7 +790,7 @@ SnapBuildGetOrBuildSnapshot(SnapBuild *builder)
 	 * The stand-in of a decode worker never builds a snapshot: it uses the
 	 * one the walreader has handed down.
 	 */
-	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+	if (AmDecodeWorkerProcess())
 		return builder->snapshot;
 
 	/* only build a new snapshot if we don't have a prebuilt one */
@@ -909,7 +885,7 @@ SnapBuildProcessChange(SnapBuild *builder, TransactionId xid, XLogRecPtr lsn)
 	 * them.  All the stand-in has to answer is whether the transaction has a
 	 * base snapshot, which is the case once the worker has been handed one.
 	 */
-	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+	if (AmDecodeWorkerProcess())
 		return ReorderBufferXidHasBaseSnapshot(builder->reorder, xid);
 
 	/*
@@ -1023,7 +999,7 @@ SnapBuildDistributeSnapshotAndInval(SnapBuild *builder, XLogRecPtr lsn, Transact
 	 * snapshot.  The tracking buffer of the walreader does not hold the
 	 * changes of the transactions, so there is nothing to distribute here.
 	 */
-	if (builder->role == SNAPBUILD_ROLE_WALREADER)
+	if (AmDecodeWalreaderProcess())
 		return;
 
 	/*
@@ -1237,7 +1213,7 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 	 * is the only process that knows which transactions changed the catalogs,
 	 * and it is the one that decides whether a new snapshot is needed.
 	 */
-	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+	if (AmDecodeWorkerProcess())
 		return;
 
 	/*
@@ -1437,7 +1413,7 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	 * still holds that are not running anymore, which is what the serial path
 	 * does as well.
 	 */
-	if (builder->role == SNAPBUILD_ROLE_STANDIN)
+	if (AmDecodeWorkerProcess())
 	{
 		xmin = ReorderBufferGetOldestXmin(builder->reorder);
 		if (xmin == InvalidTransactionId)
@@ -1492,7 +1468,7 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	 * the walsender does.  It therefore must not touch the watermarks of the
 	 * slot, they are advanced by the process that owns it.
 	 */
-	if (builder->role == SNAPBUILD_ROLE_WALREADER)
+	if (AmDecodeWalreaderProcess())
 		return;
 
 	xmin = ReorderBufferGetOldestXmin(builder->reorder);

@@ -512,6 +512,13 @@ parallel_decode_register_worker(const char *name,
 	bgw.bgw_notify_pid = MyProcPid;
 	bgw.bgw_main_arg = 0;
 
+	/*
+	 * The argument block is the way the role of the worker reaches it: the
+	 * worker reads it back from its own entry, see
+	 * ParallelDecodeWorkerTypeOfProcess().  The magic number tells our block
+	 * apart from the payload of a background worker of somebody else.
+	 */
+	arg->magic = PD_WORKER_ARG_MAGIC;
 	memcpy(bgw.bgw_extra, arg, sizeof(ParallelDecodeWorkerArg));
 
 	if (!RegisterDynamicBackgroundWorker(&bgw, &h))
@@ -2701,11 +2708,12 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 
 	/* Start the walreader. */
 	arg.dsm_handle = (int) dsm_segment_handle(parallel_decode_seg);
+	arg.type = PD_WORKERTYPE_WALREADER;
 	arg.slot_index = -1;
 	arg.db_oid = MyDatabaseId;
 	arg.start_lsn = slot->data.restart_lsn;
-	parallel_decode_register_worker("parallel decode walreader",
-									"parallel decode walreader",
+	parallel_decode_register_worker(PD_BGWORKER_TYPE_WALREADER,
+									PD_BGWORKER_TYPE_WALREADER,
 									"ParallelWalreaderMain",
 									&arg,
 									&parallel_decode_walreader_handle,
@@ -2716,11 +2724,12 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 	for (i = 0; i < parallel_decode_num_workers; i++)
 	{
 		arg.dsm_handle = (int) dsm_segment_handle(parallel_decode_seg);
+		arg.type = PD_WORKERTYPE_WORKER;
 		arg.slot_index = i;
 		arg.db_oid = MyDatabaseId;
 		arg.start_lsn = start_lsn;
-		parallel_decode_register_worker("parallel decode worker",
-										"parallel decode worker",
+		parallel_decode_register_worker(PD_BGWORKER_TYPE_WORKER,
+										PD_BGWORKER_TYPE_WORKER,
 										"ParallelDecodeWorkerMain",
 										&arg,
 										&parallel_decode_worker_handles[i],

@@ -7,6 +7,24 @@
  *
  * src/include/replication/snapbuild.h
  *
+ * The behaviour of the snapshot builder depends on the process it runs in.
+ *
+ * In a parallel decoding session the walreader is the only process that reads
+ * the WAL, so it is the only one that can drive the snapshot builder: it knows
+ * which snapshot a transaction is decoded with, and when the transactions that
+ * are in flight have to switch over to a new one.
+ *
+ * The decode workers therefore do not need a builder of their own.  They use a
+ * stand-in instead, which answers the few questions the decoding path asks
+ * from the state the walreader hands down.
+ *
+ * Which of the two a process is follows from AmDecodeWalreaderProcess() and
+ * AmDecodeWorkerProcess(), see replication/parallel_decode.h.  Both derive the
+ * answer from the type the walsender assigned to the process when it
+ * registered it, so a builder cannot disagree with the process it belongs to.
+ * Note that this ties the behaviour of the builder to the process: a process
+ * must not hold builders of two different kinds.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef SNAPBUILD_H
@@ -57,30 +75,6 @@ struct ReorderBuffer;
 struct xl_heap_new_cid;
 struct xl_running_xacts;
 
-/*
- * The role of a snapshot builder.
- *
- * In a parallel decoding session the walreader is the only process that reads
- * the WAL, so it is the only one that can drive the snapshot builder: it knows
- * which snapshot a transaction is decoded with, and when the transactions that
- * are in flight have to switch over to a new one.
- *
- * The decode workers therefore do not need a builder of their own.  They use a
- * stand-in instead, which answers the few questions the decoding path asks
- * from the state the walreader hands down.
- */
-typedef enum SnapBuildRole
-{
-	/* the serial path: the builder is driven by the decoding process */
-	SNAPBUILD_ROLE_SERIAL = 0,
-
-	/* the walreader of a parallel decoding session */
-	SNAPBUILD_ROLE_WALREADER,
-
-	/* the read-only stand-in of a decode worker */
-	SNAPBUILD_ROLE_STANDIN
-} SnapBuildRole;
-
 extern void CheckPointSnapBuild(void);
 
 extern SnapBuild *AllocateSnapshotBuilder(struct ReorderBuffer *reorder,
@@ -89,12 +83,6 @@ extern SnapBuild *AllocateSnapshotBuilder(struct ReorderBuffer *reorder,
 										  bool in_slot_creation,
 										  XLogRecPtr two_phase_at);
 extern void FreeSnapshotBuilder(SnapBuild *builder);
-
-/*
- * Turn the builder into the stand-in of a decode worker, or into the builder
- * of the walreader.
- */
-extern void SnapBuildSetRole(SnapBuild *builder, SnapBuildRole role);
 
 /*
  * Hand the state of the builder down to a decode worker.

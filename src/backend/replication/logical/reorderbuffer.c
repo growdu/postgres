@@ -848,7 +848,7 @@ ReorderBufferQueueChange(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
 	 * memory limit of the reorder buffer, which the parallel path cannot
 	 * use: its reorder buffer cannot spill to disk.
 	 */
-	if (am_decode_worker)
+	if (AmDecodeWorkerProcess())
 		ReorderBufferStreamSegment(rb, txn);
 	else
 		/* check the memory limits and evict something if needed */
@@ -2701,7 +2701,7 @@ ReorderBufferStreamAtCommit(ReorderBuffer *rb, ReorderBufferTXN *txn)
 	 * Only the decode workers produce the output of the transactions: the
 	 * serial decoding path and the walreader do not.
 	 */
-	if (!am_decode_worker)
+	if (!AmDecodeWorkerProcess())
 		return false;
 
 	/* A transaction that was streamed already has been sent. */

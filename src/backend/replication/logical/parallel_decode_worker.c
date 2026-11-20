@@ -82,16 +82,6 @@ static XLogRecPtr pd_record_lsn = InvalidXLogRecPtr;
 static int	pd_worker_index = -1;
 
 /*
- * Am I a decode worker of the parallel decoding path?
- *
- * The flag is the identity of the process: the decode worker produces the
- * output of the transactions, the walreader and the walsender do not.  The
- * code that runs in all three processes uses it to tell them apart, in the
- * same way am_walsender tells the walsender apart from the other processes.
- */
-bool		am_decode_worker = false;
-
-/*
  * The header of the record that is being processed.
  *
  * It tells the worker which worker owns the transaction of the record, and
@@ -1157,13 +1147,15 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	pqsignal(SIGTERM, parallel_decode_worker_sigterm);
 	BackgroundWorkerUnblockSignals();
 
-	/*
-	 * This process is a decode worker of the parallel decoding path: it is
-	 * the one that produces the output of the transactions.
-	 */
-	am_decode_worker = true;
-
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(ParallelDecodeWorkerArg));
+
+	/*
+	 * The walsender tells the worker what it is when it registers it.  The
+	 * worker does not get to choose, so this is a property of the way the
+	 * process was started, the same way it is for the workers of the
+	 * subscriber.
+	 */
+	Assert(arg.type == PD_WORKERTYPE_WORKER);
 
 	ctl = ParallelDecodeWorkerAttach(&arg, &slot_index, &seg, &toc);
 	if (ctl == NULL)
@@ -1229,6 +1221,15 @@ ParallelDecodeWorkerMain(Datum main_arg)
 	 * Build the decoding context.  The output plugin options and the name of
 	 * the plugin are known by the walsender, which put them into the control
 	 * block before it started the worker.
+	 *
+	 * The worker does not drive the snapshot builder.  The walreader is the
+	 * only process that reads the WAL, so it is the only one that knows which
+	 * snapshot a transaction is decoded with and when the transactions that are
+	 * in flight have to switch over to a new one.  The builder of the worker is
+	 * a stand-in: it is told about the state of the builder of the walreader
+	 * and about the snapshots the transactions are decoded with.  The builder
+	 * recognizes it from the type the process was registered with, see
+	 * AmDecodeWorkerProcess().
 	 */
 	options = PDParsePluginOptions(ctl->plugin_options, ctl->plugin_options_len);
 	slot = pd_worker_build_slot_copy(ctl);
@@ -1237,16 +1238,6 @@ ParallelDecodeWorkerMain(Datum main_arg)
 											XL_ROUTINE(.page_read = pd_worker_read_page),
 											PDPrepareWrite, pd_worker_write,
 											pd_worker_update_progress);
-
-	/*
-	 * The worker does not drive the snapshot builder.  The walreader is the
-	 * only process that reads the WAL, so it is the only one that knows which
-	 * snapshot a transaction is decoded with and when the transactions that are
-	 * in flight have to switch over to a new one.  The builder of the worker is
-	 * a stand-in: it is told about the state of the builder of the walreader
-	 * and about the snapshots the transactions are decoded with.
-	 */
-	SnapBuildSetRole(pd_ctx->snapshot_builder, SNAPBUILD_ROLE_STANDIN);
 
 	/*
 	 * The decoding context published the copy of the slot as the slot of this

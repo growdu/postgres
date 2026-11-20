@@ -25,6 +25,7 @@
 #include "access/transam.h"
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
+#include "postmaster/bgworker.h"
 #include "replication/logical.h"
 #include "replication/parallel_decode_stats.h"
 #include "storage/shm_mq.h"
@@ -50,13 +51,12 @@ extern PGDLLIMPORT int	parallel_decode_fault_inject;
 extern PGDLLIMPORT char *parallel_decode_trace_file;
 
 /*
- * Am I a decode worker of the parallel decoding path?
- *
- * The flag follows the model of am_walsender: it tells the code that runs in
- * the processes of a session which one it runs in.  Only the decode worker
- * produces the output of the transactions.
+ * The types the background workers of a parallel decoding session are
+ * registered with.  They tell the processes apart, the same way the type of a
+ * background worker tells it apart from the other background workers.
  */
-extern PGDLLIMPORT bool am_decode_worker;
+#define PD_BGWORKER_TYPE_WALREADER	"parallel decode walreader"
+#define PD_BGWORKER_TYPE_WORKER		"parallel decode worker"
 
 /*
  * The failures the fault injection knob can produce.
@@ -311,9 +311,32 @@ typedef struct ParallelDecodeControl
 
 
 
+/*
+ * The magic number that tells our argument block apart from the payload of a
+ * background worker that belongs to somebody else.
+ */
+#define PD_WORKER_ARG_MAGIC			0x50444157	/* "PDAW" */
+
+/*
+ * The role of a process that takes part in a parallel decoding session.
+ *
+ * The walsender tells a worker what it is when it registers it, the same way
+ * the launcher of the subscriber tells its workers what they are (see
+ * am_parallel_apply_worker() in replication/worker_internal.h).  The
+ * processes that do not take part in the parallel path have no role at all.
+ */
+typedef enum ParallelDecodeWorkerType
+{
+	PD_WORKERTYPE_NONE = 0,		/* the process does not take part */
+	PD_WORKERTYPE_WALREADER,	/* the only reader of the WAL */
+	PD_WORKERTYPE_WORKER		/* decodes the transactions */
+} ParallelDecodeWorkerType;
+
 /* Payload handed to the dynamic background workers through bgw_extra. */
 typedef struct ParallelDecodeWorkerArg
 {
+	uint32		magic;			/* PD_WORKER_ARG_MAGIC */
+	ParallelDecodeWorkerType type;	/* what this process is */
 	int			dsm_handle;
 	int			slot_index;		/* -1 for the walreader */
 	Oid			db_oid;			/* database the output plugin works on */
@@ -325,6 +348,68 @@ typedef struct ParallelDecodeWorkerArg
 	 */
 	XLogRecPtr	start_lsn;
 } ParallelDecodeWorkerArg;
+
+/*
+ * The argument block has to fit into the extra space of a background worker.
+ */
+StaticAssertDecl(sizeof(ParallelDecodeWorkerArg) <= BGW_EXTRALEN,
+				 "ParallelDecodeWorkerArg must fit into bgw_extra");
+
+/*
+ * What this process is in the parallel decoding session.
+ *
+ * The walsender fills the role into the argument block of the worker when it
+ * registers it, and the postmaster hands the block to the worker process.
+ * The role is therefore a property of the way the process was started: the
+ * process cannot choose it, and it cannot change it afterwards.
+ *
+ * The walsender is not a background worker, so it has no role.  The same is
+ * true for the background workers of somebody else: their argument block does
+ * not carry our magic number.
+ */
+static inline ParallelDecodeWorkerType
+ParallelDecodeWorkerTypeOfProcess(void)
+{
+	ParallelDecodeWorkerArg arg;
+
+	if (MyBgworkerEntry == NULL)
+		return PD_WORKERTYPE_NONE;
+
+	/*
+	 * The extra space of a background worker is a byte array, so the argument
+	 * block is copied out of it rather than read through a pointer.
+	 */
+	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(ParallelDecodeWorkerArg));
+
+	if (arg.magic != PD_WORKER_ARG_MAGIC)
+		return PD_WORKERTYPE_NONE;
+
+	return arg.type;
+}
+
+/*
+ * Am I a decode worker of the parallel decoding path?
+ *
+ * Only the decode worker produces the output of the transactions.
+ */
+static inline bool
+AmDecodeWorkerProcess(void)
+{
+	return ParallelDecodeWorkerTypeOfProcess() == PD_WORKERTYPE_WORKER;
+}
+
+/*
+ * Am I the walreader of a parallel decoding session?
+ *
+ * The walreader is the only process that reads the WAL, so it is the only one
+ * that drives the snapshot builder.  The decode workers and the walsender are
+ * not the walreader.
+ */
+static inline bool
+AmDecodeWalreaderProcess(void)
+{
+	return ParallelDecodeWorkerTypeOfProcess() == PD_WORKERTYPE_WALREADER;
+}
 
 /*
  * Magic number and table-of-contents keys of the shared segment.  The keys

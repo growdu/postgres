@@ -132,7 +132,7 @@ typedef struct LogicalDecodingContext
 	 * the records for the sake of its snapshot builder.  It says which worker
 	 * the process is, so that the decoding path can tell the transactions of
 	 * the workers apart.  Whether the process is a decode worker at all is
-	 * told by the flag am_decode_worker, see parallel_decode.h.
+	 * told by AmDecodeWorkerProcess(), see parallel_decode.h.
 	 */
 	int			txn_owner;
 	int			worker_index;
