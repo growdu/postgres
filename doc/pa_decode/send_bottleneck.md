@@ -683,7 +683,14 @@ pa_decode 把 `min_size` 设成 0，于是**每个事务**都要付一次 RELATI
 `PDQueueSend()`（`parallel_decode_msg.c:78`）不调 `pd_queue_count_wakeup()`，而 walreader →
 walsender 的控制流（`PD_ENT_CSEQ` / `PD_ENT_READ_POS` / `PD_ENT_WATERMARK`）走的是裸
 `PDQueueSend()`。⇒ `wakeups_down` 每提交少算约 1 次；而且 flush 次数是 SIGURG 次数的**上界**
-（`SetLatch` 在 `latch.c:648`/`:654` 会早退）。**现在报出来的唤醒速率只能当下界看。**
+（`SetLatch` 在 `latch.c:648`/`:654` 会早退）。**修之前报出来的唤醒速率只能当下界看。**
+
+> **✅ 已修**：给 `PDQueueSend()` 加了"注册唤醒计数器"的入口
+> （`PDQueueSetWakeupCounter()`），walreader 把控制队列注册进去，控制队列的每次刷新都计一次；
+> 控制消息仍然**逐条刷新、逐条唤醒**，没有批量化。`pg_parallel_decode_wakeups` 的下行语义相应改为
+> "walreader 造成的全部唤醒"（→ worker 的队列刷新 **加上** → walsender 的控制队列刷新），
+> `user_manual.md` §5.2 已同步。仍成立的 caveats：flush 次数是 SIGURG 次数的**上界**；
+> 计数的是**刷新次数**而非消息条数。
 
 **✅ 有收益、可以试的（按性价比）**
 
@@ -697,6 +704,9 @@ walsender 的控制流（`PD_ENT_CSEQ` / `PD_ENT_READ_POS` / `PD_ENT_WATERMARK`�
    控制队列的每条消息单独唤醒并计数，**不要批量化控制消息**（批量化会给放行链加延迟）。
    修完 `pg_parallel_decode_wakeups` 的语义要改：下行 = walreader → worker **加上**
    walreader → walsender 的控制流。
+   **✅ 已做**：实现上不是给 `PDQueueSend()` 加参数，而是加了
+   `PDQueueSetWakeupCounter()` 注册入口（队列数很少，注册表是进程内的小数组），
+   语义与这里写的一致。
 4. **释放链的深度**：如果 §9.9.5 的第 2 项显示 `commit_lag` 在涨，那是深度/顺序问题，
    与批间隔无关，得单独查 ACK 的乱序程度。
 
@@ -846,12 +856,13 @@ walreader 等的是 `GetFlushRecPtr()`（`parallel_walreader.c:382`），
 
 * 这**不是并行解码的缺陷**（串行等的是同一个位置）。该查的是 walwriter 的刷出能力
   （`pg_stat_wal.wal_sync` / `wal_sync_time` / `wal_buffers_full`）与磁盘，不是发布端的发送路径。
-* 发布端唯一能改的一项：**把 walreader 的 100 ms 轮询换成"WAL 刷出"通知**（只动发布端，不碰订阅端）：
-  在 `XLogFlush()` 之后 `WalSndWakeupProcessRequests()` 旁边挂一个 `ParallelDecodeNotifyWalFlush()`，
-  广播并行解码共享内存里的一个 ConditionVariable；walreader 改成在 CV 上等
-  （`ConditionVariablePrepareToSleep` → `WaitLatch(MyLatch)` → `ConditionVariableCancelSleep`），
-  保留超时兜底。
-  **收益是去掉 100 ms 的发现延迟与波纹（延迟项 + 波间空转的 CPU），不是把 50MB/s 变成 70MB/s。**
+* 发布端唯一能改的一项：**把 walreader 的 100 ms 轮询换成"WAL 刷出"通知**（只动发布端，不碰订阅端）。
+  **已实现**：walreader 改成睡在**逻辑 walsender 用的那个 ConditionVariable**上
+  （`WalSndCtl->wal_replay_cv`）——WAL 刷出时 `WalSndWakeup()` 会广播它
+  （`walsender.c:4019`），主库上每次刷出都广播，备库上每次重放都广播；
+  100 ms 的超时保留作兜底。**没有新增共享内存，也没有新的通知点**：
+  这条路径本来就是"WAL 刷出 ⇒ 叫醒逻辑解码"的那条路径，并行路径只是没有接上去。
+  **收益是去掉最多 100 ms 的发现延迟与波纹（延迟项 + 波间空转的 CPU），不是把 50MB/s 变成 70MB/s。**
 
 #### 9.10.8 对前文的修订
 
@@ -864,3 +875,291 @@ walreader 等的是 `GetFlushRecPtr()`（`parallel_walreader.c:382`），
   实测"改成 8192 后速率没动"与这个预期一致，**这个实验没有否掉任何东西**。
 * **§9.1–§9.6 与 §1–§3 描述的是 `777aecdd204` 之前的实现**（逐帧切分、`list_sort`、`pd_frame_buf` 拷贝），
   **§4 之后已经改掉**（块化 + 二叉堆 + 零拷贝）。照着 §1–§3 找瓶颈会得出已经不存在的结论。
+
+### 9.11 速率算术：40–50MB/s 是"该有的量"，还是发布端的锅
+
+本节把实测数字换算成 `design.md` §15.1 自己的口径，然后指出**两种互斥读法**，
+以及一次采样就能把它们分开的判据。
+
+#### 9.11.1 实测常数 vs §15.1 的假设常数
+
+§15.1 自己把两个常数都标成了**待实测**（15.2 第 1、2 项）：
+
+| 常数 | §15.1 的假设 | 实测（按 126w tpmc = 21000 事务/秒） | 偏离 |
+| --- | --- | --- | --- |
+| **W**：每事务 WAL 字节 | 约 3 KB | 130MB/s ÷ 21000 ≈ **6.2 KB** | 假设的 **2.1 倍** |
+| **B**：每事务协议字节 | 约 8 KB | 45MB/s ÷ 21000 ≈ **2.1 KB** | 假设的 **1/4** |
+| **B/W** | 约 2.6 | **约 0.34** | **方向反了** |
+
+⇒ **70MB/s 这个目标是用两个"待实测"的常数算出来的**，而这两个数实测下来一个偏大一个偏小，
+**比例偏了 7.6 倍**。§15.1 自己写了"早期版本用 W 去换算协议字节率，方向性误差约 B/W ≈ 2.6 倍"——
+现在这个误差没有消失，只是**换了个方向**：实测的 B/W 是 0.34，协议字节比 WAL 字节**小**，
+所以"WAL 写 130MB/s ⇒ 协议应当 340MB/s"这种换算会**高估 7.6 倍**。
+
+**实测的 130MB/s × 0.34 ≈ 44MB/s，与实测的 40–50MB/s 吻合。**
+
+#### 9.11.2 两种互斥的读法，一次采样就能分开
+
+| 读法 | 含义 | 后果 |
+| --- | --- | --- |
+| **A：发布端跟上了 WAL**（slot 的 `sent_lsn` ≈ `pg_current_wal_flush_lsn()`） | 发布端已经交付了**全部已刷出的 WAL**；45MB/s 就是这个负载的协议字节量，**发布端没有慢** | "慢"的是负载/磁盘/订阅端；发布端代码没有可优化的地方 |
+| **B：发布端跟不上 WAL**（`sent_lsn` 落后且差距在涨） | 发布端确实慢，45MB/s 是它的上限 | 嫌疑：walreader 单核（§15.1 风险 4、15.2 第 7 项）、walreader 的阻塞式分发、100ms 轮询 |
+
+判据（发布端，三次采样，间隔 2s）：
+
+```sql
+select now(), pg_current_wal_insert_lsn(), pg_current_wal_lsn(),
+       pg_current_wal_flush_lsn();
+select application_name, sent_lsn, write_lsn, flush_lsn from pg_stat_replication;
+```
+
+* `sent_lsn` 追着 `pg_current_wal_flush_lsn()` 走 ⇒ **读法 A**；
+* `sent_lsn` 落后且差距随时间增大 ⇒ **读法 B**。
+
+#### 9.11.3 "CPU 全闲"与"发布端是瓶颈"在同一个进程上不可能同时成立
+
+walreader 的 100ms 轮询（`parallel_walreader.c:423`）**只在它追平了刷出位置时才会发生**——
+也就是只在"WAL 暂时没有新的已刷出内容"时。若 walreader 是满的（它在追 130MB/s 的 WAL），
+它**永远追不平**，于是**永远不会去睡那 100ms**，轮询也就永远不发生。
+
+⇒ 所以：
+
+* 若观测到 **worker 饿着（`IPC / MessageQueueReceive`）+ 全部进程 CPU 闲**
+  ⇒ walreader **不是**满的，它是在等 WAL ⇒ **限速点在"已刷出的 WAL"这个量上，不在发布端的代码上**；
+* 若观测到 **walreader 进程本身 ~100% CPU**
+  ⇒ 限速点在 walreader 的每记录成本上（§15.1 风险 4、15.2 第 7 项），而此时 100ms 轮询无关。
+
+**这两条必须按进程分开看**（§9.10.2 已经指出"所有等待事件都是 ipc/queue receive"这句话本身是矛盾）。
+
+#### 9.11.4 波形假设的可证伪预测
+
+如果 100ms 轮询真的在起作用（流水线按波推进），那么**在波与波之间流水线是排空的**
+（worker 队列空、walsender 没有可放行的帧、在途事务数掉到 0），**波到来时又冲高**。
+
+⇒ **预测：`sum(in_flight_txns)` 应该呈锯齿（周期约 100ms），而不是稳在 65。**
+
+```sql
+-- 每 100ms 采一次，跑 10 秒
+select clock_timestamp(), sum(in_flight_txns), sum(in_flight_bytes)
+  from pg_parallel_decode_workers;
+```
+
+* **有锯齿** ⇒ 波形成立 ⇒ 100ms 轮询在起作用 ⇒ 值得按 §9.10.7 改成等 WAL 刷出事件；
+* **稳在 65、无锯齿** ⇒ 流水线一直是满的 ⇒ **波形假设被否掉**，100ms 轮询不是形状的成因，
+  得回到"发布端被下游反压"或"walreader 满"这两条。
+
+**这是最便宜的一个判据（5 分钟，只用发布端），建议先做这一个。**
+
+#### 9.11.5 无论 9.11.2 落在哪一边，发布端都有两件事该做
+
+1. **把 walreader 的 100ms 轮询换成"WAL 刷出"通知**（只动发布端，串行路径本来就是这样：
+   `xlog.c:2930/:3105` → `WalSndWakeupProcessRequests` → `WalSndWakeup` → `wal_replay_cv` 广播 →
+   `walsender.c:4031`；并行路径缺这一环）。
+   **收益是延迟与波形（波间空转、TCP 突发），不是把 45MB/s 变成 70MB/s**——
+   除非 §9.11.4 的锯齿测出来波形确实存在，并且 TCP 因为突发而丢包重传。
+2. **修唤醒计数的口径**（§9.9.6）：`PDQueueSend()` 加 wakeup 指针，控制队列每条单独唤醒并计数、
+   **不批量化**；`pg_parallel_decode_wakeups` 的"下行"语义要加上 walreader → walsender 的控制流。
+   这是口径修复（现在的数是下界），不是性能优化。
+   **✅ 已做**：见 §9.9.6 的补充说明——控制队列的唤醒现在逐条计数，`user_manual.md` §5.2 的
+   "下行"语义已改为"walreader 造成的全部唤醒"。
+
+### 9.12 队列堵住、CPU 全闲：堵点落在哪一段（发布端定位）
+
+**输入**：WAL 生成 ≈150MB/s；发送 40–50MB/s；**"发送需要排队导致阻塞"**；
+**decode worker 与 walreader 的 CPU 都非常少**（发布端与订阅端的整机 CPU 都有富余）。
+
+本节只做定位：把"堵"归到具体的一个进程、一个函数上，并给出能一次性分辨候选的测量。
+所有数字仍是静态推算，**待实测**。
+
+#### 9.12.1 "排队"在拓扑上的位置
+
+发布端的三个进程是一条直线：
+
+```
+walreader ──(worker 入队, 256KB shm_mq × N)──> decode worker
+                                                  │
+                                     (worker 出队, 256KB shm_mq × N)
+                                                  ▼
+                                              walsender ──> socket ──> 订阅端
+```
+
+* "发送需要排队"⇒ **worker 的出队满了**，worker 卡在 `shm_mq_sendv`
+  （`parallel_walreader.c:1286-1315` 的发送是 `nowait=false` 的阻塞发送）；
+* walreader 的入队随之满，walreader 卡在同样的地方；
+* **⇒ worker 与 walreader 的 CPU 低是必然的：它们在等，不是在算。**
+  这两个进程的 CPU 读数对定位**没有信息量**。
+
+#### 9.12.2 排除法：唯一的候选是 walsender
+
+| 候选 | 排除依据 |
+| --- | --- |
+| walreader | 它的队列满 ⇒ 说明 worker 不消费 ⇒ 它是**被反压的下游** |
+| decode worker | 它们的出队满 ⇒ 说明 walsender 不取 ⇒ 它们是**被反压的下游** |
+| walsender | **只剩下它** |
+
+再排除"walsender 算不过来"：walsender 的逐帧工作只有
+`pd_walsender_write_frame()`（`walsender.c:3592-3629`）里的
+一次 `GetCurrentTimestamp()`、两次 8 字节 `memcpy`（帧头时间戳 + FR-20 钳制）、
+一次 `pq_putmessage_noblock()` 的拷贝、几个原子计数器和一次 `LagTrackerWrite`。
+按 §9.3 同口径估 **约 0.2µs/帧**：40–50MB/s 对应的帧率（§9.2 口径约 190k 帧/秒；
+按 tpcc 每事务约 19 帧、21k 事务/秒估则约 400k 帧/秒，**待实测**）对应 **0.04–0.08 核**。
+**⇒ walsender 不可能是 CPU 瓶颈**，除非 ① `parallel_decode_trace_file` 开着
+（`PDTraceWrite()` 每帧一次 `write()` 系统调用，`parallel_decode_trace.c:154`），
+或 ② 帧数比估计高一个量级。
+
+**⇒ walsender 只能阻塞在一个地方：`ProcessPendingWrites()`**
+（`walsender.c:3687-3690`：`pq_flush_if_writable()` 是非阻塞的，剩余数据靠
+`ProcessPendingWrites()` 阻塞写完）。**⇒ 堵点 = socket。**
+
+#### 9.12.3 发布端的发送路径里没有订阅端的往返
+
+这一点决定了"发布端的速率上限"是什么，必须说清楚：
+
+* 释放前沿由 **worker 的 END_ACK** 推进：`parallel_decode_ack_txn()`
+  （`parallel_decode.c:792`）在收到 `PD_EVENT_END_ACK` 时被调用（`:1728`），
+  而这个事件是 worker **把事务解码完**时发的（`parallel_decode_worker.c:1009`）。
+* ⇒ 释放前沿的语义是"**这个事务解完了**"，**不是**"订阅端 apply 完了"。
+* ⇒ **发布端可以跑到订阅端前面很远**，直到 socket 装不下为止；
+  它不会因为订阅端 apply 慢而停下来等。
+
+**⇒ 发布端的速率上限 = socket 的抽干速率，而不是任何订阅端反馈。**
+（串行路径里发布端会等 `wal_replay_cv` 上的 flush 反馈，并行路径没有这一环。）
+
+#### 9.12.4 socket 的抽干速率由订阅端的**串行段**决定
+
+订阅端读一帧的路径是**一次一个 CopyData、一次一个协议消息**：
+
+* leader：`PQgetCopyData(conn->streamConn, &buf, 1)`（`libpqwalreceiver.c:913/924`）
+  → `apply_dispatch()`（`worker.c:3283`）；
+* `apply_dispatch()` 读**一个** tag 就 switch，**一个 CopyData 里塞两个消息，第二个会被丢掉**
+  ⇒ **⇒ 发布端不能合并帧**（帧率是协议锁死的）；
+* 流式事务里每条消息还要 `pa_send_data()` 转给 PA worker（`applyparallelworker.c:1146`）。
+
+而**订阅端同一时刻只能 apply 一个事务**：
+
+* `pa_xact_finish()`（`applyparallelworker.c:1618-1638`）里
+  `pa_wait_for_xact_finish(winfo)`：**leader 要等这个事务的 PA worker 做完才能继续**
+  （注释写明是为了 maintain commit order）；
+* ⇒ 65 个 pa worker 里**同一时刻只有 1 个在干活**，其余 64 个在池子里等；
+* ⇒ leader 在等 PA worker 的那段时间**不读 socket** ⇒ socket 填满 ⇒ 发布端堵在
+  `ProcessPendingWrites()`。
+
+**⇒ "发布端和订阅端 CPU 都有富余"是整机均值，掩盖了订阅端的
+"leader + 1 个 PA worker"这个串行段。40–50MB/s 就是这个串行段的速率。**
+
+#### 9.12.5 发布端自己往链路上多塞的东西：每事务的 RELATION 重发
+
+§9.1 已量化：`immediate` 档下每事务重发它触及的每张表的 RELATION
+⇒ **约 37.5% 的协议字节、约 17% 的帧是纯冗余**。
+本会话补充一条对 §9.1 的**加强**（不改结论）：
+
+* PA worker 是**池化复用**的（`pa_free_worker()` 只在池子过半或走了 spool 慢路径时才停掉它，
+  `applyparallelworker.c:556-585`），而 relmap 的条目在 `logicalrep_relmap_update()`
+  里是**覆盖**、不是删除（`relation.c:164-201`）⇒ **同一个 worker 跨事务是留着上一笔的关系定义的**；
+* **但发布端消不掉这份重发**：发布端只有一张**全局**的去重表
+  （`parallel_decode_relation_sent()`，`parallel_decode.c:838`），它不知道**下一个事务会落到 65 个
+  worker 中的哪一个** ⇒ 全局去重会让没拿到过这份定义的 worker 拿不到定义。
+* ⇒ **§9.1 的结论成立：这份冗余是订阅端"一事务一 worker"设计的代价，发布端消不掉。**
+
+**⇒ 重要推论：由于订阅端是串行 apply，发布端多发的每一个字节、每一帧，
+都直接加在那个串行段上**——它不是"占带宽"，是**乘在端到端速率上的**。
+37.5% 的冗余字节 ⇒ 端到端速率里也有大约 37.5% 是白走的。
+
+#### 9.12.6 发布端在这一侧已经榨干了吗
+
+| 杠杆 | 能不能做 | 依据 |
+| --- | --- | --- |
+| 合并帧（一个 CopyData 装多个消息） | **不能** | `apply_dispatch()` 一个 CopyData 只处理一个消息（`worker.c:3285`），合并了会丢消息 |
+| RELATION 去重 | **不能** | §9.12.5：发布端不知道哪个 worker 接手下一个事务 |
+| 提高逐帧速度（少一次拷贝、少一次系统调用） | **收益 ≤ 2%** | §9.3：walsender 的逐帧路径合计约 0.2µs/帧，加满 100% 的核也只能把 400k 帧/秒变成 5M 帧/秒，而 socket 抽干速率不变 |
+| 关掉 `parallel_decode_trace_file` | **必须确认** | 每帧一次 `write()` 系统调用；开着就足以把 walsender 顶到单核 |
+| 把 walreader 的 100ms 轮询换成 WAL 刷出通知 | 该做，但**是延迟不是速率** | §9.11.5 第 1 条 |
+
+**⇒ 结论：发布端在"发得多快"这一侧已经没有可观的收益了；
+瓶颈是 socket 的抽干速率，而 socket 的抽干速率是订阅端那个串行 apply 段的速率。
+发布端能贡献的最后一个杠杆是"少发"（RELATION 重发），而它被订阅端的设计锁住了。**
+
+#### 9.12.7 一次性分辨候选的三个测量（发布端，1 分钟）
+
+1. **帧率与每帧字节**（`pg_parallel_decode_walsender_frames`，两次采样做差）：
+
+   ```sql
+   select frames, frame_bytes, socket_writes from pg_parallel_decode_walsender_frames;
+   -- 间隔 10s 再跑一次，两个结果相减
+   ```
+
+   * 每帧字节 **≪ 100** ⇒ 定义帧（RELATION）占了大头 ⇒ §9.12.5 的 37.5% 成立；
+   * 每帧字节 **≳ 200** ⇒ 帧率不是主要矛盾，字节才是；
+   * `socket_writes` ÷ `frame_bytes` ⇒ 每 8KB 一次写还是每次都写。
+
+2. **walsender 的 wait_event**（peer §9.10.6 ① 的 SQL，按进程分组）：
+
+   * `Client / ClientWrite` ⇒ **堵在 socket**，本节的结论成立；
+   * `Extension / Extension` ⇒ 不是堵在 socket，而是在等释放前沿 ⇒ 走 §9.11.4 的锯齿判据。
+
+3. **两个开关与一个窗口**：
+
+   ```sql
+   show parallel_decode_trace_file;   -- 必须为空
+   ```
+
+   ```bash
+   ss -tin | grep -A1 <publisher-port>   # 两端都看：rwnd / cwnd / retrans / unacked
+   ```
+
+   * trace 文件非空 ⇒ 每帧一次系统调用，先关掉再测；
+   * `retrans` 持续增长 / `unacked` 长期不为 0 ⇒ **TCP 窗口**（BDP）在限速，
+   这跟 CPU 无关，两端 CPU 都有富余也照样成立。
+
+#### 9.12.8 与 §9.9 / §9.11 的关系
+
+* §9.9 说"瓶颈 4 成立但表现为被反压"，本节把"被反压"的**受力点**钉死在
+  `ProcessPendingWrites()`，并给出唯一能证实它的观测（wait_event = `ClientWrite`）。
+* §9.11.3 说"CPU 全闲与发布端是瓶颈不可能同时成立"，本节给出机制：
+  **CPU 全闲恰恰是"发布端被 socket 挡住"的症状**——发布端被挡住时，
+  下游的 worker/walreader 全部在等，所以它们的 CPU 是闲的。
+* ⇒ **用户报告的三条（150MB/s WAL、排队阻塞、worker/walreader CPU 很低）与本节完全自洽，
+  不需要假设任何额外的瓶颈。**
+
+#### 9.12.9 附带测到的一件事：walreader 的轮次约等于提交数（合并批次救不了这一段）
+
+修唤醒计数口径时顺带测到的（4 worker × 8 并发 × 40 事务 + 500 事务的突发，
+批量 64KB）。表里是**worker 队列的刷新次数**——即下行计数扣掉控制队列那部分
+（控制队列每个提交一条 CSEQ，另加少量 READ_POS / READY）：
+
+| 配置 | worker 队列的刷新次数 | 同期 `cseq_allocated` |
+| --- | --- | --- |
+| 1 个 worker | 839 | 820 |
+| 4 个 worker | 904 | 820 |
+
+1 个 worker 时，每一轮"walreader 读到没有更多 WAL → 刷新队列 → 睡觉"至多产生 **1 次**刷新
+（`pd_walreader_flush_queues()` 只刷新"有 pending"的队列），
+所以 **839 次刷新 ⇒ 至少 839 轮**（再减去"批次满了"造成的那几次，实测只有个位数）。
+⇒ **walreader 的轮次约等于提交数**：它大约每个提交醒一次。
+
+这条对本节的结论只有加强作用，没有反例：
+
+- **合并批次（`parallel_decode_batch_size`）合并的是"一轮之内"的刷新，合并不了"轮"本身。**
+  轮次由"WAL 什么时候对 walreader 可见"决定，与批大小无关。
+  实测也印证：批量 64KB 时下行计数从 3569 降到 1782（少了一半，其中控制队列那部分是常数），
+  但**提交数没变**，轮的次数也就没变——省下的是每轮里的刷新次数，不是轮数。
+- **⇒ 跨进程唤醒次数的下界就是提交数**，这一段（walreader → worker）在 tpcc 的 21k 事务/秒下
+  至少是 21k 次/秒的唤醒（1 worker 时实测 839 次 / 820 提交 ≈ 1.02 次/提交）。
+  这与 §9.12.6 的结论一致：**这一段不是速率上限**（21k 次/秒的唤醒对 CPU 的压力很小），
+  但它是**延迟**的来源（提交记录要等下一轮才被 worker 看到）。
+
+**⚠️ 这里只做了功能与正确性验证，没有做性能测试**：上面是**次数**，不是速率。
+"轮次约等于提交数"背后的机制**尚未定位**——最可能的解释是 **WAL 每个提交就被刷出一次**
+（于是 walreader 每个提交都能读到新 WAL），但 `synchronous_commit = off` 的情况下
+提交本来不该触发刷出，所以这个解释**还没有被证实**。要证伪/证实，下一步是：
+
+```sql
+-- 发布端：观察 WAL 刷出与插入的推进节奏
+select clock_timestamp(), pg_current_wal_insert_lsn(), pg_current_wal_flush_lsn();
+```
+
+连续采样若干次：**若 `flush_lsn` 与 `insert_lsn` 基本同步推进**，就是"每个提交都刷出"，
+那么合并批次在 walreader → worker 这一段**原理上就没有余地**，§9.11.5 第 1 条
+（把 100ms 轮询换成 WAL 刷出通知）也只值延迟、不值速率；
+**若两者有明显的滞后**（flush 落后 insert 一批），则轮次是被批量刷出决定的，
+合并批次还有余地，值得再测。
