@@ -756,6 +756,7 @@ typedef struct PDChunkReceiver
 	size_t		len;			/* bytes accumulated so far */
 	size_t		expected;		/* total length of the payload */
 	bool		started;		/* a transfer is in progress */
+	uint16		type;			/* the type of the transfer in progress */
 } PDChunkReceiver;
 
 extern void PDChunkReceiverInit(PDChunkReceiver *rcv);

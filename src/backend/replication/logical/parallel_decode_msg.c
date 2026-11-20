@@ -334,7 +334,14 @@ PDChunkReceiverRecv(PDChunkReceiver *rcv, shm_mq_handle *mqh, uint16 *type,
 			rcv->started = true;
 			rcv->buffer = palloc(total > 0 ? total : 1);
 
-			*type = msgtype;
+			/*
+			 * The type of the message belongs to the transfer, not to the
+			 * queue entry that happens to carry its first chunk.  Remember
+			 * it here: the transfer may be completed by a later call, and
+			 * that call has to report the type of the message that is
+			 * completed.
+			 */
+			rcv->type = msgtype;
 
 			/* The first four bytes are the length; the rest is data. */
 			data = (const char *) data + sizeof(uint32);
@@ -352,6 +359,13 @@ PDChunkReceiverRecv(PDChunkReceiver *rcv, shm_mq_handle *mqh, uint16 *type,
 
 		if (rcv->len == rcv->expected)
 		{
+			/*
+			 * The transfer is complete.  Report the type of the transfer:
+			 * the caller must not be left with whatever its own variable
+			 * happened to hold.
+			 */
+			*type = rcv->type;
+
 			*payload = rcv->buffer;
 			*len = rcv->len;
 
