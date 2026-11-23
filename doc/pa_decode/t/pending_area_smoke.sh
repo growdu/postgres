@@ -2,11 +2,11 @@
 # Verify what the publisher does when the frames that wait for their turn pile
 # up in its memory.
 #
-# The publisher holds the frames of a transaction back until the transaction has
-# its turn, so that the transactions reach the subscriber in the order they were
-# committed in.  The frames of the transactions that follow a transaction that
-# has not been released yet wait in the memory of the publisher.  Two things
-# have to hold:
+# The publisher holds the frames of a transaction back until the worker that
+# owns it has reported that it has decoded the transaction, and the frames
+# wait for the socket until they have been written.  The frames of the
+# transactions that are decoded while a big transaction is still being decoded
+# wait in the memory of the publisher.  Two things have to hold:
 #
 #   1. the publisher counts the bytes of the frames that wait, and warns when
 #      they take more than parallel_decode_pending_max_bytes.  The session
@@ -27,17 +27,15 @@
 #
 #   2. a smaller one, which starts while the big one is still being written,
 #      so that it is decoded by another worker, and which writes its rows
-#      after the big one has ended.  The frames of a streamed transaction have
-#      no commit sequence number, so they wait for the release frontier: they
-#      pile up in the pending area of the walsender while the big transaction
-#      is waiting for its turn.
+#      after the big one has ended.
 #
 # The frames of the big transaction itself do not pile up, except for the last
 # segment of it: the last segment is produced while the record that ends the
 # transaction is processed, and it waits for the transaction to have its turn.
-# The frames of the second transaction have no commit sequence number either,
-# so they wait for the release frontier: they pile up in the pending area of
-# the walsender while the big transaction is waiting for its turn.
+# The frames of the second transaction are let through as soon as the worker
+# has decoded them, but they wait for the socket, so they pile up in the
+# pending area of the walsender while the big transaction is waiting for its
+# turn.
 #
 # The big transaction ends with a row that is much bigger than the others.  The
 # worker of the big transaction is busy with that row when the walreader hands
@@ -114,10 +112,6 @@ BARRIER_TIMEOUT=${BARRIER_TIMEOUT:-2}
 # on the exact size of the pile-up.
 PENDING_MAX_BYTES=${PENDING_MAX_BYTES:-16384}
 #
-# The number of bytes the stream segments that wait for their turn may take
-# before the publisher warns about them.
-HELD_MAX_BYTES=${HELD_MAX_BYTES:-16384}
-#
 # How long the test waits for the transactions to arrive.
 WAIT=${WAIT:-300}
 #
@@ -189,7 +183,7 @@ MAX_PARALLEL_DECODE_WORKERS=$WORKERS "$SCRIPT_DIR/setup_env.sh" init
 cat >> "$ROOT/pub/postgresql.conf" <<EOF
 parallel_decode_barrier_timeout = $BARRIER_TIMEOUT
 parallel_decode_pending_max_bytes = $PENDING_MAX_BYTES
-parallel_decode_held_max_bytes = $HELD_MAX_BYTES
+lc_messages = 'C'
 EOF
 "$SCRIPT_DIR/setup_env.sh" start
 
@@ -280,19 +274,20 @@ sub_sum=$(checksum)
 #
 # The warning about the pending area.
 #
-if ! grep -q "bytes of frames that wait for their turn" "$ROOT/pub/server.log"; then
-	fail "the publisher did not warn about the frames that wait for their turn"
+if ! grep -q "bytes of frames that wait to be sent" "$ROOT/pub/server.log"; then
+	fail "the publisher did not warn about the frames that wait to be sent"
 fi
-echo "   the publisher warned about the frames that wait for their turn"
+echo "   the publisher warned about the frames that wait to be sent"
 
 #
-# The frames that wait are the stream segments of the second transaction, so the
-# publisher warns about them as well.
+# The release frontier is gone: the stream segments are not held back any
+# more, so the publisher does not warn about them.
 #
-if ! grep -q "bytes of stream segments that wait for their turn" "$ROOT/pub/server.log"; then
-	fail "the publisher did not warn about the stream segments that wait for their turn"
+if grep -q "bytes of stream segments that wait for their turn" "$ROOT/pub/server.log"; then
+	fail "the publisher held the stream segments back: the release frontier \
+should be gone"
 fi
-echo "   the publisher warned about the stream segments that wait for their turn"
+echo "   the publisher did not hold the stream segments back"
 
 #
 # The stall detection must not end the session while the worker that owns the

@@ -104,6 +104,54 @@ TXN_BOUNDARY = (MSG_BEGIN, MSG_COMMIT, MSG_STREAM_START, MSG_STREAM_COMMIT)
 # id, see _parse_message().
 _XID_IN_DESCRIPTION = re.compile(r"^xid=(\d+)")
 
+# The description of a stream abort message carries the id of the transaction
+# and the id of the subtransaction that was aborted, see _parse_message().
+_SUBXID_IN_DESCRIPTION = re.compile(r"^xid=(\d+) subxid=(\d+)")
+
+
+def _subxid_of(desc, xid):
+    """The id of the subtransaction that a stream abort message names.
+
+    The message names the transaction and the subtransaction that was
+    aborted.  The two are the same when the whole transaction was aborted.
+    """
+    match = _SUBXID_IN_DESCRIPTION.match(desc)
+    if match is None:
+        return xid
+    return int(match.group(2))
+
+
+class Phase(object):
+    """One phase of the commit_sync barrier, as recorded in a trace file.
+
+    A phase is the end event of a transaction: the commit, the abort or the
+    prepare.  The phases are released in the order of their phase numbers, so
+    that the transactions reach the subscriber in the order they were committed
+    in.  The record tells whether the phase had an end event frame at all: a
+    transaction that produced no message has no marker.
+    """
+
+    def __init__(self, index, session, cseq, flags, nframes, nbytes):
+        self.index = index
+        self.session = session
+        self.cseq = cseq
+        self.flags = flags
+        self.nframes = nframes
+        self.nbytes = nbytes
+
+    @property
+    def has_marker(self):
+        return (self.flags & 0x01) != 0
+
+    def __str__(self):
+        return "#%d phase cseq=%d marker=%s frames=%d bytes=%d" % (
+            self.index,
+            self.cseq,
+            "yes" if self.has_marker else "no",
+            self.nframes,
+            self.nbytes,
+        )
+
 
 class Frame(object):
     """One replication frame, as recorded in a trace file."""
@@ -140,8 +188,12 @@ class Frame(object):
         )
 
 
-def read_trace(path):
-    """Read a trace file and return the list of frames it contains."""
+def read_trace(path, phases=None):
+    """Read a trace file and return the list of frames it contains.
+
+    The phase records of the commit_sync barrier are not frames: they are
+    collected into the phases list, when one is given.
+    """
     frames = []
     session = 0
     with open(path, "rb") as fh:
@@ -169,6 +221,23 @@ def read_trace(path):
             continue
 
         ftype = chr(payload[0])
+        if ftype == "p":
+            # The release of a phase of the commit_sync barrier.
+            if phases is None:
+                continue
+            if len(payload) < 18:
+                raise ValueError(
+                    "short phase record at frame %d" % len(frames)
+                )
+            cseq = struct.unpack_from(">Q", payload, 1)[0]
+            flags = payload[9]
+            nframes = struct.unpack_from(">I", payload, 10)[0]
+            nbytes = struct.unpack_from(">I", payload, 14)[0]
+            phases.append(
+                Phase(len(phases), session, cseq, flags, nframes, nbytes)
+            )
+            continue
+
         if ftype not in FRAME_HEADER_LEN:
             raise ValueError(
                 "unknown frame type %r at frame %d" % (ftype, len(frames))
@@ -487,8 +556,9 @@ def split_transactions(frames):
     Returns a list of (tag, messages) pairs, in the order the transactions
     ended.  The tag is the message that ended the transaction: a commit
     message for a transaction that is not streamed, a stream commit message
-    for a transaction that is streamed.  The messages are the (tag, digest,
-    length) triples of the messages that carry data.
+    for a transaction that is streamed, a commit prepared message for a
+    prepared transaction.  The messages are the (tag, digest, length) triples
+    of the messages that carry data.
 
     A transaction that is not streamed is delimited by a begin and a commit
     message.  A transaction that is streamed is spread over the stream
@@ -496,6 +566,19 @@ def split_transactions(frames):
     of the transactions that are in flight at the same time are interleaved
     on the wire.  The changes of a streamed transaction are therefore gathered
     by the transaction id that they carry in band.
+
+    A prepared transaction is delimited by its prepare message: the prepare
+    carries the changes of the transaction, and the commit prepared or the
+    rollback prepared ends it.  The two paths do not use the same message for
+    the prepare: the serial path sends a begin prepare and a prepare message
+    for every prepared transaction, while the parallel path sends a stream
+    prepare message for the transactions that it streamed while they were in
+    progress, and a begin prepare and a prepare message for the ones that it
+    did not.  Both are handled here, so that the two paths are comparable.
+
+    A transaction that is aborted is not a transaction: the changes that were
+    sent before the abort are void, and the serial path does not send them
+    at all.  The changes of an aborted transaction are therefore dropped.
 
     The messages that delimit a transaction are not part of it, and neither
     are the relation messages: the two paths send the definition of a
@@ -515,6 +598,12 @@ def split_transactions(frames):
     #
     plain = None
     streamed = {}
+    #
+    # The changes of the prepared transactions, by transaction id.  A prepare
+    # message ends the changes of the transaction, but the transaction is not
+    # over: the commit prepared or the rollback prepared ends it.
+    #
+    prepared = {}
     in_stream = False
 
     for frame in frames:
@@ -530,6 +619,30 @@ def split_transactions(frames):
                     transactions.append((MSG_COMMIT, plain))
                 plain = None
                 continue
+            if tag == MSG_BEGIN_PREPARE:
+                # The transaction is prepared.  Its changes follow, and the
+                # prepare message ends them.
+                plain = []
+                continue
+            if tag == MSG_PREPARE:
+                # The transaction was not streamed: its changes are in the
+                # plain buffer.
+                prepared[xid] = plain if plain is not None else []
+                plain = None
+                continue
+            if tag == MSG_STREAM_PREPARE:
+                # The transaction was streamed while it was in progress: its
+                # changes are in the streamed buffer.
+                prepared[xid] = streamed.pop(xid, [])
+                continue
+            if tag == MSG_COMMIT_PREPARED:
+                transactions.append((MSG_COMMIT_PREPARED,
+                                     prepared.pop(xid, [])))
+                continue
+            if tag == MSG_ROLLBACK_PREPARED:
+                # The transaction is rolled back: its changes are void.
+                prepared.pop(xid, None)
+                continue
             if tag == MSG_STREAM_START:
                 in_stream = True
                 streamed.setdefault(xid, [])
@@ -539,6 +652,11 @@ def split_transactions(frames):
                 continue
             if tag == MSG_STREAM_COMMIT:
                 transactions.append((MSG_STREAM_COMMIT, streamed.pop(xid, [])))
+                continue
+            if tag == MSG_STREAM_ABORT:
+                # The transaction, or the subtransaction, is aborted: the
+                # changes that were sent already are void.
+                streamed.pop(_subxid_of(desc, xid), None)
                 continue
             if tag == MSG_RELATION:
                 continue
@@ -595,7 +713,8 @@ def message_lsn_map(frames):
 
 
 def cmd_dump(args):
-    frames = read_trace(args.tracefile)
+    phases = []
+    frames = read_trace(args.tracefile, phases)
     print("%d frame(s) in %s" % (len(frames), args.tracefile))
     streaming = False
     for frame in frames:
@@ -604,6 +723,10 @@ def cmd_dump(args):
             messages, streaming = parse_messages(frame.payload, streaming)
             for tag, raw, desc, xid in messages:
                 print("    %s %d bytes %s" % (tag, len(raw), desc))
+    if args.phases:
+        print("%d phase(s) in %s" % (len(phases), args.tracefile))
+        for phase in phases:
+            print(phase)
     return 0
 
 
@@ -805,6 +928,8 @@ def main(argv=None):
     p_dump.add_argument("tracefile")
     p_dump.add_argument("--messages", action="store_true",
                         help="also list the pgoutput messages of each frame")
+    p_dump.add_argument("--phases", action="store_true",
+                        help="also list the phases of the commit_sync barrier")
     p_dump.set_defaults(func=cmd_dump)
 
     p_diff = sub.add_parser("diff", help="compare two trace files")
