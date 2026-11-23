@@ -1065,10 +1065,42 @@ CREATE VIEW pg_parallel_decode_workers AS
             W.decoded_txns,
             W.in_flight_bytes,
             W.queue_depth,
-            W.wakeups
+            W.wakeups,
+            R.state,
+            R.sent_lsn,
+            R.write_lsn,
+            R.flush_lsn,
+            R.replay_lsn,
+            R.write_lag,
+            R.flush_lag,
+            R.replay_lag,
+            R.sync_priority,
+            R.sync_state,
+            R.reply_time,
+            RS.slot_name,
+            RS.plugin,
+            RS.slot_type,
+            RS.database,
+            RS.active,
+            RS.restart_lsn,
+            RS.confirmed_flush_lsn,
+            RS.wal_status,
+            RS.two_phase,
+            SL.spill_txns,
+            SL.spill_count,
+            SL.spill_bytes,
+            SL.stream_txns,
+            SL.stream_count,
+            SL.stream_bytes,
+            SL.total_txns,
+            SL.total_bytes,
+            SL.stats_reset
     FROM pg_stat_get_parallel_decode_workers() AS W
         JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = W.pid)
-        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid)
+        LEFT JOIN pg_stat_replication AS R ON (R.pid = S.pid)
+        LEFT JOIN pg_replication_slots AS RS ON (RS.active_pid = S.pid)
+        LEFT JOIN pg_stat_replication_slots AS SL ON (SL.slot_name = RS.slot_name);
 
 --
 -- pg_parallel_decode_commit_lag
@@ -1092,10 +1124,42 @@ CREATE VIEW pg_parallel_decode_commit_lag AS
             S.client_addr,
             D.cseq_allocated,
             D.cseq_released,
-            D.commit_lag
+            D.commit_lag,
+            R.state,
+            R.sent_lsn,
+            R.write_lsn,
+            R.flush_lsn,
+            R.replay_lsn,
+            R.write_lag,
+            R.flush_lag,
+            R.replay_lag,
+            R.sync_priority,
+            R.sync_state,
+            R.reply_time,
+            RS.slot_name,
+            RS.plugin,
+            RS.slot_type,
+            RS.database,
+            RS.active,
+            RS.restart_lsn,
+            RS.confirmed_flush_lsn,
+            RS.wal_status,
+            RS.two_phase,
+            SL.spill_txns,
+            SL.spill_count,
+            SL.spill_bytes,
+            SL.stream_txns,
+            SL.stream_count,
+            SL.stream_bytes,
+            SL.total_txns,
+            SL.total_bytes,
+            SL.stats_reset
     FROM pg_stat_get_parallel_decode_session() AS D
         JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
-        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid)
+        LEFT JOIN pg_stat_replication AS R ON (R.pid = S.pid)
+        LEFT JOIN pg_replication_slots AS RS ON (RS.active_pid = S.pid)
+        LEFT JOIN pg_stat_replication_slots AS SL ON (SL.slot_name = RS.slot_name);
 
 CREATE VIEW pg_parallel_decode_txn_latency AS
     SELECT
@@ -1108,10 +1172,42 @@ CREATE VIEW pg_parallel_decode_txn_latency AS
             D.txn_latency_us_max,
             CASE WHEN D.txn_count > 0
                  THEN D.txn_latency_us_sum / D.txn_count
-                 ELSE 0 END AS txn_latency_us_avg
+                 ELSE 0 END AS txn_latency_us_avg,
+            R.state,
+            R.sent_lsn,
+            R.write_lsn,
+            R.flush_lsn,
+            R.replay_lsn,
+            R.write_lag,
+            R.flush_lag,
+            R.replay_lag,
+            R.sync_priority,
+            R.sync_state,
+            R.reply_time,
+            RS.slot_name,
+            RS.plugin,
+            RS.slot_type,
+            RS.database,
+            RS.active,
+            RS.restart_lsn,
+            RS.confirmed_flush_lsn,
+            RS.wal_status,
+            RS.two_phase,
+            SL.spill_txns,
+            SL.spill_count,
+            SL.spill_bytes,
+            SL.stream_txns,
+            SL.stream_count,
+            SL.stream_bytes,
+            SL.total_txns,
+            SL.total_bytes,
+            SL.stats_reset
     FROM pg_stat_get_parallel_decode_session() AS D
         JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
-        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid)
+        LEFT JOIN pg_stat_replication AS R ON (R.pid = S.pid)
+        LEFT JOIN pg_replication_slots AS RS ON (RS.active_pid = S.pid)
+        LEFT JOIN pg_stat_replication_slots AS SL ON (SL.slot_name = RS.slot_name);
 
 CREATE VIEW pg_parallel_decode_pending_commit_age AS
     SELECT
@@ -1120,10 +1216,42 @@ CREATE VIEW pg_parallel_decode_pending_commit_age AS
             S.application_name,
             S.client_addr,
             D.commit_lag,
-            D.pending_commit_age_us
+            D.pending_commit_age_us,
+            R.state,
+            R.sent_lsn,
+            R.write_lsn,
+            R.flush_lsn,
+            R.replay_lsn,
+            R.write_lag,
+            R.flush_lag,
+            R.replay_lag,
+            R.sync_priority,
+            R.sync_state,
+            R.reply_time,
+            RS.slot_name,
+            RS.plugin,
+            RS.slot_type,
+            RS.database,
+            RS.active,
+            RS.restart_lsn,
+            RS.confirmed_flush_lsn,
+            RS.wal_status,
+            RS.two_phase,
+            SL.spill_txns,
+            SL.spill_count,
+            SL.spill_bytes,
+            SL.stream_txns,
+            SL.stream_count,
+            SL.stream_bytes,
+            SL.total_txns,
+            SL.total_bytes,
+            SL.stats_reset
     FROM pg_stat_get_parallel_decode_session() AS D
         JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
-        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid)
+        LEFT JOIN pg_stat_replication AS R ON (R.pid = S.pid)
+        LEFT JOIN pg_replication_slots AS RS ON (RS.active_pid = S.pid)
+        LEFT JOIN pg_stat_replication_slots AS SL ON (SL.slot_name = RS.slot_name);
 
 CREATE VIEW pg_parallel_decode_walsender_frames AS
     SELECT
@@ -1133,10 +1261,42 @@ CREATE VIEW pg_parallel_decode_walsender_frames AS
             S.client_addr,
             D.frames,
             D.frame_bytes,
-            D.socket_writes
+            D.socket_writes,
+            R.state,
+            R.sent_lsn,
+            R.write_lsn,
+            R.flush_lsn,
+            R.replay_lsn,
+            R.write_lag,
+            R.flush_lag,
+            R.replay_lag,
+            R.sync_priority,
+            R.sync_state,
+            R.reply_time,
+            RS.slot_name,
+            RS.plugin,
+            RS.slot_type,
+            RS.database,
+            RS.active,
+            RS.restart_lsn,
+            RS.confirmed_flush_lsn,
+            RS.wal_status,
+            RS.two_phase,
+            SL.spill_txns,
+            SL.spill_count,
+            SL.spill_bytes,
+            SL.stream_txns,
+            SL.stream_count,
+            SL.stream_bytes,
+            SL.total_txns,
+            SL.total_bytes,
+            SL.stats_reset
     FROM pg_stat_get_parallel_decode_session() AS D
         JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
-        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid)
+        LEFT JOIN pg_stat_replication AS R ON (R.pid = S.pid)
+        LEFT JOIN pg_replication_slots AS RS ON (RS.active_pid = S.pid)
+        LEFT JOIN pg_stat_replication_slots AS SL ON (SL.slot_name = RS.slot_name);
 
 CREATE VIEW pg_parallel_decode_wakeups AS
     SELECT
@@ -1146,10 +1306,42 @@ CREATE VIEW pg_parallel_decode_wakeups AS
             S.client_addr,
             D.wakeups_down,
             D.wakeups_up,
-            D.wakeups_down + D.wakeups_up AS wakeups_total
+            D.wakeups_down + D.wakeups_up AS wakeups_total,
+            R.state,
+            R.sent_lsn,
+            R.write_lsn,
+            R.flush_lsn,
+            R.replay_lsn,
+            R.write_lag,
+            R.flush_lag,
+            R.replay_lag,
+            R.sync_priority,
+            R.sync_state,
+            R.reply_time,
+            RS.slot_name,
+            RS.plugin,
+            RS.slot_type,
+            RS.database,
+            RS.active,
+            RS.restart_lsn,
+            RS.confirmed_flush_lsn,
+            RS.wal_status,
+            RS.two_phase,
+            SL.spill_txns,
+            SL.spill_count,
+            SL.spill_bytes,
+            SL.stream_txns,
+            SL.stream_count,
+            SL.stream_bytes,
+            SL.total_txns,
+            SL.total_bytes,
+            SL.stats_reset
     FROM pg_stat_get_parallel_decode_session() AS D
         JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = D.pid)
-        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+        LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid)
+        LEFT JOIN pg_stat_replication AS R ON (R.pid = S.pid)
+        LEFT JOIN pg_replication_slots AS RS ON (RS.active_pid = S.pid)
+        LEFT JOIN pg_stat_replication_slots AS SL ON (SL.slot_name = RS.slot_name);
 
 CREATE VIEW pg_stat_database AS
     SELECT
