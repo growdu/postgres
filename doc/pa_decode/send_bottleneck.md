@@ -954,9 +954,14 @@ select clock_timestamp(), sum(in_flight_txns), sum(in_flight_bytes)
 
 1. **把 walreader 的 100ms 轮询换成"WAL 刷出"通知**（只动发布端，串行路径本来就是这样：
    `xlog.c:2930/:3105` → `WalSndWakeupProcessRequests` → `WalSndWakeup` → `wal_replay_cv` 广播 →
-   `walsender.c:4031`；并行路径缺这一环）。
+   `walsender.c:4031`）。
    **收益是延迟与波形（波间空转、TCP 突发），不是把 45MB/s 变成 70MB/s**——
    除非 §9.11.4 的锯齿测出来波形确实存在，并且 TCP 因为突发而丢包重传。
+   **✅ 已做**（2026-11-23 复核，见 §9.12.10 的结论 5）：原文写"并行路径缺这一环"，**那是错的**——
+   并行路径**早就在**等 WAL 刷出事件了：`parallel_walreader.c:446-473` 睡在
+   `WalSndCtl->wal_replay_cv` 上（`ConditionVariableTimedSleep(..., 100L, ...)`，
+   100 ms 只是兜底超时），刷出经 `xlog.c:2577` → `xlog.c:2930/:3105` → `WalSndWakeup()` →
+   `walsender.c:4181` 广播这个条件变量。⇒ 这条**只值延迟、不值速率**。
 2. **修唤醒计数的口径**（§9.9.6）：`PDQueueSend()` 加 wakeup 指针，控制队列每条单独唤醒并计数、
    **不批量化**；`pg_parallel_decode_wakeups` 的"下行"语义要加上 walreader → walsender 的控制流。
    这是口径修复（现在的数是下界），不是性能优化。
@@ -1121,7 +1126,7 @@ walreader ──(worker 入队, 256KB shm_mq × N)──> decode worker
 * ⇒ **用户报告的三条（150MB/s WAL、排队阻塞、worker/walreader CPU 很低）与本节完全自洽，
   不需要假设任何额外的瓶颈。**
 
-#### 9.12.9 附带测到的一件事：walreader 的轮次约等于提交数（合并批次救不了这一段）
+#### 9.12.9 附带测到的一件事：worker 队列的刷新次数约等于提交数（**这不是轮次**）
 
 修唤醒计数口径时顺带测到的（4 worker × 8 并发 × 40 事务 + 500 事务的突发，
 批量 64KB）。表里是**worker 队列的刷新次数**——即下行计数扣掉控制队列那部分
@@ -1132,10 +1137,16 @@ walreader ──(worker 入队, 256KB shm_mq × N)──> decode worker
 | 1 个 worker | 839 | 820 |
 | 4 个 worker | 904 | 820 |
 
+当时的推断是：
+
 1 个 worker 时，每一轮"walreader 读到没有更多 WAL → 刷新队列 → 睡觉"至多产生 **1 次**刷新
 （`pd_walreader_flush_queues()` 只刷新"有 pending"的队列），
 所以 **839 次刷新 ⇒ 至少 839 轮**（再减去"批次满了"造成的那几次，实测只有个位数）。
 ⇒ **walreader 的轮次约等于提交数**：它大约每个提交醒一次。
+
+> **⚠️ 这个推断是错的（2026-11-23 更正，机制与实测见 §9.12.10）**：它漏掉了**每个事务
+> 自己产生的两次强制刷新**——那两次与"轮"无关。所以"刷新次数 ≈ 提交数"**推不出**
+> "轮次 ≈ 提交数"。实测：**2000 个提交只对应 24 轮**（每轮约 88 个提交）。
 
 这条对本节的结论只有加强作用，没有反例：
 
@@ -1143,23 +1154,99 @@ walreader ──(worker 入队, 256KB shm_mq × N)──> decode worker
   轮次由"WAL 什么时候对 walreader 可见"决定，与批大小无关。
   实测也印证：批量 64KB 时下行计数从 3569 降到 1782（少了一半，其中控制队列那部分是常数），
   但**提交数没变**，轮的次数也就没变——省下的是每轮里的刷新次数，不是轮数。
-- **⇒ 跨进程唤醒次数的下界就是提交数**，这一段（walreader → worker）在 tpcc 的 21k 事务/秒下
-  至少是 21k 次/秒的唤醒（1 worker 时实测 839 次 / 820 提交 ≈ 1.02 次/提交）。
-  这与 §9.12.6 的结论一致：**这一段不是速率上限**（21k 次/秒的唤醒对 CPU 的压力很小），
-  但它是**延迟**的来源（提交记录要等下一轮才被 worker 看到）。
+- **⇒ 跨进程唤醒次数的下界是 2 × 事务数**，这一段（walreader → worker）在 tpcc 的 21k 事务/秒下
+  至少是 42k 次/秒的唤醒（实测：worker 队列 839 次 / 820 提交 ≈ 1.02 次/提交，
+  加上控制队列的每提交一条 CSEQ，合计 ≈ 1.94 次/提交，见 §9.12.10）。
+  这与 §9.12.6 的结论一致：**这一段不是速率上限**（42k 次/秒的唤醒对 CPU 的压力很小），
+  但它是**延迟**的来源（提交记录要等下一次刷出才被 worker 看到——见 §9.12.10 的结论 4）。
 
 **⚠️ 这里只做了功能与正确性验证，没有做性能测试**：上面是**次数**，不是速率。
-"轮次约等于提交数"背后的机制**尚未定位**——最可能的解释是 **WAL 每个提交就被刷出一次**
-（于是 walreader 每个提交都能读到新 WAL），但 `synchronous_commit = off` 的情况下
-提交本来不该触发刷出，所以这个解释**还没有被证实**。要证伪/证实，下一步是：
+"刷新次数 ≈ 提交数"背后的机制**已经定位**（§9.12.10）：**既不是**"每个提交都刷出 WAL"，
+也**不是**"每个提交醒一轮"，而是**每个事务强制刷 2 次队列**。
+当时给的两个候选判据（发布端连续采样）：
 
 ```sql
 -- 发布端：观察 WAL 刷出与插入的推进节奏
 select clock_timestamp(), pg_current_wal_insert_lsn(), pg_current_wal_flush_lsn();
 ```
 
-连续采样若干次：**若 `flush_lsn` 与 `insert_lsn` 基本同步推进**，就是"每个提交都刷出"，
-那么合并批次在 walreader → worker 这一段**原理上就没有余地**，§9.11.5 第 1 条
-（把 100ms 轮询换成 WAL 刷出通知）也只值延迟、不值速率；
-**若两者有明显的滞后**（flush 落后 insert 一批），则轮次是被批量刷出决定的，
-合并批次还有余地，值得再测。
+**实测走的是"两者有明显的滞后"那条分支**（`synchronous_commit = off` 下 flush 落后
+insert 一批，刷出位置 4.8 秒里只前进 24 次），也就是说**轮次是被批量刷出决定的**。
+但实测同时说明：**批量已经在 WAL 这一层发生了**（2000 个提交 ⇒ 24 次刷出 ⇒ 每轮约 88 个提交），
+walreader → worker 这一段里 `parallel_decode_batch_size` **能合并的东西已经没有了**；
+剩下的每事务 2 次强制刷新是**逐条语义**（控制队列的 CSEQ 逐条计数、
+base snapshot 不批量化），本来就**不该**被合并。细节见 §9.12.10。
+
+#### 9.12.10 机制问题已定位：WAL 什么时候对 walreader 可见（刷出节奏实测）
+
+**要回答的问题**：§9.12.9 里"刷新次数 ≈ 提交数"的机制到底是什么？
+两个候选：(a) **每个提交都被刷出**（于是 walreader 每个提交都能读到新 WAL，
+轮次 ≈ 提交数）；(b) **刷出是批量的**（轮次由刷出次数决定，与提交数无关）。
+
+**测法**：发布端上开一条 `streaming = parallel` 的订阅，用 2000 个单行事务做负载
+（`BEGIN; INSERT; SELECT pg_sleep(0.001); COMMIT;`，一个事务一个提交，提交数精确可数），
+同时用两个采样器连续读：
+
+* **采样器 A**（一条语句、逐行读）：`clock_timestamp()`、`pg_current_wal_insert_lsn()`、
+  `pg_current_wal_flush_lsn()`，间隔约 2 ms——它给出**刷出位置前进的次数**
+  与 **insert − flush 的落后量**；
+* **采样器 B**（一条语句一条采样，逐条读 `pg_stat_get_parallel_decode_session()`）：
+  `cseq_allocated` 与 `wakeups_down`——它给出**每次刷出之间 walreader 拿走了几个提交**
+  与**唤醒计数**。
+
+**结果**（1 worker / 4 worker，`synchronous_commit` 分别 off / on）：
+
+| 配置 | 提交数 | 窗口 | 刷出位置前进次数 | insert − flush（中位 / 最大） | 每次刷出拿到的提交数（中位） | `wakeups_down` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `synchronous_commit = off`，1 worker | 2000 | 4.79 s | **24**（5.0 次/秒） | 11,264 B / 22,136 B | **88** | 3877（1.94/提交） |
+| `synchronous_commit = off`，4 worker | 2000 | 4.83 s | **24** | 11,712 B / 23,728 B | **92** | 4045（2.02/提交） |
+| `synchronous_commit = on`，1 worker | 2000 | 5.64 s | **1956**（≈每提交一次） | 128 B / 944 B | **1** | 8042（4.02/提交） |
+
+三种配置的 WAL 总量相同（357,008 B），所以差别只来自**刷出节奏**。
+窗口结束时 `cseq_allocated` 是 1866 / 1910 / 1999（提交数 2000）——walreader 还没完全追上，
+这正是"每轮一批"的另一面。
+
+**对照实验**（1 worker，`synchronous_commit = off`）：
+
+| 负载 | 记录数 | 提交数 | `wakeups_down` |
+| --- | --- | --- | --- |
+| 每事务 1 条 | 2000 | 2000 | **3877**（≈1.94/提交） |
+| **1 个事务里 2000 条** | 2000 | **1** | **24**（一个事务只贡献 1 次 CSEQ + 1 次 base snapshot，其余按轮刷出） |
+| 每事务 10 条 | 20000 | 2000 | **4436**（≈2.2/提交） |
+
+⇒ 唤醒次数跟**事务数**走，不跟**记录数**走（第三行的记录数是第一行的 10 倍，
+唤醒数几乎一样）。
+
+**结论**：
+
+1. **`synchronous_commit = off` ⇒ 提交不刷出 WAL**（`xact.c:1481` 的条件里
+   `synchronous_commit > SYNCHRONOUS_COMMIT_OFF` 不成立）。实测 4.79 秒里刷出位置只前进
+   **24 次**，即 **5 次/秒**——这正是 walwriter 的节奏（`wal_writer_delay` 默认 200 ms；
+   `XLogBackgroundFlush()`，`xlog.c:2985`）。`insert − flush` 的中位数 11 KB、最大 22 KB，
+   ⇒ **flush 明显落后 insert 一批**。§9.12.9 的候选 (a) **被证伪**。
+2. **`synchronous_commit = on` ⇒ 每个提交刷一次**：2000 个提交对应 1956 次刷出，
+   `insert − flush` 的中位数只有 128 B。⇒ "每个提交都刷出"**只在这个设置下成立**，
+   它不能被当成并行路径的固有性质。
+3. **walreader 的有效轮次由刷出决定，与提交数无关**：2000 个提交只对应 **24 轮**，
+   每轮约 **88 个提交**（4 worker 时 92 个）。⇒ §9.12.9 那张表里的 839 / 904
+   **不能**当成轮次读。
+4. **§9.12.9 的结论仍然成立，但理由要改**：唤醒次数的下界是 **2 × 事务数**，不是 1 × 提交数——
+   **控制队列**每提交一条 CSEQ（`pd_walreader_send_cseq()`，`parallel_walreader.c:908`，
+   `PDQueueSend(..., force_flush = true)`），**worker 队列**每个事务一次 base snapshot
+   （`pd_walreader_gate_change()` :1681 → `pd_walreader_publish_base()` :1514 →
+   `pd_walreader_send_to()` :1310 → `PDQueueSendUnbatched()`，
+   `parallel_decode_msg.c:661`，**不批量化**）。延迟的来源也改了：**不是**"等下一轮"，
+   而是"等下一次刷出"（一批，约 88 个提交）。
+5. **§9.11.5 第 1 条的前提已经过时**：并行路径**早就在**等 WAL 刷出事件了——
+   `parallel_walreader.c:446-473` 睡在 `WalSndCtl->wal_replay_cv` 上
+   （`ConditionVariableTimedSleep(..., 100L, ...)`，100 ms 只是兜底超时），
+   而刷出会广播这个条件变量：`XLogWrite()` → `WalSndWakeupRequest()`（`xlog.c:2577`）→
+   `WalSndWakeupProcessRequests()`（`xlog.c:2930` / `:3105`）→ `WalSndWakeup()` →
+   `ConditionVariableBroadcast(&WalSndCtl->wal_replay_cv)`（`walsender.c:4181`）。
+   ⇒ "这一环只值延迟、不值速率"的判断仍然成立，但它**已经实现了**
+   （§9.11.5 第 1 条已补"✅ 已做"），不需要再做。
+
+**⚠️ 这里只做了功能与正确性验证，没有做性能测试**：上面全是**次数**与**字节数**，
+不是速率；"每轮 88 个提交"是本机这一组负载的观察值，**吞吐数字仍待性能环境实测回填**。
+探针脚本是一次性的（在 `/tmp` 下，不在仓库里）：它跑的是 `doc/pa_decode/t/setup_env.sh`
+的私有目录与端口，发布端与订阅端都在本机。
