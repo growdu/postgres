@@ -994,6 +994,7 @@ parallel_decode_release_markers(void)
 		TimestampTz alloc_time;
 		TimestampTz ack_time;
 		bool		found;
+		bool		has_marker = false;
 
 		pending = (PDPendingTxn *) hash_search(parallel_decode_pending,
 											   &parallel_decode_marker_phase,
@@ -1015,6 +1016,7 @@ parallel_decode_release_markers(void)
 		marker = parallel_decode_find_marker(parallel_decode_marker_phase);
 		if (marker != NULL)
 		{
+			has_marker = true;
 			parallel_decode_ready = lappend(parallel_decode_ready,
 											marker->marker);
 			pending->nframes++;
@@ -1030,7 +1032,7 @@ parallel_decode_release_markers(void)
 		 * phases can be checked from the outside.
 		 */
 		PDTraceWritePhase(parallel_decode_marker_phase,
-						   marker != NULL ? PD_PHASE_HAS_MARKER : 0,
+						   has_marker ? PD_PHASE_HAS_MARKER : 0,
 						   pending->nframes, pending->nbytes);
 
 		/*
