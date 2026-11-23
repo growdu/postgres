@@ -211,7 +211,7 @@ held 表的元素只会被**按位置从小到大**取出，所以用按 (位置
 - **worker 侧把非流式事务的帧攒成一个 `PD_BLK_TXN` 块**（设计文档 §5.2 的 `PD_BLK_TXN`）。当前非流式路径仍然是一条变更一条队列消息，walsender 侧只能逐帧持有。把一个事务的帧攒成一条队列消息，可以把**每帧一次 `shm_mq` 往返**摊薄成**每事务一次**——这是非流式路径上剩下的最大的一笔开销。注意：非流式事务的帧本来就要等到 cseq 轮到才放行，所以攒批**不增加延迟**。
   *这条的必要性取决于 §8：并行解码如果把所有事务都变成流段（`stream_all_transactions`），非流式路径就只剩兼容意义，这条可以降级。*
 
-- **held 区的背压**：目前 `parallel_decode_held_max_bytes` 只告警、不限流（`parallel_decode.c:57`）。放行跟不上时 held 区会一直涨。加背压要小心与 barrier 的交互（可能死锁），需要单独设计。
+- **待放行区的背压**：目前 `parallel_decode_pending_max_bytes` 只告警、不限流。放行跟不上时待放行区会一直涨。加背压要小心与 barrier 的交互（可能死锁），需要单独设计。（v0.27 起"等放行前沿的 held 区"没有了：无 cseq 的数据帧 settle 即走，只有结束事件在相位屏障上等；held 区的 GUC `parallel_decode_held_max_bytes` 已删除。）
 
 ## 8. 方向：并行解码只走流式路径
 
@@ -342,7 +342,7 @@ select commit_lag, pending_commit_age_us from pg_parallel_decode_pending_commit_
 ```
 
 `cseq_allocated` 持续增长而 `cseq_released` 停滞 ⇒ 有事务卡在提交序上，它后面的所有字节都发不出去
-（held 区只涨不落，`parallel_decode_held_max_bytes` 只告警不限流）。tpcc 里一个长事务就能造成这个现象。
+（待放行区只涨不落，`parallel_decode_pending_max_bytes` 只告警不限流）。tpcc 里一个长事务就能造成这个现象。v0.27 起这两个字段是**相位号**：`cseq_allocated` 是 walreader 已分配的最高相位，`cseq_released` 是 walsender 已放行的最高相位，差值是**结束事件**的积压——数据 settle 即走，不在这个差值里。
 
 ### 9.5 各侧的杠杆
 
