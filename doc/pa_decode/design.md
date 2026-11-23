@@ -70,6 +70,7 @@
   - [8.2 分片与整事务两种输出形态](#82-分片与整事务两种输出形态)
 - [9. 异常处理](#9-异常处理)
 - [10. 模块划分](#10-模块划分)
+  - [10.1 walsender 里的两条解码路径与分界点](#101-walsender-里的两条解码路径与分界点)
 - [11. 接口说明](#11-接口说明)
   - [11.1 用户接口（新增 GUC）](#111-用户接口新增-guc)
   - [11.2 程序内部接口](#112-程序内部接口)
@@ -1650,6 +1651,36 @@ pending_commits[]   /* 按 cseq 排序的挂起结束事件表 */
 
 另外 `ReorderBufferCanStartStreaming()`（`reorderbuffer.c:4028-4047`）要改为读共享状态块而不是读 `ctx->snapshot_builder` 与 `ctx->reader->ReadRecPtr`——worker 既没有 snapbuild 也不读 WAL（6.1）。**若不改，它在 worker 里恒为 false，所有超阈值的事务都会掉进 spill 路径**（而 spill 路径在 worker 侧已禁用，见 8.2），等于第 8 章在 worker 里失效。
 
+### 10.1 walsender 里的两条解码路径与分界点
+
+`walsender.c` 里同时住着两条解码路径，它们**互不影响**：
+
+| 路径 | 谁解码 | 帧从哪来 | 订阅端 | 会话函数 |
+| --- | --- | --- | --- | --- |
+| 串行 | walsender 自己 | `XLogSendLogical()` 读 WAL 并解码 | `streaming='on'` 或不请求流式 | `StartSerialLogicalReplication()` |
+| 并行 | decode worker | `pd_walsender_send()` 转发 worker 产出的帧 | `streaming='parallel'` | `StartParallelLogicalReplication()` |
+
+**分界点只有一个**——`StartLogicalReplication()` 在建解码上下文之前判一次：
+
+```c
+if (ParallelDecodeEnabled() &&
+    ParallelDecodeSubscriberAppliesInParallel(cmd->options))
+    StartParallelLogicalReplication(cmd);
+else
+    StartSerialLogicalReplication(cmd);
+```
+
+判完之后，两条路径各走各的函数，彼此不引用：
+
+- 串行路径的 `XLogSendLogical()` 里**没有**任何 `ParallelDecode*()` 调用；
+- 并行路径的代码集中在 `walsender.c` 的"并行解码路径"一节（`pd_walsender_send()` / `pd_walsender_write_frames()` / `pd_walsender_write_frame()` / `pd_walsender_idle()`），串行路径不调用其中任何一个；
+- 会话级资源（`ParallelDecodeSessionStart()` / `ParallelDecodeSessionStop()`）只出现在并行路径里，串行路径连它们的名字都不提；
+- 串行路径读 WAL（`XLogBeginRead()`），并行路径不读——WAL 由 walreader 读，worker 只拿到转发给它的记录。
+
+**共享的只有协议本身**：`PDPrepareWrite()` / `WalSndPrepareWrite()` / `WalSndWriteData()` 两条路径共用，因为帧头必须逐字节一致；`WalSndLoop()` 的循环体也是共用的，区别只在送进来的 `send_data` 函数是哪一个。循环体里"catch up 时要不要自己阻塞"这个判断由 `logical_sender` 参数显式给出，不再靠"送进来的函数是不是 `XLogSendLogical`"来猜——两条逻辑路径都在 `send_data` 里自己阻塞。
+
+**位置上报的钳制留在并行模块里**：`WalSndKeepalive()` 只调用 `ParallelDecodeReportPosition()`，由并行模块决定要不要把位置钳到放行前沿（不变式 S1，§7.4.1）；串行路径没有前沿，位置原样上报。
+
 ## 11. 接口说明
 
 ### 11.1 用户接口（新增 GUC）
@@ -2220,3 +2251,4 @@ P7 已落实其中的 1、2、3、5、6、7 条：worker 的错误在循环内�
 | v0.25 | 2026-11-20 | **分块传输的消息类型不再丢失：大消息不会再被当成另一种消息丢掉**。(1) **缺陷**：`PDChunkReceiverRecv()`（`parallel_decode_msg.c`）只在**传输开始**的那一次调用里把消息类型写给调用方的 `*type`；载荷超过队列条目（256KB）时被切成 64KB 的块来传，接收方要分多次调用才拼得齐，**完成传输的那次调用从不写 `*type`**。三个调用点（`ParallelDecodeNextFrame()`、`ParallelDecodeNextFrameNoWait()`、worker 侧的 `pd_worker_recv_record()`）用的都是每次调用新建的未初始化局部变量，于是完成的载荷带着残留的类型被处理：8MB 的流段（`PD_ENT_SEGMENT`）被当成 `PD_ENT_POSITION`，载荷被当成一个位置读掉，**整段数据静默丢失**——两侧都不报错，发布端 `sent_lsn` 与订阅端 `latest_end_lsn` 还一致；残留值落在范围外时则是 `unexpected message of type 0/3`，发布端会话直接崩。(2) **为什么是偶发的**：残留值来自上一次处理的消息类型。上一次是流段（14）时大消息恰好被正确处理，上一次是 position（12）时就丢——**待放行区积压**正好造出这个条件（积压期间 walsender 只处理 position，最后那个大流段才从队列里出来）。(3) **修法**：`PDChunkReceiver` 增加 `type` 字段，传输开始时记住类型，传输完成时写回 `*type`——传输的状态属于传输，不能放在调用方的局部变量里。(4) **验证**：`pending_area_smoke.sh` 连跑 14 次全过（修之前约 4 成概率丢那一行）；新增 `big_row_smoke.sh` 覆盖"一条变更大于一个队列条目"这件事本身（它抓不到这个 bug：前后都是流段，残留类型正好是对的）。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
 | v0.26 | 2026-11-20 | **快照构建器的"角色"不再由枚举字段承载，改由进程身份推导**。(1) **改动**：删掉 `SnapBuildRole` 枚举、`SnapBuild` 上的 `role` 字段和 `SnapBuildSetRole()`，改为两个**判断函数**——`AmDecodeWorkerProcess()` 与 `AmDecodeWalreaderProcess()`（`src/include/replication/parallel_decode.h` 里的 `static inline`）。判据是**框架分配的类型** `ParallelDecodeWorkerType`（`NONE` / `WALREADER` / `WORKER`）：walsender 在注册 bgworker 时把类型写进参数块 `ParallelDecodeWorkerArg`（连同一个 magic 数，用来把我们的块和别人的 bgworker 负载区分开），参数块随 `bgw_extra` 交给 worker 进程；判断函数再从本进程自己的 `MyBgworkerEntry->bgw_extra` 读回来。walsender 不是 bgworker（`MyBgworkerEntry` 为 NULL），别人的 bgworker 参数块没有 magic 数，两者都得到 `NONE`。这与 upstream 订阅端的 `am_parallel_apply_worker()`（`worker_internal.h`：类型由 launcher 分配到共享结构里，worker 进程只读不写）同构：**进程的身份是它启动方式的属性，不需要自己记住并宣布**，因此不存在"忘了设置"或"设错时机"，builder 也不可能与所属进程不一致。(2) **动机**：角色在本实现里是**进程级常量**——没有任何进程同时持有两种角色的 builder，因此把它存在 builder 对象里是冗余状态；更要紧的是枚举的默认值是"串行"，角色只能**事后补设**，任何一条忘了调用 `SnapBuildSetRole()` 的路径都会让 decode worker 静默按串行语义跑（自己建快照、自己推进快照状态机、自己跟踪目录变更提交），症状随机且极难定位。原先用于同一目的的布尔变量 `am_decode_worker`（v0.11 起用于 `reorderbuffer.c` 的分叉）也一并去掉。(3) **保留的约束**：判断函数等价于枚举的前提是"一个进程内不会出现两种角色的 builder"，这条约束写进了 `snapbuild.h` 的注释。(4) **改动面**：`snapbuild.c` 五个函数里的六个分叉点改为调用判断函数——`SnapBuildGetOrBuildSnapshot()`、`SnapBuildProcessChange()`、`SnapBuildCommitTxn()`、`SnapBuildProcessRunningXacts()`（两处：worker 侧的替身分支与 walreader 侧的跳过槽水位分支）、`SnapBuildDistributeSnapshotAndInval()`；另有 `SnapBuildSetSnapshot()` 里的断言从"角色是替身"改为"进程是 decode worker"；`reorderbuffer.c` 的两处改用 `AmDecodeWorkerProcess()`。两个 worker 的入口函数各加一条断言，检查框架分配的类型与自己该是的角色一致。行为不变。**本机功能与正确性验证**：编译干净；`doc/pa_decode/t/` 下全套冒烟脚本 **21/21 通过**（**非性能测试**） |
 | v0.27 | 2026-11-23 | **发布端的放行机制换成 design2 的 commit_sync 相位屏障：数据帧 settle 即放行（可跨事务乱序），结束事件按相位保序**。(1) **动机**：旧机制是"cseq 严格放行 + frontier 判门"两道闸门——事务 k 的结束事件必须等 k-1 的结束事件放行后才放行；无 cseq 的流式分片还要过 v0.23 的判门，等"在它之前就结束的事务"的结束事件（不变式 I-ORDER）。这套机制等价于 FIFO，达不到 design2 的目标（`design2.md:71-103`：不相交事务可以乱序下发，结束事件按相位保序）。(2) **实现**（只动发布端；**wire 格式不变**——一条变更一个 CopyData，标志在帧头内部，不新增消息类型）：**帧头加一个标志位**——`PDFrameHeader` 新增 `uint8 flags`，`PD_FRAME_MARKER` 表示"这一帧是 commit / abort / prepare 的报文"；worker 包住 `commit_cb` / `abort_cb` / `prepare_cb` / `commit_prepared_cb` / `rollback_prepared_cb`，置标志后调原回调，`pd_worker_write` 把标志写进帧头并发完即清（**段内的帧不带标志**——结束事件永远落在段外）。**walsender 把数据帧与标记帧分开**：标记帧收进按相位排序的表，数据帧（cseq == 0）一到就进就绪队列。**相位屏障**：`parallel_decode_marker_phase` 是下一个要下发的相位，相位 k 的标记帧在"它自己的数据已 settle（worker 报告解码完成）"且"相位 1..k-1 的标记帧都已下发"时才下发；**空事务没有结束事件，它的相位照样推进**，否则后面的标记永远等不到。**相位号沿用 cseq 的分配**（WAL 提交序），因此"相位 = 事务在屏障中的次序 = 提交序"。(3) **删除**：frontier 判门（`parallel_decode_frame_may_go` / `parallel_decode_release_held_frames` / `parallel_decode_hold_block`）与二叉堆 held 区、"分片越过了更早事务的提交"的 `WARNING`（乱序下发现在是预期行为，不再是异常）、GUC `parallel_decode_held_max_bytes`（held 区没有了）。**放行前沿 F 本身保留**——它仍是钳制帧 LSN 与 keepalive 的 end_lsn 的那个 F（不变式 S1），与"帧何时下发"无关。(4) **监控视图**：`cseq_allocated` / `cseq_released` 的**字段名保留，语义改为相位号**；`pg_parallel_decode_commit_lag` 报的因此是**结束事件的积压**，不是数据的积压（数据 settle 即走，不积压）。(5) **不变式 I-ORDER 不再成立**：位置为 q 的无 cseq 帧**可以**越过在 q 之前就结束的事务的结束事件。串行路径不变（它的输出顺序就是 WAL 记录的处理顺序）。**代价**：发布端用行锁串行化的一对事务，在订阅端可能变成并发 apply → 订阅端报出**发布端没有的 deadlock**。本次改动的安全前提是**订阅端单 stream 串行 apply**（`worker.c` 的单值 `stream_xid`，leader 等 PA worker 做完才读下一帧）；**该前提在某些路径上不成立时（leader 未等待、prepared 事务、两侧表结构不同导致锁序反转），删除判门就是一次正确性回归**——`stream_order_smoke.sh` 的"相交事务"场景专门覆盖它。(6) **验证**：新增三个冒烟——`disjoint_reorder_smoke.sh`（不相交事务乱序下发，行的内容与顺序基线一致）、`marker_order_smoke.sh`（数据乱序而结束事件严格按提交序到达订阅端）、`marker_tag_smoke.sh`（每个事务恰好一帧带 `PD_FRAME_MARKER`，且它紧邻该事务最后一条数据之后）；`stream_order_smoke.sh` 改写为"数据可越序 + 结束事件保序 + 相交事务不报 deadlock"。**本机只做功能与正确性验证，吞吐数字仍待性能环境实测回填** |
+| v0.28 | 2026-11-23 | **并行解码路径与串行解码路径在 `walsender.c` 里彻底分开：分界点只有一个，两条路径互不引用**。(1) **动机**：并行路径此前是**寄生在串行流程里**的——`StartLogicalReplication()` 在串行的建上下文、建会话、发 CopyBothResponse 的流程中间插一段 `if (pd_parallel)`；`XLogSendLogical()` 内部用 `if (ParallelDecodeActive())` 分叉，一半是串行一半是并行；`WalSndKeepalive()` 里也有 `if (ParallelDecodeActive())`；`WalSndLoop()` 靠“送进来的函数是不是 `XLogSendLogical`”来区分逻辑与物理会话。并行逻辑因此出现在串行代码的每一个关键点上，串行路径的行为要靠“并行会话没在跑”这个前提来保证。(2) **分界点**：`StartLogicalReplication()` 在建解码上下文之前判一次，然后整个会话交给 `StartSerialLogicalReplication()` 或 `StartParallelLogicalReplication()`，两者互不引用。**串行路径的 `XLogSendLogical()` 里不再有任何 `ParallelDecode*()` 调用**；会话级的 `ParallelDecodeSessionStart()` / `ParallelDecodeSessionStop()` 只出现在并行路径里；并行路径的代码集中在 `walsender.c` 的“并行解码路径”一节；串行路径读 WAL（`XLogBeginRead()`），并行路径不读（WAL 由 walreader 读）。(3) **发送函数也分开**：`pd_walsender_send()` 是并行路径的 `XLogSendLogical()` 对应物，两者各自调用共用的 `UpdateLogicalSendState()`；`WalSndLoop()` 新增 `logical_sender` 参数显式说明“catch up 时由 `send_data` 自己阻塞”，不再靠函数指针比较来猜——**这修掉了一个隐患**：并行路径此前送进循环的是 `XLogSendLogical`，循环因此按“逻辑会话”处理；分开之后若仍按函数指针比较，并行会话会被当成物理会话，在 catch up 后于循环里阻塞而不是在 `send_data` 里等 worker 的帧。(4) **钳制留在并行模块里**：`WalSndKeepalive()` 改为调用 `ParallelDecodeReportPosition()`，由并行模块决定要不要把位置钳到放行前沿（不变式 S1）；串行路径没有前沿，位置原样上报。(5) **共享的部分只有协议本身**：`PDPrepareWrite()` / `WalSndPrepareWrite()` / `WalSndWriteData()` 两条路径共用——帧头必须逐字节一致。(6) **验证**：本机只做功能与正确性验证（**不做吞吐测试**），全部冒烟通过（含串行路径的 `repl_smoke.sh` / `copy_data_smoke.sh` / `stream_all_txn_smoke.sh` 与并行路径的其余用例）；**吞吐数字仍待性能环境实测回填** |

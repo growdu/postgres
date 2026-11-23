@@ -1113,6 +1113,16 @@ extern XLogRecPtr ParallelDecodeWalreaderPosition(void);
 extern XLogRecPtr ParallelDecodeFrontier(void);
 
 /*
+ * The position the session reports to the subscriber.
+ *
+ * The subscriber folds the position of the keepalive frames into its flush
+ * position, just like the position of a data frame, so the position of the
+ * parallel path is limited to the release frontier.  The serial path has no
+ * frontier, and its position is reported as it is.
+ */
+extern XLogRecPtr ParallelDecodeReportPosition(XLogRecPtr lsn);
+
+/*
  * Limit a position to the release frontier.
  *
  * This is used for the position of the keepalive frames, which the subscriber

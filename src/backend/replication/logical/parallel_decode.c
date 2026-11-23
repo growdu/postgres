@@ -1368,6 +1368,28 @@ ParallelDecodeFrontier(void)
 }
 
 /*
+ * The position the session reports to the subscriber.
+ *
+ * The parallel decoding path sends the frames of a transaction before the
+ * transaction is complete, so the position of the session can be ahead of the
+ * transactions that have not been delivered yet.  The position is therefore
+ * limited to the release frontier, so that the subscriber does not skip them.
+ *
+ * The serial decoding path has no frontier: the position it reports is the
+ * position it has sent, and this function returns it unchanged.  The decision
+ * belongs here, so that the walsender does not have to know which path it
+ * runs.
+ */
+XLogRecPtr
+ParallelDecodeReportPosition(XLogRecPtr lsn)
+{
+	if (!ParallelDecodeActive())
+		return lsn;
+
+	return ParallelDecodeClampLSN(lsn);
+}
+
+/*
  * Limit a position to the release frontier.
  */
 XLogRecPtr

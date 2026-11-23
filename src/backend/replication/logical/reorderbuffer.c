@@ -101,7 +101,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/logical.h"
-#include "replication/parallel_decode.h"
+#include "replication/parallel_decode.h"	/* for AmDecodeWorkerProcess() */
 #include "replication/reorderbuffer.h"
 #include "replication/slot.h"
 #include "replication/snapbuild.h"	/* just for SnapBuildSnapDecRefcount */
