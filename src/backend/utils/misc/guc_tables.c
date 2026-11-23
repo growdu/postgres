@@ -3059,41 +3059,22 @@ struct config_int ConfigureNamesInt[] =
 
 	{
 		{"parallel_decode_pending_max_bytes", PGC_SIGHUP, REPLICATION_SENDING,
-			gettext_noop("Sets the number of bytes the frames of the transactions "
-						 "that wait for their turn may take before the publisher "
-						 "warns about it."),
+			gettext_noop("Sets the number of bytes the frames that the publisher "
+						 "holds may take before the publisher warns about it."),
 			gettext_noop("The publisher holds the frames of a transaction back "
-						 "until the transaction has its turn, so that the "
-						 "transactions reach the subscriber in the order they "
-						 "were committed in.  A transaction that takes long to "
-						 "decode holds the queue back, and then the frames of "
-						 "all the transactions that end in the meantime pile up "
-						 "in the memory of the publisher.  The publisher warns "
-						 "when that happens; the session keeps running.  Zero "
-						 "turns the warning off.  The change takes effect as soon "
-						 "as the configuration is reloaded.")
+						 "until the worker has decoded the transaction.  The "
+						 "data of the transaction is then sent to the "
+						 "subscriber as soon as it is decoded, and only its "
+						 "end event waits for its turn in the commit_sync "
+						 "barrier.  A transaction that takes long to decode "
+						 "holds the queue back, and then the frames of all the "
+						 "transactions that end in the meantime pile up in the "
+						 "memory of the publisher.  The publisher warns when "
+						 "that happens; the session keeps running.  Zero turns "
+						 "the warning off.  The change takes effect as soon as "
+						 "the configuration is reloaded.")
 		},
 		&parallel_decode_pending_max_bytes,
-		64 * 1024 * 1024, 0, INT_MAX,
-		NULL, NULL, NULL
-	},
-
-	{
-		{"parallel_decode_held_max_bytes", PGC_SIGHUP, REPLICATION_SENDING,
-			gettext_noop("Sets the number of bytes the stream segments that wait "
-						 "for the release frontier may take before the publisher "
-						 "warns about it."),
-			gettext_noop("A stream segment has no commit sequence number, so it "
-						 "waits for the transactions that ended before it.  The "
-						 "segments that wait take the memory of the publisher, and "
-						 "the publisher warns when they take more than this "
-						 "limit; the session keeps running.  The segments are "
-						 "never dropped, because the subscriber would end up with "
-						 "incomplete data.  Zero turns the warning off.  The "
-						 "change takes effect as soon as the configuration is "
-						 "reloaded.")
-		},
-		&parallel_decode_held_max_bytes,
 		64 * 1024 * 1024, 0, INT_MAX,
 		NULL, NULL, NULL
 	},

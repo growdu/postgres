@@ -174,6 +174,36 @@ PDTraceWrite(const char *data, size_t len)
 }
 
 /*
+ * Record the release of a phase of the commit_sync barrier.
+ *
+ * The record tells what the barrier did with the phase: the phase number of
+ * the transaction, whether the phase had an end event frame, and how many
+ * frames and bytes it held.
+ */
+void
+PDTraceWritePhase(uint64 cseq, uint32 flags, uint32 nframes, uint32 nbytes)
+{
+	uint8		buf[18];
+	uint32		net;
+
+	if (pd_trace_fd < 0 || pd_trace_broken)
+		return;
+
+	buf[0] = 'p';
+	net = pd_trace_be32((uint32) (cseq >> 32));
+	memcpy(buf + 1, &net, sizeof(net));
+	net = pd_trace_be32((uint32) (cseq & 0xFFFFFFFF));
+	memcpy(buf + 5, &net, sizeof(net));
+	buf[9] = (uint8) flags;
+	net = pd_trace_be32(nframes);
+	memcpy(buf + 10, &net, sizeof(net));
+	net = pd_trace_be32(nbytes);
+	memcpy(buf + 14, &net, sizeof(net));
+
+	PDTraceWrite((const char *) buf, sizeof(buf));
+}
+
+/*
  * Close the trace file.
  */
 void

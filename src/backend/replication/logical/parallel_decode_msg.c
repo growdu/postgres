@@ -677,18 +677,21 @@ PDQueueSendUnbatched(PDQueueSender *sender, uint16 type,
  * Send a replication frame to the walsender.
  *
  * The frame is preceded by a PDFrameHeader, which tells the walsender how far
- * the decoding has come and which transaction the frame belongs to.  A frame
- * can be larger than one queue entry, so the transfer is chunked.
+ * the decoding has come and which transaction the frame belongs to.  The flags
+ * tell the walsender whether the frame carries the end event of the
+ * transaction.  A frame can be larger than one queue entry, so the transfer is
+ * chunked.
  */
 void
 PDQueueSendFrame(PDQueueSender *sender, uint64 end_lsn, uint64 cseq,
-				 const char *frame, size_t len)
+				 uint8 flags, const char *frame, size_t len)
 {
 	PDFrameHeader fh;
 
 	fh.end_lsn = end_lsn;
 	fh.cseq = cseq;
 	fh.length = (uint32) len;
+	fh.flags = flags;
 
 	pd_queue_send_batched(sender, PD_ENT_FRAME, &fh, sizeof(fh), frame, len);
 }

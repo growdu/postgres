@@ -1070,6 +1070,20 @@ CREATE VIEW pg_parallel_decode_workers AS
         JOIN pg_stat_get_activity(NULL) AS S ON (S.pid = W.pid)
         LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
 
+--
+-- pg_parallel_decode_commit_lag
+--
+-- cseq_allocated and cseq_released are phase numbers.  A phase is the place
+-- of a transaction in the commit_sync barrier: the phases are the transactions
+-- that the walreader numbered, and the numbers follow the order in which the
+-- transactions were committed.  A phase is released when the end event of its
+-- transaction has been sent, so commit_lag is the number of the transactions
+-- that have ended but whose end event has not been sent yet.
+--
+-- The data of a transaction is not held back by the barrier: it is sent as
+-- soon as the worker that owns the transaction has produced it.  The backlog
+-- is therefore the backlog of the end events, not the backlog of the data.
+--
 CREATE VIEW pg_parallel_decode_commit_lag AS
     SELECT
             S.pid,

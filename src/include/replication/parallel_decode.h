@@ -46,7 +46,6 @@ extern PGDLLIMPORT int	parallel_decode_stream_segment_changes;
 extern PGDLLIMPORT int	parallel_decode_batch_size;
 extern PGDLLIMPORT int	parallel_decode_barrier_timeout;
 extern PGDLLIMPORT int	parallel_decode_pending_max_bytes;
-extern PGDLLIMPORT int	parallel_decode_held_max_bytes;
 extern PGDLLIMPORT int	parallel_decode_fault_inject;
 extern PGDLLIMPORT char *parallel_decode_trace_file;
 
@@ -103,13 +102,30 @@ extern bool ParallelDecodeSubscriberAppliesInParallel(List *plugin_options);
  *
  * File format: a sequence of records, each one a 4 byte big endian length
  * followed by that many bytes of payload.  A payload whose first byte is zero
- * is a session marker (the remaining eight bytes hold the session id); every
- * other payload is one replication frame, i.e. the payload of a CopyData
- * message, which starts with the frame type ('w', 'k', 'r' or 'c').
+ * is a session marker (the remaining eight bytes hold the session id); a
+ * payload whose first byte is 'p' is a phase record (see below); every other
+ * payload is one replication frame, i.e. the payload of a CopyData message,
+ * which starts with the frame type ('w', 'k', 'r' or 'c').
+ *
+ * A phase record tells what the commit_sync barrier did with a phase: it is
+ * written when the phase is let pass.  The payload is
+ *
+ *	'p'			the type of the record
+ *	cseq		8 bytes, the phase number of the transaction
+ *	flags		1 byte, PD_PHASE_HAS_MARKER if the phase had an end event
+ *	nframes		4 bytes, the number of the frames of the phase
+ *	nbytes		4 bytes, the number of the bytes of the phase
  */
 extern void PDTraceInit(void);
 extern void PDTraceWrite(const char *data, size_t len);
+extern void PDTraceWritePhase(uint64 cseq, uint32 flags, uint32 nframes,
+							   uint32 nbytes);
 extern void PDTraceShutdown(void);
+
+/*
+ * The flags of a phase record.
+ */
+#define PD_PHASE_HAS_MARKER	0x01	/* the phase had an end event frame */
 
 /*
  * Lifecycle, called from the walsender that owns the replication slot.
@@ -258,6 +274,7 @@ typedef struct ParallelDecodeControl
 	 * serialized form of PD_MAX_PLUGIN_OPTIONS bytes.
 	 */
 	char		slot_name[NAMEDATALEN];
+
 	Oid			database;
 	bool		two_phase;
 	XLogRecPtr	two_phase_at;
@@ -285,10 +302,23 @@ typedef struct ParallelDecodeControl
 	 * of the worker slots, every one of them has exactly one writer:
 	 * cseq_allocated and walreader_wakeups are written by the walreader,
 	 * cseq_released by the walsender.
+	 *
+	 * The two numbers are phase numbers.  A phase is the place of a
+	 * transaction in the commit_sync barrier: the phases are the transactions
+	 * that the walreader numbered, and the numbers follow the order in which
+	 * the transactions were committed.  The phase of a transaction is released
+	 * when its end event has been sent, so the difference between the two
+	 * numbers is the number of the transactions that have ended but whose end
+	 * event has not been sent yet.
+	 *
+	 * The data of a transaction is not held back by the barrier: it is sent as
+	 * soon as the worker that owns the transaction has produced it.  The
+	 * backlog is therefore the backlog of the end events, not the backlog of
+	 * the data.
 	 */
-	volatile uint64 cseq_allocated;		/* the highest commit sequence number
+	volatile uint64 cseq_allocated;		/* the highest phase number
 										 * the walreader has handed out */
-	volatile uint64 cseq_released;		/* the highest commit sequence number
+	volatile uint64 cseq_released;		/* the highest phase number
 										 * the walsender has released */
 	volatile uint64 walreader_wakeups;	/* signals the walreader sent to the
 										 * workers and over the control
@@ -708,13 +738,30 @@ typedef struct PDWatermark
  * transaction back until the commit sequence number of the transaction has
  * its turn, so that the transactions are applied in the order they were
  * committed in.
+ *
+ * flags tells the walsender what kind of frame this is.  A frame that is
+ * tagged with PD_FRAME_MARKER carries the end event of a transaction: the
+ * commit, the abort or the prepare.  The walsender sends the end events in
+ * the order of their phases, which is the order the transactions were
+ * committed in.
  */
 typedef struct PDFrameHeader
 {
 	uint64		end_lsn;			/* decoding position after the record */
 	uint64		cseq;				/* commit sequence number of the transaction */
 	uint32		length;			/* length of the frame that follows */
+	uint8		flags;			/* PD_FRAME_* */
 } PDFrameHeader;
+
+/*
+ * The frame carries the end event of a transaction.
+ *
+ * The end event of a transaction is the frame that tells the subscriber that
+ * the transaction is over: the commit, the abort or the prepare.  The frame is
+ * tagged with the flag, so that the walsender can tell the end events of the
+ * transactions apart from the frames that carry the changes of a transaction.
+ */
+#define PD_FRAME_MARKER			0x01
 
 /*
  * The header of a frame that carries the definition of a relation.
@@ -904,9 +951,12 @@ extern void PDQueueSenderFlush(PDQueueSender *sender);
  *
  * cseq is the commit sequence number of the transaction the frame belongs to.
  * It is zero for the frames that are not part of a transaction.
+ *
+ * flags tells the walsender whether the frame carries the end event of the
+ * transaction, see PD_FRAME_MARKER.
  */
 extern void PDQueueSendFrame(PDQueueSender *sender, uint64 end_lsn, uint64 cseq,
-							  const char *frame, size_t len);
+							  uint8 flags, const char *frame, size_t len);
 
 /*
  * Send a frame that carries the definition of a relation to the walsender.

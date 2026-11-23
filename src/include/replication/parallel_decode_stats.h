@@ -63,9 +63,9 @@ typedef struct ParallelDecodeStats
 	TimestampTz start_time;
 
 	/*
-	 * The commit sequence numbers.  The difference between them is the
-	 * backlog of the ordering: the number of transactions that have ended but
-	 * have not been released to the subscriber yet.
+	 * The phase numbers of the commit_sync barrier.  The difference between
+	 * them is the backlog of the ordering: the number of transactions that
+	 * have ended but whose end event has not been sent to the subscriber yet.
 	 */
 	uint64		cseq_allocated;
 	uint64		cseq_released;

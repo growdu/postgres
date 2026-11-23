@@ -23,7 +23,6 @@
 
 #include "access/xlogdefs.h"
 #include "catalog/pg_subscription.h"
-#include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
@@ -53,7 +52,6 @@ int			parallel_decode_stream_segment_changes = 8;
 int			parallel_decode_batch_size = 64 * 1024;
 int			parallel_decode_barrier_timeout = 60;	/* seconds, 0 disables it */
 int			parallel_decode_pending_max_bytes = 64 * 1024 * 1024;	/* 0 disables the warning */
-int			parallel_decode_held_max_bytes = 64 * 1024 * 1024;	/* 0 disables the warning */
 int			parallel_decode_fault_inject = PD_FAULT_NONE;
 
 /* Session state, only touched by the walsender. */
@@ -127,22 +125,51 @@ typedef struct PDQueuedBlock
 /*
  * The frames of a transaction that are waiting for their turn.
  *
- * The frames of a transaction are held back until the transaction has its
- * turn, so that the transactions reach the subscriber in the order they were
- * committed in.  The turn comes when the worker that owns the transaction has
- * reported that it has decoded it: the report is sent after the frames of the
- * transaction, so the transaction is complete when it arrives.
+ * The frames of a transaction are held back until the worker that owns the
+ * transaction has reported that it has decoded it: the report is sent after
+ * the frames of the transaction, so the transaction is complete when it
+ * arrives.  The data of the transaction is then free to go, and the end event
+ * of the transaction waits for its phase.
+ *
+ * The phase of a transaction is its place in the commit_sync barrier: the
+ * phases are the end events of the transactions, and they are released in the
+ * order the transactions were committed in.
+ *
+ * The end event of the transaction is the frame that carries it: the commit,
+ * the abort or the prepare.  It is kept apart from the other frames, because
+ * it is the frame that the barrier orders.  A transaction that has no end
+ * event frame has no marker: an empty transaction and a transaction that was
+ * aborted without a message produce no frame at all.
  */
 typedef struct PDPendingTxn
 {
 	uint64		cseq;			/* the commit sequence number of the transaction */
 	List	   *frames;			/* the frames, in the order they were produced */
+	PDQueuedBlock *marker;		/* the frame that carries the end event of the
+								 * transaction, or NULL */
 	bool		acked;			/* the worker has reported the end of the transaction */
 	TimestampTz alloc_time;	/* when the walreader reported the transaction */
 	TimestampTz ack_time;		/* when the worker reported it decoded */
 	XLogRecPtr	end_lsn;		/* the start of the record that ended the
 								 * transaction */
+	uint32		nframes;		/* the number of the frames of the transaction that
+								 * have been let through */
+	uint32		nbytes;			/* the number of the bytes of the transaction that
+								 * have been let through */
 } PDPendingTxn;
+
+/*
+ * The end event of a transaction that waits for its phase.
+ *
+ * The end events are the markers of the commit_sync barrier.  They are sent in
+ * the order of their phases, and a phase is the place of the transaction in the
+ * order in which the transactions were committed.
+ */
+typedef struct PDMarker
+{
+	uint64		cseq;			/* the phase of the end event */
+	PDQueuedBlock *marker;	/* the frame that carries the end event */
+} PDMarker;
 
 /*
  * The transactions whose frames are waiting for their turn, keyed by their
@@ -154,11 +181,11 @@ static HTAB *parallel_decode_pending = NULL;
  * The number of bytes the frames of the session take in the memory of the
  * walsender.
  *
- * The frames of a transaction are held back until the transaction has its
- * turn.  A transaction that takes long to decode therefore holds the queue
- * back, and the frames of all the transactions that end in the meantime pile
- * up in the memory of the walsender.  The counter is what the warning about
- * that is based on.
+ * The frames of a transaction wait for their turn until the transaction has
+ * been decoded, and the stream segments wait for the socket.  A transaction
+ * that takes long to decode therefore holds the queue back, and the frames of
+ * all the transactions that end in the meantime pile up in the memory of the
+ * walsender.  The counter is what the warning about that is based on.
  */
 static int64 parallel_decode_pending_bytes = 0;
 
@@ -168,24 +195,6 @@ static int64 parallel_decode_pending_bytes = 0;
  * shrunk below the limit.
  */
 static bool parallel_decode_pending_warned = false;
-
-/*
- * The bytes of the frames that wait for the release frontier.
- *
- * The frames that have no commit sequence number wait until the transactions
- * that ended before them have been sent.  They take the memory of the walsender
- * while they wait, and the counter is what the warning about that is based on.
- * The frames are never dropped: the subscriber would end up with incomplete
- * data.
- */
-static int64 parallel_decode_held_bytes = 0;
-
-/*
- * Whether the warning about the size of the held area has been given for the
- * current episode.  The warning is given again once the held area has shrunk
- * below the limit.
- */
-static bool parallel_decode_held_warned = false;
 
 /*
  * The relations whose definition the session has sent to the subscriber.
@@ -208,40 +217,33 @@ static bool parallel_decode_held_warned = false;
 static HTAB *parallel_decode_sent_relations = NULL;
 
 /*
- * The commit sequence number of the transaction whose frames may be sent next.
+ * The phase of the commit_sync barrier: the phase whose end event may be sent
+ * next.
+ *
+ * The phases are the transactions that the walreader numbered, and the numbers
+ * follow the order in which the transactions were committed.  A phase is done
+ * when the data of its transaction has been let through and its end event has
+ * been sent.  The end events of the phases that follow may not overtake it, so
+ * the subscriber learns that the transactions are over in the order in which
+ * they were committed.
+ *
+ * The data of a transaction does not wait for its phase: it is sent as soon as
+ * the worker that owns the transaction has produced it.  That is what lets the
+ * subscriber apply the transactions at the same time.
  */
-static uint64 parallel_decode_next_cseq = 1;
+static uint64 parallel_decode_marker_phase = 1;
+
+/*
+ * The end events that wait for their phase.
+ *
+ * The list is ordered by the phase of the end events.
+ */
+static List *parallel_decode_markers = NIL;
 
 /*
  * The blocks that may be sent, in the order they have to be sent.
  */
 static List *parallel_decode_ready = NIL;
-
-/*
- * The blocks that have no commit sequence number and wait for their turn.
- *
- * The frames of a stream segment and the frames of a subtransaction abort
- * belong to a transaction that has not ended yet, so they have no commit
- * sequence number to order them by.  They still have to reach the subscriber
- * in the order of the positions they were produced at: a frame that comes
- * later in the WAL may not be applied before a frame that comes earlier.
- *
- * The blocks are kept in a heap that is ordered by their position, so that the
- * blocks leave it in the order of their positions.  A heap is used rather
- * than a sorted list because the blocks are inserted one at a time: sorting
- * the whole collection again for every block would make the cost of the
- * insertions grow with the number of the blocks that wait.
- */
-static binaryheap *parallel_decode_held = NULL;
-
-/*
- * The number that tells the blocks of the held heap apart.
- *
- * Two blocks can have the same position: the frames of one segment do, for
- * example.  The number is the second key of the order of the held heap, so
- * that the blocks that were produced earlier leave it earlier.
- */
-static uint64 parallel_decode_frame_seq = 0;
 
 /*
  * The block whose frames are being handed out.
@@ -258,18 +260,6 @@ static uint32		parallel_decode_cur_index = 0;
 
 /* The offset of the next frame of the current block in its buffer. */
 static size_t		parallel_decode_cur_off = 0;
-
-/*
- * The largest position of the frames that have no commit sequence number and
- * have been sent.
- *
- * The frames that have no commit sequence number may not overtake the end
- * event of a transaction that ended before them: the subscriber applies the
- * transactions at the same time, and two transactions that the publisher
- * serialized with row locks must not be applied at the same time.  The counter
- * is what the check of that rule is based on.
- */
-static XLogRecPtr parallel_decode_sent_stream_max = InvalidXLogRecPtr;
 
 /*
  * The transactions that have been given a commit sequence number, with the
@@ -307,10 +297,26 @@ static instr_time parallel_decode_worker_progress[MAX_PARALLEL_DECODE_WORKERS];
 /*
  * Read the messages the walreader has sent on the control channel.
  *
- * The declaration is here because the frames that have no commit sequence
- * number need the release frontier, which is computed from those messages.
+ * The declaration is here because the release frontier is computed from those
+ * messages.
  */
 static void parallel_decode_drain_control(void);
+
+/*
+ * Let the data of a transaction that has settled pass.
+ *
+ * The declaration is here because the report of the worker lets the data of
+ * the transaction go.
+ */
+static void parallel_decode_release_data(PDPendingTxn *pending);
+
+/*
+ * Compare two end events by their phase.
+ *
+ * The declaration is here because the end events are kept in the order of
+ * their phases.
+ */
+static int parallel_decode_marker_cmp(const ListCell *a, const ListCell *b);
 
 /*
  * Take the frames that are on their way off the output queues.
@@ -622,7 +628,7 @@ ParallelDecodeWalreaderPosition(void)
 }
 
 /*
- * Account for the bytes of a frame that waits for its turn.
+ * Account for the bytes of a frame that the walsender holds.
  *
  * The frames take the memory of the walsender until they have been sent.
  * Warn when they take more than the limit: the session keeps working, but the
@@ -642,13 +648,15 @@ parallel_decode_account_pending_bytes(size_t len)
 
 			ereport(WARNING,
 					(errmsg("the parallel decoding session holds %lld bytes of "
-							"frames that wait for their turn",
+							"frames that wait to be sent",
 							(long long) parallel_decode_pending_bytes),
-					 errdetail("The frames of a transaction are held back until "
-							   "the transaction has its turn, so that the "
-							   "transactions reach the subscriber in the order "
-							   "they were committed in.  A transaction that takes "
-							   "long to decode holds the queue back."),
+					 errdetail("The frames of a transaction wait for their turn "
+							   "until the transaction has been decoded, and the "
+							   "stream segments wait for the socket.  A "
+							   "transaction that takes long to decode holds the "
+							   "queue back, and then the frames of all the "
+							   "transactions that end in the meantime pile up "
+							   "in the memory of the publisher."),
 					 errhint("The limit is parallel_decode_pending_max_bytes. "
 							 "The warning is given once until the pending area "
 							 "shrinks below the limit.")));
@@ -659,83 +667,58 @@ parallel_decode_account_pending_bytes(size_t len)
 }
 
 /*
- * Account for the bytes of a frame that waits for the release frontier.
- *
- * The frames take the memory of the walsender until the frontier has moved
- * past them.  Warn when they take more than the limit: the session keeps
- * working, but the memory it uses is worth knowing about.
- */
-static void
-parallel_decode_account_held_bytes(size_t len)
-{
-	parallel_decode_held_bytes += len;
-
-	if (parallel_decode_held_max_bytes > 0 &&
-		parallel_decode_held_bytes > parallel_decode_held_max_bytes)
-	{
-		if (!parallel_decode_held_warned)
-		{
-			parallel_decode_held_warned = true;
-
-			ereport(WARNING,
-					(errmsg("the parallel decoding session holds %lld bytes of "
-							"stream segments that wait for their turn",
-							(long long) parallel_decode_held_bytes),
-					 errdetail("A stream segment has no commit sequence number, "
-							   "so it waits for the transactions that ended "
-							   "before it.  The segments are never dropped, "
-							   "because the subscriber would end up with "
-							   "incomplete data."),
-					 errhint("The limit is parallel_decode_held_max_bytes. "
-							 "The warning is given once until the held area "
-							 "shrinks below the limit.")));
-		}
-	}
-	else if (parallel_decode_held_warned)
-		parallel_decode_held_warned = false;
-}
-
-/*
- * Give the bytes of a frame back that waited for the release frontier.
- */
-static void
-parallel_decode_release_held_bytes(size_t len)
-{
-	parallel_decode_held_bytes -= len;
-
-	if (parallel_decode_held_bytes < 0)
-		parallel_decode_held_bytes = 0;
-}
-
-/*
  * Remember a frame of a transaction that is waiting for its turn.
  *
  * relid is the relation the frame defines, or InvalidOid when the frame does
  * not carry the definition of a relation.
  *
+ * marker tells whether the frame carries the end event of the transaction: the
+ * commit, the abort or the prepare.  The end event is the frame that the
+ * commit_sync barrier orders, so it is kept apart from the other frames of
+ * the transaction.
+ *
  * The frame takes over the buffer of the message it arrived in: data points
  * into raw, and raw is the allocation that is freed when the block is.
  */
+/*
+ * Find the entry of a transaction, and fill it in when it is new.
+ *
+ * The entry is the record of the transaction that the walreader reported, that
+ * the worker reported and that the frames of the transaction arrived in.
+ */
+static PDPendingTxn *
+parallel_decode_pending_entry(uint64 cseq, bool *found)
+{
+	PDPendingTxn *pending;
+
+	pending = (PDPendingTxn *) hash_search(parallel_decode_pending, &cseq,
+										   HASH_ENTER, found);
+	if (!*found)
+	{
+		pending->cseq = cseq;
+		pending->frames = NIL;
+		pending->marker = NULL;
+		pending->acked = false;
+		pending->alloc_time = 0;
+		pending->ack_time = 0;
+		pending->end_lsn = InvalidXLogRecPtr;
+		pending->nframes = 0;
+		pending->nbytes = 0;
+	}
+
+	return pending;
+}
+
 static void
 parallel_decode_add_pending_frame(uint64 cseq, char *data, size_t len,
 								   char *raw, XLogRecPtr end_lsn, Oid relid,
-								   uint64 epoch)
+								   uint64 epoch, bool marker)
 {
 	PDPendingTxn *pending;
 	PDQueuedBlock *block;
 	bool		found;
 
-	pending = (PDPendingTxn *) hash_search(parallel_decode_pending, &cseq,
-										   HASH_ENTER, &found);
-	if (!found)
-	{
-		pending->cseq = cseq;
-		pending->frames = NIL;
-		pending->acked = false;
-		pending->alloc_time = 0;
-		pending->ack_time = 0;
-		pending->end_lsn = InvalidXLogRecPtr;
-	}
+	pending = parallel_decode_pending_entry(cseq, &found);
 
 	/*
 	 * The frames of a transaction are sent before the report that the
@@ -769,7 +752,23 @@ parallel_decode_add_pending_frame(uint64 cseq, char *data, size_t len,
 	block->counted = true;
 	block->seq = 0;
 
-	pending->frames = lappend(pending->frames, block);
+	/*
+	 * A transaction has one end event, so a second marker means that the
+	 * participants of the session disagree.
+	 */
+	if (marker)
+	{
+		if (pending->marker != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("parallel decode transaction %llu has more than one "
+							"end event",
+							(unsigned long long) cseq)));
+
+		pending->marker = block;
+	}
+	else
+		pending->frames = lappend(pending->frames, block);
 
 	/*
 	 * The frames take the memory of the walsender until they have been sent.
@@ -790,20 +789,34 @@ parallel_decode_ack_txn(uint64 cseq)
 	PDPendingTxn *pending;
 	bool		found;
 
-	pending = (PDPendingTxn *) hash_search(parallel_decode_pending, &cseq,
-										   HASH_ENTER, &found);
-	if (!found)
-	{
-		pending->cseq = cseq;
-		pending->frames = NIL;
-		pending->acked = false;
-		pending->alloc_time = 0;
-		pending->ack_time = 0;
-		pending->end_lsn = InvalidXLogRecPtr;
-	}
+	pending = parallel_decode_pending_entry(cseq, &found);
 
 	pending->acked = true;
 	pending->ack_time = GetCurrentTimestamp();
+
+	/*
+	 * The transaction is complete, so its data may go.  The data of a
+	 * transaction does not wait for the end events of the older transactions:
+	 * the subscriber applies the transactions at the same time, and that is
+	 * what lets it use more than one apply worker.
+	 */
+	parallel_decode_release_data(pending);
+
+	/*
+	 * The end event of the transaction is the marker of the commit_sync
+	 * barrier.  It waits for its phase.
+	 */
+	if (pending->marker != NULL)
+	{
+		PDMarker *marker = palloc(sizeof(PDMarker));
+
+		marker->cseq = cseq;
+		marker->marker = pending->marker;
+		pending->marker = NULL;
+
+		parallel_decode_markers = lappend(parallel_decode_markers, marker);
+		list_sort(parallel_decode_markers, parallel_decode_marker_cmp);
+	}
 }
 
 /*
@@ -865,188 +878,227 @@ parallel_decode_relation_sent(PDQueuedBlock *block)
 }
 
 /*
- * Order the blocks of the held heap by their position.
- *
- * The blocks that come first in the WAL have to leave the heap first, so that
- * the subscriber applies them in the order the publisher serialized them.  The
- * number of the block is the second key of the order, so that the blocks that
- * were produced earlier leave the heap earlier.
- *
- * The heap of the library keeps the largest element at the top, so the
- * comparison is reversed: the block that comes first has to be at the top.
+ * Compare two end events by their phase.
  */
 static int
-parallel_decode_block_pos_cmp(Datum a, Datum b, void *arg)
+parallel_decode_marker_cmp(const ListCell *a, const ListCell *b)
 {
-	const PDQueuedBlock *ba = (const PDQueuedBlock *) DatumGetPointer(a);
-	const PDQueuedBlock *bb = (const PDQueuedBlock *) DatumGetPointer(b);
+	const PDMarker *ma = (const PDMarker *) lfirst(a);
+	const PDMarker *mb = (const PDMarker *) lfirst(b);
 
-	(void) arg;
-
-	if (ba->end_lsn < bb->end_lsn)
-		return 1;
-	if (ba->end_lsn > bb->end_lsn)
+	if (ma->cseq < mb->cseq)
 		return -1;
-	if (ba->seq < bb->seq)
+	if (ma->cseq > mb->cseq)
 		return 1;
-	if (ba->seq > bb->seq)
-		return -1;
 
 	return 0;
 }
 
 /*
- * The number of blocks the heap of the held blocks starts with.
+ * Let the data of a transaction that has settled pass.
  *
- * The heap grows when it is full, so this is only the size it starts with.
- */
-#define PD_HELD_HEAP_INITIAL	64
-
-/*
- * Add a block to the heap of the blocks that wait for their turn.
+ * The data of a transaction does not wait for the end events of the older
+ * transactions: the subscriber applies the transactions at the same time, and
+ * that is what lets it use more than one apply worker.  Only the end events are
+ * ordered, and they are ordered by the commit_sync barrier.
  *
- * The blocks are inserted one at a time and their number is not known in
- * advance, so the heap has to grow when it is full.  Growing it is done by
- * building a new heap that holds twice as many blocks.
+ * The end event of the transaction is not part of the data: it is the marker of
+ * the barrier, and it waits for its phase.
+ *
+ * The data of a transaction that was streamed is not here either: it is in the
+ * stream segments, and those have been sent already.  The data of a
+ * transaction that was not streamed is here, and it is sent before the end
+ * event of the transaction: the subscriber applies the frames of a transaction
+ * to the transaction that they belong to.
  */
 static void
-parallel_decode_held_add(PDQueuedBlock *block)
+parallel_decode_release_data(PDPendingTxn *pending)
 {
-	if (parallel_decode_held->bh_size >= parallel_decode_held->bh_space)
+	ListCell   *lc;
+	uint32		nframes = 0;
+	uint32		nbytes = 0;
+
+	foreach(lc, pending->frames)
 	{
-		binaryheap *old = parallel_decode_held;
-		binaryheap *grown;
-		int			i;
+		PDQueuedBlock *block = (PDQueuedBlock *) lfirst(lc);
 
-		grown = binaryheap_allocate(old->bh_space * 2, old->bh_compare,
-									 old->bh_arg);
-		for (i = 0; i < old->bh_size; i++)
-			binaryheap_add_unordered(grown, binaryheap_get_node(old, i));
-		binaryheap_build(grown);
-		binaryheap_free(old);
+		/*
+		 * The definition of a relation is sent to the subscriber once.  The
+		 * transactions reach the subscriber in the order of their phases, so the
+		 * definition that the transaction with the smallest phase number
+		 * produces is the one that has to be sent: the subscriber sees it before
+		 * the changes of the transactions that follow it.
+		 */
+		if (block->relid != InvalidOid &&
+			parallel_decode_relation_sent(block))
+		{
+			/*
+			 * The definition is not needed, so the block is dropped.  Its memory
+			 * belongs to the pending area, so it has to be given back to it.
+			 */
+			parallel_decode_pending_bytes -= block->len;
+			pfree(block->raw);
+			pfree(block);
+			continue;
+		}
 
-		parallel_decode_held = grown;
+		parallel_decode_ready = lappend(parallel_decode_ready, block);
+		nframes++;
+		nbytes += block->len;
 	}
 
-	binaryheap_add(parallel_decode_held, PointerGetDatum(block));
+	list_free(pending->frames);
+	pending->frames = NIL;
+
+	pending->nframes += nframes;
+	pending->nbytes += nbytes;
 }
 
 /*
- * Decide whether a frame that has no commit sequence number may be sent.
- *
- * The frame belongs to a transaction that has not ended yet, so it has no
- * commit sequence number to order it by.  It may not overtake the end event
- * of a transaction that ended before it: the subscriber uses the order of the
- * frames to decide which transactions it applies at the same time, and two
- * transactions that the publisher serialized with row locks must not be
- * applied at the same time.
- *
- * The frontier holds the transactions that have ended but have not been
- * released yet, and its first entry is the oldest of them.  The frame may go
- * when the record that ended that transaction comes after the frame: the
- * changes of the frame are then before the end event of the transaction, and
- * that is the order the serial path produces them in.
- *
- * The position of the end event is the start of the record that ended the
- * transaction, and the position of the frame is the end of the record that
- * produced it.  The frame may go when the two positions are the same: the
- * record that produced the frame then ends exactly where the record that ends
- * the transaction begins, so the changes of the frame are before the end event
- * of the transaction.
- *
- * The last segment of a transaction is produced while the record that ends the
- * transaction is processed, and it carries the position of that record, so it
- * passes the gate as well.  It is let through before the end event of its own
- * transaction goes on the wire, because the subscriber needs the changes of the
- * segment before it learns that the transaction is over.
+ * Find the end event that waits for a phase.
  */
-static bool
-parallel_decode_frame_may_go(XLogRecPtr end_lsn)
+static PDMarker *
+parallel_decode_find_marker(uint64 cseq)
 {
-	PDCseqInfo *info;
+	ListCell   *lc;
 
-	if (parallel_decode_frontier == NIL)
-		return true;
-
-	info = (PDCseqInfo *) linitial(parallel_decode_frontier);
-
-	return (XLogRecPtr) info->end_lsn >= end_lsn;
-}
-
-/*
- * Remember that a frame that has no commit sequence number is on its way to
- * the subscriber.
- *
- * The position of the frame is the position of the record that produced it.
- * The largest of those positions is what the check of the order of the end
- * events is based on.
- */
-static void
-parallel_decode_note_stream_frame(XLogRecPtr end_lsn)
-{
-	if (end_lsn > parallel_decode_sent_stream_max)
-		parallel_decode_sent_stream_max = end_lsn;
-}
-
-/*
- * Hold the block that has no commit sequence number back.
- *
- * The block waits in the heap of the held blocks until the frontier has moved
- * past its position.  The bytes of the block are counted in the size of the
- * pending area: they wait for their turn just like the frames of a transaction
- * do.
- *
- * The frames of one segment are held together, so that they leave the heap one
- * after the other: the subscriber accepts only one open stream segment at a
- * time.
- */
-static void
-parallel_decode_hold_block(PDQueuedBlock *block)
-{
-	block->seq = ++parallel_decode_frame_seq;
-	block->counted = true;
-
-	parallel_decode_account_pending_bytes(block->len);
-	parallel_decode_account_held_bytes(block->len);
-
-	parallel_decode_held_add(block);
-}
-
-/*
- * Let the blocks of the held heap that have their turn pass.
- *
- * The heap is ordered by the position of the blocks, and the blocks leave it
- * in that order: a block that comes later in the WAL may not be sent before a
- * block that comes earlier.  The blocks stop at the first one that has to
- * wait, because the blocks that come after it wait at least as long.
- */
-static void
-parallel_decode_release_held_frames(void)
-{
-	while (!binaryheap_empty(parallel_decode_held))
+	foreach(lc, parallel_decode_markers)
 	{
-		PDQueuedBlock *block;
+		PDMarker *marker = (PDMarker *) lfirst(lc);
 
-		block = (PDQueuedBlock *) binaryheap_first(parallel_decode_held);
+		if (marker->cseq == cseq)
+			return marker;
+	}
 
-		if (!parallel_decode_frame_may_go(block->end_lsn))
+	return NULL;
+}
+
+/*
+ * Let the end events that have their phase pass.
+ *
+ * The end event of a phase may be sent when the data of its transaction has
+ * been sent and the end events of the phases before it have been sent.  The
+ * phases that follow may not overtake it: the subscriber applies the
+ * transactions in the order in which they were committed.
+ *
+ * A transaction that produced no message has no end event: its phase is done
+ * all the same, and the phases that follow may pass.
+ */
+static void
+parallel_decode_release_markers(void)
+{
+	for (;;)
+	{
+		PDPendingTxn *pending;
+		PDMarker *marker;
+		TimestampTz alloc_time;
+		TimestampTz ack_time;
+		bool		found;
+
+		pending = (PDPendingTxn *) hash_search(parallel_decode_pending,
+											   &parallel_decode_marker_phase,
+											   HASH_FIND, &found);
+
+		/*
+		 * The phase has to be known and settled: the walsender has to know
+		 * whether the transaction has an end event at all, and that is what the
+		 * report of the worker tells.
+		 */
+		if (!found || !pending->acked)
 			break;
 
-		binaryheap_remove_first(parallel_decode_held);
+		/*
+		 * The end event of the phase goes on the wire now.  It is the last
+		 * frame of the transaction: the subscriber has to see the changes of the
+		 * transaction before it learns that the transaction is over.
+		 */
+		marker = parallel_decode_find_marker(parallel_decode_marker_phase);
+		if (marker != NULL)
+		{
+			parallel_decode_ready = lappend(parallel_decode_ready,
+											marker->marker);
+			pending->nframes++;
+			pending->nbytes += marker->marker->len;
 
-		parallel_decode_release_held_bytes(block->len);
-		parallel_decode_note_stream_frame(block->end_lsn);
-		parallel_decode_ready = lappend(parallel_decode_ready, block);
+			parallel_decode_markers = list_delete_ptr(parallel_decode_markers,
+											   marker);
+			pfree(marker);
+		}
+
+		/*
+		 * Record what the barrier did with the phase, so that the order of the
+		 * phases can be checked from the outside.
+		 */
+		PDTraceWritePhase(parallel_decode_marker_phase,
+						   marker != NULL ? PD_PHASE_HAS_MARKER : 0,
+						   pending->nframes, pending->nbytes);
+
+		/*
+		 * The timestamps of the round trip are read before the entry is
+		 * removed: the entry belongs to the hash table, and the table may
+		 * reuse its memory as soon as the entry is gone.
+		 */
+		alloc_time = pending->alloc_time;
+		ack_time = pending->ack_time;
+
+		hash_search(parallel_decode_pending, &parallel_decode_marker_phase,
+					HASH_REMOVE, NULL);
+
+		/*
+		 * The transaction has made the round trip from the walreader to the
+		 * worker and back.  The time it took is the time the transaction waited
+		 * for its turn plus the time it was decoded, which is what the
+		 * monitoring views report as the latency of the transaction.
+		 */
+		if (alloc_time != 0 && ack_time != 0 &&
+			parallel_decode_ctl != NULL)
+		{
+			int64		latency;
+
+			/* the timestamps are in microseconds */
+			latency = ack_time - alloc_time;
+			if (latency < 0)
+				latency = 0;
+
+			parallel_decode_ctl->txn_count++;
+			parallel_decode_ctl->txn_latency_us_sum += (uint64) latency;
+			if ((uint64) latency > parallel_decode_ctl->txn_latency_us_max)
+				parallel_decode_ctl->txn_latency_us_max = (uint64) latency;
+		}
+
+		if (parallel_decode_ctl != NULL)
+			parallel_decode_ctl->cseq_released = parallel_decode_marker_phase;
+
+		parallel_decode_marker_phase++;
+
+		/*
+		 * The transaction has been released, so it does not hold the release
+		 * frontier back anymore.  The entries of the transactions that were
+		 * released before it are gone as well: the report of the walreader may
+		 * have arrived after the transaction was released.
+		 */
+		while (parallel_decode_frontier != NIL)
+		{
+			PDCseqInfo *info = (PDCseqInfo *) linitial(parallel_decode_frontier);
+
+			if (info->cseq >= parallel_decode_marker_phase)
+				break;
+
+			parallel_decode_frontier =
+				list_delete_first(parallel_decode_frontier);
+			pfree(info);
+		}
 	}
 }
 
 /*
  * Let the transactions that have their turn pass.
  *
- * A transaction has its turn when it is the one the walsender is waiting for
- * and the worker that owns it has reported that it has decoded it.  The
- * frames of the transaction are then moved to the list of the frames that may
- * be sent.
+ * A transaction has its turn when the worker that owns it has reported that it
+ * has decoded it: the report is sent after the frames of the transaction, so
+ * the transaction is complete when it arrives.  The data of the transaction is
+ * then free to go, and its end event takes its place in the commit_sync
+ * barrier.
  */
 static void
 parallel_decode_release_txns(void)
@@ -1059,139 +1111,11 @@ parallel_decode_release_txns(void)
 	 */
 	parallel_decode_drain_control();
 
-	for (;;)
-	{
-		PDPendingTxn *pending;
-		ListCell   *lc;
-		bool		found;
-
-		pending = (PDPendingTxn *) hash_search(parallel_decode_pending,
-											   &parallel_decode_next_cseq,
-											   HASH_FIND, &found);
-		if (!found || !pending->acked)
-			break;
-
-		/*
-		 * The frames that have no commit sequence number have to reach the
-		 * subscriber before the end event of their transaction.  The frontier
-		 * still holds the transaction that is released now, so the frames that
-		 * may go are let through before its end event is put on the wire.
-		 */
-		parallel_decode_release_held_frames();
-
-		/*
-		 * The frames that have no commit sequence number may not overtake the
-		 * end event of a transaction that ended before them.  The subscriber
-		 * applies the transactions at the same time, and two transactions that
-		 * the publisher serialized with row locks must not be applied at the
-		 * same time: the subscriber would report a deadlock that the
-		 * publisher does not have.
-		 *
-		 * The frames that are let through above do not overtake anything: the
-		 * frontier still holds the transaction that is released now, so they
-		 * are at the position of its end event at the latest.
-		 */
-		if (parallel_decode_sent_stream_max != InvalidXLogRecPtr &&
-			pending->end_lsn != InvalidXLogRecPtr &&
-			parallel_decode_sent_stream_max > pending->end_lsn)
-		{
-			ereport(WARNING,
-					(errmsg("the parallel decoding session sent a stream "
-							"segment before the commit of an older "
-							"transaction"),
-					 errdetail("The segment at position %X/%X was sent "
-							   "before the transaction that ended at position "
-							   "%X/%X was committed.",
-							   LSN_FORMAT_ARGS(parallel_decode_sent_stream_max),
-							   LSN_FORMAT_ARGS(pending->end_lsn)),
-					 errhint("The subscriber applies the transactions at the "
-							 "same time.  Two transactions that the publisher "
-							 "serialized with row locks must not be applied "
-							 "at the same time, or the subscriber reports a "
-							 "deadlock that the publisher does not have.")));
-		}
-
-		foreach(lc, pending->frames)
-		{
-			PDQueuedBlock *block = (PDQueuedBlock *) lfirst(lc);
-
-			/*
-			 * The definition of a relation is sent to the subscriber once.
-			 * The transactions reach the subscriber in the order of their
-			 * commit sequence numbers, so the definition that the transaction
-			 * with the smallest sequence number produces is the one that has
-			 * to be sent: the subscriber sees it before the changes of the
-			 * transactions that follow it.
-			 */
-			if (block->relid != InvalidOid &&
-				parallel_decode_relation_sent(block))
-			{
-				/*
-				 * The definition is not needed, so the block is dropped.  Its
-				 * memory belongs to the pending area, so it has to be given
-				 * back to it.
-				 */
-				parallel_decode_pending_bytes -= block->len;
-				pfree(block->raw);
-				pfree(block);
-				continue;
-			}
-
-			parallel_decode_ready = lappend(parallel_decode_ready, block);
-		}
-
-		list_free(pending->frames);
-		hash_search(parallel_decode_pending, &parallel_decode_next_cseq,
-					HASH_REMOVE, NULL);
-
-		/*
-		 * The transaction has made the round trip from the walreader to the
-		 * worker and back.  The time it took is the time the transaction
-		 * waited for its turn plus the time it was decoded, which is what the
-		 * monitoring views report as the latency of the transaction.
-		 */
-		if (pending->alloc_time != 0 && pending->ack_time != 0 &&
-			parallel_decode_ctl != NULL)
-		{
-			int64		latency;
-
-			/* the timestamps are in microseconds */
-			latency = pending->ack_time - pending->alloc_time;
-			if (latency < 0)
-				latency = 0;
-
-			parallel_decode_ctl->txn_count++;
-			parallel_decode_ctl->txn_latency_us_sum += (uint64) latency;
-			if ((uint64) latency > parallel_decode_ctl->txn_latency_us_max)
-				parallel_decode_ctl->txn_latency_us_max = (uint64) latency;
-		}
-
-		if (parallel_decode_ctl != NULL)
-			parallel_decode_ctl->cseq_released = parallel_decode_next_cseq;
-
-		/*
-		 * The transaction has been released, so it does not hold the release
-		 * frontier back anymore.
-		 */
-		if (parallel_decode_frontier != NIL)
-		{
-			PDCseqInfo *info = (PDCseqInfo *) linitial(parallel_decode_frontier);
-
-			if (info->cseq == parallel_decode_next_cseq)
-			{
-				parallel_decode_frontier =
-					list_delete_first(parallel_decode_frontier);
-				pfree(info);
-			}
-		}
-
-		parallel_decode_next_cseq++;
-
-		/*
-		 * The frontier has moved, so the frames that waited for it may go.
-		 */
-		parallel_decode_release_held_frames();
-	}
+	/*
+	 * The end events go on the wire in the order of their phases.  The data of
+	 * the transactions does not wait for them.
+	 */
+	parallel_decode_release_markers();
 }
 
 /*
@@ -1230,7 +1154,7 @@ parallel_decode_record_cseq(const PDCseqInfo *info)
 	 * frontier back.  This happens when the report of the transaction was
 	 * handled before the message of the walreader was read.
 	 */
-	if (info->cseq < parallel_decode_next_cseq)
+	if (info->cseq < parallel_decode_marker_phase)
 		return;
 
 	/*
@@ -1238,17 +1162,7 @@ parallel_decode_record_cseq(const PDCseqInfo *info)
 	 * waiting of the transaction for its turn, which is what the monitoring
 	 * views report as the age of the longest pending commit.
 	 */
-	pending = (PDPendingTxn *) hash_search(parallel_decode_pending,
-										   &info->cseq, HASH_ENTER, &found);
-	if (!found)
-	{
-		pending->cseq = info->cseq;
-		pending->frames = NIL;
-		pending->acked = false;
-		pending->alloc_time = 0;
-		pending->ack_time = 0;
-		pending->end_lsn = InvalidXLogRecPtr;
-	}
+	pending = parallel_decode_pending_entry(info->cseq, &found);
 	if (pending->alloc_time == 0)
 		pending->alloc_time = GetCurrentTimestamp();
 
@@ -1637,8 +1551,7 @@ parallel_decode_take_ready_frame(PDFrame *out)
 	/*
 	 * The block leaves the memory of the walsender once its last frame has
 	 * been handed out, so the bytes it takes there are given back to the size
-	 * of the pending area then.  The blocks that never waited for their turn
-	 * were not counted there.
+	 * of the pending area then.
 	 */
 	if (block->counted && parallel_decode_cur_index >= block->nframes)
 		parallel_decode_pending_bytes -= block->len;
@@ -1755,10 +1668,17 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					 * The frame is not part of a transaction that has ended,
 					 * which happens for the fragments of a streamed
 					 * transaction and for the abort of a subtransaction.
-					 * There is no commit sequence number to order it by, so
-					 * it has to wait for the release frontier: it may not
-					 * overtake the end event of a transaction that ended
-					 * before it.
+					 * There is no commit sequence number to order it by, and
+					 * no phase to attach it to: it belongs to a transaction
+					 * that is still running.
+					 *
+					 * The frame is sent as soon as it arrives.  It does not
+					 * wait for the end events of the transactions that ended
+					 * before it: the data of a transaction may be sent before
+					 * the end events of the older transactions, which is what
+					 * lets the subscriber apply the transactions at the same
+					 * time.  Only the end events are ordered, and they are
+					 * ordered by the commit_sync barrier.
 					 */
 					PDQueuedBlock *block;
 
@@ -1771,18 +1691,18 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 					block->end_lsn = (XLogRecPtr) fh.end_lsn;
 					block->relid = InvalidOid;
 					block->epoch = 0;
-					block->counted = false;
+					block->counted = true;
 					block->seq = 0;
 
 					/*
-					 * The frontier is computed from the messages of the
-					 * walreader, so the control channel has to be read before
-					 * the frame is judged.
+					 * The frame is not held back, but it still waits for the
+					 * socket, so it takes the memory of the pending area until
+					 * it has been sent.
 					 */
-					parallel_decode_drain_control();
+					parallel_decode_account_pending_bytes(block->len);
 
-					parallel_decode_hold_block(block);
-					parallel_decode_release_held_frames();
+					parallel_decode_ready = lappend(parallel_decode_ready,
+													 block);
 
 					/* The buffer of the message is the block now. */
 					return true;
@@ -1794,7 +1714,8 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 													 fh.length,
 													 (char *) payload,
 													 (XLogRecPtr) fh.end_lsn,
-													 InvalidOid, 0);
+													 InvalidOid, 0,
+													 (fh.flags & PD_FRAME_MARKER) != 0);
 
 					/* The buffer of the message is the block now. */
 					return true;
@@ -1839,7 +1760,8 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 												 rh.length,
 												 (char *) payload,
 												 (XLogRecPtr) rh.end_lsn,
-												 (Oid) rh.relid, rh.epoch);
+												 (Oid) rh.relid, rh.epoch,
+												 false);
 
 				/* The buffer of the message is the block now. */
 				return true;
@@ -1914,22 +1836,29 @@ parallel_decode_handle_message(int worker, uint16 type, const void *payload,
 				block->end_lsn = (XLogRecPtr) sh.end_lsn;
 				block->relid = InvalidOid;
 				block->epoch = 0;
-				block->counted = false;
+				block->counted = true;
 				block->seq = 0;
 
 				/*
-				 * A segment has no commit sequence number, so its frames have
-				 * to wait for the release frontier: they may not overtake the
-				 * end event of a transaction that ended before them.
+				 * A segment has no commit sequence number and no phase: it
+				 * belongs to a transaction that is still running.  It is sent
+				 * as soon as it arrives, without waiting for the end events of
+				 * the transactions that ended before it.  The data of a
+				 * transaction may be sent before the end events of the older
+				 * transactions, which is what lets the subscriber apply the
+				 * transactions at the same time.
 				 *
-				 * The frontier is computed from the messages of the walreader,
-				 * so the control channel has to be read before the frames are
-				 * judged.
+				 * The frames of the segment reach the subscriber without the
+				 * frames of another transaction in between: the segment is
+				 * kept as one block, and the blocks are written out one after
+				 * the other.
+				 *
+				 * The segment waits for the socket, so it takes the memory of
+				 * the pending area until it has been sent.
 				 */
-				parallel_decode_drain_control();
+				parallel_decode_account_pending_bytes(block->len);
 
-				parallel_decode_hold_block(block);
-				parallel_decode_release_held_frames();
+				parallel_decode_ready = lappend(parallel_decode_ready, block);
 
 				/* The buffer of the message is the block now. */
 				return true;
@@ -2464,7 +2393,7 @@ ParallelDecodePublishStats(bool force)
 	 * one at the head of the queue of the pending transactions.
 	 */
 	pending = (PDPendingTxn *) hash_search(parallel_decode_pending,
-										   &parallel_decode_next_cseq,
+										   &parallel_decode_marker_phase,
 										   HASH_FIND, &found);
 
 	SpinLockAcquire(&MyWalSnd->mutex);
@@ -2693,18 +2622,12 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 													  128, &hash_ctl,
 													  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	parallel_decode_next_cseq = 1;
+	parallel_decode_marker_phase = 1;
+	parallel_decode_markers = NIL;
 	parallel_decode_ready = NIL;
-	parallel_decode_held = binaryheap_allocate(PD_HELD_HEAP_INITIAL,
-												parallel_decode_block_pos_cmp,
-												NULL);
-	parallel_decode_frame_seq = 0;
 	parallel_decode_cur_block = NULL;
 	parallel_decode_cur_index = 0;
 	parallel_decode_cur_off = 0;
-	parallel_decode_sent_stream_max = InvalidXLogRecPtr;
-	parallel_decode_held_bytes = 0;
-	parallel_decode_held_warned = false;
 
 	/* Start the walreader. */
 	arg.dsm_handle = (int) dsm_segment_handle(parallel_decode_seg);
@@ -2908,7 +2831,8 @@ ParallelDecodeSessionStop(void)
 		PDChunkReceiverReset(&parallel_decode_chunk_rcv[i]);
 	parallel_decode_idle_cb = NULL;
 	parallel_decode_position = InvalidXLogRecPtr;
-	parallel_decode_next_cseq = 1;
+	parallel_decode_marker_phase = 1;
+	parallel_decode_markers = NIL;
 
 	/*
 	 * The blocks that are waiting to be sent go away with the session: they
@@ -2923,23 +2847,6 @@ ParallelDecodeSessionStop(void)
 	}
 
 	/*
-	 * The frames that wait for the frontier go away with the session: they
-	 * belong to the transactions of this session.
-	 */
-	if (parallel_decode_held != NULL)
-	{
-		while (!binaryheap_empty(parallel_decode_held))
-		{
-			PDQueuedBlock *block;
-
-			block = (PDQueuedBlock *) binaryheap_remove_first(parallel_decode_held);
-			parallel_decode_free_block(block);
-		}
-		binaryheap_free(parallel_decode_held);
-		parallel_decode_held = NULL;
-	}
-
-	/*
 	 * The block whose frames are being handed out goes away with the session
 	 * as well.
 	 */
@@ -2947,10 +2854,6 @@ ParallelDecodeSessionStop(void)
 	parallel_decode_cur_block = NULL;
 	parallel_decode_cur_index = 0;
 	parallel_decode_cur_off = 0;
-	parallel_decode_frame_seq = 0;
-	parallel_decode_sent_stream_max = InvalidXLogRecPtr;
-	parallel_decode_held_bytes = 0;
-	parallel_decode_held_warned = false;
 
 	/*
 	 * The frontier of the session goes away with it: it describes the

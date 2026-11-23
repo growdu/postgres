@@ -174,6 +174,16 @@ static bool pd_segment_active = false;
 static LogicalDecodeStreamStartCB pd_plugin_stream_start = NULL;
 static LogicalDecodeStreamStopCB pd_plugin_stream_stop = NULL;
 
+/*
+ * Whether the frame that is written next is the end event of a transaction.
+ *
+ * The worker wraps the callbacks of the output plugin that report the end of
+ * a transaction, so that it knows which frame carries the end event.  The
+ * walsender sends the end events in the order of their phases, which is the
+ * order the transactions were committed in.
+ */
+static bool pd_pending_marker = false;
+
 /* The wait event the worker reports while it waits for the walreader. */
 static uint32 pd_wait_event = PG_WAIT_EXTENSION;
 
@@ -283,6 +293,7 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 	uint32		len;
 	Oid			relid;
 	uint64		epoch;
+	uint8		flags;
 
 	/*
 	 * The session is winding down, so the frame is of no use anymore.  It is
@@ -308,7 +319,14 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		/*
 		 * The frames of the segment are stored with their length in front of
 		 * them, so that the walsender can find the boundaries of the frames.
+		 *
+		 * The end event of a transaction never falls inside a segment: the
+		 * plugin writes it after the segment has been closed.  The flag is
+		 * cleared anyway, so that it cannot tag a frame of another
+		 * transaction.
 		 */
+		pd_pending_marker = false;
+
 		len = (uint32) ctx->out->len;
 		appendBinaryStringInfo(pd_segment, (char *) &len, sizeof(len));
 		appendBinaryStringInfo(pd_segment, ctx->out->data, ctx->out->len);
@@ -330,8 +348,16 @@ pd_worker_write(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 		return;
 	}
 
+	/*
+	 * The frame carries the end event of the transaction, so it is tagged
+	 * with the marker flag.  The walsender sends the end events in the order
+	 * of their phases.
+	 */
+	flags = pd_pending_marker ? PD_FRAME_MARKER : 0;
+	pd_pending_marker = false;
+
 	PDQueueSendFrame(&pd_out_sender, (uint64) pd_end_lsn, pd_current_cseq,
-					 ctx->out->data, ctx->out->len);
+					 flags, ctx->out->data, ctx->out->len);
 }
 
 /*
@@ -413,6 +439,120 @@ pd_worker_stream_stop(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 
 	pd_segment_active = false;
 	pd_worker_send_segment();
+}
+
+/*
+ * The callbacks of the output plugin that report the end of a transaction.
+ *
+ * The worker wraps them, so that it knows which frame carries the end event
+ * of the transaction.  The walsender sends the end events in the order of
+ * their phases, so that the transactions are applied by the subscriber in the
+ * order they were committed in.
+ */
+static LogicalDecodeCommitCB pd_plugin_commit = NULL;
+static LogicalDecodePrepareCB pd_plugin_prepare = NULL;
+static LogicalDecodeCommitPreparedCB pd_plugin_commit_prepared = NULL;
+static LogicalDecodeRollbackPreparedCB pd_plugin_rollback_prepared = NULL;
+static LogicalDecodeStreamCommitCB pd_plugin_stream_commit = NULL;
+static LogicalDecodeStreamAbortCB pd_plugin_stream_abort = NULL;
+static LogicalDecodeStreamPrepareCB pd_plugin_stream_prepare = NULL;
+
+/*
+ * Note that the frame that is written next is the end event of a transaction.
+ *
+ * The flag is cleared once the frame has been written, and it is cleared
+ * again when the callback is done, so that a callback that writes no frame at
+ * all does not tag the frame of another transaction.
+ */
+static void
+pd_worker_note_marker(void)
+{
+	pd_pending_marker = true;
+}
+
+/*
+ * The 'commit' callback of the output plugin.
+ */
+static void
+pd_worker_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+				 XLogRecPtr commit_lsn)
+{
+	pd_worker_note_marker();
+	pd_plugin_commit(ctx, txn, commit_lsn);
+	pd_pending_marker = false;
+}
+
+/*
+ * The 'prepare' callback of the output plugin.
+ */
+static void
+pd_worker_prepare(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+				  XLogRecPtr prepare_lsn)
+{
+	pd_worker_note_marker();
+	pd_plugin_prepare(ctx, txn, prepare_lsn);
+	pd_pending_marker = false;
+}
+
+/*
+ * The 'commit_prepared' callback of the output plugin.
+ */
+static void
+pd_worker_commit_prepared(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+						   XLogRecPtr commit_lsn)
+{
+	pd_worker_note_marker();
+	pd_plugin_commit_prepared(ctx, txn, commit_lsn);
+	pd_pending_marker = false;
+}
+
+/*
+ * The 'rollback_prepared' callback of the output plugin.
+ */
+static void
+pd_worker_rollback_prepared(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+							 XLogRecPtr prepare_end_lsn,
+							 TimestampTz prepare_time)
+{
+	pd_worker_note_marker();
+	pd_plugin_rollback_prepared(ctx, txn, prepare_end_lsn, prepare_time);
+	pd_pending_marker = false;
+}
+
+/*
+ * The 'stream_commit' callback of the output plugin.
+ */
+static void
+pd_worker_stream_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+						XLogRecPtr commit_lsn)
+{
+	pd_worker_note_marker();
+	pd_plugin_stream_commit(ctx, txn, commit_lsn);
+	pd_pending_marker = false;
+}
+
+/*
+ * The 'stream_abort' callback of the output plugin.
+ */
+static void
+pd_worker_stream_abort(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+					   XLogRecPtr abort_lsn)
+{
+	pd_worker_note_marker();
+	pd_plugin_stream_abort(ctx, txn, abort_lsn);
+	pd_pending_marker = false;
+}
+
+/*
+ * The 'stream_prepare' callback of the output plugin.
+ */
+static void
+pd_worker_stream_prepare(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+						 XLogRecPtr prepare_lsn)
+{
+	pd_worker_note_marker();
+	pd_plugin_stream_prepare(ctx, txn, prepare_lsn);
+	pd_pending_marker = false;
 }
 
 /*
@@ -1291,6 +1431,48 @@ ParallelDecodeWorkerMain(Datum main_arg)
 		pd_plugin_stream_stop = pd_ctx->callbacks.stream_stop_cb;
 		pd_ctx->callbacks.stream_start_cb = pd_worker_stream_start;
 		pd_ctx->callbacks.stream_stop_cb = pd_worker_stream_stop;
+	}
+
+	/*
+	 * The worker tells the walsender which frame carries the end event of a
+	 * transaction, so that the walsender can send the end events in the order
+	 * of their phases.  The callbacks of the plugin that report the end of a
+	 * transaction are wrapped for that.
+	 */
+	if (pd_ctx->callbacks.commit_cb != NULL)
+	{
+		pd_plugin_commit = pd_ctx->callbacks.commit_cb;
+		pd_ctx->callbacks.commit_cb = pd_worker_commit;
+	}
+	if (pd_ctx->callbacks.prepare_cb != NULL)
+	{
+		pd_plugin_prepare = pd_ctx->callbacks.prepare_cb;
+		pd_ctx->callbacks.prepare_cb = pd_worker_prepare;
+	}
+	if (pd_ctx->callbacks.commit_prepared_cb != NULL)
+	{
+		pd_plugin_commit_prepared = pd_ctx->callbacks.commit_prepared_cb;
+		pd_ctx->callbacks.commit_prepared_cb = pd_worker_commit_prepared;
+	}
+	if (pd_ctx->callbacks.rollback_prepared_cb != NULL)
+	{
+		pd_plugin_rollback_prepared = pd_ctx->callbacks.rollback_prepared_cb;
+		pd_ctx->callbacks.rollback_prepared_cb = pd_worker_rollback_prepared;
+	}
+	if (pd_ctx->callbacks.stream_commit_cb != NULL)
+	{
+		pd_plugin_stream_commit = pd_ctx->callbacks.stream_commit_cb;
+		pd_ctx->callbacks.stream_commit_cb = pd_worker_stream_commit;
+	}
+	if (pd_ctx->callbacks.stream_abort_cb != NULL)
+	{
+		pd_plugin_stream_abort = pd_ctx->callbacks.stream_abort_cb;
+		pd_ctx->callbacks.stream_abort_cb = pd_worker_stream_abort;
+	}
+	if (pd_ctx->callbacks.stream_prepare_cb != NULL)
+	{
+		pd_plugin_stream_prepare = pd_ctx->callbacks.stream_prepare_cb;
+		pd_ctx->callbacks.stream_prepare_cb = pd_worker_stream_prepare;
 	}
 
 	ereport(LOG,
