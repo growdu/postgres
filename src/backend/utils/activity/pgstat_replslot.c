@@ -77,12 +77,37 @@ pgstat_reset_replslot(const char *name)
 void
 pgstat_report_replslot(ReplicationSlot *slot, const PgStat_StatReplSlotEntry *repSlotStat)
 {
+	pgstat_report_replslot_by_index(ReplicationSlotIndex(slot), repSlotStat);
+}
+
+/*
+ * Report replication slot statistics, given the index of the slot.
+ *
+ * The index is what identifies a slot in the statistics, but it can only be
+ * computed from a slot that lives in the array of the slots.  A process that
+ * works on a copy of a slot instead of the slot itself (the decode workers of
+ * the parallel decoding path) has to be told the index of the slot.
+ */
+void
+pgstat_report_replslot_by_index(int slot_index, const PgStat_StatReplSlotEntry *repSlotStat)
+{
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_ReplSlot *shstatent;
 	PgStat_StatReplSlotEntry *statent;
 
+	/*
+	 * The entry of the statistics is created when it does not exist, and it is
+	 * written out at shutdown under the name of the slot that has the index.
+	 * An index that belongs to no slot would therefore be written out under a
+	 * name that cannot be found, and the process that writes the statistics
+	 * would read out of bounds.  Such an index is a bug, but it must not take
+	 * the server down: the statistics are dropped instead.
+	 */
+	if (slot_index < 0 || slot_index >= max_replication_slots)
+		return;
+
 	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_REPLSLOT, InvalidOid,
-											ReplicationSlotIndex(slot), false);
+											slot_index, false);
 	shstatent = (PgStatShared_ReplSlot *) entry_ref->shared_stats;
 	statent = &shstatent->stats;
 

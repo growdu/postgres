@@ -667,6 +667,7 @@ extern PgStat_TableStatus *find_tabstat_entry(Oid rel_id);
 extern void pgstat_reset_replslot(const char *name);
 struct ReplicationSlot;
 extern void pgstat_report_replslot(struct ReplicationSlot *slot, const PgStat_StatReplSlotEntry *repSlotStat);
+extern void pgstat_report_replslot_by_index(int slot_index, const PgStat_StatReplSlotEntry *repSlotStat);
 extern void pgstat_create_replslot(struct ReplicationSlot *slot);
 extern void pgstat_acquire_replslot(struct ReplicationSlot *slot);
 extern void pgstat_drop_replslot(struct ReplicationSlot *slot);

@@ -35,6 +35,7 @@
 #include "pgstat.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
+#include "replication/parallel_decode.h"
 #include "replication/reorderbuffer.h"
 #include "replication/slotsync.h"
 #include "replication/snapbuild.h"
@@ -2024,7 +2025,21 @@ UpdateDecodingStats(LogicalDecodingContext *ctx)
 	repSlotStat.total_txns = rb->totalTxns;
 	repSlotStat.total_bytes = rb->totalBytes;
 
-	pgstat_report_replslot(ctx->slot, &repSlotStat);
+	if (AmDecodeWorkerProcess())
+	{
+		/*
+		 * The decode worker does not own the slot: it works on a copy of it,
+		 * so the index of the slot cannot be computed from the pointer the
+		 * worker has.  The statistics are reported for the slot of the
+		 * session instead, which the walsender owns.
+		 */
+		int		slot_index = ParallelDecodeWorkerSlotIndex();
+
+		if (slot_index >= 0)
+			pgstat_report_replslot_by_index(slot_index, &repSlotStat);
+	}
+	else
+		pgstat_report_replslot(ctx->slot, &repSlotStat);
 
 	rb->spillTxns = 0;
 	rb->spillCount = 0;

@@ -31,6 +31,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "replication/parallel_decode.h"
+#include "replication/slot.h"
 #include "replication/walsender_private.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
@@ -2545,6 +2546,7 @@ ParallelDecodeSessionStart(ReplicationSlot *slot,
 	parallel_decode_ctl->two_phase_at = slot->data.two_phase_at;
 	strlcpy(parallel_decode_ctl->slot_name, NameStr(slot->data.name),
 			NAMEDATALEN);
+	parallel_decode_ctl->repl_slot_index = ReplicationSlotIndex(slot);
 	strlcpy(parallel_decode_ctl->plugin_name, NameStr(slot->data.plugin),
 			NAMEDATALEN);
 	if (plugin_options_len > sizeof(parallel_decode_ctl->plugin_options))

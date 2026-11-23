@@ -179,6 +179,12 @@ extern void ParallelDecodeWorkerMain(Datum main_arg);
 extern void ParallelWalreaderMain(Datum main_arg);
 
 /*
+ * The index of the replication slot of the session, as the decode worker sees
+ * it.  Returns -1 if the index is not known.
+ */
+extern int ParallelDecodeWorkerSlotIndex(void);
+
+/*
  * Shared control block.  Lives in the dynamic shared memory area created by
  * the walsender and is attached by walreader and decode workers.
  */
@@ -274,6 +280,16 @@ typedef struct ParallelDecodeControl
 	 * serialized form of PD_MAX_PLUGIN_OPTIONS bytes.
 	 */
 	char		slot_name[NAMEDATALEN];
+
+	/*
+	 * The index of the replication slot of the session.
+	 *
+	 * The index identifies the slot in the statistics of the slots, but it can
+	 * only be computed from a slot that lives in the array of the slots.  The
+	 * workers work on a copy of the slot, so they cannot compute it themselves:
+	 * the walsender owns the slot and hands the index over to them.
+	 */
+	int			repl_slot_index;
 
 	Oid			database;
 	bool		two_phase;

@@ -1233,6 +1233,25 @@ pd_worker_wakeup_counter(void)
 }
 
 /*
+ * The index of the replication slot of the session.
+ *
+ * The worker does not own the slot: it works on a copy of it, so it cannot
+ * compute the index of the slot from the pointer it has.  The walsender owns
+ * the slot and puts its index into the control block, so the worker can ask
+ * for it here.
+ *
+ * Returns -1 if the index is not known.
+ */
+int
+ParallelDecodeWorkerSlotIndex(void)
+{
+	if (pd_ctl == NULL)
+		return -1;
+
+	return pd_ctl->repl_slot_index;
+}
+
+/*
  * Detach from the queues of the worker.
  *
  * The worker is the receiver on the channel the walreader hands the records
