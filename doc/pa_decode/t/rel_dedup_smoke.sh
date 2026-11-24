@@ -88,6 +88,11 @@ EOF
 echo "== setting up the clusters"
 "$SCRIPT_DIR/setup_env.sh" init
 "$SCRIPT_DIR/setup_env.sh" start
+#
+# The traces are written by appending, so the files of an earlier run have to
+# be gone before the sessions that write them start.
+#
+rm -f "$TRACE_SERIAL" "$TRACE_PARALLEL"
 
 echo "== creating the schema"
 pub -c "create table pd_t (id bigserial primary key, v text)"

@@ -98,6 +98,16 @@ lc_messages = 'C'
 EOF
 "$SCRIPT_DIR/setup_env.sh" start
 rm -f "$TRACE"
+#
+# The handshake files of the two transactions have to be gone before the test
+# starts: they live directly in $ROOT, and setup_env.sh init only wipes
+# $ROOT/pub and $ROOT/sub, so a file that another test (or an earlier run of
+# this one) left behind would still be there.  A stale first.done would let
+# the second transaction commit before the first one, and the end events would
+# then be in the order of the commits -- which is what the barrier promises,
+# but the opposite of what this test checks.
+#
+rm -f "$ROOT/first.done" "$ROOT/second.done"
 
 echo "== creating the schema"
 pub -c "create table pd_t (id int primary key, v text)"

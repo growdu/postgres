@@ -97,6 +97,14 @@ cat >>"$ROOT/sub/postgresql.conf" <<EOF
 lc_messages = 'C'
 EOF
 "$SCRIPT_DIR/setup_env.sh" start
+#
+# The trace is written by appending, so a file that an earlier run left behind
+# would still be in it.  The handshake files of the two transactions live
+# directly in $ROOT, and setup_env.sh init only wipes $ROOT/pub and $ROOT/sub,
+# so a stale one would let the second transaction commit before the first one.
+# See marker_order_smoke.sh for the details.
+#
+rm -f "$TRACE" "$ROOT/first.done" "$ROOT/second.done"
 
 echo "== creating the schema"
 pub -c "create table pd_a (id int primary key, v text)"
